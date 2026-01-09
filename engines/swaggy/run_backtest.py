@@ -396,6 +396,8 @@ def main() -> None:
                         )
                     trade = None
                     state["in_pos"] = False
+                    if exited.exit_reason == "SL":
+                        state["swaggy_last_sl_ts"] = float(exited.exit_ts or ts) / 1000.0
                     cooldown_until = idx + max(0, int(args.trade_cooldown_bars))
 
             if pending is not None and idx == pending.entry_idx:
@@ -451,6 +453,19 @@ def main() -> None:
                 engine_config=cfg,
                 now_ts=now_ts,
             )
+            reason = (decision.reason_codes or [""])[0]
+            if reason == "COOLDOWN":
+                bars_left = ""
+                if isinstance(decision.evidence, dict):
+                    bars_left = decision.evidence.get("bars_left", "")
+                log_fn(f"[swaggy] ENTRY_SKIP reason=COOLDOWN sym={symbol} bars_left={bars_left}")
+            elif reason == "ZONE_REENTRY":
+                log_fn(f"[swaggy] ENTRY_SKIP reason=ZONE_REENTRY sym={symbol}")
+            elif reason == "SL_COOLDOWN":
+                bars_left = ""
+                if isinstance(decision.evidence, dict):
+                    bars_left = decision.evidence.get("bars_left", "")
+                log_fn(f"[swaggy] SL_COOLDOWN_ACTIVE sym={symbol} bars_left={bars_left}")
             if _decision_entry_ready(decision):
                 if trade is not None:
                     trade_stats["skipped_in_pos"] += 1

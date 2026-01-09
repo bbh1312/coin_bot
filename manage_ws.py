@@ -113,6 +113,15 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
     open_tr = er._get_open_trade(state, "LONG", symbol)
     if not open_tr:
         return
+    st = state.get(symbol, {}) if isinstance(state, dict) else {}
+    last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
+    last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
+    if (
+        isinstance(last_exit_ts, (int, float))
+        and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
+        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
+    ):
+        return
     engine_label = er._engine_label_from_reason((open_tr.get("meta") or {}).get("reason"))
     if engine_label == "UNKNOWN":
         return
@@ -161,6 +170,15 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
 def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
     open_tr = er._get_open_trade(state, "SHORT", symbol)
     if not open_tr:
+        return
+    st = state.get(symbol, {}) if isinstance(state, dict) else {}
+    last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
+    last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
+    if (
+        isinstance(last_exit_ts, (int, float))
+        and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
+        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
+    ):
         return
     engine_label = er._engine_label_from_reason((open_tr.get("meta") or {}).get("reason"))
     if engine_label == "UNKNOWN":
@@ -241,6 +259,11 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts):
         pnl_usdt=pnl_long,
         reason="auto_exit_tp",
     )
+    st = state.get(symbol, {}) if isinstance(state, dict) else {}
+    if isinstance(st, dict):
+        st["last_exit_ts"] = now_ts
+        st["last_exit_reason"] = "auto_exit_tp"
+        state[symbol] = st
     er._append_report_line(symbol, "LONG", profit_unlev, pnl_long, engine_label)
     print(f"[manage-ws] long_tp_exit sym={symbol} roi={profit_unlev:.2f}% pnl={pnl_long}")
     er.send_telegram(
@@ -288,6 +311,11 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
         pnl_usdt=pnl_short,
         reason="auto_exit_tp",
     )
+    st = state.get(symbol, {}) if isinstance(state, dict) else {}
+    if isinstance(st, dict):
+        st["last_exit_ts"] = now_ts
+        st["last_exit_reason"] = "auto_exit_tp"
+        state[symbol] = st
     er._append_report_line(symbol, "SHORT", profit_unlev, pnl_short, engine_label)
     print(f"[manage-ws] short_tp_exit sym={symbol} roi={profit_unlev:.2f}% pnl={pnl_short}")
     er.send_telegram(
@@ -303,7 +331,7 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
 
 def main():
     er.MANAGE_WS_MODE = True
-    er.SUPPRESS_RECONCILE_ALERTS = True
+    er.SUPPRESS_RECONCILE_ALERTS = False
     er._install_error_hooks()
     state = er.load_state()
     er._reload_runtime_settings_from_disk(state)

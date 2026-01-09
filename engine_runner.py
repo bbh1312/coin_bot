@@ -375,6 +375,39 @@ def _append_entry_log(path: str, line: str) -> None:
     except Exception:
         pass
 
+def _append_atlas_route_log(engine: str, symbol: str, payload: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.join("logs", "atlas"), exist_ok=True)
+        date_tag = time.strftime("%Y%m%d")
+        path = os.path.join("logs", "atlas", f"atlas_{date_tag}.log")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        def _val(v: Any) -> str:
+            if v is None or v == "":
+                return "N/A"
+            if isinstance(v, bool):
+                return "1" if v else "0"
+            return str(v)
+
+        parts = [f"ts={ts}", f"engine={engine}", f"symbol={symbol}"]
+        for key in (
+            "side",
+            "state",
+            "regime",
+            "reason",
+            "trade_allowed",
+            "allow_long",
+            "allow_short",
+            "size_mult",
+            "block_reason",
+        ):
+            if key in payload:
+                parts.append(f"{key}={_val(payload.get(key))}")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(" ".join(parts) + "\n")
+    except Exception:
+        pass
+
 def _append_log_lines(path: str, lines: list) -> None:
     if not lines:
         return
@@ -1378,6 +1411,29 @@ def _run_swaggy_cycle(
         dist_pct = dbg.get("dist_pct")
         atlas_gate = state.get("_atlas_swaggy_gate") or {}
         atlas_local = _compute_atlas_swaggy_local(symbol, decision, atlas_gate, swaggy_cfg)
+        block_reason = None
+        size_mult = None
+        if side == "LONG":
+            block_reason = atlas_local.get("atlas_long_block_reason")
+            size_mult = atlas_local.get("long_size_mult")
+        elif side == "SHORT":
+            block_reason = atlas_local.get("atlas_short_block_reason")
+            size_mult = atlas_local.get("short_size_mult")
+        _append_atlas_route_log(
+            "SWAGGY",
+            symbol,
+            {
+                "side": side,
+                "state": atlas_local.get("state"),
+                "regime": atlas_gate.get("regime"),
+                "reason": atlas_gate.get("reason"),
+                "trade_allowed": atlas_gate.get("trade_allowed"),
+                "allow_long": atlas_local.get("allow_long"),
+                "allow_short": atlas_local.get("allow_short"),
+                "size_mult": size_mult,
+                "block_reason": block_reason,
+            },
+        )
         if side == "LONG" and not atlas_local.get("allow_long", 0):
             block_reason = atlas_local.get("atlas_long_block_reason") or "ATLAS_LONG_NO_EXCEPTION"
             detail = (
@@ -1716,6 +1772,8 @@ def _run_atlas_fabio_cycle(
     active_positions_total,
     dir_hint,
     send_alert,
+    entry_callback=None,
+    now_ts: Optional[float] = None,
 ):
     result = {"long_hits": 0, "short_hits": 0}
     buf = []
@@ -1754,6 +1812,7 @@ def _run_atlas_fabio_cycle(
         return result
     if not isinstance(active_positions_total, int):
         active_positions_total = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+    now_ts = now_ts if isinstance(now_ts, (int, float)) else time.time()
 
     funnel = {
         "candidates_total": 0,
@@ -1813,7 +1872,7 @@ def _run_atlas_fabio_cycle(
             funnel["blocked_in_pos"] += 1
             continue
         last_entry = float(st.get("last_entry", 0))
-        if (time.time() - last_entry) < COOLDOWN_SEC:
+        if (now_ts - last_entry) < COOLDOWN_SEC:
             funnel["skip_precheck"] += 1
             funnel["blocked_cooldown"] += 1
             continue
@@ -2178,6 +2237,20 @@ def _run_atlas_fabio_cycle(
             )
 
         side = best_side
+        _append_atlas_route_log(
+            "ATLASFABIO",
+            symbol,
+            {
+                "side": side,
+                "state": gate.get("state"),
+                "regime": gate.get("regime"),
+                "reason": gate.get("reason"),
+                "trade_allowed": gate.get("trade_allowed"),
+                "allow_long": gate.get("allow_long"),
+                "allow_short": gate.get("allow_short"),
+                "size_mult": size_mult,
+            },
+        )
         trigger_hard = bool(best_res.get("trigger_hard"))
         trigger_soft = bool(best_res.get("trigger_soft"))
         trigger_mode = best_res.get("trigger_mode") or "NONE"
@@ -2241,13 +2314,17 @@ def _run_atlas_fabio_cycle(
             symbol,
             side,
             st,
-            time.time(),
+            now_ts,
             "NA",
             None,
             live_ok=LONG_LIVE_TRADING if side == "LONG" else LIVE_TRADING,
             max_positions=MAX_OPEN_POSITIONS,
             active_positions=cur_total,
         )
+        if (not gate_ok) and backtest_mode and gate_reason == "live_off":
+            funnel["entry_live_off"] += 1
+            _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=BACKTEST")
+            gate_ok = True
         if not gate_ok:
             funnel["entry_gate_skip"] += 1
             if gate_reason == "in_pos":
@@ -2285,6 +2362,18 @@ def _run_atlas_fabio_cycle(
         _append_atlasfabio_log(entry_line)
         if not backtest_mode:
             _append_entry_log("fabio/atlasfabio_entries.log", entry_line)
+        if callable(entry_callback):
+            try:
+                entry_callback(
+                    symbol=symbol,
+                    side=side,
+                    strength=strength,
+                    reasons=reasons,
+                    gate=gate,
+                    fabio_res=best_res,
+                )
+            except Exception:
+                pass
 
         funnel["entry_signal"] += 1
         if side == "LONG":
@@ -2898,6 +2987,11 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
             reason="position_closed_detected",
         )
         engine_label = _engine_label_from_reason((meta or {}).get("reason"))
+        if meta.get("sl_order_id") and engine_label == "SWAGGY":
+            st = state.get(symbol, {})
+            if isinstance(st, dict):
+                st["swaggy_last_sl_ts"] = exit_ts
+                state[symbol] = st
         if not SUPPRESS_RECONCILE_ALERTS:
             _append_report_line(symbol, "LONG", None, pnl, engine_label)
         if (
@@ -3064,6 +3158,11 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
             reason=exit_reason,
         )
         engine_label = _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
+        if exit_reason == "auto_exit_sl" and engine_label == "SWAGGY":
+            st = state.get(symbol, {})
+            if isinstance(st, dict):
+                st["swaggy_last_sl_ts"] = exit_ts
+                state[symbol] = st
         st = state.get(symbol, {})
         seen_ts = st.get("short_pos_seen_ts") if isinstance(st, dict) else None
         recent_seen = False
@@ -3180,6 +3279,11 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             _append_report_line(sym, "SHORT", None, None, engine_label)
             last_entry_val = float(st.get("last_entry", 0))
             state[sym] = {"in_pos": False, "last_ok": False, "last_entry": last_entry_val, "dca_adds": 0}
+            if exit_reason == "auto_exit_sl" and engine_label == "SWAGGY":
+                st = state.get(sym, {})
+                if isinstance(st, dict):
+                    st["swaggy_last_sl_ts"] = now
+                    state[sym] = st
             if isinstance(open_tr, dict) and engine_label != "UNKNOWN" and _trade_has_entry(open_tr):
                 send_telegram(
                     f"🔴 <b>숏 청산</b>\n"
@@ -3562,44 +3666,105 @@ def _update_report_csv(tr: dict) -> None:
         roi = tr.get("roi_pct")
         engine = tr.get("engine_label") or ""
         exit_reason = tr.get("exit_reason") or ""
-        rows = []
+        def _to_float(val: Any) -> Optional[float]:
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        def _calc_win_loss(pnl_val: Any, roi_val: Any) -> tuple[str, str]:
+            base = _to_float(pnl_val)
+            if base is None:
+                base = _to_float(roi_val)
+            if base is None:
+                return "", ""
+            if base > 0:
+                return "1", "0"
+            if base < 0:
+                return "0", "1"
+            return "0", "0"
+
+        expected_cols = [
+            "entry_ts",
+            "symbol",
+            "side",
+            "engine",
+            "entry_price",
+            "qty",
+            "exit_ts",
+            "exit_price",
+            "roi",
+            "pnl",
+            "exit_reason",
+            "win",
+            "loss",
+        ]
+        records = []
         if os.path.exists(report_path):
             with open(report_path, "r", encoding="utf-8") as f:
                 rows = [line.rstrip("\n") for line in f.readlines()]
-        if rows:
-            header = rows[0]
-        else:
-            header = "entry_ts,symbol,side,engine,entry_price,qty,exit_ts,exit_price,roi,pnl,exit_reason"
-            rows = [header]
+            if rows:
+                header_cols = rows[0].split(",")
+                for row in rows[1:]:
+                    parts = row.split(",")
+                    if len(parts) < len(header_cols):
+                        parts += [""] * (len(header_cols) - len(parts))
+                    rec = {header_cols[i]: parts[i] for i in range(len(header_cols))}
+                    records.append(rec)
+
         key = f"{entry_ts_str}|{symbol}|{side}"
         updated = False
-        for idx in range(1, len(rows)):
-            parts = rows[idx].split(",")
-            if len(parts) < 3:
-                continue
-            row_key = f"{parts[0]}|{parts[1]}|{parts[2]}"
+        for rec in records:
+            row_key = f"{rec.get('entry_ts','')}|{rec.get('symbol','')}|{rec.get('side','')}"
             if row_key == key:
-                rows[idx] = (
-                    f"{entry_ts_str},{symbol},{side},{engine},"
-                    f"{entry_price if entry_price is not None else ''},"
-                    f"{qty if qty is not None else ''},"
-                    f"{exit_ts_str},{exit_price if exit_price is not None else ''},"
-                    f"{roi if roi is not None else ''},{pnl if pnl is not None else ''},"
-                    f"{exit_reason}"
+                rec.update(
+                    {
+                        "entry_ts": entry_ts_str,
+                        "symbol": symbol,
+                        "side": side,
+                        "engine": engine,
+                        "entry_price": entry_price if entry_price is not None else "",
+                        "qty": qty if qty is not None else "",
+                        "exit_ts": exit_ts_str,
+                        "exit_price": exit_price if exit_price is not None else "",
+                        "roi": roi if roi is not None else "",
+                        "pnl": pnl if pnl is not None else "",
+                        "exit_reason": exit_reason,
+                    }
                 )
+                win, loss = _calc_win_loss(rec.get("pnl"), rec.get("roi"))
+                rec["win"] = win
+                rec["loss"] = loss
                 updated = True
                 break
         if not updated:
-            rows.append(
-                f"{entry_ts_str},{symbol},{side},{engine},"
-                f"{entry_price if entry_price is not None else ''},"
-                f"{qty if qty is not None else ''},"
-                f"{exit_ts_str},{exit_price if exit_price is not None else ''},"
-                f"{roi if roi is not None else ''},{pnl if pnl is not None else ''},"
-                f"{exit_reason}"
+            win, loss = _calc_win_loss(pnl, roi)
+            records.append(
+                {
+                    "entry_ts": entry_ts_str,
+                    "symbol": symbol,
+                    "side": side,
+                    "engine": engine,
+                    "entry_price": entry_price if entry_price is not None else "",
+                    "qty": qty if qty is not None else "",
+                    "exit_ts": exit_ts_str,
+                    "exit_price": exit_price if exit_price is not None else "",
+                    "roi": roi if roi is not None else "",
+                    "pnl": pnl if pnl is not None else "",
+                    "exit_reason": exit_reason,
+                    "win": win,
+                    "loss": loss,
+                }
             )
+
         with open(report_path, "w", encoding="utf-8") as f:
-            for line in rows:
+            f.write(",".join(expected_cols) + "\n")
+            for rec in records:
+                if not rec.get("win") and not rec.get("loss"):
+                    win, loss = _calc_win_loss(rec.get("pnl"), rec.get("roi"))
+                    rec["win"] = win
+                    rec["loss"] = loss
+                line = ",".join(str(rec.get(col, "")) for col in expected_cols)
                 f.write(line + "\n")
     except Exception:
         pass

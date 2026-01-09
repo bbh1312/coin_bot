@@ -100,6 +100,7 @@ class SwaggyConfig:
     short_max_dist_retest: float = 0.0020
     short_max_dist_rejection: float = 0.0025
     short_max_dist_sweep: float = 0.0015
+    reclaim_ext_atr_mult: float = 0.60
     symbol_entry_cooldown_min: int = 30
     swing_lookback_1h: int = 60
     swing_lookback_mtf: int = 32
@@ -108,6 +109,15 @@ class SwaggyConfig:
     level_cap: int = 25
     no_trigger_log_sample_pct: float = 0.10
     sweep_log_sample_pct: float = 0.10
+    # frequency control
+    symbol_cooldown_bars: int = 3
+    zone_reentry_limit: int = 1
+    post_sl_cooldown_bars: int = 5
+    # TP / SL
+    sl_mode: str = "FIXED_PCT"  # FIXED_PCT | ZONE_BASED | INVALID_EPS
+    sl_buffer_atr: float = 0.25
+    sl_pct: float = 0.02
+    tp_pct: float = 0.02
 
 
 @dataclass
@@ -232,13 +242,16 @@ class SwaggyEngine(BaseEngine):
         df_4h = cycle_cache.get_df(symbol, cfg.tf_htf2, 200)
         if not df_4h.empty and len(df_4h) > 1:
             df_4h = df_4h.iloc[:-1]
+        position_state = {}
+        if ctx and isinstance(ctx.state, dict):
+            position_state = ctx.state.get(symbol, {}) or {}
         decision = self.evaluate_symbol(
             sym=symbol,
             candles_4h=df_4h,
             candles_1h=df_1h,
             candles_15m=df_15m,
             candles_5m=df_5m,
-            position_state=self._state.get(symbol, {}),
+            position_state=position_state,
             engine_config=cfg,
             now_ts=ctx.now_ts,
         )
@@ -803,6 +816,67 @@ class SwaggyEngine(BaseEngine):
                 evidence=evidence,
             )
 
+        if trigger.kind == "RECLAIM":
+            atr = _atr(candles_5m, cfg.touch_atr_len)
+            zone_high = trigger.level.high if trigger.level.high is not None else trigger.level.price
+            zone_low = trigger.level.low if trigger.level.low is not None else trigger.level.price
+            if trigger.side == "long":
+                if (last_price - zone_high) > (atr * cfg.reclaim_ext_atr_mult):
+                    evidence = dict(trigger.evidence or {})
+                    evidence["atr"] = atr
+                    evidence["zone_high"] = zone_high
+                    evidence["ext_atr_mult"] = cfg.reclaim_ext_atr_mult
+                    evidence["ext_dist"] = last_price - zone_high
+                    _inject_regime_evidence(evidence, regime_state, cfg)
+                    return SwaggyDecision(
+                        sym=sym,
+                        side=trigger.side,
+                        entry_ready=0,
+                        entry_px=None,
+                        sl_px=None,
+                        tp1_px=None,
+                        tp2_px=None,
+                        reason_codes=["RECLAIM_TOO_EXTENDED"],
+                        debug=self._debug_payload(
+                            last_price,
+                            regime_state.regime,
+                            trigger,
+                            vp,
+                            "RECLAIM_TOO_EXTENDED",
+                            trigger_debug,
+                        ),
+                        filters={"dist": 0, "lvn_gap": 0, "expansion": 0, "cooldown": 0, "regime": 0, "weak_signal": 0, "sweep_confirm": 0},
+                        evidence=evidence,
+                    )
+            elif trigger.side == "short":
+                if (zone_low - last_price) > (atr * cfg.reclaim_ext_atr_mult):
+                    evidence = dict(trigger.evidence or {})
+                    evidence["atr"] = atr
+                    evidence["zone_low"] = zone_low
+                    evidence["ext_atr_mult"] = cfg.reclaim_ext_atr_mult
+                    evidence["ext_dist"] = zone_low - last_price
+                    _inject_regime_evidence(evidence, regime_state, cfg)
+                    return SwaggyDecision(
+                        sym=sym,
+                        side=trigger.side,
+                        entry_ready=0,
+                        entry_px=None,
+                        sl_px=None,
+                        tp1_px=None,
+                        tp2_px=None,
+                        reason_codes=["RECLAIM_TOO_EXTENDED"],
+                        debug=self._debug_payload(
+                            last_price,
+                            regime_state.regime,
+                            trigger,
+                            vp,
+                            "RECLAIM_TOO_EXTENDED",
+                            trigger_debug,
+                        ),
+                        filters={"dist": 0, "lvn_gap": 0, "expansion": 0, "cooldown": 0, "regime": 0, "weak_signal": 0, "sweep_confirm": 0},
+                        evidence=evidence,
+                    )
+
         if regime_state.regime == "range" and trigger.side == "long":
             dist_pct = abs(last_price - trigger.level.price) / trigger.level.price if trigger.level.price else 1.0
             if not (trigger.kind == "RECLAIM" and trigger.strength >= cfg.entry_min_range and dist_pct <= cfg.max_dist_reclaim):
@@ -991,7 +1065,19 @@ class SwaggyEngine(BaseEngine):
                 evidence=evidence,
             )
 
-        risk = build_risk_plan(trigger.side, last_price, trigger.level, levels, cfg.invalid_eps)
+        sl_atr = _atr(candles_5m, cfg.touch_atr_len)
+        risk = build_risk_plan(
+            trigger.side,
+            last_price,
+            trigger.level,
+            levels,
+            cfg.invalid_eps,
+            sl_mode=cfg.sl_mode,
+            sl_atr=sl_atr,
+            sl_buffer_atr=cfg.sl_buffer_atr,
+            sl_pct=cfg.sl_pct,
+            tp_pct=cfg.tp_pct,
+        )
         if risk is None:
             return SwaggyDecision(
                 sym=sym,
@@ -1042,10 +1128,111 @@ class SwaggyEngine(BaseEngine):
             trigger.evidence["tp1_fallback_r"] = cfg.tp1_fallback_r
         _inject_regime_evidence(trigger.evidence, regime_state, cfg)
 
+        zone_id = _zone_id(trigger.level)
+        if cfg.symbol_cooldown_bars > 0:
+            last_entry_bar = state.get("last_entry_bar")
+            if isinstance(last_entry_bar, int):
+                bars_since = bar_idx - last_entry_bar
+                if bars_since < cfg.symbol_cooldown_bars:
+                    bars_left = cfg.symbol_cooldown_bars - bars_since
+                    evidence = dict(trigger.evidence or {})
+                    evidence["bars_left"] = bars_left
+                    evidence["cooldown_bars"] = cfg.symbol_cooldown_bars
+                    _inject_regime_evidence(evidence, regime_state, cfg)
+                    print(f"[swaggy] ENTRY_SKIP reason=COOLDOWN sym={sym} bars_left={bars_left}")
+                    return SwaggyDecision(
+                        sym=sym,
+                        side=trigger.side,
+                        entry_ready=0,
+                        entry_px=None,
+                        sl_px=None,
+                        tp1_px=None,
+                        tp2_px=None,
+                        reason_codes=["COOLDOWN"],
+                        debug=self._debug_payload(
+                            last_price,
+                            regime_state.regime,
+                            trigger,
+                            vp,
+                            "COOLDOWN",
+                            trigger_debug,
+                        ),
+                        filters=filter_bits,
+                        evidence=evidence,
+                    )
+        if cfg.zone_reentry_limit > 0 and zone_id:
+            last_zone_id = state.get("last_zone_id")
+            zone_count = int(state.get("zone_entry_count", 0) or 0)
+            if last_zone_id == zone_id and zone_count >= cfg.zone_reentry_limit:
+                evidence = dict(trigger.evidence or {})
+                evidence["zone_id"] = zone_id
+                evidence["zone_entry_count"] = zone_count
+                evidence["zone_reentry_limit"] = cfg.zone_reentry_limit
+                _inject_regime_evidence(evidence, regime_state, cfg)
+                print(f"[swaggy] ENTRY_SKIP reason=ZONE_REENTRY sym={sym}")
+                return SwaggyDecision(
+                    sym=sym,
+                    side=trigger.side,
+                    entry_ready=0,
+                    entry_px=None,
+                    sl_px=None,
+                    tp1_px=None,
+                    tp2_px=None,
+                    reason_codes=["ZONE_REENTRY"],
+                    debug=self._debug_payload(
+                        last_price,
+                        regime_state.regime,
+                        trigger,
+                        vp,
+                        "ZONE_REENTRY",
+                        trigger_debug,
+                    ),
+                    filters=filter_bits,
+                    evidence=evidence,
+                )
+        if cfg.post_sl_cooldown_bars > 0:
+            last_sl_ts = state.get("swaggy_last_sl_ts")
+            if isinstance(last_sl_ts, (int, float)):
+                bars_since = int((now_ts - float(last_sl_ts)) / 300.0)
+                if bars_since < cfg.post_sl_cooldown_bars:
+                    bars_left = cfg.post_sl_cooldown_bars - bars_since
+                    evidence = dict(trigger.evidence or {})
+                    evidence["bars_left"] = bars_left
+                    evidence["post_sl_cooldown_bars"] = cfg.post_sl_cooldown_bars
+                    _inject_regime_evidence(evidence, regime_state, cfg)
+                    print(f"[swaggy] SL_COOLDOWN_ACTIVE sym={sym} bars_left={bars_left}")
+                    return SwaggyDecision(
+                        sym=sym,
+                        side=trigger.side,
+                        entry_ready=0,
+                        entry_px=None,
+                        sl_px=None,
+                        tp1_px=None,
+                        tp2_px=None,
+                        reason_codes=["SL_COOLDOWN"],
+                        debug=self._debug_payload(
+                            last_price,
+                            regime_state.regime,
+                            trigger,
+                            vp,
+                            "SL_COOLDOWN",
+                            trigger_debug,
+                        ),
+                        filters=filter_bits,
+                        evidence=evidence,
+                    )
         state["last_signal_ts"] = now_ts
         state["last_entry_ts"] = now_ts
+        state["last_entry_bar"] = bar_idx
         state["phase"] = "COOLDOWN"
         state["cooldown_until"] = now_ts + cfg.cooldown_min * 60
+        if zone_id:
+            last_zone_id = state.get("last_zone_id")
+            if last_zone_id == zone_id:
+                state["zone_entry_count"] = int(state.get("zone_entry_count", 0) or 0) + 1
+            else:
+                state["zone_entry_count"] = 1
+            state["last_zone_id"] = zone_id
         state.update({
             "in_pos": False,
             "side": trigger.side,
@@ -1268,7 +1455,7 @@ def _classify_gate(decision: SwaggyDecision) -> tuple[str, str, str]:
             f"dist_ema60_pct={_fmt_float(evidence.get('dist_to_ema60_pct'))}"
         )
         return "S4_LOCAL_FILTERS", "BULL_SHORT_BLOCKED_EARLY", detail
-    if reason in ("RANGE_LONG_GATE", "REENTRY_BLOCK", "SHORT_BULL_BLOCK"):
+    if reason in ("RANGE_LONG_GATE", "REENTRY_BLOCK", "SHORT_BULL_BLOCK", "ZONE_REENTRY", "SL_COOLDOWN", "RECLAIM_TOO_EXTENDED"):
         detail = f"strength={_fmt_float(strength)} dist_pct={_fmt_float(dist_pct)} trigger={trigger}"
         return "S4_LOCAL_FILTERS", reason, detail
     if reason in ("LVN_GAP", "DIST_FAIL", "EXPANSION_BAR", "COOLDOWN", "REGIME_BLOCK", "OTHER_FILTER_FAIL"):
@@ -1365,6 +1552,18 @@ def _level_by_price(levels: List[Level], price: float, cluster_pct: float) -> Op
     if best and best_dist is not None and best_dist <= cluster_pct:
         return best
     return None
+
+
+def _zone_id(level: Level) -> str:
+    if not isinstance(level, Level):
+        return ""
+    low = "na"
+    high = "na"
+    if isinstance(level.low, (int, float)):
+        low = f"{level.low:.6g}"
+    if isinstance(level.high, (int, float)):
+        high = f"{level.high:.6g}"
+    return f"{level.kind}:{level.price:.6g}:{low}:{high}"
 
 
 def _reason_label(reason: str) -> str:
@@ -1560,13 +1759,21 @@ def _short_bull_exception_info(
 
 
 def _update_recent_triggers(state: Dict[str, Any], bar_idx: int, trigger: Trigger) -> None:
-    window = state.setdefault("recent_triggers", deque(maxlen=20))
-    window.append({
+    max_len = 20
+    recent = state.get("recent_triggers")
+    if isinstance(recent, deque):
+        recent = list(recent)
+    if not isinstance(recent, list):
+        recent = []
+    recent.append({
         "bar": bar_idx,
         "trigger": trigger.kind,
         "side": trigger.side,
         "strength": trigger.strength,
     })
+    if len(recent) > max_len:
+        recent = recent[-max_len:]
+    state["recent_triggers"] = recent
 
 
 def _has_confirm(
@@ -1584,7 +1791,9 @@ def _has_confirm(
             return True, "SAME_BAR_RECLAIM", trigger_strength, 0, "SAME_BAR_RECLAIM"
         if side == "short" and last_close < level_price:
             return True, "SAME_BAR_RECLAIM", trigger_strength, 0, "SAME_BAR_RECLAIM"
-    if not isinstance(recent, deque) or not recent:
+    if isinstance(recent, deque):
+        recent = list(recent)
+    if not isinstance(recent, list) or not recent:
         return False, "none", 0.0, None, "none"
     cur_bar = recent[-1]["bar"] if recent else None
     if cur_bar is None:
