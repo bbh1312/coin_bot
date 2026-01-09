@@ -250,6 +250,50 @@ def _fmt_price_safe(entry_price: Any, sl_pct: Any, side: str = "LONG") -> str:
     except Exception:
         return "N/A"
 
+def _fmt_entry_price(val: Any) -> str:
+    try:
+        return f"{float(val):.6g}"
+    except Exception:
+        return "N/A"
+
+def _send_entry_alert(
+    send_alert,
+    side: str,
+    symbol: str,
+    engine: str,
+    entry_price: Any = None,
+    usdt: Any = None,
+    reason: Optional[str] = None,
+    sl: Optional[str] = None,
+    tp: Optional[str] = None,
+    live: Optional[bool] = None,
+    order_info: Optional[str] = None,
+    extras: Optional[list] = None,
+) -> None:
+    if not send_alert:
+        return
+    side_key = (side or "").upper()
+    icon = "🟢" if side_key == "LONG" else "🟣" if side_key == "SHORT" else "⚪"
+    side_label = "롱" if side_key == "LONG" else "숏" if side_key == "SHORT" else side_key
+    lines = [f"{icon} <b>{side_label} 시그널</b>", f"<b>{symbol}</b>"]
+    if entry_price is not None or usdt is not None:
+        entry_disp = _fmt_entry_price(entry_price)
+        if usdt is not None:
+            try:
+                usdt_disp = f"{float(usdt):.0f}"
+            except Exception:
+                usdt_disp = "N/A"
+            lines.append(f"진입가≈{entry_disp} (USDT {usdt_disp})")
+        else:
+            lines.append(f"진입가≈{entry_disp}")
+    sl_disp = sl if sl else "N/A"
+    tp_disp = tp if tp else "N/A"
+    lines.append(f"손절가={sl_disp} 익절가={tp_disp}")
+    lines.append(f"엔진: {engine}")
+    reason_disp = reason if (reason and str(reason).strip()) else "N/A"
+    lines.append(f"사유: {reason_disp}")
+    send_alert("\n".join(lines))
+
 
 def _compute_impulse_metrics(symbol: str) -> Optional[dict]:
     df = cycle_cache.get_df(symbol, "5m", max(FABIO_LONG_BB_PERIOD * 2, 30))
@@ -460,6 +504,15 @@ def _get_open_trade(state: Dict[str, dict], side: str, symbol: str) -> Optional[
         if tr.get("status") == "open" and tr.get("side") == side and tr.get("symbol") == symbol:
             return tr
     return None
+
+def _trade_has_entry(tr: Optional[dict]) -> bool:
+    if not isinstance(tr, dict):
+        return False
+    for key in ("entry_ts", "entry_ts_ms", "entry_price", "qty"):
+        val = tr.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            return True
+    return False
 
 def _get_open_symbols(state: Dict[str, dict], side: str) -> List[str]:
     log = _get_trade_log(state)
@@ -1005,7 +1058,19 @@ def _run_fabio_cycle(
                             finally:
                                 _entry_lock_release(state, symbol, owner="fabio")
                     else:
-                        send_alert(f"🟢 <b>롱 시그널(FABIO)</b>\n<b>{symbol}</b>")
+                        _send_entry_alert(
+                            send_alert,
+                            side="LONG",
+                            symbol=symbol,
+                            engine="FABIO",
+                            entry_price=None,
+                            usdt=USDT_PER_TRADE,
+                            reason="조건 충족",
+                            live=LONG_LIVE_TRADING,
+                            order_info="(알림 전용)",
+                            sl=None,
+                            tp=None,
+                        )
                         print(f"[fabio] 롱 시그널 {symbol}")
                 continue
         if fabio_res.get("short"):
@@ -1127,14 +1192,21 @@ def _run_fabio_cycle(
                         _entry_lock_release(state, symbol, owner="fabio")
                 st["last_entry"] = time.time()
                 state[symbol] = st
-                entry_disp = f"{entry_price_disp:.6g}" if entry_price_disp is not None else "N/A"
-                send_alert(
-                    f"🟣 <b>숏 시그널</b>\n"
-                    f"<b>{symbol}</b>\n"
-                    f"진입가≈{entry_disp} (USDT {USDT_PER_TRADE:.0f})\n"
-                    "엔진: FABIO\n"
-                    f"사유: 조건 충족{' (early=Y)' if had_early else ''}\n"
-                    f"live: {'ON' if LIVE_TRADING else 'OFF'} | {order_info}"
+                reason = "조건 충족"
+                if had_early:
+                    reason = f"{reason} (early=Y)"
+                _send_entry_alert(
+                    send_alert,
+                    side="SHORT",
+                    symbol=symbol,
+                    engine="FABIO",
+                    entry_price=entry_price_disp,
+                    usdt=USDT_PER_TRADE,
+                    reason=reason,
+                    live=LIVE_TRADING,
+                    order_info=order_info,
+                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                    tp=None,
                 )
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -1466,15 +1538,24 @@ def _run_swaggy_cycle(
                 entry_usdt = USDT_PER_TRADE * float(atlas_local.get("long_size_mult", 1.0) or 1.0)
                 if (decision.debug or {}).get("regime") == "range":
                     entry_usdt *= 0.5
-                send_alert(
-                    "🟢 <b>롱 시그널</b>\n"
-                    f"<b>{symbol}</b>\n"
-                    f"진입가≈{entry_price_disp or 'N/A'} (USDT {entry_usdt:.0f})\n"
-                    f"손절가={_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side='LONG')} 익절가={decision.tp1_px}\n"
-                    "엔진: SWAGGY\n"
-                    f"사유: {reason_codes}\n"
-                    f"{atlas_info}\n"
-                    f"live: {'ON' if LONG_LIVE_TRADING else 'OFF'} | {order_info}"
+                tp_disp = None
+                if isinstance(decision.tp1_px, (int, float)):
+                    tp_disp = f"{float(decision.tp1_px):.6g}"
+                reason_full = reason_codes
+                if atlas_info:
+                    reason_full = f"{reason_full} | {atlas_info}" if reason_full else atlas_info
+                _send_entry_alert(
+                    send_alert,
+                    side="LONG",
+                    symbol=symbol,
+                    engine="SWAGGY",
+                    entry_price=entry_price_disp,
+                    usdt=entry_usdt,
+                    reason=reason_full,
+                    live=LONG_LIVE_TRADING,
+                    order_info=order_info,
+                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
+                    tp=tp_disp,
                 )
             else:
                 entry_usdt = USDT_PER_TRADE * float(atlas_local.get("long_size_mult", 1.0) or 1.0)
@@ -1482,15 +1563,24 @@ def _run_swaggy_cycle(
                     entry_usdt *= 0.5
                 entry_price_disp = decision.entry_px
                 order_info = "(알림 전용)"
-                send_alert(
-                    "🟢 <b>롱 시그널</b>\n"
-                    f"<b>{symbol}</b>\n"
-                    f"진입가≈{entry_price_disp or 'N/A'} (USDT {entry_usdt:.0f})\n"
-                    f"손절가={_fmt_price_safe(decision.entry_px, AUTO_EXIT_LONG_SL_PCT, side='LONG')} 익절가={decision.tp1_px}\n"
-                    "엔진: SWAGGY\n"
-                    f"사유: {reason_codes}\n"
-                    f"{atlas_info}\n"
-                    f"live: {'ON' if LONG_LIVE_TRADING else 'OFF'} | {order_info}"
+                tp_disp = None
+                if isinstance(decision.tp1_px, (int, float)):
+                    tp_disp = f"{float(decision.tp1_px):.6g}"
+                reason_full = reason_codes
+                if atlas_info:
+                    reason_full = f"{reason_full} | {atlas_info}" if reason_full else atlas_info
+                _send_entry_alert(
+                    send_alert,
+                    side="LONG",
+                    symbol=symbol,
+                    engine="SWAGGY",
+                    entry_price=entry_price_disp,
+                    usdt=entry_usdt,
+                    reason=reason_full,
+                    live=LONG_LIVE_TRADING,
+                    order_info=order_info,
+                    sl=_fmt_price_safe(decision.entry_px, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
+                    tp=tp_disp,
                 )
         else:
             result["short_hits"] += 1
@@ -1571,14 +1661,21 @@ def _run_swaggy_cycle(
                 f"reason={atlas_gate.get('reason')} rs={_fmt_float(atlas_local.get('rs'))} "
                 f"corr={_fmt_float(atlas_local.get('corr'))}"
             )
-            send_alert(
-                f"🟣 <b>숏 시그널</b>\n"
-                f"<b>{symbol}</b>\n"
-                f"진입가≈{entry_disp} (USDT {entry_usdt:.0f})\n"
-                "엔진: SWAGGY\n"
-                f"사유: {reason_codes}\n"
-                f"{atlas_info}\n"
-                f"live: {'ON' if LIVE_TRADING else 'OFF'} | {order_info}"
+            reason_full = reason_codes
+            if atlas_info:
+                reason_full = f"{reason_full} | {atlas_info}" if reason_full else atlas_info
+            _send_entry_alert(
+                send_alert,
+                side="SHORT",
+                symbol=symbol,
+                engine="SWAGGY",
+                entry_price=entry_price_disp,
+                usdt=entry_usdt,
+                reason=reason_full,
+                live=LIVE_TRADING,
+                order_info=order_info,
+                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                tp=None,
             )
         time.sleep(PER_SYMBOL_SLEEP)
     if format_cut_top and format_zone_stats:
@@ -2253,14 +2350,17 @@ def _run_atlas_fabio_cycle(
                         )
                         active_positions_total += 1
                         if send_alert:
-                            entry_disp = f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A"
-                            send_alert(
-                                f"🟢 <b>롱 시그널</b>\n"
-                                f"<b>{symbol}</b>\n"
-                                f"진입가≈{entry_disp} (USDT {final_usdt:.0f})\n"
-                                "엔진: ATLASFABIO\n"
-                                "사유: ATLAS + FABIO\n"
-                                f"live: {'ON' if LONG_LIVE_TRADING else 'OFF'}"
+                            _send_entry_alert(
+                                send_alert,
+                                side="LONG",
+                                symbol=symbol,
+                                engine="ATLASFABIO",
+                                entry_price=fill_price,
+                                usdt=final_usdt,
+                                reason="ATLAS + FABIO",
+                                live=LONG_LIVE_TRADING,
+                                sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
+                                tp=None,
                             )
                     except Exception as e:
                         funnel["entry_gate_skip_exchange"] += 1
@@ -2270,7 +2370,19 @@ def _run_atlas_fabio_cycle(
                         _entry_lock_release(state, symbol, owner="atlasfabio")
             else:
                 _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=SIGNAL")
-                send_alert(f"🟢 <b>롱 시그널(ATLASFABIO)</b>\n<b>{symbol}</b>")
+                _send_entry_alert(
+                    send_alert,
+                    side="LONG",
+                    symbol=symbol,
+                    engine="ATLASFABIO",
+                    entry_price=None,
+                    usdt=final_usdt,
+                    reason="ATLAS + FABIO",
+                    live=LONG_LIVE_TRADING,
+                    order_info="(알림 전용)",
+                    sl=None,
+                    tp=None,
+                )
                 _entry_lock_release(state, symbol, owner="atlasfabio")
         else:
             order_info = "(알림 전용)"
@@ -2319,14 +2431,18 @@ def _run_atlas_fabio_cycle(
                     )
                     active_positions_total += 1
                     if send_alert:
-                        entry_disp = f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A"
-                        send_alert(
-                            f"🟣 <b>숏 시그널</b>\n"
-                            f"<b>{symbol}</b>\n"
-                            f"진입가≈{entry_disp} (USDT {final_usdt:.0f})\n"
-                            "엔진: ATLASFABIO\n"
-                            f"사유: {reasons}\n"
-                            f"live: {'ON' if LIVE_TRADING else 'OFF'} | {order_info}"
+                        _send_entry_alert(
+                            send_alert,
+                            side="SHORT",
+                            symbol=symbol,
+                            engine="ATLASFABIO",
+                            entry_price=fill_price,
+                            usdt=final_usdt,
+                            reason=reasons,
+                            live=LIVE_TRADING,
+                            order_info=order_info,
+                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                            tp=None,
                         )
                 except Exception as e:
                     order_info = f"order_error: {e}"
@@ -2338,13 +2454,17 @@ def _run_atlas_fabio_cycle(
             else:
                 _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=SIGNAL")
                 _entry_lock_release(state, symbol, owner="atlasfabio")
-            entry_disp = f"{entry_price_disp:.6g}" if entry_price_disp is not None else "N/A"
-            send_alert(
-                f"🟣 <b>숏 시그널</b>\n"
-                f"<b>{symbol}</b>\n"
-                f"진입가≈{entry_disp} (USDT {final_usdt:.0f})\n"
-                "엔진: ATLASFABIO\n"
-                f"live: {'ON' if LIVE_TRADING else 'OFF'} | {order_info}"
+            _send_entry_alert(
+                send_alert,
+                side="SHORT",
+                symbol=symbol,
+                engine="ATLASFABIO",
+                entry_price=entry_price_disp,
+                usdt=final_usdt,
+                live=LIVE_TRADING,
+                order_info=order_info,
+                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                tp=None,
             )
             time.sleep(PER_SYMBOL_SLEEP)
 
@@ -2511,12 +2631,16 @@ def _run_dtfx_cycle(
                         }
                         write_dtfx_log(payload, prefix="entries", mode="entry")
                     if send_alert:
-                        entry_disp = f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A"
-                        send_alert(
-                            f"🟢 <b>DTFX 롱 진입</b>\n<b>{symbol}</b>\n"
-                            f"진입가≈{entry_disp} (USDT {USDT_PER_TRADE:.0f})\n"
-                            f"손절가={_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side='LONG')}\n"
-                            f"event={sig.pattern}"
+                        _send_entry_alert(
+                            send_alert,
+                            side="LONG",
+                            symbol=symbol,
+                            engine="DTFX",
+                            entry_price=fill_price,
+                            usdt=USDT_PER_TRADE,
+                            reason=f"event={sig.pattern}",
+                            live=LONG_LIVE_TRADING,
+                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
                         )
                 else:
                     res = short_market(symbol, usdt_amount=USDT_PER_TRADE, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
@@ -2567,12 +2691,16 @@ def _run_dtfx_cycle(
                         }
                         write_dtfx_log(payload, prefix="entries", mode="entry")
                     if send_alert:
-                        entry_disp = f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A"
-                        send_alert(
-                            f"🔴 <b>DTFX 숏 진입</b>\n<b>{symbol}</b>\n"
-                            f"진입가≈{entry_disp} (USDT {USDT_PER_TRADE:.0f})\n"
-                            f"손절가={_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side='SHORT')}\n"
-                            f"event={sig.pattern}"
+                        _send_entry_alert(
+                            send_alert,
+                            side="SHORT",
+                            symbol=symbol,
+                            engine="DTFX",
+                            entry_price=fill_price,
+                            usdt=USDT_PER_TRADE,
+                            reason=f"event={sig.pattern}",
+                            live=LIVE_TRADING,
+                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
                         )
             except Exception as e:
                 print(f"[dtfx] order error {symbol} side={side}: {e}")
@@ -2772,7 +2900,12 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
         engine_label = _engine_label_from_reason((meta or {}).get("reason"))
         if not SUPPRESS_RECONCILE_ALERTS:
             _append_report_line(symbol, "LONG", None, pnl, engine_label)
-        if send_telegram and not SUPPRESS_RECONCILE_ALERTS:
+        if (
+            send_telegram
+            and not SUPPRESS_RECONCILE_ALERTS
+            and engine_label != "UNKNOWN"
+            and _trade_has_entry(tr)
+        ):
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
             send_telegram(
@@ -2946,7 +3079,14 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
         evidence_short = recent_seen or recent_fill
         if evidence_short and not SUPPRESS_RECONCILE_ALERTS:
             _append_report_line(symbol, "SHORT", None, pnl, engine_label)
-        if send_telegram and isinstance(open_trade_index.get(symbol), dict) and evidence_short and not SUPPRESS_RECONCILE_ALERTS:
+        if (
+            send_telegram
+            and isinstance(open_trade_index.get(symbol), dict)
+            and evidence_short
+            and not SUPPRESS_RECONCILE_ALERTS
+            and engine_label != "UNKNOWN"
+            and _trade_has_entry(tr)
+        ):
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
             exit_tag = "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
@@ -3040,12 +3180,13 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             _append_report_line(sym, "SHORT", None, None, engine_label)
             last_entry_val = float(st.get("last_entry", 0))
             state[sym] = {"in_pos": False, "last_ok": False, "last_entry": last_entry_val, "dca_adds": 0}
-            send_telegram(
-                f"🔴 <b>숏 청산</b>\n"
-                f"<b>{sym}</b>\n"
-                f"엔진: {engine_label}\n"
-                f"사유: {exit_tag}"
-            )
+            if isinstance(open_tr, dict) and engine_label != "UNKNOWN" and _trade_has_entry(open_tr):
+                send_telegram(
+                    f"🔴 <b>숏 청산</b>\n"
+                    f"<b>{sym}</b>\n"
+                    f"엔진: {engine_label}\n"
+                    f"사유: {exit_tag}"
+                )
             time.sleep(0.1)
             continue
 
@@ -3209,12 +3350,13 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 st["last_ok"] = False
                 st["dca_adds"] = 0
                 state[sym] = st
-                send_telegram(
-                    f"🔴 <b>롱 청산</b>\n"
-                    f"<b>{sym}</b>\n"
-                    f"엔진: {engine_label}\n"
-                    f"사유: MANUAL"
-                )
+                if engine_label != "UNKNOWN" and _trade_has_entry(open_tr):
+                    send_telegram(
+                        f"🔴 <b>롱 청산</b>\n"
+                        f"<b>{sym}</b>\n"
+                        f"엔진: {engine_label}\n"
+                        f"사유: MANUAL"
+                    )
                 time.sleep(0.1)
                 continue
             open_tr = _get_open_trade(state, "LONG", sym)
@@ -3522,130 +3664,7 @@ def _sync_positions_state(state: dict, symbols: list) -> None:
                 st["in_pos"] = False
                 state[sym] = st
 
-def _run_manage_only() -> None:
-    _install_error_hooks()
-    print("[시작] 관리 루프 전용 모드 초기화 중...")
-    symbols = get_symbols()
-    print(f"[초기화] {len(symbols)}개 심볼 로드됨")
-    state = load_state()
-    print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
-    state["_symbols"] = symbols
-    state["_manage_only"] = True
-    global rsi_engine, div15m_engine, MANAGE_ONLY_MODE
-    MANAGE_ONLY_MODE = True
-    rsi_engine = RsiEngine() if RsiEngine else None
-    div15m_engine = Div15mLongEngine() if Div15mLongEngine else None
-    # state에 저장된 설정 복원 (없으면 기본값 사용)
-    global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, DIV15M_LONG_ENABLED
-    global USDT_PER_TRADE
-    AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
-    state["_auto_exit"] = AUTO_EXIT_ENABLED
-    AUTO_EXIT_LONG_TP_PCT = float(state.get("_auto_exit_long_tp_pct", 3.0))
-    AUTO_EXIT_LONG_SL_PCT = float(state.get("_auto_exit_long_sl_pct", 3.0))
-    AUTO_EXIT_SHORT_TP_PCT = float(state.get("_auto_exit_short_tp_pct", 3.0))
-    AUTO_EXIT_SHORT_SL_PCT = float(state.get("_auto_exit_short_sl_pct", 3.0))
-    state["_auto_exit_long_tp_pct"] = AUTO_EXIT_LONG_TP_PCT
-    state["_auto_exit_long_sl_pct"] = AUTO_EXIT_LONG_SL_PCT
-    state["_auto_exit_short_tp_pct"] = AUTO_EXIT_SHORT_TP_PCT
-    state["_auto_exit_short_sl_pct"] = AUTO_EXIT_SHORT_SL_PCT
-    if isinstance(state.get("_long_live"), bool):
-        LONG_LIVE_TRADING = bool(state.get("_long_live"))
-    else:
-        state["_long_live"] = LONG_LIVE_TRADING
-    if isinstance(state.get("_live_trading"), bool):
-        LIVE_TRADING = bool(state.get("_live_trading"))
-    if isinstance(state.get("_div15m_long_enabled"), bool):
-        DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
-    else:
-        state["_div15m_long_enabled"] = DIV15M_LONG_ENABLED
-    FABIO_ENABLED = False
-    state["_fabio_enabled"] = False
-    if isinstance(state.get("_atlas_fabio_enabled"), bool):
-        ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
-    else:
-        state["_atlas_fabio_enabled"] = ATLAS_FABIO_ENABLED
-    if isinstance(state.get("_swaggy_enabled"), bool):
-        SWAGGY_ENABLED = bool(state.get("_swaggy_enabled"))
-    else:
-        state["_swaggy_enabled"] = SWAGGY_ENABLED
-    if isinstance(state.get("_dtfx_enabled"), bool):
-        DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
-    else:
-        state["_dtfx_enabled"] = DTFX_ENABLED
-    if isinstance(state.get("_entry_usdt"), (int, float)):
-        try:
-            val = float(state.get("_entry_usdt"))
-            if val > 0:
-                USDT_PER_TRADE = val
-        except Exception:
-            pass
-    else:
-        state["_entry_usdt"] = USDT_PER_TRADE
-    if isinstance(state.get("_max_open_positions"), (int, float)):
-        try:
-            val = int(state.get("_max_open_positions"))
-            if val > 0:
-                MAX_OPEN_POSITIONS = val
-        except Exception:
-            pass
-    else:
-        state["_max_open_positions"] = MAX_OPEN_POSITIONS
-    try:
-        set_dry_run(not LIVE_TRADING)
-    except Exception:
-        pass
-    try:
-        if state.get("_chat_id"):
-            global CHAT_ID_RUNTIME
-            CHAT_ID_RUNTIME = str(state.get("_chat_id"))
-            print(f"[telegram] runtime CHAT_ID set to {CHAT_ID_RUNTIME}")
-    except Exception:
-        pass
-    send_telegram(
-        "✅ RSI 스캐너 시작 (관리 루프 전용)\n"
-        f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
-        f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt n, /atlasfabio on|off|status, /swaggy on|off|status, /dtfx on|off|status, /max_pos n, /report today|yesterday, /status"
-    )
-    try:
-        refresh_positions_cache(force=True)
-    except Exception:
-        pass
-    _sync_positions_state(state, symbols)
-    cached_long_ex = CachedExchange(exchange)
-    print(f"[manage-loop] started (sleep={MANAGE_LOOP_SLEEP_SEC:.1f}s)")
-    last_sync_ts = 0.0
-    last_cfg_save_ts = 0.0
-    while True:
-        handle_telegram_commands(state)
-        if (time.time() - last_cfg_save_ts) >= 2.0:
-            try:
-                _save_runtime_settings_only(state)
-            except Exception:
-                pass
-            last_cfg_save_ts = time.time()
-        now = time.time()
-        if (now - last_sync_ts) >= 60.0:
-            try:
-                refresh_positions_cache(force=True)
-            except Exception:
-                pass
-            _sync_positions_state(state, symbols)
-            last_sync_ts = now
-        buf = []
-        _set_thread_log_buffer(buf)
-        try:
-            _run_manage_cycle(state, exchange, cached_long_ex, send_telegram)
-        except Exception as e:
-            print("[manage-loop] error:", e)
-        finally:
-            _set_thread_log_buffer(None)
-        time.sleep(MANAGE_LOOP_SLEEP_SEC)
-
 def send_telegram(text: str, allow_early: bool = False, chat_id: Optional[str] = None) -> bool:
-    if not MANAGE_ONLY_MODE:
-        return False
     return _send_telegram_direct(text, allow_early=allow_early, chat_id=chat_id)
 
 def _send_telegram_direct(text: str, allow_early: bool = False, chat_id: Optional[str] = None) -> bool:
@@ -4165,7 +4184,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
             state_dirty = True
         if state_dirty:
             try:
-                if MANAGE_ONLY_MODE:
+                if MANAGE_WS_MODE:
                     _save_runtime_settings_only(state)
                 else:
                     save_state(state)
@@ -4324,8 +4343,7 @@ AUTO_EXIT_GRACE_SEC: int = 30     # 진입 직후 자동청산 금지 구간
 MANAGE_LOOP_ENABLED: bool = True  # 관리 루프 분리 실행 여부
 MANAGE_LOOP_SLEEP_SEC: float = 2.0  # 관리 루프 주기(초)
 MANAGE_TICKER_TTL_SEC: float = 5.0  # 관리 루프 티커 캐시 TTL(초)
-MANAGE_ONLY_MODE: bool = False  # 관리 전용 모드에서는 텔레그램 명령 처리
-RUNTIME_CONFIG_RELOAD_SEC: float = 5.0  # 관리 전용 모드 변경사항 반영 주기
+RUNTIME_CONFIG_RELOAD_SEC: float = 5.0  # 런타임 설정 변경사항 반영 주기
 MANAGE_WS_MODE: bool = False  # WS 관리 모듈 사용 시 메인 리컨실/관리 비활성
 SUPPRESS_RECONCILE_ALERTS: bool = False  # 리컨실 알림 억제용(WS 관리 테스트)
 SHORT_POS_SAMPLE_DIV: int = 20  # 1/N 샘플링
@@ -4547,7 +4565,7 @@ def run():
     # 전역 백오프 변수는 run 스코프에서 재할당 하므로 선 선언 필요
     global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, RATE_LIMIT_LOG_TS
     global TOTAL_CYCLES, TOTAL_ELAPSED, TOTAL_REST_CALLS, TOTAL_429_COUNT
-    global MANAGE_LOOP_ENABLED, MANAGE_ONLY_MODE, MANAGE_WS_MODE
+    global MANAGE_LOOP_ENABLED, MANAGE_WS_MODE
     _install_error_hooks()
     print("[시작] RSI 스캐너 초기화 중...")
     symbols = get_symbols()
@@ -4633,7 +4651,6 @@ def run():
         MANAGE_WS_MODE = bool(state.get("_manage_ws_mode"))
     else:
         state["_manage_ws_mode"] = MANAGE_WS_MODE
-    MANAGE_ONLY_MODE = False
     if "--no-manage-loop" in sys.argv:
         MANAGE_LOOP_ENABLED = False
     try:
@@ -4693,10 +4710,7 @@ def run():
             print(f"[rate-limit] global backoff active: sleep {sleep_sec:.1f}s")
             time.sleep(sleep_sec)
             continue
-        # --- Telegram 명령 처리 (관리 전용 모드에서만) ---
-        if MANAGE_ONLY_MODE:
-            handle_telegram_commands(state)
-        if not MANAGE_ONLY_MODE and (now - last_cfg_reload_ts) >= RUNTIME_CONFIG_RELOAD_SEC:
+        if (now - last_cfg_reload_ts) >= RUNTIME_CONFIG_RELOAD_SEC:
             _reload_runtime_settings_from_disk(state)
             last_cfg_reload_ts = now
         try:
@@ -5464,15 +5478,24 @@ def run():
                 if vol_ok:
                     reason_parts.append("거래량 급증")
                 reason = ", ".join(reason_parts)
-                entry_disp = f"{entry_price_disp:.6g}" if entry_price_disp is not None else "N/A"
-                send_telegram(
-                    f"🟣 <b>숏 시그널</b>\n"
-                    f"<b>{symbol}</b>\n"
-                    f"진입가≈{entry_disp} (USDT {USDT_PER_TRADE:.0f})\n"
-                    f"엔진: RSI\n"
-                    f"사유: {reason if reason else '조건 충족'}\n"
-                    f"RSI: 1h {rsis.get('1h',0):.2f} | 15m {rsis.get('15m',0):.2f} | 5m {rsis.get('5m',0):.2f} | 3m {rsis.get('3m',0):.2f}\n"
-                    f"live: {'ON' if LIVE_TRADING else 'OFF'} | {order_info}"
+                rsi_line = (
+                    f"RSI: 1h {rsis.get('1h',0):.2f} | 15m {rsis.get('15m',0):.2f} | "
+                    f"5m {rsis.get('5m',0):.2f} | 3m {rsis.get('3m',0):.2f}"
+                )
+                reason_full = reason if reason else "조건 충족"
+                reason_full = f"{reason_full} | {rsi_line}"
+                _send_entry_alert(
+                    send_telegram,
+                    side="SHORT",
+                    symbol=symbol,
+                    engine="RSI",
+                    entry_price=entry_price_disp,
+                    usdt=USDT_PER_TRADE,
+                    reason=reason_full,
+                    live=LIVE_TRADING,
+                    order_info=order_info,
+                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                    tp=None,
                 )
 
         if not run_div15m_long:
@@ -5618,14 +5641,18 @@ def run():
 
             state[symbol]["last_entry"] = time.time()
 
-            entry_disp = f"{entry_price_disp:.6g}" if entry_price_disp is not None else "N/A"
-            send_telegram(
-                f"🟢 <b>롱 시그널</b>\n"
-                f"<b>{symbol}</b>\n"
-                f"진입가≈{entry_disp} (USDT {USDT_PER_TRADE:.0f})\n"
-                "엔진: DIV15M_LONG\n"
-                f"사유: trigger={event.reasons or 'ENTRY_READY'}\n"
-                f"live: {'ON' if LONG_LIVE_TRADING else 'OFF'} | {order_info}"
+            _send_entry_alert(
+                send_telegram,
+                side="LONG",
+                symbol=symbol,
+                engine="DIV15M_LONG",
+                entry_price=entry_price_disp,
+                usdt=USDT_PER_TRADE,
+                reason=f"trigger={event.reasons or 'ENTRY_READY'}",
+                live=LONG_LIVE_TRADING,
+                order_info=order_info,
+                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
+                tp=None,
             )
 
         if int(time.time()) % 30 == 0:
@@ -5711,7 +5738,4 @@ def run():
         time.sleep(CYCLE_SLEEP)
 
 if __name__ == "__main__":
-    if "--manage-only" in sys.argv:
-        _run_manage_only()
-    else:
-        run()
+    run()

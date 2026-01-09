@@ -302,7 +302,6 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
 
 
 def main():
-    er.MANAGE_ONLY_MODE = True
     er.MANAGE_WS_MODE = True
     er.SUPPRESS_RECONCILE_ALERTS = True
     er._install_error_hooks()

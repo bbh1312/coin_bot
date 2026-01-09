@@ -14,11 +14,11 @@ pip install ccxt pandas requests websocket-client
 - 파비오 전용 모드: 환경변수 `FABIO_ONLY_MODE=1` 설정 시 RSI/롱스캘프 스캔은 건너뛰고 파비오만 실행
 
 ## Run
-- 메인&관리 동시 : python engine_runner.py
+- 메인&관리 동시 : ./run_all.sh
 - 메인: python engine_runner.py --no-manage-loop
-- 관리: python engine_runner.py --manage-only
 - 웹소켓관리 : python manage_ws.py
+- 메인+웹소켓관리 동시 : ./run_all.sh (기본 --no-manage-loop 포함)
 - 아틀라스 알림 : python -m atlas_test.main
-- 
+
 ## Live 전환
 - `executor.py`에서 `DRY_RUN = False`로 변경 후 실행
