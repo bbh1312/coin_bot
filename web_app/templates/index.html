@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RSI Scanner Web Control</title>
+    <style>
+        body { font-family: "Segoe UI", Arial, sans-serif; background:#0d1117; color:#cdd9e5; margin:0; padding:0; }
+        .container { max-width:900px; margin:0 auto; padding:1.5rem; }
+        header { margin-bottom:1rem; }
+        h1 { margin-bottom:0.25rem; }
+        .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:1rem; }
+        .card { background:#161b22; border:1px solid #30363d; border-radius:0.75rem; padding:1rem; }
+        button { padding:0.5rem 0.85rem; border:none; border-radius:0.5rem; background:#238636; color:#fff; cursor:pointer; }
+        button.secondary { background:#57606a; }
+        pre { background:#0d1117; border:1px solid #30363d; padding:0.75rem; border-radius:0.5rem; overflow:auto; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>RSI Scanner Console</h1>
+            <p>Commands: {{ cmd_help | join(", ") }}</p>
+        </header>
+        <div class="grid">
+            <div class="card">
+                <strong>Toggle Controls</strong>
+                <form id="cmd-form">
+                    <select id="cmd-select">
+                        {% for cmd in cmd_help %}
+                        <option value="{{ cmd }}">{{ cmd }}</option>
+                        {% endfor %}
+                    </select>
+                    <input type="text" id="cmd-arg" placeholder="on/off" />
+                    <button type="submit">Send Command</button>
+                </form>
+                <div id="cmd-status"></div>
+            </div>
+            <div class="card">
+                <strong>State Snapshot</strong>
+                <ul>
+                    <li>Fabio: {{ 'ON' if state.get('_fabio_enabled') else 'OFF' }}</li>
+                    <li>AtlasFabio: {{ 'ON' if state.get('_atlas_fabio_enabled') else 'OFF' }}</li>
+                    <li>Swaggy: {{ 'ON' if state.get('_swaggy_enabled') else 'OFF' }}</li>
+                    <li>Auto Exit: {{ 'ON' if state.get('_auto_exit') else 'OFF' }}</li>
+                </ul>
+                <small>Open positions per log: {{ totals.LONG + totals.SHORT }}</small>
+            </div>
+            <div class="card">
+                <strong>Quick Links</strong>
+                <button onclick="location.href='/status'">🔁 Refresh Status</button>
+                <button onclick="location.href='/report/{{ (state['_daily_report_date'] or '') if state.get('_daily_report_date') else '' }}'">📊 Yesterday Report</button>
+            </div>
+        </div>
+        <section class="card" style="margin-top:1rem;">
+            <h2>Log Preview</h2>
+            <pre id="log-preview">Loading...</pre>
+        </section>
+    </div>
+    <script>
+        document.getElementById("cmd-form").addEventListener("submit", async function (ev) {
+            ev.preventDefault();
+            const cmd = document.getElementById("cmd-select").value;
+            const arg = document.getElementById("cmd-arg").value.trim();
+            const payload = { cmd: `${cmd}${arg ? " " + arg : ""}` };
+            const res = await fetch("/command", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            document.getElementById("cmd-status").textContent = JSON.stringify(data);
+        });
+        async function refreshLogs() {
+            const res = await fetch("/report/today");
+            if (res.ok) {
+                document.getElementById("log-preview").textContent = await res.text();
+                return;
+            }
+            document.getElementById("log-preview").textContent = "Report not available.";
+        }
+        refreshLogs();
+    </script>
+</body>
+</html>
