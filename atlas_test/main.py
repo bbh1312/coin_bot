@@ -53,9 +53,11 @@ def _build_summary_message(cfg: Config, summary_ts: int, results: dict, universe
     bears = results.get("bears", [])
     exits = results.get("exits", [])
     counts = results.get("counts", {"STRONG_BULL": 0, "STRONG_BEAR": 0, "NO_TRADE": 0})
+    total = sum(int(v or 0) for v in counts.values())
     lines = [
         f"[ATLAS-TEST] 15m 요약 (KST {time_str})",
         f"Universe: {universe_label}",
+        f"Universe size: {total}",
         f"STRONG_BULL: {counts.get('STRONG_BULL', 0)} | STRONG_BEAR: {counts.get('STRONG_BEAR', 0)} | NO_TRADE: {counts.get('NO_TRADE', 0)}",
         "",
         "TOP BULL",
@@ -94,7 +96,10 @@ def _build_common_universe(cfg: Config, tickers: dict) -> tuple:
         top_n=int(cfg.fabio_universe_top_n or 0) or None,
         anchors=anchors,
     )
-    label = f"abs(pct) top {cfg.fabio_universe_top_n} + anchors(BTC/ETH)"
+    label = (
+        f"qVol>={int(cfg.min_quote_volume):,} abs(pct) top {cfg.fabio_universe_top_n} "
+        "anchors(BTC/ETH)"
+    )
     return universe, label
 
 
