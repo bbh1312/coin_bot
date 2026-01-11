@@ -61,6 +61,15 @@ class Config:
     trend_cont_min_closes: int = 2
     trend_cont_hold_bars: int = 5
     trend_cont_hold_ratio_min: float = 0.6
+    pullback_only: bool = True
+    location_required: bool = True
+    bb_len: int = 20
+    bb_mult: float = 2.0
+    location_long_touch_pct: float = 0.002
+    location_short_touch_pct: float = 0.002
+    location_ema7_atr_mult: float = 0.6
+    location_bb_long_max: float = 0.60
+    location_bb_short_min: float = 0.40
 
 
 def ema_list(values, n: int):
@@ -80,6 +89,18 @@ def sma_list(values, n: int):
     for i in range(n - 1, len(values)):
         out.append(sum(values[i - n + 1:i + 1]) / n)
     return out
+
+
+def bollinger_last(values, n: int, k: float) -> Optional[tuple]:
+    if len(values) < n or n <= 1:
+        return None
+    window = values[-n:]
+    mean = sum(window) / n
+    var = sum((v - mean) ** 2 for v in window) / n
+    std = var ** 0.5
+    upper = mean + k * std
+    lower = mean - k * std
+    return mean, upper, lower
 
 
 def atr_list(highs, lows, closes, n: int):
@@ -287,6 +308,9 @@ def evaluate_symbol(
         "vol_ratio": None,
         "dist_to_ema20": None,
         "atr_now": None,
+        "retest_strict": None,
+        "location_ok": None,
+        "bb_pos": None,
     }
     bucket = _get_bucket_with_key(state, bucket_key)
     sym = bucket.setdefault(symbol, {"mode": "IDLE", "last_ts": None})
@@ -469,6 +493,14 @@ def evaluate_symbol(
                     if reclaim and bullish:
                         retest_ok = True
                         break
+        retest_strict = False
+        if len(ltf_closes) >= 2 and len(ema20_ltf) >= 2 and len(ltf_lows) >= 2:
+            prev_low = float(ltf_lows[-2])
+            ema20_prev = float(ema20_ltf[-2])
+            if ema20_prev > 0:
+                touched = prev_low <= ema20_prev * (1 + cfg.location_long_touch_pct)
+                reclaimed = l_close > l_ema20
+                retest_strict = bool(touched and reclaimed)
         vol_ok = l_vol_ratio >= cfg.trigger_vol_ratio_min
         trigger_price_ok = (l_close > l_ema7 and l_close > l_open)
         trigger_ok = (trigger_price_ok and vol_ok)
@@ -506,6 +538,20 @@ def evaluate_symbol(
         trend_cont_trigger = False
         atr_vals = atr_list(ltf_highs, ltf_lows, ltf_closes, cfg.atr_len)
         atr_now = atr_vals[-1] if atr_vals else None
+        bb_vals = bollinger_last(ltf_closes, cfg.bb_len, cfg.bb_mult)
+        bb_pos = None
+        bb_ok = False
+        if bb_vals:
+            _, bb_up, bb_dn = bb_vals
+            if bb_up != bb_dn:
+                bb_pos = (l_close - bb_dn) / (bb_up - bb_dn)
+                bb_ok = bb_pos <= cfg.location_bb_long_max
+        ema20_touch_ok = l_low <= l_ema20 * (1 + cfg.location_long_touch_pct)
+        ema7_dist_ok = False
+        if isinstance(atr_now, (int, float)) and atr_now > 0:
+            ema7_dist_ok = abs(l_close - l_ema7) <= float(atr_now) * cfg.location_ema7_atr_mult
+        location_hits = sum(1 for v in (ema20_touch_ok, ema7_dist_ok, bb_ok) if v)
+        location_ok = location_hits >= 2
         body = abs(l_close - l_open)
         body_ok = True
         if isinstance(atr_now, (int, float)) and atr_now > 0:
@@ -531,9 +577,12 @@ def evaluate_symbol(
         touch_ok = (l_low <= l_ema7 * (1 + cfg.long_touch_tol)) and (l_close >= l_ema7)
         if dist_ok and body_ok and (not fast_drop) and (consecutive_ok or breakout_ok or touch_ok):
             trend_cont_trigger = True
-        entry_ready = confirm_ok and retest_ok and dist_ok and vol_ok
+        retest_ok_final = bool(retest_ok and retest_strict) if cfg.pullback_only else bool(retest_ok)
+        location_ok_final = bool(location_ok) if cfg.location_required else True
+        entry_ready = confirm_ok and retest_ok_final and dist_ok and vol_ok and location_ok_final
         res["confirm_ok"] = bool(confirm_ok)
-        res["retest_ok"] = bool(retest_ok)
+        res["retest_ok"] = bool(retest_ok_final)
+        res["retest_strict"] = bool(retest_strict)
         res["dist_ok"] = bool(dist_ok)
         res["vol_ok"] = bool(vol_ok)
         res["trigger_ok"] = bool(trigger_ok)
@@ -560,11 +609,13 @@ def evaluate_symbol(
         res["vol_avg"] = l_vol_sma
         res["dist_to_ema20"] = dist_ratio
         res["atr_now"] = atr_now
+        res["location_ok"] = bool(location_ok_final)
+        res["bb_pos"] = bb_pos
         res["dist_pct"] = dist_pct
         res["dist_ratio"] = dist_ratio
         res["dist_mode"] = "ratio"
         trigger_rsi = bool(rsi_ok)
-        trigger_retest = bool(retest_ok)
+        trigger_retest = bool(retest_strict)
         trigger_vol = bool(vol_ok)
         trigger_struct = bool(confirm_ok)
         trigger_ema = bool(l_close > l_ema7)
@@ -597,7 +648,7 @@ def evaluate_symbol(
             "ema_align": ema_align_ok,
             "rsi_reversal": rsi_reversal_ok,
             "vol": bool(vol_ok),
-            "retest": bool(retest_ok),
+            "retest": bool(retest_ok_final),
             "structure": structure_ok,
             "dist": bool(dist_ok),
         }
@@ -615,15 +666,18 @@ def evaluate_symbol(
             and l_close > l_open
             and vol_ok
             and confirm_ok
-            and retest_ok
+            and retest_ok_final
             and dist_ok
+            and location_ok_final
         ):
             sym["mode"] = "IDLE"
             res["long"] = True
-            res["reason"] = "fabio_long"
+            res["reason"] = "fabio_long|retest"
         else:
-            if not retest_ok:
+            if not retest_ok_final:
                 res["block_reason"] = "retest"
+            elif not location_ok_final:
+                res["block_reason"] = "no_location"
             elif not dist_ok:
                 res["block_reason"] = "chase"
             elif l_vol_ratio < cfg.trigger_vol_ratio_min:
@@ -763,6 +817,14 @@ def evaluate_symbol(
                 recent_threshold = max(0, len(stf_closes) - int(cfg.short_retest_recent))
                 if last_reject_idx >= recent_threshold:
                     retest_reject_ok = True
+        retest_strict = False
+        if len(stf_closes) >= 2 and len(ema20_stf) >= 2 and len(stf_highs) >= 2:
+            prev_high = float(stf_highs[-2])
+            ema20_prev = float(ema20_stf[-2])
+            if ema20_prev > 0:
+                touched = prev_high >= ema20_prev * (1 - cfg.location_short_touch_pct)
+                reclaimed = s_close < s_ema20
+                retest_strict = bool(touched and reclaimed)
 
         trigger_ok = False
         trigger_price_ok = s_close < s_ema20
@@ -793,6 +855,20 @@ def evaluate_symbol(
         structure_ok = retest_reject_ok or lower_high or upper_wick_chain
         atr_vals = atr_list(stf_highs, stf_lows, stf_closes, cfg.atr_len)
         atr_now = atr_vals[-1] if atr_vals else None
+        bb_vals = bollinger_last(stf_closes, cfg.bb_len, cfg.bb_mult)
+        bb_pos = None
+        bb_ok = False
+        if bb_vals:
+            _, bb_up, bb_dn = bb_vals
+            if bb_up != bb_dn:
+                bb_pos = (s_close - bb_dn) / (bb_up - bb_dn)
+                bb_ok = bb_pos >= cfg.location_bb_short_min
+        ema20_touch_ok = s_high >= s_ema20 * (1 - cfg.location_short_touch_pct)
+        ema7_dist_ok = False
+        if isinstance(atr_now, (int, float)) and atr_now > 0:
+            ema7_dist_ok = abs(s_close - s_ema7) <= float(atr_now) * cfg.location_ema7_atr_mult
+        location_hits = sum(1 for v in (ema20_touch_ok, ema7_dist_ok, bb_ok) if v)
+        location_ok = location_hits >= 2
         impulse_block = False
         block_until = sym.get("short_block_until_ts")
         s_ts = None
@@ -817,6 +893,8 @@ def evaluate_symbol(
             if impulse_up and tf_ms > 0 and s_ts:
                 sym["short_block_until_ts"] = s_ts + tf_ms * max(1, int(cfg.short_impulse_cooldown_bars))
                 impulse_block = True
+        retest_ok_final = bool(retest_reject_ok and retest_strict) if cfg.pullback_only else bool(retest_reject_ok)
+        location_ok_final = bool(location_ok) if cfg.location_required else True
         entry_ready = (
             regime_ok
             and structure_ok
@@ -826,10 +904,13 @@ def evaluate_symbol(
             and (vol_ok or not cfg.short_vol_required)
             and (not fast_drop)
             and (not impulse_block)
+            and retest_ok_final
+            and location_ok_final
         )
 
         res["confirm_ok"] = bool(structure_ok)
-        res["retest_ok"] = bool(retest_reject_ok)
+        res["retest_ok"] = bool(retest_ok_final)
+        res["retest_strict"] = bool(retest_strict)
         res["dist_ok"] = bool(dist_ok)
         res["vol_ok"] = bool(vol_ok)
         res["trigger_ok"] = bool(trigger_ok)
@@ -851,11 +932,13 @@ def evaluate_symbol(
         res["vol_avg"] = s_vol_sma
         res["dist_to_ema20"] = dist_ratio
         res["atr_now"] = atr_now
+        res["location_ok"] = bool(location_ok_final)
+        res["bb_pos"] = bb_pos
         res["dist_pct"] = dist_pct
         res["dist_ratio"] = dist_ratio
         res["dist_mode"] = "ratio"
         trigger_rsi = bool(rsi_downturn)
-        trigger_retest = bool(retest_reject_ok)
+        trigger_retest = bool(retest_strict)
         trigger_vol = bool(vol_ok)
         trigger_struct = bool(structure_ok)
         trigger_ema = bool(s_close < s_ema20)
@@ -887,7 +970,7 @@ def evaluate_symbol(
             "ema_align": ema_align_ok,
             "rsi_reversal": rsi_reversal_ok,
             "vol": bool(vol_ok),
-            "retest": bool(retest_reject_ok),
+            "retest": bool(retest_ok_final),
             "structure": structure_ok,
             "dist": bool(dist_ok),
         }
@@ -903,12 +986,16 @@ def evaluate_symbol(
         if entry_ready:
             sym["mode"] = "IDLE"
             res["short"] = True
-            res["reason"] = "fabio_short"
+            res["reason"] = "fabio_short|retest"
         else:
             if not regime_ok:
                 res["block_reason"] = "regime"
             elif impulse_block:
                 res["block_reason"] = "impulse_up"
+            elif not retest_ok_final:
+                res["block_reason"] = "retest"
+            elif not location_ok_final:
+                res["block_reason"] = "no_location"
             elif not dist_ok or fast_drop:
                 res["block_reason"] = "chase"
             elif not rsi_downturn:

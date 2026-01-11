@@ -883,7 +883,7 @@ def _run_fabio_cycle(
         if allowed_dir == "SHORT" and wait_mode == "WAIT_LONG":
             fabio_res["entry_ready"] = False
             fabio_res["long"] = False
-        if fabio_res.get("block_reason") == "retest":
+        if fabio_res.get("block_reason") == "retest" and not getattr(fabio_cfg, "pullback_only", False):
             rsi_val = fabio_res.get("rsi")
             rsi_ok = isinstance(rsi_val, (int, float)) and rsi_val >= 53.0
             trigger_ok = bool(fabio_res.get("trigger_ok"))
@@ -912,6 +912,20 @@ def _run_fabio_cycle(
                     f"result={fabio_res.get('trigger_ok')} detail={fabio_res.get('block_reason')}"
                 )
                 fabio_trigger_debug += 1
+        if fabio_res.get("block_reason") == "no_location":
+            bb_pos = fabio_res.get("bb_pos")
+            ema20 = fabio_res.get("price_ema20")
+            atr_now = fabio_res.get("atr_now")
+            side_disp = side_tag or "NA"
+            print(
+                "SKIP reason=NO_LOCATION side=%s bb_pos=%s ema20=%s atr=%s"
+                % (
+                    side_disp,
+                    _fmt_float(bb_pos, 4),
+                    _fmt_float(ema20, 6),
+                    _fmt_float(atr_now, 6),
+                )
+            )
         funnel["evaluated"] += 1
         _inc_side_local("evaluated")
         if fabio_res.get("confirm_ok") is True:
