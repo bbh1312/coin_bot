@@ -161,8 +161,8 @@ def _score_breakdown(result: dict) -> dict:
 
 def _append_detail_log(line: str) -> None:
     try:
-        os.makedirs("logs", exist_ok=True)
-        with open(os.path.join("logs", "atlas_test_detail.log"), "a", encoding="utf-8") as f:
+        os.makedirs(os.path.join("logs", "atlas"), exist_ok=True)
+        with open(os.path.join("logs", "atlas", "atlas_test_detail.log"), "a", encoding="utf-8") as f:
             f.write(line.rstrip("\n") + "\n")
     except Exception:
         pass

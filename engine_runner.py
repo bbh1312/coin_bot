@@ -186,6 +186,13 @@ def _ts_to_kst_str(ts: float) -> str:
     except Exception:
         return "unknown"
 
+def _now_kst_str() -> str:
+    try:
+        dt = datetime.now(timezone.utc) + timedelta(hours=9)
+        return dt.strftime("%Y-%m-%d %H:%M:%S KST")
+    except Exception:
+        return "unknown"
+
 def _date_str_kst(ts: float) -> str:
     try:
         dt = datetime.fromtimestamp(ts, tz=timezone.utc) + timedelta(hours=9)
@@ -384,6 +391,15 @@ def _append_log_lines(path: str, lines: list) -> None:
         with open(full_path, "a", encoding="utf-8") as f:
             for line in lines:
                 f.write(line.rstrip("\n") + "\n")
+    except Exception:
+        pass
+
+def _append_rsi_detail_log(line: str) -> None:
+    try:
+        full_path = os.path.join("logs", "rsi", "rsi_detail.log")
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "a", encoding="utf-8") as f:
+            f.write(line.rstrip("\n") + "\n")
     except Exception:
         pass
 
@@ -5311,7 +5327,8 @@ def run():
             dtfx_thread.start()
         if not run_rsi_short:
             print("[모드] FABIO_ONLY 활성화: RSI 스캔 스킵")
-        for symbol in universe_momentum:
+        universe_total = len(universe_momentum)
+        for idx, symbol in enumerate(universe_momentum, start=1):
             if not run_rsi_short:
                 break
             scanned += 1
@@ -5368,16 +5385,76 @@ def run():
                 continue
 
             rsis = scan_result.rsis
+            rsis_prev = scan_result.rsis_prev
+            r3m_val = scan_result.r3m_val
             rsi5m_downturn = scan_result.rsi5m_downturn
             rsi3m_downturn = scan_result.rsi3m_downturn
             vol_ok = scan_result.vol_ok
             struct_ok = scan_result.struct_ok
             struct_metrics = scan_result.struct_metrics
+            vol_cur = scan_result.vol_cur
+            vol_avg = scan_result.vol_avg
             spike_ready = scan_result.spike_ready
             struct_ready = scan_result.struct_ready
             pass_count = scan_result.pass_count
+            miss_count = scan_result.miss_count
+            trigger_ok = scan_result.trigger_ok
+            impulse_block = scan_result.impulse_block
             ready_entry = scan_result.ready_entry
             pass_tally[min(max(pass_count, 0), 6)] += 1
+            vol_ratio = (float(vol_cur) / float(vol_avg)) if (vol_cur and vol_avg and vol_avg > 0) else None
+            struct_lower_highs = struct_metrics.get("lower_highs") if isinstance(struct_metrics, dict) else None
+            struct_wick_reject = struct_metrics.get("wick_reject") if isinstance(struct_metrics, dict) else None
+            wick_ratio_1 = struct_metrics.get("upper_wick_ratio_1") if isinstance(struct_metrics, dict) else None
+            wick_ratio_2 = struct_metrics.get("upper_wick_ratio_2") if isinstance(struct_metrics, dict) else None
+            thr = rsi_engine.config.thresholds if rsi_engine and hasattr(rsi_engine, "config") else {}
+            detail_line = (
+                "[{ts}] [rsi-detail] idx={idx}/{total} sym={sym} "
+                "rsi1h={r1h} rsi15={r15} rsi5={r5} rsi5_prev={r5p} "
+                "rsi3={r3} rsi3_prev={r3p} rsi3_prev2={r3p2} "
+                "thr1h={t1h} thr15={t15} thr5={t5} thr3={t3} "
+                "down5={d5} down3={d3} ok_tf={oktf} trigger={trig} "
+                "vol_ok={vok} vol_cur={vcur} vol_avg={vavg} vol_ratio={vr} "
+                "struct_ok={sok} lower_highs={lh} wick_reject={wr} wick1={w1} wick2={w2} "
+                "impulse_block={imp} spike_ready={spk} struct_ready={str} ready={ready} "
+                "pass={pc} miss={mc}"
+            ).format(
+                ts=_now_kst_str(),
+                idx=idx,
+                total=universe_total,
+                sym=symbol,
+                r1h=_fmt_float(rsis.get("1h"), 2),
+                r15=_fmt_float(rsis.get("15m"), 2),
+                r5=_fmt_float(rsis.get("5m"), 2),
+                r5p=_fmt_float(rsis_prev.get("5m"), 2),
+                r3=_fmt_float(rsis.get("3m"), 2),
+                r3p=_fmt_float(rsis_prev.get("3m"), 2),
+                r3p2=_fmt_float(r3m_val, 2),
+                t1h=_fmt_float(thr.get("1h"), 2) if isinstance(thr, dict) else "N/A",
+                t15=_fmt_float(thr.get("15m"), 2) if isinstance(thr, dict) else "N/A",
+                t5=_fmt_float(thr.get("5m"), 2) if isinstance(thr, dict) else "N/A",
+                t3=_fmt_float(thr.get("3m"), 2) if isinstance(thr, dict) else "N/A",
+                d5="Y" if rsi5m_downturn else "N",
+                d3="Y" if rsi3m_downturn else "N",
+                oktf="Y" if scan_result.ok_tf else "N",
+                trig="Y" if trigger_ok else "N",
+                vok="Y" if vol_ok else "N",
+                vcur=_fmt_float(vol_cur, 2),
+                vavg=_fmt_float(vol_avg, 2),
+                vr=_fmt_float(vol_ratio, 2),
+                sok="Y" if struct_ok else "N",
+                lh="Y" if struct_lower_highs else "N",
+                wr="Y" if struct_wick_reject else "N",
+                w1=_fmt_float(wick_ratio_1, 3),
+                w2=_fmt_float(wick_ratio_2, 3),
+                imp="Y" if impulse_block else "N",
+                spk="Y" if spike_ready else "N",
+                str="Y" if struct_ready else "N",
+                ready="Y" if ready_entry else "N",
+                pc=pass_count,
+                mc=miss_count,
+            )
+            _append_rsi_detail_log(detail_line)
 
             # update state for edge detection
             state.setdefault(symbol, {})
