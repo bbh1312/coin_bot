@@ -51,6 +51,7 @@ try:
     from engines.atlas.atlas_engine import AtlasEngine, AtlasSwaggyConfig
     from engines.rsi.engine import RsiEngine
     from engines.div15m_long.engine import Div15mLongEngine
+    from engines.div15m_short.engine import Div15mShortEngine
     from engines.universe import build_universe_from_tickers
     from engines.dtfx.engine import DTFXEngine, DTFXConfig
     from engines.dtfx.core.logger import write_dtfx_log
@@ -64,6 +65,7 @@ except Exception:
     AtlasSwaggyConfig = None
     RsiEngine = None
     Div15mLongEngine = None
+    Div15mShortEngine = None
     build_universe_from_tickers = None
     DTFXEngine = None
     DTFXConfig = None
@@ -96,6 +98,7 @@ atlas_engine = None
 atlas_swaggy_cfg = None
 rsi_engine = None
 div15m_engine = None
+div15m_short_engine = None
 dtfx_engine = None
 
 load_env()
@@ -4382,6 +4385,8 @@ ATLAS_FABIO_PAPER = False
 SWAGGY_ENABLED = True
 DTFX_ENABLED = True
 DIV15M_LONG_ENABLED = True
+DIV15M_SHORT_ENABLED = True
+ONLY_DIV15M_SHORT = False
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
@@ -4589,13 +4594,14 @@ def run():
     state = load_state()
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
-    global swaggy_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, div15m_engine
+    global swaggy_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, div15m_engine, div15m_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     atlas_engine = AtlasEngine() if AtlasEngine else None
     atlas_swaggy_cfg = AtlasSwaggyConfig() if AtlasSwaggyConfig else None
     global rsi_engine
     rsi_engine = RsiEngine() if RsiEngine else None
     div15m_engine = Div15mLongEngine() if Div15mLongEngine else None
+    div15m_short_engine = Div15mShortEngine() if Div15mShortEngine else None
     dtfx_engine = DTFXEngine() if DTFXEngine else None
     dtfx_cfg = DTFXConfig() if DTFXConfig else None
     if dtfx_engine and dtfx_cfg and EngineContext:
@@ -4607,7 +4613,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, DIV15M_LONG_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
     global USDT_PER_TRADE
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
@@ -4631,6 +4637,10 @@ def run():
         DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
     else:
         state["_div15m_long_enabled"] = DIV15M_LONG_ENABLED
+    if isinstance(state.get("_div15m_short_enabled"), bool):
+        DIV15M_SHORT_ENABLED = bool(state.get("_div15m_short_enabled"))
+    else:
+        state["_div15m_short_enabled"] = DIV15M_SHORT_ENABLED
     FABIO_ENABLED = False
     state["_fabio_enabled"] = False
     if isinstance(state.get("_atlas_fabio_enabled"), bool):
@@ -4645,6 +4655,21 @@ def run():
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
         state["_dtfx_enabled"] = DTFX_ENABLED
+    if "--only-div15m-short" in sys.argv:
+        ONLY_DIV15M_SHORT = True
+        DIV15M_LONG_ENABLED = False
+        DIV15M_SHORT_ENABLED = True
+        SWAGGY_ENABLED = False
+        DTFX_ENABLED = False
+        FABIO_ENABLED = False
+        ATLAS_FABIO_ENABLED = False
+        state["_div15m_long_enabled"] = False
+        state["_div15m_short_enabled"] = True
+        state["_swaggy_enabled"] = False
+        state["_dtfx_enabled"] = False
+        state["_fabio_enabled"] = False
+        state["_atlas_fabio_enabled"] = False
+        print("[모드] ONLY_DIV15M_SHORT 활성화: div15m_short만 스캔")
     if isinstance(state.get("_entry_usdt"), (int, float)):
         try:
             val = float(state.get("_entry_usdt"))
@@ -4808,8 +4833,9 @@ def run():
             cycle_label = f"{base_label}-RT{realtime_count}"
             print(f"\n[사이클 {cycle_label}] (동일 캔들) realtime only (heavy_scan=N)")
         cycle_start = time.time()
-        run_rsi_short = True
-        run_div15m_long = bool(DIV15M_LONG_ENABLED and div15m_engine)
+        run_rsi_short = not ONLY_DIV15M_SHORT
+        run_div15m_long = bool((not ONLY_DIV15M_SHORT) and DIV15M_LONG_ENABLED and div15m_engine)
+        run_div15m_short = bool(div15m_short_engine and (DIV15M_SHORT_ENABLED or ONLY_DIV15M_SHORT))
         # 기존 Manage/SYNC는 Universe 생성 후로 이동하여 universe 심볼도 포함
 
         # --- Universe build ---
@@ -4904,6 +4930,8 @@ def run():
         rsi_universe_len = len(universe_momentum)
         div15m_universe = list(shared_universe)
         div15m_universe_len = len(div15m_universe)
+        div15m_short_universe = list(shared_universe)
+        div15m_short_universe_len = len(div15m_short_universe)
         fabio_universe = []
         fabio_label = "realtime_only"
         fabio_dir_hint = {}
@@ -5239,10 +5267,54 @@ def run():
                 int(div15m_cfg.RSI_LEN + div15m_cfg.WARMUP_BARS + 10),
                 int(div15m_cfg.EMA_REGIME_LEN + 5),
             )
+        div15m_short_cfg = div15m_short_engine.config if div15m_short_engine else None
+        div15m_short_limit = 0
+        if div15m_short_cfg:
+            div15m_short_limit = max(
+                int(div15m_short_cfg.LOOKBACK_BARS + div15m_short_cfg.PIVOT_L * 2 + 10),
+                int(div15m_short_cfg.RSI_LEN + div15m_short_cfg.WARMUP_BARS + 10),
+                int(div15m_short_cfg.EMA_REGIME_LEN + 5),
+            )
 
         def _div15m_log(msg: str) -> None:
             date_tag = time.strftime("%Y%m%d")
             _append_entry_log(f"div15m_long/div15m_live_{date_tag}.log", msg)
+        def _div15m_short_log(msg: str) -> None:
+            date_tag = time.strftime("%Y%m%d")
+            _append_entry_log(f"div15m_short/div15m_live_{date_tag}.log", msg)
+
+        def _div15m_short_csv(event) -> None:
+            if event is None:
+                return
+            date_tag = time.strftime("%Y%m%d")
+            path = os.path.join("logs", "div15m_short", f"div15m_short_signals_{date_tag}.csv")
+            header = [
+                "ts",
+                "symbol",
+                "event",
+                "entry_px",
+                "p1_idx",
+                "p2_idx",
+                "high1",
+                "high2",
+                "rsi1",
+                "rsi2",
+                "score",
+                "reasons",
+            ]
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                need_header = not os.path.exists(path)
+                with open(path, "a", encoding="utf-8") as f:
+                    if need_header:
+                        f.write(",".join(header) + "\n")
+                    f.write(
+                        f"{event.ts},{event.symbol},{event.event},{event.entry_px:.6g},"
+                        f"{event.p1_idx},{event.p2_idx},{event.high1:.6g},{event.high2:.6g},"
+                        f"{event.rsi1:.6g},{event.rsi2:.6g},{event.score:.4f},{event.reasons}\n"
+                    )
+            except Exception:
+                pass
         active_positions = int(active_positions_total)
         pos_limit_logged = False
         fabio_long_hits = 0
@@ -5541,7 +5613,7 @@ def run():
 
                 state[symbol]["last_entry"] = time.time()
 
-                reason_parts = []
+                reason_parts = ["RSI222"]
                 if spike_ready and struct_ready:
                     reason_parts.append("SPIKE+STRUCT")
                 elif spike_ready:
@@ -5732,6 +5804,186 @@ def run():
                 tp=None,
             )
 
+        if not run_div15m_short:
+            print("[모드] DIV15M_SHORT 비활성: 숏 다이버전스 스캔 스킵")
+        div15m_short_bucket = state.setdefault("_div15m_short", {})
+        for symbol in div15m_short_universe:
+            if not run_div15m_short:
+                break
+
+            st = div15m_short_bucket.get(symbol, {"in_pos": False, "last_entry": 0})
+            in_pos = bool(st.get("in_pos", False))
+            last_entry = float(st.get("last_entry", 0))
+
+            if not in_pos:
+                try:
+                    existing_amt = get_short_position_amount(symbol)
+                except Exception:
+                    existing_amt = 0.0
+                if existing_amt > 0:
+                    st["in_pos"] = True
+                    div15m_short_bucket[symbol] = st
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+
+            if in_pos:
+                try:
+                    existing_amt = get_short_position_amount(symbol)
+                except Exception:
+                    existing_amt = 0.0
+                if existing_amt > 0:
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                st["in_pos"] = False
+                div15m_short_bucket[symbol] = st
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+            cur_total = count_open_positions(force=True)
+            if not isinstance(cur_total, int):
+                cur_total = active_positions
+            if cur_total >= MAX_OPEN_POSITIONS:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+            if now - last_entry < COOLDOWN_SEC:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+            if not div15m_short_engine or not div15m_short_cfg:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+            df_15m = cycle_cache.get_df(symbol, "15m", limit=div15m_short_limit)
+            if df_15m.empty or len(df_15m) < div15m_short_limit:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            df_15m = df_15m.iloc[:-1]
+            if df_15m.empty:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+            idx = len(df_15m) - 1
+            close_15m = df_15m["close"]
+            rsi_15m = div15m_short_engine._rsi_wilder(close_15m, div15m_short_cfg.RSI_LEN)
+            ema_fast = div15m_short_engine._ema(close_15m, div15m_short_cfg.EMA_FAST)
+            ema_slow = div15m_short_engine._ema(close_15m, div15m_short_cfg.EMA_SLOW)
+            ema_regime = div15m_short_engine._ema(close_15m, div15m_short_cfg.EMA_REGIME_LEN)
+            macd_hist = div15m_short_engine._macd_hist(
+                close_15m,
+                div15m_short_cfg.MACD_FAST,
+                div15m_short_cfg.MACD_SLOW,
+                div15m_short_cfg.MACD_SIGNAL,
+            )
+
+            event = div15m_short_engine.process_candidate(
+                symbol,
+                df_15m,
+                idx,
+                rsi_15m,
+                ema_fast,
+                ema_slow,
+                ema_regime,
+                _div15m_short_log,
+                macd_hist,
+            )
+            div15m_short_engine.on_bar(symbol, df_15m, idx, rsi_15m, ema_fast, ema_slow, _div15m_short_log)
+            if not event or event.event != "ENTRY_READY":
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+            date_tag = time.strftime("%Y%m%d")
+            _append_entry_log(
+                f"div15m_short/div15m_entries_{date_tag}.log",
+                "engine=div15m_short side=SHORT symbol=%s price=%s qty=%s usdt=%s p1=%s p2=%s score=%.4f"
+                % (
+                    symbol,
+                    f"{event.entry_px:.6g}" if isinstance(event.entry_px, (int, float)) else "N/A",
+                    "N/A",
+                    f"{USDT_PER_TRADE:.2f}",
+                    event.p1_idx,
+                    event.p2_idx,
+                    float(event.score or 0.0),
+                ),
+            )
+            _div15m_short_csv(event)
+            order_info = "(알림 전용)"
+            entry_price_disp = None
+            if LIVE_TRADING:
+                guard_key = _entry_guard_key(state, symbol, "SHORT")
+                if not _entry_guard_acquire(state, symbol, key=guard_key):
+                    print(f"[entry] 숏 중복 차단 ({symbol})")
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                try:
+                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "div15m_short")
+                    if not seen_ok:
+                        print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=div15m_short blocked_by={seen_by}")
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
+                    res = short_market(
+                        symbol,
+                        usdt_amount=USDT_PER_TRADE,
+                        leverage=LEVERAGE,
+                        margin_mode=MARGIN_MODE,
+                    )
+                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
+                    qty = res.get("amount") or res.get("order", {}).get("amount")
+                    sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
+                    sl_id = None
+                    if isinstance(sl_order, dict):
+                        sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
+                    order_info = (
+                        f"entry_price={fill_price} qty={qty} usdt={USDT_PER_TRADE} "
+                        f"sl={'ok' if sl_order else 'skip'}"
+                    )
+                    entry_price_disp = fill_price
+                    st["in_pos"] = True
+                    _log_trade_entry(
+                        state,
+                        side="SHORT",
+                        symbol=symbol,
+                        entry_ts=time.time(),
+                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                        qty=qty if isinstance(qty, (int, float)) else None,
+                        usdt=USDT_PER_TRADE,
+                        meta={"reason": "div15m_short", "sl_order_id": sl_id},
+                    )
+                    _append_entry_log(
+                        f"div15m_short/div15m_entries_{date_tag}.log",
+                        "engine=div15m_short side=SHORT symbol=%s price=%s qty=%s usdt=%s p1=%s p2=%s score=%.4f"
+                        % (
+                            symbol,
+                            f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
+                            f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
+                            f"{USDT_PER_TRADE:.2f}",
+                            event.p1_idx,
+                            event.p2_idx,
+                            float(event.score or 0.0),
+                        ),
+                    )
+                    active_positions += 1
+                except Exception as e:
+                    order_info = f"order_error: {e}"
+                finally:
+                    _entry_guard_release(state, symbol, key=guard_key)
+
+            st["last_entry"] = time.time()
+            div15m_short_bucket[symbol] = st
+            _send_entry_alert(
+                send_telegram,
+                side="SHORT",
+                symbol=symbol,
+                engine="DIV15M_SHORT",
+                entry_price=entry_price_disp,
+                usdt=USDT_PER_TRADE,
+                reason=f"trigger={event.reasons or 'ENTRY_READY'}",
+                live=LIVE_TRADING,
+                order_info=order_info,
+                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                tp=None,
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
         if int(time.time()) % 30 == 0:
             _reload_runtime_settings_from_disk(state)
             save_state(state)

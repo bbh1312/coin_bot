@@ -12,6 +12,8 @@ from .notifier_telegram import send_message
 from .state_store import load_state, save_state
 from engines.universe import build_universe_from_tickers
 
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 
 def _fmt_kst(ts_ms: int) -> str:
     kst = timezone(timedelta(hours=9))
@@ -161,8 +163,9 @@ def _score_breakdown(result: dict) -> dict:
 
 def _append_detail_log(line: str) -> None:
     try:
-        os.makedirs(os.path.join("logs", "atlas"), exist_ok=True)
-        with open(os.path.join("logs", "atlas", "atlas_test_detail.log"), "a", encoding="utf-8") as f:
+        log_dir = os.path.join(ROOT_DIR, "logs", "atlas")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "atlas_test_detail.log"), "a", encoding="utf-8") as f:
             f.write(line.rstrip("\n") + "\n")
     except Exception:
         pass
@@ -232,10 +235,11 @@ def main() -> None:
                 continue
             state_now = result.get("state") or "NO_TRADE"
             counts[state_now] = counts.get(state_now, 0) + 1
+            atlas_local = result.get("atlas_local") or {}
             breakdown = _score_breakdown(result)
             detail_line = (
                 "[{ts}] [atlas-test] idx={idx} sym={sym} state={state} score={score} "
-                "regime={regime} part=R{sr}/RS{srsi}/I{sind}/V{svol} "
+                "regime={regime} dir={direction} part=R{sr}/RS{srsi}/I{sind}/V{svol} "
                 "rs={rs} rs_z={rsz} rs_slow={rsl} rs_z_slow={rszl} "
                 "corr={corr} beta={beta} corr_slow={corrs} beta_slow={betas} "
                 "vol={vol}"
@@ -246,6 +250,7 @@ def main() -> None:
                 state=state_now,
                 score=int(result.get("score") or 0),
                 regime=breakdown.get("regime"),
+                direction=atlas_local.get("symbol_direction"),
                 sr=breakdown.get("score_regime"),
                 srsi=breakdown.get("score_rs"),
                 sind=breakdown.get("score_indep"),
@@ -262,7 +267,6 @@ def main() -> None:
             )
             print(detail_line)
             _append_detail_log(detail_line)
-            atlas_local = result.get("atlas_local") or {}
             entry = {
                 "symbol": sym.replace("/USDT:USDT", ""),
                 "score": result.get("score") or 0,

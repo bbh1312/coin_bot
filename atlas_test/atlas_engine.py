@@ -103,6 +103,7 @@ def compute_atlas_local(symbol: str, gate: Dict[str, Any], cfg: AtlasSwaggyConfi
         "corr_slow": None,
         "beta_slow": None,
         "state": gate.get("regime"),
+        "symbol_direction": "UNKNOWN",
     }
     btc_fast = _rs_metrics(cfg.ref_symbol, cfg, cfg.rs_n, cfg.corr_m)
     alt_fast = _rs_metrics(symbol, cfg, cfg.rs_n, cfg.corr_m)
@@ -155,6 +156,13 @@ def compute_atlas_local(symbol: str, gate: Dict[str, Any], cfg: AtlasSwaggyConfi
         "corr_slow": corr_slow,
         "beta_slow": beta_slow,
     })
+    if isinstance(rs_fast, (int, float)):
+        if rs_fast > 0:
+            out["symbol_direction"] = "BULL"
+        elif rs_fast < 0:
+            out["symbol_direction"] = "BEAR"
+        else:
+            out["symbol_direction"] = "NEUTRAL"
     return out
 
 

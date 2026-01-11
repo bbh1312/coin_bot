@@ -7,8 +7,10 @@ from typing import Dict, List, Optional
 @dataclass
 class RsiConfig:
     thresholds: Dict[str, float] = field(
-        default_factory=lambda: {"3m": 80.0, "5m": 80.0, "15m": 75.0, "1h": 75.0}
+        default_factory=lambda: {"3m": 80.0, "5m": 80.0, "15m": 80.0, "1h": 80.0}
     )
+    rsi3m_downturn_threshold: float = 75.0
+    rsi3m_spike_threshold: float = 80.0
     tf_check_order: List[str] = field(default_factory=lambda: ["1h", "15m", "5m", "3m"])
     min_quote_volume_usdt: float = 30_000_000.0
     universe_top_n: Optional[int] = 40

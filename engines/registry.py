@@ -8,6 +8,7 @@ from engines.swaggy.swaggy_engine import SwaggyEngine
 from engines.atlas.atlas_engine import AtlasEngine
 from engines.dtfx.engine import DTFXEngine
 from engines.div15m_long.engine import Div15mLongEngine
+from engines.div15m_short.engine import Div15mShortEngine
 
 
 _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
@@ -16,6 +17,7 @@ _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
     "atlas": AtlasEngine,
     "dtfx": DTFXEngine,
     "div15m_long": Div15mLongEngine,
+    "div15m_short": Div15mShortEngine,
 }
 
 
