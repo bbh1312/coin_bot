@@ -2,6 +2,7 @@
 
 이 문서는 atlas_test의 점수 산정에 쓰이는 4가지 항목의 상세 계산을 정리한다.
 기준 코드는 `engines/atlas/atlas_engine.py`와 `atlas_test/atlas_engine.py`이다.
+아래에는 운영 중 자주 보이는 `n/a`/고정 패턴의 원인도 함께 설명한다.
 
 ## 1) Regime (시장 상태)
 
@@ -118,3 +119,23 @@ Regime 점수 반영 (atlas_test)
 
 기본 임계값 (AtlasSwaggyConfig)
 - `vol_pass = 1.3`
+
+## 운영 이슈: rs/corr/beta/vol이 n/a로 고정되는 이유
+
+증상
+- 요약에서 RS/상관/베타/거래량이 `n/a`
+- 점수가 25(또는 15/5)에서 고정되는 패턴
+
+원인
+- `compute_swaggy_local()`는 `long_requires_exception != 1`일 때 조기 리턴한다.
+- bull/normal 구간에서는 `long_requires_exception`이 0인 경우가 많아 로컬 지표 계산이 생략된다.
+- 이때 `allow_long/allow_short`만 채워지고 `rs/corr/beta/vol`은 계산되지 않는다.
+- `atlas_test`는 이 로컬 값을 그대로 점수 계산에 넣기 때문에 RS/독립성/거래량 점수가 항상 미부여로 남는다.
+
+관련 코드
+- `engines/atlas/atlas_engine.py`의 `compute_swaggy_local()`
+- `atlas_test/atlas_engine.py`의 `_score_from_atlas()`
+
+완화 방향
+- 로컬 지표를 항상 계산하도록 `compute_swaggy_local()`의 early return 조건을 완화
+- 또는 `atlas_test`에서 점수 산정 시 로컬 계산을 강제로 수행하도록 별도 경로 추가
