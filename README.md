@@ -18,6 +18,8 @@ pip install ccxt pandas requests websocket-client
 - 메인: python engine_runner.py
 - 웹소켓 관리모드 (단독실행) : python manage_ws.py
 - 아틀라스 알림 : python -m atlas_test.main
+- 웹 실행 python web_app/app.py (http://127.0.0.1:5000)
+
 
 ## 백테스트
 - RSI 엔진

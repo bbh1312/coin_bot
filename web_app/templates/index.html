@@ -3,83 +3,351 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>RSI Scanner Web Control</title>
+    <title>Command Control Deck</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
     <style>
-        body { font-family: "Segoe UI", Arial, sans-serif; background:#0d1117; color:#cdd9e5; margin:0; padding:0; }
-        .container { max-width:900px; margin:0 auto; padding:1.5rem; }
-        header { margin-bottom:1rem; }
-        h1 { margin-bottom:0.25rem; }
-        .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:1rem; }
-        .card { background:#161b22; border:1px solid #30363d; border-radius:0.75rem; padding:1rem; }
-        button { padding:0.5rem 0.85rem; border:none; border-radius:0.5rem; background:#238636; color:#fff; cursor:pointer; }
-        button.secondary { background:#57606a; }
-        pre { background:#0d1117; border:1px solid #30363d; padding:0.75rem; border-radius:0.5rem; overflow:auto; }
+        :root {
+            --bg: #0b0f14;
+            --panel: #121923;
+            --panel-2: #0f151f;
+            --text: #e8edf2;
+            --muted: #94a3b8;
+            --accent: #f59e0b;
+            --accent-2: #22c55e;
+            --line: rgba(148, 163, 184, 0.2);
+            --danger: #ef4444;
+            --shadow: 0 24px 60px rgba(2, 6, 23, 0.55);
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: "Space Grotesk", "Segoe UI", sans-serif;
+            background: radial-gradient(circle at top, #1d2736 0%, #0b0f14 60%, #07090c 100%);
+            color: var(--text);
+            margin: 0;
+            min-height: 100vh;
+        }
+        .layout {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2.5rem 1.5rem 3.5rem;
+            position: relative;
+        }
+        .glow {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: radial-gradient(circle at 70% 10%, rgba(34,197,94,0.12), transparent 45%),
+                        radial-gradient(circle at 20% 30%, rgba(245,158,11,0.18), transparent 50%);
+        }
+        header {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        h1 {
+            font-size: clamp(2rem, 3vw, 3rem);
+            margin: 0;
+            letter-spacing: -0.02em;
+        }
+        .subtitle {
+            color: var(--muted);
+            margin-top: 0.35rem;
+        }
+        .status-pill {
+            background: rgba(15, 23, 42, 0.75);
+            border: 1px solid var(--line);
+            padding: 0.8rem 1.2rem;
+            border-radius: 999px;
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.85rem;
+        }
+        .grid {
+            display: grid;
+            gap: 1.5rem;
+        }
+        .grid-2 {
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        }
+        .card {
+            background: linear-gradient(135deg, rgba(18,25,35,0.96), rgba(9,12,17,0.95));
+            border: 1px solid var(--line);
+            border-radius: 1.2rem;
+            padding: 1.5rem;
+            box-shadow: var(--shadow);
+            position: relative;
+            overflow: hidden;
+        }
+        .card h2 {
+            margin: 0 0 1rem;
+            font-size: 1.1rem;
+            letter-spacing: 0.02em;
+        }
+        .card .hint {
+            color: var(--muted);
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+        }
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.25rem 0.6rem;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            font-size: 0.75rem;
+            color: var(--muted);
+        }
+        .chip.on {
+            color: var(--accent-2);
+            border-color: rgba(34,197,94,0.4);
+        }
+        .chip.off {
+            color: var(--danger);
+            border-color: rgba(239,68,68,0.35);
+        }
+        .toggle {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid var(--line);
+        }
+        .toggle:last-child { border-bottom: none; }
+        .toggle button {
+            background: rgba(148, 163, 184, 0.1);
+            border: 1px solid var(--line);
+            color: var(--text);
+            padding: 0.35rem 0.75rem;
+            border-radius: 0.6rem;
+            cursor: pointer;
+        }
+        .toggle button.active {
+            background: var(--accent);
+            color: #1b1b1b;
+            border-color: transparent;
+        }
+        .form-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-top: 0.6rem;
+        }
+        #risk-controls .toggle {
+            gap: 1rem;
+        }
+        #risk-controls .toggle > div:first-child {
+            flex: 0.75;
+            font-size: 1rem;
+        }
+        #risk-controls .form-row {
+            flex: 0.65;
+            justify-content: flex-end;
+        }
+        #risk-controls .form-row input {
+            width: 100%;
+            max-width: 11rem;
+        }
+        input, select {
+            background: var(--panel-2);
+            border: 1px solid var(--line);
+            color: var(--text);
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.65rem;
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.9rem;
+        }
+        .primary {
+            background: var(--accent);
+            color: #151515;
+            border: none;
+            padding: 0.6rem 1rem;
+            border-radius: 0.7rem;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .secondary {
+            background: transparent;
+            border: 1px solid var(--line);
+            color: var(--text);
+            padding: 0.6rem 1rem;
+            border-radius: 0.7rem;
+            cursor: pointer;
+        }
+        pre {
+            background: #05070a;
+            border: 1px solid var(--line);
+            padding: 1rem;
+            border-radius: 0.9rem;
+            overflow: auto;
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.85rem;
+        }
+        .fade-in {
+            animation: fadeIn 0.6s ease forwards;
+            opacity: 0;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
     </style>
 </head>
 <body>
-    <div class="container">
+    <div class="layout">
+        <div class="glow"></div>
         <header>
-            <h1>RSI Scanner Console</h1>
-            <p>Commands: {{ cmd_help | join(", ") }}</p>
+            <div>
+                <h1>Command Control Deck</h1>
+                <div class="subtitle">엔진 토글, 라이브 모드, 리스크 값까지 한 화면에서 설정</div>
+            </div>
+            <div class="status-pill" id="status-pill">Loading status...</div>
         </header>
-        <div class="grid">
+        <div class="grid grid-2 fade-in">
             <div class="card">
-                <strong>Toggle Controls</strong>
-                <form id="cmd-form">
-                    <select id="cmd-select">
-                        {% for cmd in cmd_help %}
-                        <option value="{{ cmd }}">{{ cmd }}</option>
-                        {% endfor %}
-                    </select>
-                    <input type="text" id="cmd-arg" placeholder="on/off" />
-                    <button type="submit">Send Command</button>
-                </form>
-                <div id="cmd-status"></div>
+                <h2>Live Execution</h2>
+                <div class="hint">실주문 모드와 자동 청산을 빠르게 전환합니다.</div>
+                <div id="live-controls"></div>
             </div>
             <div class="card">
-                <strong>State Snapshot</strong>
-                <ul>
-                    <li>Fabio: {{ 'ON' if state.get('_fabio_enabled') else 'OFF' }}</li>
-                    <li>AtlasFabio: {{ 'ON' if state.get('_atlas_fabio_enabled') else 'OFF' }}</li>
-                    <li>Swaggy: {{ 'ON' if state.get('_swaggy_enabled') else 'OFF' }}</li>
-                    <li>Auto Exit: {{ 'ON' if state.get('_auto_exit') else 'OFF' }}</li>
-                </ul>
-                <small>Open positions per log: {{ totals.LONG + totals.SHORT }}</small>
+                <h2>Engines</h2>
+                <div class="hint">실행 엔진을 ON/OFF 하세요.</div>
+                <div id="engine-controls"></div>
             </div>
             <div class="card">
-                <strong>Quick Links</strong>
-                <button onclick="location.href='/status'">🔁 Refresh Status</button>
-                <button onclick="location.href='/report/{{ (state['_daily_report_date'] or '') if state.get('_daily_report_date') else '' }}'">📊 Yesterday Report</button>
+                <h2>Risk & Size</h2>
+                <div class="hint">진입 비율, 동시 포지션, 롱/숏 TP·SL을 조정합니다.</div>
+                <div id="risk-controls"></div>
             </div>
         </div>
-        <section class="card" style="margin-top:1rem;">
-            <h2>Log Preview</h2>
+        <section class="card fade-in" style="margin-top:1.5rem;">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem;">
+                <h2 style="margin:0;">리포트</h2>
+                <div class="form-row" style="margin:0;">
+                    <input type="date" id="report-date" />
+                    <button class="secondary" type="button" id="report-load">불러오기</button>
+                </div>
+            </div>
             <pre id="log-preview">Loading...</pre>
         </section>
     </div>
     <script>
-        document.getElementById("cmd-form").addEventListener("submit", async function (ev) {
-            ev.preventDefault();
-            const cmd = document.getElementById("cmd-select").value;
-            const arg = document.getElementById("cmd-arg").value.trim();
-            const payload = { cmd: `${cmd}${arg ? " " + arg : ""}` };
+        const COMMANDS = {{ commands | tojson }};
+        const statusPill = document.getElementById("status-pill");
+        const liveControls = document.getElementById("live-controls");
+        const engineControls = document.getElementById("engine-controls");
+        const riskControls = document.getElementById("risk-controls");
+
+        async function sendCommand(payload) {
             const res = await fetch("/command", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload),
             });
+            await res.json();
+            return res.ok;
+        }
+
+        function buildToggleRow(item, current) {
+            const row = document.createElement("div");
+            row.className = "toggle";
+            const label = document.createElement("div");
+            label.textContent = item.label;
+            const btn = document.createElement("button");
+            btn.textContent = current ? "ON" : "OFF";
+            btn.className = current ? "active" : "";
+            btn.addEventListener("click", async () => {
+                await sendCommand({ key: item.key, value: !current });
+                await refreshStatus();
+            });
+            row.appendChild(label);
+            row.appendChild(btn);
+            return row;
+        }
+
+        function buildNumberRow(item, current) {
+            const row = document.createElement("div");
+            row.className = "toggle";
+            const label = document.createElement("div");
+            label.textContent = item.label;
+            const wrap = document.createElement("div");
+            wrap.className = "form-row";
+            const input = document.createElement("input");
+            input.type = "number";
+            input.step = item.step || 1;
+            if (current !== undefined && current !== null) {
+                input.value = current;
+            }
+            const btn = document.createElement("button");
+            btn.textContent = "Apply";
+            btn.addEventListener("click", async () => {
+                await sendCommand({ key: item.key, value: input.value });
+                await refreshStatus();
+            });
+            wrap.appendChild(input);
+            wrap.appendChild(btn);
+            row.appendChild(label);
+            row.appendChild(wrap);
+            return row;
+        }
+
+        async function refreshStatus() {
+            const res = await fetch("/status");
+            if (!res.ok) {
+                statusPill.textContent = "Status fetch failed";
+                return;
+            }
             const data = await res.json();
-            document.getElementById("cmd-status").textContent = JSON.stringify(data);
-        });
-        async function refreshLogs() {
-            const res = await fetch("/report/today");
+            const pos = data.positions ?? 0;
+            const liveShort = data._live_trading ? "ON" : "OFF";
+            const liveLong = data._long_live ? "ON" : "OFF";
+            statusPill.textContent = `Positions ${pos} | Live S ${liveShort} | Live L ${liveLong}`;
+            liveControls.innerHTML = "";
+            engineControls.innerHTML = "";
+            riskControls.innerHTML = "";
+            COMMANDS.forEach((item) => {
+                const current = data[item.key];
+                if (item.type === "toggle") {
+                    const row = buildToggleRow(item, Boolean(current));
+                    if (["/live", "/long_live", "/auto_exit"].includes(item.cmd)) {
+                        liveControls.appendChild(row);
+                    } else {
+                        engineControls.appendChild(row);
+                    }
+                } else {
+                    riskControls.appendChild(buildNumberRow(item, current));
+                }
+            });
+        }
+
+        function _fmtDate(d) {
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, "0");
+            const day = String(d.getDate()).padStart(2, "0");
+            return `${y}-${m}-${day}`;
+        }
+
+        async function refreshLogs(dateStr) {
+            const target = dateStr || _fmtDate(new Date());
+            const res = await fetch(`/report/${target}`);
             if (res.ok) {
                 document.getElementById("log-preview").textContent = await res.text();
                 return;
             }
-            document.getElementById("log-preview").textContent = "Report not available.";
+            document.getElementById("log-preview").textContent = "오늘 리포트가 아직 없습니다.";
         }
-        refreshLogs();
+
+        refreshStatus();
+        const reportDate = document.getElementById("report-date");
+        reportDate.value = _fmtDate(new Date());
+        document.getElementById("report-load").addEventListener("click", () => {
+            refreshLogs(reportDate.value);
+        });
+        reportDate.addEventListener("change", () => refreshLogs(reportDate.value));
+        refreshLogs(reportDate.value);
     </script>
 </body>
 </html>

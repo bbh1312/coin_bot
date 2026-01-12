@@ -240,13 +240,13 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
     )
 
 
-def _handle_long_tp(state, symbol, detail, mark_px, now_ts):
+def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
     entry_px = detail.get("entry")
     if not isinstance(entry_px, (int, float)) or entry_px <= 0:
-        return
+        return False
     profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
     if profit_unlev < er.AUTO_EXIT_LONG_TP_PCT:
-        return
+        return False
     open_tr = er._get_open_trade(state, "LONG", symbol)
     engine_label = er._engine_label_from_reason(
         (open_tr.get("meta") or {}).get("reason") if open_tr else None
@@ -300,15 +300,16 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts):
         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
         f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
     )
+    return True
 
 
-def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
+def _handle_short_tp(state, symbol, detail, mark_px, now_ts) -> bool:
     entry_px = detail.get("entry")
     if not isinstance(entry_px, (int, float)) or entry_px <= 0:
-        return
+        return False
     profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
     if profit_unlev < er.AUTO_EXIT_SHORT_TP_PCT:
-        return
+        return False
     open_tr = er._get_open_trade(state, "SHORT", symbol)
     engine_label = er._engine_label_from_reason(
         (open_tr.get("meta") or {}).get("reason") if open_tr else None
@@ -362,6 +363,129 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
         f"{'' if pnl_short is None else f' 손익={pnl_short:+.3f} USDT'}"
     )
+    return True
+
+
+def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
+    entry_px = detail.get("entry")
+    if not isinstance(entry_px, (int, float)) or entry_px <= 0:
+        return False
+    profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
+    if profit_unlev > -er.AUTO_EXIT_LONG_SL_PCT:
+        return False
+    open_tr = er._get_open_trade(state, "LONG", symbol)
+    engine_label = er._engine_label_from_reason(
+        (open_tr.get("meta") or {}).get("reason") if open_tr else None
+    )
+    try:
+        executor_mod.set_dry_run(False if er.LONG_LIVE_TRADING else True)
+    except Exception:
+        pass
+    res = executor_mod.close_long_market(symbol)
+    executor_mod.cancel_stop_orders(symbol)
+    exit_order_id = None
+    if isinstance(res, dict):
+        exit_order_id = res.get("order_id") or er._extract_order_id(res.get("order"))
+    avg_price = (
+        res.get("order", {}).get("average")
+        or res.get("order", {}).get("price")
+        or res.get("order", {}).get("info", {}).get("avgPrice")
+    )
+    filled = res.get("order", {}).get("filled") or res.get("order", {}).get("amount")
+    cost = res.get("order", {}).get("cost") or res.get("order", {}).get("info", {}).get("cumQuote")
+    pnl_long = detail.get("pnl")
+    er._close_trade(
+        state,
+        side="LONG",
+        symbol=symbol,
+        exit_ts=now_ts,
+        exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
+        pnl_usdt=pnl_long,
+        reason="auto_exit_sl",
+        exit_order_id=exit_order_id,
+    )
+    st = state.get(symbol, {}) if isinstance(state, dict) else {}
+    if isinstance(st, dict):
+        st["last_exit_ts"] = now_ts
+        st["last_exit_reason"] = "auto_exit_sl"
+        state[symbol] = st
+    order_block = er._format_order_id_block(
+        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+        exit_order_id,
+    )
+    order_line = f"{order_block}\n" if order_block else ""
+    er.send_telegram(
+        f"🔴 <b>롱 청산</b>\n"
+        f"<b>{symbol}</b>\n"
+        f"엔진: {engine_label}\n"
+        f"사유: SL\n"
+        f"{order_line}"
+        f"체결가={avg_price} 수량={filled} 비용={cost}\n"
+        f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
+        f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
+    )
+    return True
+
+
+def _handle_short_sl(state, symbol, detail, mark_px, now_ts) -> bool:
+    entry_px = detail.get("entry")
+    if not isinstance(entry_px, (int, float)) or entry_px <= 0:
+        return False
+    profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
+    if profit_unlev > -er.AUTO_EXIT_SHORT_SL_PCT:
+        return False
+    open_tr = er._get_open_trade(state, "SHORT", symbol)
+    engine_label = er._engine_label_from_reason(
+        (open_tr.get("meta") or {}).get("reason") if open_tr else None
+    )
+    try:
+        executor_mod.set_dry_run(False if er.LIVE_TRADING else True)
+    except Exception:
+        pass
+    res = executor_mod.close_short_market(symbol)
+    executor_mod.cancel_stop_orders(symbol)
+    exit_order_id = None
+    if isinstance(res, dict):
+        exit_order_id = res.get("order_id") or er._extract_order_id(res.get("order"))
+    avg_price = (
+        res.get("order", {}).get("average")
+        or res.get("order", {}).get("price")
+        or res.get("order", {}).get("info", {}).get("avgPrice")
+    )
+    filled = res.get("order", {}).get("filled") or res.get("order", {}).get("amount")
+    cost = res.get("order", {}).get("cost") or res.get("order", {}).get("info", {}).get("cumQuote")
+    pnl_short = detail.get("pnl")
+    er._close_trade(
+        state,
+        side="SHORT",
+        symbol=symbol,
+        exit_ts=now_ts,
+        exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
+        pnl_usdt=pnl_short,
+        reason="auto_exit_sl",
+        exit_order_id=exit_order_id,
+    )
+    st = state.get(symbol, {}) if isinstance(state, dict) else {}
+    if isinstance(st, dict):
+        st["last_exit_ts"] = now_ts
+        st["last_exit_reason"] = "auto_exit_sl"
+        state[symbol] = st
+    order_block = er._format_order_id_block(
+        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+        exit_order_id,
+    )
+    order_line = f"{order_block}\n" if order_block else ""
+    er.send_telegram(
+        f"🔴 <b>숏 청산</b>\n"
+        f"<b>{symbol}</b>\n"
+        f"엔진: {engine_label}\n"
+        f"사유: SL\n"
+        f"{order_line}"
+        f"체결가={avg_price} 수량={filled} 비용={cost}\n"
+        f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
+        f"{'' if pnl_short is None else f' 손익={pnl_short:+.3f} USDT'}"
+    )
+    return True
 
 
 def main():
@@ -444,7 +568,9 @@ def main():
                 if mark_px is None:
                     mark_px = detail.get("mark")
                 if isinstance(mark_px, (int, float)):
-                    _handle_long_tp(state, symbol, detail, mark_px, now_ts)
+                    closed = _handle_long_tp(state, symbol, detail, mark_px, now_ts)
+                    if not closed:
+                        _handle_long_sl(state, symbol, detail, mark_px, now_ts)
                 # TODO(manage-ws): 추가 롱 청산 조건(현재 주석 처리)
                 # - SL/보호 조건
                 # - 추가 리스크 기반 exit
@@ -453,7 +579,9 @@ def main():
                 if mark_px is None:
                     mark_px = detail.get("mark")
                 if isinstance(mark_px, (int, float)):
-                    _handle_short_tp(state, symbol, detail, mark_px, now_ts)
+                    closed = _handle_short_tp(state, symbol, detail, mark_px, now_ts)
+                    if not closed:
+                        _handle_short_sl(state, symbol, detail, mark_px, now_ts)
                 # TODO(manage-ws): 추가 숏 청산 조건(현재 주석 처리)
                 # - SL/보호 조건
                 # - 추가 리스크 기반 exit

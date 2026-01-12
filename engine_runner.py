@@ -680,6 +680,12 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "SWAGGY"
     if key in ("dtfx_long", "dtfx_short"):
         return "DTFX"
+    if key == "div15m_long":
+        return "DIV15M_LONG"
+    if key == "div15m_short":
+        return "DIV15M_SHORT"
+    if key == "pumpfade_short":
+        return "PUMPFADE"
     if key == "short_entry":
         return "RSI"
     if key == "long_entry":
@@ -756,7 +762,7 @@ def _prune_trade_log(state: Dict[str, dict], keep_days: int = 14) -> None:
             kept.append(tr)
     state["_trade_log"] = kept
 
-def _build_daily_report(state: Dict[str, dict], report_date: str) -> str:
+def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool = False) -> str:
     records = _read_report_csv_records(report_date)
     totals = {
         "LONG": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
@@ -804,14 +810,20 @@ def _build_daily_report(state: Dict[str, dict], report_date: str) -> str:
             rec["win"] = False
 
     def _fmt_symbol_row(symbol: str, engine: str, pnl_val: Optional[float], win_flag: Optional[bool]) -> str:
+        if isinstance(symbol, str):
+            symbol = symbol.replace(":USDT", "").replace("/USDT", "")
         pnl_str = f"{pnl_val:+.3f} USDT" if isinstance(pnl_val, (int, float)) else "N/A"
         if win_flag is True:
-            wl = "W"
+            wl = "승"
         elif win_flag is False:
-            wl = "L"
+            wl = "패"
         else:
             wl = "N/A"
-        return f"{symbol} | {engine} | {pnl_str} | {wl}"
+        symbol_fmt = f"{symbol:<15}"
+        engine_fmt = f"{engine:<10}"
+        pnl_fmt = f"{pnl_str:>13}"
+        wl_fmt = f"{wl:^4}"
+        return f"| {symbol_fmt} | {engine_fmt} | {pnl_fmt} | {wl_fmt} |"
     if records is not None:
         for rec in records:
             if not rec.get("exit_ts"):
@@ -980,6 +992,11 @@ def _build_daily_report(state: Dict[str, dict], report_date: str) -> str:
             exec_ts = tr.get("exit_ts") if isinstance(tr.get("exit_ts"), (int, float)) else None
             _update_symbol_row(side, symbol, reason, pnl, win_flag, exec_ts)
 
+    count_width = 4
+    pnl_width = 29
+    win_width = 6
+    wl_width = 3
+
     def _format_total(t: dict) -> str:
         if t["pnl_valid"] > 0 and t["notional"] > 0:
             total_pct = (t["pnl"] / t["notional"]) * 100.0
@@ -990,21 +1007,57 @@ def _build_daily_report(state: Dict[str, dict], report_date: str) -> str:
         total_outcomes = t["wins"] + t["losses"]
         win_rate = (t["wins"] / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
         losses = t["losses"]
+        if compact:
+            return f"총진입={t['count']} 총수익={pnl_usdt_part} 승률={win_rate:.1f}% 승={t['wins']} 패={losses}"
+        pnl_fmt = f"{pnl_usdt_part:<{pnl_width}}"
+        count_fmt = f"{t['count']:<{count_width}}"
+        win_fmt = f"{win_rate:.1f}%"
+        win_fmt = f"{win_fmt:<{win_width}}"
+        win_cnt = f"{t['wins']:<{wl_width}}"
+        loss_cnt = f"{losses:<{wl_width}}"
+        return f"{count_fmt} | {pnl_fmt} | {win_fmt} | {win_cnt} | {loss_cnt}"
+
+    def _summary_header(label: str) -> str:
         return (
-            f"total_entries={t['count']} total_pnl={pnl_part} ({pnl_usdt_part}) "
-            f"win_rate={win_rate:.1f}% wins={t['wins']} losses={losses}"
+            f"| {label:<10} | {'총진입':<{count_width}} | {'총수익':<{pnl_width}} | "
+            f"{'승률':<{win_width}} | {'승':<{wl_width}} | {'패':<{wl_width}} |"
         )
 
-    def total_line(side: str) -> str:
-        return f"- <b>{_format_total(totals[side])}</b>"
+    def _summary_sep() -> str:
+        label_sep = "-" * 11
+        count_sep = "-" * (count_width + 2)
+        pnl_sep = "-" * (pnl_width + 2)
+        win_sep = "-" * (win_width + 2)
+        wl_sep = "-" * (wl_width + 2)
+        return f"|{label_sep}|{count_sep}|{pnl_sep}|{win_sep}|{wl_sep}|{wl_sep}|"
+
+    def total_line(side: str) -> list:
+        if compact:
+            return [f"- <b>{_format_total(totals[side])}</b>"]
+        return [
+            _summary_header("구분"),
+            _summary_sep(),
+            f"| 합계       | {_format_total(totals[side])} |",
+        ]
 
     def engine_lines(side: str) -> list:
-        return [f"- {eng} {_format_total(t)}" for eng, t in sorted(engine_totals[side].items())]
+        if compact:
+            return [f"- {eng} {_format_total(t)}" for eng, t in sorted(engine_totals[side].items())]
+        lines = [
+            _summary_header("엔진"),
+            _summary_sep(),
+        ]
+        for eng, t in sorted(engine_totals[side].items()):
+            lines.append(f"| {eng:<10} | {_format_total(t)} |")
+        return lines
     def symbol_lines(side: str) -> list:
         bucket = symbol_rows.get(side) or {}
         if not bucket:
-            return [f"- (symbols) none"]
-        lines = []
+            return ["(symbols) none"]
+        lines = [
+            "| Symbol          | Engine     | PnL           | 결과 |",
+            "|-----------------|------------|---------------|------|",
+        ]
         ordered = sorted(
             bucket.items(),
             key=lambda item: (
@@ -1014,18 +1067,35 @@ def _build_daily_report(state: Dict[str, dict], report_date: str) -> str:
             ),
         )
         for (symbol, engine), rec in ordered:
-            lines.append(f"- {_fmt_symbol_row(symbol, engine, rec.get('pnl'), rec.get('win'))}")
+            lines.append(_fmt_symbol_row(symbol, engine, rec.get("pnl"), rec.get("win")))
         return lines
-    lines = [f"📊 일일 리포트 (KST, {report_date})", "🔴 SHORT"]
-    lines.append(total_line("SHORT"))
+    total_entries = totals["LONG"]["count"] + totals["SHORT"]["count"]
+    total_wins = totals["LONG"]["wins"] + totals["SHORT"]["wins"]
+    total_losses = totals["LONG"]["losses"] + totals["SHORT"]["losses"]
+    total_outcomes = total_wins + total_losses
+    total_win_rate = (total_wins / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
+    lines = [
+        f"📊 일일 리포트 (KST, {report_date})",
+        f"- 총진입={total_entries} 승={total_wins} 패={total_losses} 승률={total_win_rate:.1f}%",
+        "🔴 SHORT",
+    ]
+    lines.extend(total_line("SHORT"))
+    if not compact:
+        lines.append("")
     lines.extend(engine_lines("SHORT"))
     lines.append("🔎 SHORT SYMBOLS")
+    lines.append("<pre>")
     lines.extend(symbol_lines("SHORT"))
+    lines.append("</pre>")
     lines.append("🟢 LONG")
-    lines.append(total_line("LONG"))
+    lines.extend(total_line("LONG"))
+    if not compact:
+        lines.append("")
     lines.extend(engine_lines("LONG"))
     lines.append("🔎 LONG SYMBOLS")
+    lines.append("<pre>")
     lines.extend(symbol_lines("LONG"))
+    lines.append("</pre>")
     return "\n".join(lines)
 
 def _run_fabio_cycle(
@@ -1407,10 +1477,6 @@ def _run_fabio_cycle(
                                         entry_order_id = _order_id_from_res(res)
                                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                                         qty = res.get("amount") or res.get("order", {}).get("amount")
-                                        sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
-                                        sl_id = None
-                                        if isinstance(sl_order, dict):
-                                            sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                                         if res.get("order") or res.get("status") in ("ok", "dry_run"):
                                             funnel["entry_order_ok"] += 1
                                             _inc_side_local("order_ok")
@@ -1426,10 +1492,7 @@ def _run_fabio_cycle(
                                             qty=qty if isinstance(qty, (int, float)) else None,
                                             usdt=_resolve_entry_usdt(),
                                             entry_order_id=entry_order_id,
-                                            meta={
-                                                "reason": "fabio_long",
-                                                "sl_order_id": sl_id,
-                                            },
+                                            meta={"reason": "fabio_long"},
                                         )
                                         active_positions_total += 1
                                     except Exception as e:
@@ -1540,15 +1603,8 @@ def _run_fabio_cycle(
                             entry_order_id = _order_id_from_res(res)
                             fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                             qty = res.get("amount") or res.get("order", {}).get("amount")
-                            sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
-                            sl_ok = bool(sl_order) and sl_order.get("status") == "ok"
-                            sl_reason = sl_order.get("reason") if isinstance(sl_order, dict) else "unknown"
-                            sl_id = None
-                            if isinstance(sl_order, dict):
-                                sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                             order_info = (
-                                f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()} "
-                                f"sl={'ok' if sl_ok else f'skip({sl_reason})'}"
+                                f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
                             )
                             entry_price_disp = fill_price
                             st["in_pos"] = True
@@ -1565,7 +1621,7 @@ def _run_fabio_cycle(
                                 qty=qty if isinstance(qty, (int, float)) else None,
                                 usdt=_resolve_entry_usdt(),
                                 entry_order_id=entry_order_id,
-                                meta={"reason": "fabio_short", "sl_order_id": sl_id},
+                                meta={"reason": "fabio_short"},
                             )
                             active_positions_total += 1
                         except Exception as e:
@@ -1916,15 +1972,8 @@ def _run_swaggy_cycle(
                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                         qty = res.get("amount") or res.get("order", {}).get("amount")
                         entry_price_disp = fill_price
-                        sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
-                        sl_id = None
-                        sl_ok = bool(sl_order) and sl_order.get("status") == "ok"
-                        sl_reason = sl_order.get("reason") if isinstance(sl_order, dict) else "unknown"
-                        if isinstance(sl_order, dict):
-                            sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                         order_info = (
-                            f"entry_price={fill_price} qty={qty} usdt={entry_usdt} "
-                            f"sl={'ok' if sl_ok else f'skip({sl_reason})'}"
+                            f"entry_price={fill_price} qty={qty} usdt={entry_usdt}"
                         )
                         st["in_pos"] = True
                         st["last_entry"] = time.time()
@@ -1938,10 +1987,7 @@ def _run_swaggy_cycle(
                             qty=qty if isinstance(qty, (int, float)) else None,
                             usdt=entry_usdt,
                             entry_order_id=entry_order_id,
-                            meta={
-                                "reason": "swaggy_long",
-                                "sl_order_id": sl_id,
-                            },
+                            meta={"reason": "swaggy_long"},
                         )
                         active_positions_total += 1
                     finally:
@@ -2043,16 +2089,8 @@ def _run_swaggy_cycle(
                             pos_amt = None
                         print(f"[short-entry] sym={symbol} pos_amt={pos_amt} fill={fill_price} qty={qty}")
                         entry_price_disp = fill_price
-                        sl_pct = AUTO_EXIT_SHORT_SL_PCT
-                        sl_order = _place_short_sl_order(symbol, fill_price, sl_pct, qty=qty)
-                        sl_ok = bool(sl_order) and sl_order.get("status") == "ok"
-                        sl_reason = sl_order.get("reason") if isinstance(sl_order, dict) else "unknown"
-                        sl_id = None
-                        if isinstance(sl_order, dict):
-                            sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                         order_info = (
-                            f"entry_price={fill_price} qty={qty} usdt={entry_usdt} "
-                            f"sl={'ok' if sl_ok else f'skip({sl_reason})'}"
+                            f"entry_price={fill_price} qty={qty} usdt={entry_usdt}"
                         )
                         st["in_pos"] = True
                         st["last_entry"] = time.time()
@@ -2066,7 +2104,7 @@ def _run_swaggy_cycle(
                             qty=qty if isinstance(qty, (int, float)) else None,
                             usdt=_resolve_entry_usdt(),
                             entry_order_id=entry_order_id,
-                            meta={"reason": "swaggy_short", "sl_order_id": sl_id},
+                            meta={"reason": "swaggy_short"},
                         )
                         active_positions_total += 1
                     finally:
@@ -2780,10 +2818,6 @@ def _run_atlas_fabio_cycle(
                         entry_order_id = _order_id_from_res(res)
                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                         qty = res.get("amount") or res.get("order", {}).get("amount")
-                        sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
-                        sl_id = None
-                        if isinstance(sl_order, dict):
-                            sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                         if res.get("order") or res.get("status") in ("ok", "dry_run"):
                             funnel["entry_order_ok"] += 1
                         st = state.get(symbol, {})
@@ -2799,10 +2833,7 @@ def _run_atlas_fabio_cycle(
                             qty=qty if isinstance(qty, (int, float)) else None,
                             usdt=final_usdt,
                             entry_order_id=entry_order_id,
-                            meta={
-                                "reason": "atlasfabio_long",
-                                "sl_order_id": sl_id,
-                            },
+                            meta={"reason": "atlasfabio_long"},
                         )
                         active_positions_total += 1
                         if send_alert:
@@ -2863,15 +2894,8 @@ def _run_atlas_fabio_cycle(
                     entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
-                    sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
-                    sl_ok = bool(sl_order) and sl_order.get("status") == "ok"
-                    sl_reason = sl_order.get("reason") if isinstance(sl_order, dict) else "unknown"
-                    sl_id = None
-                    if isinstance(sl_order, dict):
-                        sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                     order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={final_usdt:.2f} "
-                        f"sl={'ok' if sl_ok else f'skip({sl_reason})'}"
+                        f"entry_price={fill_price} qty={qty} usdt={final_usdt:.2f}"
                     )
                     entry_price_disp = fill_price
                     st["in_pos"] = True
@@ -2887,7 +2911,7 @@ def _run_atlas_fabio_cycle(
                         qty=qty if isinstance(qty, (int, float)) else None,
                         usdt=final_usdt,
                         entry_order_id=entry_order_id,
-                        meta={"reason": "atlasfabio_short", "sl_order_id": sl_id},
+                        meta={"reason": "atlasfabio_short"},
                     )
                     active_positions_total += 1
                     if send_alert:
@@ -3052,7 +3076,6 @@ def _run_dtfx_cycle(
                     entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
-                    sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
                     result["long_hits"] += 1
                     st["last_entry"] = time.time()
                     state[symbol] = st
@@ -3088,7 +3111,6 @@ def _run_dtfx_cycle(
                                 "entry_price": fill_price,
                                 "qty": qty,
                                 "usdt": _resolve_entry_usdt(),
-                                "sl_order": sl_order,
                                 "dtfx": (sig.meta or {}).get("dtfx", {}),
                             },
                         }
@@ -3111,10 +3133,6 @@ def _run_dtfx_cycle(
                     entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
-                    sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
-                    sl_id = None
-                    if isinstance(sl_order, dict):
-                        sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                     result["short_hits"] += 1
                     st["in_pos"] = True
                     st["last_entry"] = time.time()
@@ -3128,7 +3146,7 @@ def _run_dtfx_cycle(
                         qty=qty if isinstance(qty, (int, float)) else None,
                         usdt=_resolve_entry_usdt(),
                         entry_order_id=entry_order_id,
-                        meta={"reason": "dtfx_short", "event": sig.pattern, "sl_order_id": sl_id},
+                        meta={"reason": "dtfx_short", "event": sig.pattern},
                     )
                     active_positions_total += 1
                     if write_dtfx_log:
@@ -3151,7 +3169,6 @@ def _run_dtfx_cycle(
                                 "entry_price": fill_price,
                                 "qty": qty,
                                 "usdt": _resolve_entry_usdt(),
-                                "sl_order": sl_order,
                                 "dtfx": (sig.meta or {}).get("dtfx", {}),
                             },
                         }
@@ -3485,15 +3502,19 @@ def _trade_realized_pnl(trade: dict) -> Optional[float]:
     except Exception:
         return None
 
-def _fetch_my_trades_range(ex, symbol: str, start_ms: int, end_ms: int, limit: int = 500) -> list:
+def _fetch_my_trades_range(ex, symbol: Optional[str], start_ms: int, end_ms: int, limit: int = 500) -> list:
     since = start_ms
     out = []
     last_ts = None
     while True:
         try:
-            batch = ex.fetch_my_trades(symbol, since=since, limit=limit)
+            if symbol:
+                batch = ex.fetch_my_trades(symbol, since=since, limit=limit)
+            else:
+                batch = ex.fetch_my_trades(since=since, limit=limit)
         except Exception as e:
-            print(f"[report-api] fetch_my_trades failed sym={symbol} err={e}")
+            sym_tag = symbol if symbol else "*"
+            print(f"[report-api] fetch_my_trades failed sym={sym_tag} err={e}")
             break
         if not batch:
             break
@@ -3624,15 +3645,27 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
             return False
 
     entry_map, entry_by_symbol = _load_entry_events_map(report_date)
-    symbols = sorted({tr.get("symbol") for tr in targets if tr.get("symbol")})
     order_map = {}
-    for sym in symbols:
-        trades = _fetch_my_trades_range(ex, sym, start_ms, end_ms)
+    trades = _fetch_my_trades_range(ex, None, start_ms, end_ms)
+    if trades:
         for t in trades:
             oid = _trade_order_id(t)
             if not oid:
                 continue
             order_map.setdefault(oid, []).append(t)
+    else:
+        symbols = {tr.get("symbol") for tr in targets if tr.get("symbol")}
+        for (sym, _side) in entry_by_symbol.keys():
+            if sym:
+                symbols.add(sym)
+        symbols = sorted(symbols)
+        for sym in symbols:
+            trades = _fetch_my_trades_range(ex, sym, start_ms, end_ms)
+            for t in trades:
+                oid = _trade_order_id(t)
+                if not oid:
+                    continue
+                order_map.setdefault(oid, []).append(t)
 
     expected_cols = [
         "entry_ts",
@@ -4463,6 +4496,11 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         reason="auto_exit_tp",
                         exit_order_id=exit_order_id,
                     )
+                    st = state.get(sym, {})
+                    if isinstance(st, dict):
+                        st["last_exit_ts"] = now
+                        st["last_exit_reason"] = "auto_exit_tp"
+                        state[sym] = st
                     _append_report_line(sym, "SHORT", profit_unlev, pnl_usdt, engine_label)
                     order_block = _format_order_id_block(
                         open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
@@ -4479,6 +4517,62 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                         f"{'' if pnl_usdt is None else f' 손익={pnl_usdt:+.3f} USDT'}"
                         f"{'' if roi_leveraged is None else f' 레버리지ROI={roi_leveraged:.2f}%'}"
+                    )
+                    time.sleep(0.15)
+                    continue
+                if profit_unlev is not None and profit_unlev <= -AUTO_EXIT_SHORT_SL_PCT:
+                    open_tr = _get_open_trade(state, "SHORT", sym)
+                    engine_label = _engine_label_from_reason(
+                        (open_tr.get("meta") or {}).get("reason") if open_tr else None
+                    )
+                    pnl_usdt = pos_detail.get("pnl") if isinstance(pos_detail, dict) else None
+                    try:
+                        set_dry_run(False if LIVE_TRADING else True)
+                    except Exception:
+                        pass
+                    res = close_short_market(sym)
+                    exit_order_id = _order_id_from_res(res)
+                    cancel_stop_orders(sym)
+                    last_entry_val = float(st.get("last_entry", 0))
+                    state[sym] = {"in_pos": False, "last_ok": False, "last_entry": last_entry_val, "dca_adds": 0}
+                    avg_price = (
+                        res.get("order", {}).get("average")
+                        or res.get("order", {}).get("price")
+                        or res.get("order", {}).get("info", {}).get("avgPrice")
+                    )
+                    filled = res.get("order", {}).get("filled") or res.get("order", {}).get("amount")
+                    cost = res.get("order", {}).get("cost") or res.get("order", {}).get("info", {}).get("cumQuote")
+                    exit_tag = "SL"
+                    _close_trade(
+                        state,
+                        side="SHORT",
+                        symbol=sym,
+                        exit_ts=now,
+                        exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
+                        pnl_usdt=pnl_usdt,
+                        reason="auto_exit_sl",
+                        exit_order_id=exit_order_id,
+                    )
+                    st = state.get(sym, {})
+                    if isinstance(st, dict):
+                        st["last_exit_ts"] = now
+                        st["last_exit_reason"] = "auto_exit_sl"
+                        state[sym] = st
+                    _append_report_line(sym, "SHORT", profit_unlev, pnl_usdt, engine_label)
+                    order_block = _format_order_id_block(
+                        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+                        exit_order_id,
+                    )
+                    order_line = f"{order_block}\n" if order_block else ""
+                    send_telegram(
+                        f"🔴 <b>숏 청산</b>\n"
+                        f"<b>{sym}</b>\n"
+                        f"엔진: {engine_label}\n"
+                        f"사유: {exit_tag}\n"
+                        f"{order_line}"
+                        f"체결가={avg_price} 수량={filled} 비용={cost}\n"
+                        f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
+                        f"{'' if pnl_usdt is None else f' 손익={pnl_usdt:+.3f} USDT'}"
                     )
                     time.sleep(0.15)
                     continue
@@ -4576,54 +4670,110 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
         if not AUTO_EXIT_ENABLED:
             continue
-        if profit_unlev < AUTO_EXIT_LONG_TP_PCT:
-            continue
-        engine_label = _engine_label_from_reason(
-            (open_tr.get("meta") or {}).get("reason") if open_tr else None
-        )
-        try:
-            set_dry_run(False if LONG_LIVE_TRADING else True)
-        except Exception:
-            pass
-        res = close_long_market(sym)
-        exit_order_id = _order_id_from_res(res)
-        cancel_stop_orders(sym)
-        avg_price = (
-            res.get("order", {}).get("average")
-            or res.get("order", {}).get("price")
-            or res.get("order", {}).get("info", {}).get("avgPrice")
-        )
-        filled = res.get("order", {}).get("filled") or res.get("order", {}).get("amount")
-        cost = res.get("order", {}).get("cost") or res.get("order", {}).get("info", {}).get("cumQuote")
-        exit_tag = "TP"
-        pnl_long = detail.get("pnl")
-        _close_trade(
-            state,
-            side="LONG",
-            symbol=sym,
-            exit_ts=now,
-            exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
-            pnl_usdt=pnl_long,
-            reason="auto_exit_tp",
-            exit_order_id=exit_order_id,
-        )
-        _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
-        order_block = _format_order_id_block(
-            open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-            exit_order_id,
-        )
-        order_line = f"{order_block}\n" if order_block else ""
-        send_telegram(
-            f"🟢 <b>롱 청산</b>\n"
-            f"<b>{sym}</b>\n"
-            f"엔진: {engine_label}\n"
-            f"사유: {exit_tag}\n"
-            f"{order_line}"
-            f"체결가={avg_price} 수량={filled} 비용={cost}\n"
-            f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
-            f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
-        )
-        time.sleep(0.15)
+        if profit_unlev >= AUTO_EXIT_LONG_TP_PCT:
+            engine_label = _engine_label_from_reason(
+                (open_tr.get("meta") or {}).get("reason") if open_tr else None
+            )
+            try:
+                set_dry_run(False if LONG_LIVE_TRADING else True)
+            except Exception:
+                pass
+            res = close_long_market(sym)
+            exit_order_id = _order_id_from_res(res)
+            cancel_stop_orders(sym)
+            avg_price = (
+                res.get("order", {}).get("average")
+                or res.get("order", {}).get("price")
+                or res.get("order", {}).get("info", {}).get("avgPrice")
+            )
+            filled = res.get("order", {}).get("filled") or res.get("order", {}).get("amount")
+            cost = res.get("order", {}).get("cost") or res.get("order", {}).get("info", {}).get("cumQuote")
+            exit_tag = "TP"
+            pnl_long = detail.get("pnl")
+            _close_trade(
+                state,
+                side="LONG",
+                symbol=sym,
+                exit_ts=now,
+                exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
+                pnl_usdt=pnl_long,
+                reason="auto_exit_tp",
+                exit_order_id=exit_order_id,
+            )
+            st = state.get(sym, {})
+            if isinstance(st, dict):
+                st["last_exit_ts"] = now
+                st["last_exit_reason"] = "auto_exit_tp"
+                state[sym] = st
+            _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
+            order_block = _format_order_id_block(
+                open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+                exit_order_id,
+            )
+            order_line = f"{order_block}\n" if order_block else ""
+            send_telegram(
+                f"🟢 <b>롱 청산</b>\n"
+                f"<b>{sym}</b>\n"
+                f"엔진: {engine_label}\n"
+                f"사유: {exit_tag}\n"
+                f"{order_line}"
+                f"체결가={avg_price} 수량={filled} 비용={cost}\n"
+                f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
+                f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
+            )
+            time.sleep(0.15)
+        elif profit_unlev <= -AUTO_EXIT_LONG_SL_PCT:
+            engine_label = _engine_label_from_reason(
+                (open_tr.get("meta") or {}).get("reason") if open_tr else None
+            )
+            try:
+                set_dry_run(False if LONG_LIVE_TRADING else True)
+            except Exception:
+                pass
+            res = close_long_market(sym)
+            exit_order_id = _order_id_from_res(res)
+            cancel_stop_orders(sym)
+            avg_price = (
+                res.get("order", {}).get("average")
+                or res.get("order", {}).get("price")
+                or res.get("order", {}).get("info", {}).get("avgPrice")
+            )
+            filled = res.get("order", {}).get("filled") or res.get("order", {}).get("amount")
+            cost = res.get("order", {}).get("cost") or res.get("order", {}).get("info", {}).get("cumQuote")
+            exit_tag = "SL"
+            pnl_long = detail.get("pnl")
+            _close_trade(
+                state,
+                side="LONG",
+                symbol=sym,
+                exit_ts=now,
+                exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
+                pnl_usdt=pnl_long,
+                reason="auto_exit_sl",
+                exit_order_id=exit_order_id,
+            )
+            st = state.get(sym, {})
+            if isinstance(st, dict):
+                st["last_exit_ts"] = now
+                st["last_exit_reason"] = "auto_exit_sl"
+                state[sym] = st
+            _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
+            order_block = _format_order_id_block(
+                open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+                exit_order_id,
+            )
+            order_line = f"{order_block}\n" if order_block else ""
+            send_telegram(
+                f"🔴 <b>롱 청산</b>\n"
+                f"<b>{sym}</b>\n"
+                f"엔진: {engine_label}\n"
+                f"사유: {exit_tag}\n"
+                f"{order_line}"
+                f"체결가={avg_price} 수량={filled} 비용={cost}\n"
+                f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
+                f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
+            )
+            time.sleep(0.15)
 
     tickers = _get_manage_tickers(state, exchange, MANAGE_TICKER_TTL_SEC)
     _reconcile_long_trades(state, cached_long_ex, tickers)
@@ -4667,6 +4817,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_chat_id",
         "_manage_ws_mode",
         "_entry_event_offset",
+        "_runtime_cfg_ts",
     ]
     for key in keys:
         if key in disk:
@@ -4730,6 +4881,7 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_tg_queue_offset",
         "_chat_id",
         "_manage_ws_mode",
+        "_runtime_cfg_ts",
     ]
     for key in keys:
         if key in state:
@@ -5161,6 +5313,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
 
                 if ((cmd == "/status" or cmd == "status") or lower.startswith("/status") or lower.startswith("status")) and not responded:
                     print(f"[telegram] status cmd matched: cmd='{cmd}' responded={responded}")
+                    _reload_runtime_settings_from_disk(state)
                     try:
                         open_pos = count_open_positions(force=True)
                         if not isinstance(open_pos, int):
@@ -5477,7 +5630,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         _sync_report_with_api(state, report_date)
                     except Exception as e:
                         print(f"[report-api] sync failed report_date={report_date} err={e}")
-                    report_msg = _build_daily_report(state, report_date)
+                    report_msg = _build_daily_report(state, report_date, compact=True)
                     ok = _reply(report_msg)
                     print(f"[telegram] report cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                     responded = True
@@ -5865,6 +6018,37 @@ def load_state() -> Dict[str, dict]:
         return {}
 
 def save_state(state: Dict[str, dict]) -> None:
+    disk = None
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            disk = json.load(f)
+    except Exception:
+        disk = None
+    if isinstance(disk, dict):
+        disk_ts = disk.get("_runtime_cfg_ts")
+        state_ts = state.get("_runtime_cfg_ts")
+        if isinstance(disk_ts, (int, float)) and (not isinstance(state_ts, (int, float)) or disk_ts > state_ts):
+            runtime_keys = [
+                "_auto_exit",
+                "_auto_exit_long_tp_pct",
+                "_auto_exit_long_sl_pct",
+                "_auto_exit_short_tp_pct",
+                "_auto_exit_short_sl_pct",
+                "_live_trading",
+                "_long_live",
+                "_max_open_positions",
+                "_entry_usdt",
+                "_atlas_fabio_enabled",
+                "_swaggy_enabled",
+                "_dtfx_enabled",
+                "_pumpfade_enabled",
+                "_div15m_long_enabled",
+                "_div15m_short_enabled",
+                "_runtime_cfg_ts",
+            ]
+            for key in runtime_keys:
+                if key in disk:
+                    state[key] = disk.get(key)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -6903,13 +7087,8 @@ def run():
                         # 알림용 간략 정보
                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                         qty = res.get("amount") or res.get("order", {}).get("amount")
-                        sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
-                        sl_id = None
-                        if isinstance(sl_order, dict):
-                            sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                         order_info = (
-                            f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()} "
-                            f"sl={'ok' if sl_order else 'skip'}"
+                            f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
                         )
                         entry_price_disp = fill_price
                         state[symbol]["in_pos"] = True
@@ -6923,7 +7102,7 @@ def run():
                             qty=qty if isinstance(qty, (int, float)) else None,
                             usdt=_resolve_entry_usdt(),
                             entry_order_id=entry_order_id,
-                            meta={"reason": "short_entry", "sl_order_id": sl_id},
+                            meta={"reason": "short_entry"},
                         )
                         _append_entry_log(
                             "rsi_entries.log",
@@ -7090,13 +7269,8 @@ def run():
                     entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
-                    sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
-                    sl_id = None
-                    if isinstance(sl_order, dict):
-                        sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                     order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()} "
-                        f"sl={'ok' if sl_order else 'skip'}"
+                        f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
                     )
                     entry_price_disp = fill_price
                     st["in_pos"] = True
@@ -7111,7 +7285,7 @@ def run():
                         qty=qty if isinstance(qty, (int, float)) else None,
                         usdt=_resolve_entry_usdt(),
                         entry_order_id=entry_order_id,
-                        meta={"reason": "div15m_long", "sl_order_id": sl_id},
+                        meta={"reason": "div15m_long"},
                     )
                     date_tag = time.strftime("%Y%m%d")
                     _append_entry_log(
@@ -7276,13 +7450,8 @@ def run():
                     entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
-                    sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
-                    sl_id = None
-                    if isinstance(sl_order, dict):
-                        sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                     order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()} "
-                        f"sl={'ok' if sl_order else 'skip'}"
+                        f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
                     )
                     entry_price_disp = fill_price
                     st["in_pos"] = True
@@ -7295,7 +7464,7 @@ def run():
                         qty=qty if isinstance(qty, (int, float)) else None,
                         usdt=_resolve_entry_usdt(),
                         entry_order_id=entry_order_id,
-                        meta={"reason": "div15m_short", "sl_order_id": sl_id},
+                        meta={"reason": "div15m_short"},
                     )
                     _append_entry_log(
                         f"div15m_short/div15m_entries_{date_tag}.log",
@@ -7421,7 +7590,7 @@ def run():
                 _sync_report_with_api(state, report_date)
             except Exception as e:
                 print(f"[report-api] daily sync failed report_date={report_date} err={e}")
-            report_msg = _build_daily_report(state, report_date)
+            report_msg = _build_daily_report(state, report_date, compact=True)
             send_telegram(report_msg)
             state["_daily_report_date"] = today_kst
             _reload_runtime_settings_from_disk(state)
