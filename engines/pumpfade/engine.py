@@ -56,21 +56,34 @@ class PumpFadeEngine(BaseEngine):
         symbol: str,
         cfg: PumpFadeConfig,
     ) -> Optional[PumpFadeSignal]:
+        def _blocked(reason: str, meta_extra: Optional[Dict[str, Any]] = None) -> PumpFadeSignal:
+            meta = {"block_reason": reason}
+            if meta_extra:
+                meta.update(meta_extra)
+            return PumpFadeSignal(
+                symbol=symbol,
+                entry_ready=False,
+                entry_price=None,
+                entry_zone=None,
+                reasons=[],
+                meta=meta,
+            )
+
         df15 = cycle_cache.get_df(symbol, cfg.tf_trigger, limit=max(80, cfg.lookback_hh + 10))
         if df15.empty or len(df15) < max(60, cfg.lookback_hh + 3):
-            return None
+            return _blocked("DATA_MISSING")
         df15 = df15.iloc[:-1]
         if len(df15) < max(60, cfg.lookback_hh + 3):
-            return None
+            return _blocked("DATA_MISSING")
 
         failure_idx = len(df15) - 2
         confirm_idx = len(df15) - 1
         if failure_idx < 2 or confirm_idx <= failure_idx:
-            return None
+            return _blocked("DATA_MISSING")
 
         tickers = ctx.state.get("_tickers") if isinstance(ctx.state, dict) else None
         if not self._pump_candidate(symbol, tickers, cfg):
-            return None
+            return _blocked("PUMP_FILTER")
 
         closes = df15["close"].astype(float).tolist()
         highs = df15["high"].astype(float).tolist()
@@ -83,28 +96,29 @@ class PumpFadeEngine(BaseEngine):
         ema60 = self._ema_series(df15["close"], cfg.ema_slow)
         atr15 = self._atr_series(df15, cfg.atr_len)
         if ema7 is None or ema20 is None or ema60 is None or atr15 is None:
-            return None
+            return _blocked("DATA_MISSING")
         if len(ema20) <= confirm_idx or len(atr15) <= confirm_idx:
-            return None
+            return _blocked("DATA_MISSING")
 
         atr_now = float(atr15.iloc[confirm_idx])
         ema20_now = float(ema20.iloc[confirm_idx])
         close_now = closes[confirm_idx]
         dist_to_ema20 = abs(close_now - ema20_now)
         if atr_now > 0 and dist_to_ema20 > atr_now * cfg.dist_to_ema20_atr_mult:
-            return None
+            return _blocked("DIST_EMA20", {"atr15": atr_now, "dist_to_ema20": dist_to_ema20})
+        slope_blocked = False
         if cfg.ema20_slope_lookback > 0 and atr_now > 0:
             slope_idx = max(0, confirm_idx - cfg.ema20_slope_lookback)
             if slope_idx < confirm_idx:
                 ema20_slope = float(ema20.iloc[confirm_idx]) - float(ema20.iloc[slope_idx])
                 if ema20_slope > atr_now * cfg.ema20_slope_atr_mult_max:
-                    return None
+                    slope_blocked = True
 
         hh_start = max(0, confirm_idx - cfg.lookback_hh)
         hh_end = confirm_idx
         hh_window = highs[hh_start:hh_end]
         if not hh_window:
-            return None
+            return _blocked("DATA_MISSING")
         hh_n = max(hh_window)
         retest_low = hh_n - (atr_now * cfg.retest_atr_high)
         retest_high = hh_n + (atr_now * cfg.retest_atr_low)
@@ -112,7 +126,7 @@ class PumpFadeEngine(BaseEngine):
         fail_low = lows[failure_idx]
         in_retest = retest_low <= fail_high <= retest_high or fail_high >= retest_low
         if not in_retest:
-            return None
+            return _blocked("RETEST_ZONE")
 
         prior_start = max(0, failure_idx - cfg.lookback_hh)
         prior_hh = max(highs[prior_start:failure_idx])
@@ -121,11 +135,15 @@ class PumpFadeEngine(BaseEngine):
         tiny_eps = cfg.failure_eps
         fail_open = opens[failure_idx]
         fail_close = closes[failure_idx]
+        failure_range = fail_high - fail_low
+        failure_close_pos = None
+        if failure_range > 0:
+            failure_close_pos = (fail_close - fail_low) / failure_range
         body = max(1e-9, abs(fail_close - fail_open))
         upper_wick = fail_high - max(fail_open, fail_close)
         atr_fail = float(atr15.iloc[failure_idx]) if len(atr15) > failure_idx else atr_now
         if atr_fail > 0 and body < atr_fail * cfg.min_body_atr_mult:
-            return None
+            return _blocked("FAIL_BODY", {"atr15": atr_fail, "body": body})
         if (
             fail_high >= prior_hh * (1 - tiny_eps)
             and fail_close <= prior_hh
@@ -143,35 +161,7 @@ class PumpFadeEngine(BaseEngine):
             failure_ok = True
             failure_reasons.append("break_fail_close_weak")
         if not failure_ok:
-            return None
-
-        confirm_ok = False
-        confirm_type = ""
-        confirm_close = closes[confirm_idx]
-        if cfg.confirm_use_low_break and confirm_close < fail_low:
-            confirm_ok = True
-            confirm_type = "LOW_BREAK"
-        if cfg.confirm_use_ema7:
-            ema7_now = float(ema7.iloc[confirm_idx])
-            if confirm_close < ema7_now and not confirm_ok:
-                confirm_ok = True
-                confirm_type = "EMA7"
-        if not confirm_ok:
-            return None
-
-        vol_failure = vols[failure_idx]
-        vol_prev = vols[failure_idx - 1] if failure_idx - 1 >= 0 else vol_failure
-        peak_start = max(0, failure_idx - max(1, int(cfg.vol_peak_lookback)))
-        vol_peak = max(vols[peak_start:failure_idx + 1])
-        if vol_peak > 0 and vol_failure >= vol_peak * cfg.vol_peak_block:
-            return None
-        vol_ok = False
-        if vol_peak > 0 and vol_failure <= vol_peak * cfg.vol_peak_mult_ok:
-            vol_ok = True
-        if vol_prev > 0 and vol_failure <= vol_prev * cfg.vol_prev_mult_ok:
-            vol_ok = True
-        if not vol_ok:
-            return None
+            return _blocked("FAIL_CANDLE")
 
         rsi_now = None
         rsi_prev = None
@@ -183,10 +173,65 @@ class PumpFadeEngine(BaseEngine):
             rsi_prev = float(rsi_series.iloc[confirm_idx - 1])
             rsi_turn = rsi_prev > rsi_now
             rsi_strong = rsi_now < cfg.rsi_strong_threshold
-        if cfg.rsi_turn_required and not rsi_turn:
-            return None
-        if cfg.rsi_strong_required and not rsi_strong:
-            return None
+
+        confirm_ok = False
+        confirm_type = ""
+        confirm_subtype = ""
+        confirm_close = closes[confirm_idx]
+        ema7_now = float(ema7.iloc[confirm_idx])
+        if cfg.confirm_use_low_break and confirm_close < fail_low:
+            confirm_ok = True
+            confirm_type = "LOW_BREAK"
+            confirm_subtype = "LOW_BREAK"
+        if cfg.confirm_use_ema7 and not confirm_ok:
+            if confirm_close < ema7_now:
+                rsi_confirm_ok = bool(rsi_turn) and isinstance(rsi_now, (int, float)) and rsi_now <= cfg.rsi_turn_max
+                if rsi_confirm_ok:
+                    confirm_ok = True
+                    confirm_type = "EMA7_RSI" if cfg.aggressive_mode else "EMA7"
+                    confirm_subtype = confirm_type
+        if cfg.aggressive_mode and not confirm_ok:
+            if (
+                confirm_close < ((fail_high + fail_low) * 0.5)
+                and rsi_turn
+                and (failure_close_pos is None or failure_close_pos <= cfg.failure_close_pos_max)
+            ):
+                confirm_ok = True
+                confirm_type = "MID_BREAK"
+                confirm_subtype = "MID_BREAK"
+        if slope_blocked and confirm_type != "LOW_BREAK":
+            return _blocked(
+                "EMA20_SLOPE_BLOCK",
+                {"atr15": atr_now, "ema20_slope": ema20_slope if "ema20_slope" in locals() else None},
+            )
+        if not confirm_ok:
+            return _blocked("CONFIRM")
+
+        vol_failure = vols[failure_idx]
+        vol_prev = vols[failure_idx - 1] if failure_idx - 1 >= 0 else vol_failure
+        peak_start = max(0, failure_idx - max(1, int(cfg.vol_peak_lookback)))
+        vol_peak = max(vols[peak_start:failure_idx + 1])
+        if vol_peak > 0 and vol_failure >= vol_peak * cfg.vol_peak_block:
+            return _blocked("VOL_PEAK_BLOCK", {"vol_failure": vol_failure, "vol_peak": vol_peak})
+        vol_ok = False
+        vol_peak_mult_ok = cfg.vol_peak_mult_ok_aggr if cfg.aggressive_mode else cfg.vol_peak_mult_ok
+        vol_prev_mult_ok = cfg.vol_prev_mult_ok_aggr if cfg.aggressive_mode else cfg.vol_prev_mult_ok
+        if vol_peak > 0 and vol_failure <= vol_peak * vol_peak_mult_ok:
+            vol_ok = True
+        if vol_prev > 0 and vol_failure <= vol_prev * vol_prev_mult_ok:
+            vol_ok = True
+        if not vol_ok:
+            return _blocked("VOL_WEAK", {"vol_failure": vol_failure, "vol_peak": vol_peak, "vol_prev": vol_prev})
+
+        if cfg.aggressive_mode:
+            rsi_ok = bool(rsi_turn) and isinstance(rsi_now, (int, float)) and rsi_now <= cfg.rsi_turn_max
+            if not rsi_ok:
+                return _blocked("RSI_TURN", {"rsi": rsi_now, "rsi_prev": rsi_prev})
+        else:
+            if cfg.rsi_turn_required and not rsi_turn:
+                return _blocked("RSI_TURN", {"rsi": rsi_now, "rsi_prev": rsi_prev})
+            if cfg.rsi_strong_required and not rsi_strong:
+                return _blocked("RSI_STRONG", {"rsi": rsi_now})
 
         hist_increasing = False
         hist_now = None
@@ -196,7 +241,7 @@ class PumpFadeEngine(BaseEngine):
             hist_prev = float(macd_hist.iloc[confirm_idx - 1])
             hist_increasing = hist_now > hist_prev
         if cfg.macd_block_increasing and hist_increasing and isinstance(hist_now, (int, float)) and hist_now > 0:
-            return None
+            return _blocked("MACD_INC", {"macd_hist": hist_now})
 
         if cfg.confirm_use_5m:
             df5 = cycle_cache.get_df(symbol, cfg.tf_confirm, limit=60)
@@ -207,17 +252,19 @@ class PumpFadeEngine(BaseEngine):
                 return None
             ema7_5m = self._ema_series(df5["close"], cfg.ema_fast)
             if ema7_5m is None or len(ema7_5m) < 1:
-                return None
+                return _blocked("DATA_MISSING")
             last5_close = float(df5["close"].iloc[-1])
             if last5_close >= float(ema7_5m.iloc[-1]):
-                return None
+                return _blocked("CONFIRM_5M")
 
         entry_low = (fail_high + fail_low) * 0.5
         entry_high = fail_high
-        entry_price = entry_low
-        ema7_now = float(ema7.iloc[confirm_idx])
-        if entry_low <= ema7_now <= entry_high:
-            entry_price = ema7_now
+        entry_high_buffer = atr_now * cfg.entry_high_buffer_atr if atr_now > 0 else 0.0
+        ema7_buffer = atr_now * cfg.entry_ema7_buffer_atr if atr_now > 0 else 0.0
+        target_high = fail_high - entry_high_buffer
+        target_ema7 = ema7_now + ema7_buffer
+        entry_price = min(target_high, target_ema7)
+        entry_price = max(entry_low, entry_price)
 
         reasons = [
             "retest_zone",
@@ -240,9 +287,12 @@ class PumpFadeEngine(BaseEngine):
             "retest_high": retest_high,
             "failure_high": fail_high,
             "failure_low": fail_low,
+            "failure_close_pos": failure_close_pos,
             "entry_low": entry_low,
             "entry_high": entry_high,
             "entry_price": entry_price,
+            "ema7_now": ema7_now,
+            "ema20_slope_blocked": slope_blocked,
             "vol_failure": vol_failure,
             "vol_peak": vol_peak,
             "vol_peak_lookback": cfg.vol_peak_lookback,
@@ -257,7 +307,9 @@ class PumpFadeEngine(BaseEngine):
             "confirm_close_lt_fail_low": confirm_close < fail_low,
             "confirm_close_lt_ema7": confirm_close < float(ema7.iloc[confirm_idx]),
             "confirm_type": confirm_type,
+            "confirm_subtype": confirm_subtype or confirm_type,
             "atr15": atr_now,
+            "aggressive_mode": 1 if cfg.aggressive_mode else 0,
         }
         return PumpFadeSignal(
             symbol=symbol,

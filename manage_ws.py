@@ -366,7 +366,7 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
 
 def main():
     er.MANAGE_WS_MODE = True
-    er.SUPPRESS_RECONCILE_ALERTS = False
+    er.SUPPRESS_RECONCILE_ALERTS = True
     er._install_error_hooks()
     state = er.load_state()
     er._reload_runtime_settings_from_disk(state)

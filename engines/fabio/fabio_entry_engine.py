@@ -63,6 +63,10 @@ class Config:
     trend_cont_hold_ratio_min: float = 0.6
     pullback_only: bool = True
     location_required: bool = True
+    pullback_strict_long: bool = True
+    pullback_strict_short: bool = True
+    pullback_ema20_touch_pct: float = 0.001
+    overext_ema7_pct: float = 0.005
     bb_len: int = 20
     bb_mult: float = 2.0
     location_long_touch_pct: float = 0.002
@@ -415,6 +419,22 @@ def evaluate_symbol(
     l_vol_sma = float(vol_sma_ltf[-1]) if vol_sma_ltf[-1] is not None else 0.0
     l_vol_ratio = (l_vol / l_vol_sma) if l_vol_sma > 0 else 0.0
     ext = abs(l_close - l_ema20) / l_ema20 * 100.0 if l_ema20 else 0.0
+    overext = False
+    if l_close > 0:
+        ext7 = (l_close - l_ema7) / l_close
+        overext = ext7 > cfg.overext_ema7_pct
+    if res.get("vol_avg") is None:
+        res["vol_avg"] = l_vol_sma
+    if res.get("vol_ratio") is None:
+        res["vol_ratio"] = l_vol_ratio
+    if res.get("dist_to_ema20") is None and l_ema20 > 0:
+        res["dist_to_ema20"] = (l_close - l_ema20) / l_ema20
+    if res.get("rsi") is None:
+        base_rsi = rsi_list(ltf_closes, getattr(cfg, "rsi_len", 14))
+        res["rsi"] = base_rsi[-1] if base_rsi else None
+    if res.get("atr_now") is None:
+        base_atr = atr_list(ltf_highs, ltf_lows, ltf_closes, cfg.atr_len)
+        res["atr_now"] = base_atr[-1] if base_atr else None
     if ext > cfg.ltf_max_extension_pct:
         res["block_reason"] = "chase"
         return res
@@ -501,6 +521,27 @@ def evaluate_symbol(
                 touched = prev_low <= ema20_prev * (1 + cfg.location_long_touch_pct)
                 reclaimed = l_close > l_ema20
                 retest_strict = bool(touched and reclaimed)
+        pullback_strict_ok = False
+        if len(ltf_closes) >= 2 and len(ema7_ltf) >= 2:
+            prev_low = float(ltf_lows[-2])
+            prev_high = float(ltf_highs[-2])
+            ema7_prev = float(ema7_ltf[-2])
+            ema20_prev = float(ema20_ltf[-2])
+            touch_ema7 = prev_low <= ema7_prev
+            touch_ema20 = False
+            if ema20_prev > 0:
+                touch_ema20 = prev_low <= ema20_prev * (1 + cfg.pullback_ema20_touch_pct)
+            reclaimed = l_close > l_ema7
+            pullback_strict_ok = bool((touch_ema7 or touch_ema20) and reclaimed)
+            res["pullback_prev_low"] = prev_low
+            res["pullback_prev_high"] = prev_high
+            res["pullback_ema7_prev"] = ema7_prev
+            res["pullback_ema7_now"] = float(l_ema7)
+            res["pullback_ema20_prev"] = ema20_prev
+            res["pullback_ema20_th"] = (
+                float(ema20_prev) * (1 + cfg.pullback_ema20_touch_pct) if ema20_prev > 0 else None
+            )
+            res["pullback_close_now"] = float(l_close)
         vol_ok = l_vol_ratio >= cfg.trigger_vol_ratio_min
         trigger_price_ok = (l_close > l_ema7 and l_close > l_open)
         trigger_ok = (trigger_price_ok and vol_ok)
@@ -580,9 +621,15 @@ def evaluate_symbol(
         retest_ok_final = bool(retest_ok and retest_strict) if cfg.pullback_only else bool(retest_ok)
         location_ok_final = bool(location_ok) if cfg.location_required else True
         entry_ready = confirm_ok and retest_ok_final and dist_ok and vol_ok and location_ok_final
+        if overext:
+            entry_ready = False
+        if cfg.pullback_strict_long and not pullback_strict_ok:
+            entry_ready = False
         res["confirm_ok"] = bool(confirm_ok)
         res["retest_ok"] = bool(retest_ok_final)
         res["retest_strict"] = bool(retest_strict)
+        res["pullback_strict_ok"] = bool(pullback_strict_ok)
+        res["overext"] = bool(overext)
         res["dist_ok"] = bool(dist_ok)
         res["vol_ok"] = bool(vol_ok)
         res["trigger_ok"] = bool(trigger_ok)
@@ -669,12 +716,18 @@ def evaluate_symbol(
             and retest_ok_final
             and dist_ok
             and location_ok_final
+            and (pullback_strict_ok or not cfg.pullback_strict_long)
+            and not overext
         ):
             sym["mode"] = "IDLE"
             res["long"] = True
             res["reason"] = "fabio_long|retest"
         else:
-            if not retest_ok_final:
+            if overext:
+                res["block_reason"] = "overext"
+            elif cfg.pullback_strict_long and not pullback_strict_ok:
+                res["block_reason"] = "no_ema7_pullback"
+            elif not retest_ok_final:
                 res["block_reason"] = "retest"
             elif not location_ok_final:
                 res["block_reason"] = "no_location"
@@ -729,6 +782,10 @@ def evaluate_symbol(
         s_vol = float(stf_vols[-1])
         s_vol_sma = float(vol_sma_stf[-1]) if vol_sma_stf[-1] is not None else 0.0
         s_vol_ratio = (s_vol / s_vol_sma) if s_vol_sma > 0 else 0.0
+        overext = False
+        if s_close > 0:
+            ext7 = (s_ema7 - s_close) / s_close
+            overext = ext7 > cfg.overext_ema7_pct
 
         regime_ok = False
         if h_ema60 is not None and h_ema60 > 0:
@@ -825,6 +882,27 @@ def evaluate_symbol(
                 touched = prev_high >= ema20_prev * (1 - cfg.location_short_touch_pct)
                 reclaimed = s_close < s_ema20
                 retest_strict = bool(touched and reclaimed)
+        pullback_strict_ok = False
+        if len(stf_closes) >= 2 and len(ema7_stf) >= 2:
+            prev_high = float(stf_highs[-2])
+            prev_low = float(stf_lows[-2])
+            ema7_prev = float(ema7_stf[-2])
+            ema20_prev = float(ema20_stf[-2])
+            touch_ema7 = prev_high >= ema7_prev
+            touch_ema20 = False
+            if ema20_prev > 0:
+                touch_ema20 = prev_high >= ema20_prev * (1 - cfg.pullback_ema20_touch_pct)
+            reclaimed = (s_close < s_ema7) or (s_close < s_ema20)
+            pullback_strict_ok = bool((touch_ema7 or touch_ema20) and reclaimed)
+            res["pullback_prev_low"] = prev_low
+            res["pullback_prev_high"] = prev_high
+            res["pullback_ema7_prev"] = ema7_prev
+            res["pullback_ema7_now"] = float(s_ema7)
+            res["pullback_ema20_prev"] = ema20_prev
+            res["pullback_ema20_th"] = (
+                float(ema20_prev) * (1 - cfg.pullback_ema20_touch_pct) if ema20_prev > 0 else None
+            )
+            res["pullback_close_now"] = float(s_close)
 
         trigger_ok = False
         trigger_price_ok = s_close < s_ema20
@@ -907,10 +985,16 @@ def evaluate_symbol(
             and retest_ok_final
             and location_ok_final
         )
+        if overext:
+            entry_ready = False
+        if cfg.pullback_strict_short and not pullback_strict_ok:
+            entry_ready = False
 
         res["confirm_ok"] = bool(structure_ok)
         res["retest_ok"] = bool(retest_ok_final)
         res["retest_strict"] = bool(retest_strict)
+        res["pullback_strict_ok"] = bool(pullback_strict_ok)
+        res["overext"] = bool(overext)
         res["dist_ok"] = bool(dist_ok)
         res["vol_ok"] = bool(vol_ok)
         res["trigger_ok"] = bool(trigger_ok)
@@ -988,7 +1072,11 @@ def evaluate_symbol(
             res["short"] = True
             res["reason"] = "fabio_short|retest"
         else:
-            if not regime_ok:
+            if overext:
+                res["block_reason"] = "overext"
+            elif cfg.pullback_strict_short and not pullback_strict_ok:
+                res["block_reason"] = "no_ema7_pullback"
+            elif not regime_ok:
                 res["block_reason"] = "regime"
             elif impulse_block:
                 res["block_reason"] = "impulse_up"

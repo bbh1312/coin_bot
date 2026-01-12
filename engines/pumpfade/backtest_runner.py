@@ -30,6 +30,9 @@ def parse_args():
     parser.add_argument("--sl-pct", type=float, default=0.03)
     parser.add_argument("--tp-pct", type=float, default=0.03)
     parser.add_argument("--out", type=str, default="")
+    parser.add_argument("--out-trades", type=str, default="")
+    parser.add_argument("--out-cancels", type=str, default="")
+    parser.add_argument("--aggressive", action="store_true")
     return parser.parse_args()
 
 
@@ -84,6 +87,13 @@ def _append_line(path: str, line: str) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
+def _csv_header(path: str, header: str) -> None:
+    if not path:
+        return
+    if os.path.exists(path):
+        return
+    _append_line(path, header)
+
 
 def run_symbol(
     symbol: str,
@@ -93,6 +103,8 @@ def run_symbol(
     engine: PumpFadeEngine,
     cfg: PumpFadeConfig,
     out_path: str,
+    out_trades: str,
+    out_cancels: str,
     sl_pct: float,
     tp_pct: float,
 ) -> None:
@@ -115,7 +127,22 @@ def run_symbol(
     hits = 0
     pending = None
     trade = None
-    stats = {"trades": 0, "wins": 0, "losses": 0, "tp": 0, "sl": 0, "pending_cancel": 0}
+    stats = {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "tp": 0,
+        "sl": 0,
+        "pending_cancel": 0,
+        "pending_cancel_timeout": 0,
+        "pending_cancel_prior_hh": 0,
+        "mfe_sum": 0.0,
+        "mae_sum": 0.0,
+        "hold_sum": 0.0,
+    }
+    block_counts = {}
+    eval_count = 0
+    confirm_stats = {}
     for i in range(len(tf15_raw) - 1):
         idx_15 = i
         ts = int(tf15_raw[idx_15][0])
@@ -138,6 +165,14 @@ def run_symbol(
         c = float(tf15_raw[idx_15][4])
 
         if trade is not None:
+            entry_px = trade["entry_px"]
+            if entry_px > 0:
+                mfe = (entry_px - l) / entry_px
+                mae = (h - entry_px) / entry_px
+                if mfe > trade["mfe"]:
+                    trade["mfe"] = mfe
+                if mae > trade["mae"]:
+                    trade["mae"] = mae
             sl_hit = h >= trade["sl_px"]
             tp_hit = l <= trade["tp_px"]
             exit_reason = None
@@ -162,41 +197,170 @@ def run_symbol(
                     stats["tp"] += 1
                 else:
                     stats["sl"] += 1
+                holding_bars = max(1, idx_15 - trade["entry_idx"] + 1)
+                stats["mfe_sum"] += trade["mfe"]
+                stats["mae_sum"] += trade["mae"]
+                stats["hold_sum"] += holding_bars
+                confirm_type = trade.get("confirm_type") or "UNKNOWN"
+                ct_stats = confirm_stats.setdefault(
+                    confirm_type,
+                    {
+                        "trades": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp": 0,
+                        "sl": 0,
+                        "mfe_sum": 0.0,
+                        "mae_sum": 0.0,
+                        "hold_sum": 0.0,
+                    },
+                )
+                ct_stats["trades"] += 1
+                if pnl_pct >= 0:
+                    ct_stats["wins"] += 1
+                else:
+                    ct_stats["losses"] += 1
+                if exit_reason == "TP":
+                    ct_stats["tp"] += 1
+                else:
+                    ct_stats["sl"] += 1
+                ct_stats["mfe_sum"] += trade["mfe"]
+                ct_stats["mae_sum"] += trade["mae"]
+                ct_stats["hold_sum"] += holding_bars
                 log_exit = (
                     "PUMPFADE_TRADE_EXIT "
                     f"sym={symbol} reason={exit_reason} entry_px={trade['entry_px']:.6g} "
-                    f"exit_px={exit_px:.6g} pnl_pct={pnl_pct:.4f}"
+                    f"exit_px={exit_px:.6g} pnl_pct={pnl_pct:.4f} "
+                    f"mfe={trade['mfe']:.4f} mae={trade['mae']:.4f} hold={holding_bars}"
                 )
                 print(log_exit)
+                _append_line(
+                    out_trades,
+                    ",".join(
+                        [
+                            trade.get("entry_dt") or "",
+                            datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            symbol,
+                            f"{trade['entry_px']:.6g}",
+                            f"{exit_px:.6g}",
+                            exit_reason,
+                            f"{pnl_pct:.6f}",
+                            f"{trade['mfe']:.6f}",
+                            f"{trade['mae']:.6f}",
+                            str(holding_bars),
+                            str(trade.get("confirm_type") or ""),
+                            "1" if trade.get("aggressive_mode") else "0",
+                            f"{trade.get('prior_hh') or ''}",
+                            f"{trade.get('failure_high') or ''}",
+                            f"{trade.get('failure_low') or ''}",
+                            f"{trade.get('entry_gap_high') or ''}",
+                            f"{trade.get('entry_gap_ema7') or ''}",
+                        ]
+                    ),
+                )
                 trade = None
 
         if pending is not None and trade is None:
-            if h >= pending["entry_px"]:
+            if pending.get("prior_hh") and h >= pending["prior_hh"] * (1 + cfg.failure_eps):
+                stats["pending_cancel"] += 1
+                stats["pending_cancel_prior_hh"] += 1
+                _append_line(
+                    out_cancels,
+                    ",".join(
+                        [
+                            pending.get("signal_dt") or "",
+                            datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            symbol,
+                            f"{pending.get('entry_px'):.6g}" if pending.get("entry_px") else "",
+                            "PRIOR_HH",
+                            str(pending.get("confirm_type") or ""),
+                            "1" if pending.get("aggressive_mode") else "0",
+                            f"{pending.get('prior_hh') or ''}",
+                            f"{pending.get('failure_high') or ''}",
+                            f"{pending.get('failure_low') or ''}",
+                            f"{pending.get('entry_gap_high') or ''}",
+                            f"{pending.get('entry_gap_ema7') or ''}",
+                        ]
+                    ),
+                )
+                pending = None
+            elif h >= pending["entry_px"]:
                 entry_px = pending["entry_px"]
                 trade = {
                     "entry_px": entry_px,
                     "entry_ts": ts,
+                    "entry_dt": pending.get("signal_dt"),
                     "sl_px": entry_px * (1 + sl_pct),
                     "tp_px": entry_px * (1 - tp_pct),
+                    "entry_idx": idx_15,
+                    "mfe": 0.0,
+                    "mae": 0.0,
+                    "confirm_type": pending.get("confirm_type"),
+                    "aggressive_mode": pending.get("aggressive_mode"),
+                    "prior_hh": pending.get("prior_hh"),
+                    "failure_high": pending.get("failure_high"),
+                    "failure_low": pending.get("failure_low"),
+                    "entry_gap_high": pending.get("entry_gap_high"),
+                    "entry_gap_ema7": pending.get("entry_gap_ema7"),
                 }
                 print(
                     "PUMPFADE_TRADE_ENTRY "
-                    f"sym={symbol} entry_px={entry_px:.6g} sl={trade['sl_px']:.6g} tp={trade['tp_px']:.6g}"
+                    f"sym={symbol} entry_px={entry_px:.6g} sl={trade['sl_px']:.6g} "
+                    f"tp={trade['tp_px']:.6g} confirm={trade.get('confirm_type') or 'N/A'}"
                 )
                 pending = None
             elif idx_15 > pending["expire_idx"]:
                 stats["pending_cancel"] += 1
+                stats["pending_cancel_timeout"] += 1
+                _append_line(
+                    out_cancels,
+                    ",".join(
+                        [
+                            pending.get("signal_dt") or "",
+                            datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            symbol,
+                            f"{pending.get('entry_px'):.6g}" if pending.get("entry_px") else "",
+                            "TIMEOUT",
+                            str(pending.get("confirm_type") or ""),
+                            "1" if pending.get("aggressive_mode") else "0",
+                            f"{pending.get('prior_hh') or ''}",
+                            f"{pending.get('failure_high') or ''}",
+                            f"{pending.get('failure_low') or ''}",
+                            f"{pending.get('entry_gap_high') or ''}",
+                            f"{pending.get('entry_gap_ema7') or ''}",
+                        ]
+                    ),
+                )
                 pending = None
 
         if trade is not None or pending is not None:
             continue
 
-        sig = engine.on_tick(ctx, symbol)
+        sig = engine.evaluate_symbol(ctx, symbol, cfg)
         if not sig:
+            continue
+        eval_count += 1
+        if not sig.entry_ready:
+            reason = (sig.meta or {}).get("block_reason")
+            if reason:
+                block_counts[reason] = block_counts.get(reason, 0) + 1
             continue
         meta = sig.meta or {}
         dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-        print(f"[ENTRY] {symbol} {dt}Z price={sig.entry_price:.6g} reasons={','.join(meta.get('reasons') or [])}")
+        confirm_subtype = meta.get("confirm_subtype") or meta.get("confirm_type") or ""
+        aggr_flag = "Y" if meta.get("aggressive_mode") else "N"
+        print(
+            f"[ENTRY] {symbol} {dt}Z price={sig.entry_price:.6g} confirm={confirm_subtype} "
+            f"aggr={aggr_flag} reasons={','.join(meta.get('reasons') or [])}"
+        )
+        entry_gap_high = None
+        entry_gap_ema7 = None
+        failure_high = meta.get("failure_high")
+        ema7_now = meta.get("ema7_now")
+        if isinstance(failure_high, (int, float)):
+            entry_gap_high = float(failure_high) - float(sig.entry_price)
+        if isinstance(ema7_now, (int, float)):
+            entry_gap_ema7 = float(sig.entry_price) - float(ema7_now)
         line = ",".join(
             [
                 dt,
@@ -206,7 +370,10 @@ def run_symbol(
                 f"{meta.get('failure_high') or ''}",
                 f"{meta.get('failure_low') or ''}",
                 f"{meta.get('confirm_close') or ''}",
-                f"{meta.get('confirm_type') or ''}",
+                f"{confirm_subtype}",
+                "1" if meta.get("aggressive_mode") else "0",
+                f"{entry_gap_high or ''}",
+                f"{entry_gap_ema7 or ''}",
                 f"{meta.get('vol_failure') or ''}",
                 f"{meta.get('vol_peak') or ''}",
                 f"{meta.get('rsi') or ''}",
@@ -223,13 +390,56 @@ def run_symbol(
             "entry_px": sig.entry_price,
             "signal_idx": idx_15,
             "expire_idx": idx_15 + max(1, int(cfg.entry_timeout_bars)),
+            "prior_hh": meta.get("prior_hh"),
+            "confirm_type": confirm_subtype or "UNKNOWN",
+            "aggressive_mode": bool(meta.get("aggressive_mode")),
+            "signal_dt": dt,
+            "failure_high": meta.get("failure_high"),
+            "failure_low": meta.get("failure_low"),
+            "entry_gap_high": entry_gap_high,
+            "entry_gap_ema7": entry_gap_ema7,
         }
 
     winrate = (stats["wins"] / stats["trades"] * 100.0) if stats["trades"] > 0 else 0.0
+    avg_mfe = (stats["mfe_sum"] / stats["trades"]) if stats["trades"] > 0 else 0.0
+    avg_mae = (stats["mae_sum"] / stats["trades"]) if stats["trades"] > 0 else 0.0
+    avg_hold = (stats["hold_sum"] / stats["trades"]) if stats["trades"] > 0 else 0.0
     print(
         f"[BACKTEST] {symbol} trades={stats['trades']} wins={stats['wins']} losses={stats['losses']} "
-        f"winrate={winrate:.2f}% tp={stats['tp']} sl={stats['sl']} pending_cancel={stats['pending_cancel']}"
+        f"winrate={winrate:.2f}% tp={stats['tp']} sl={stats['sl']} "
+        f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f} "
+        f"pending_cancel={stats['pending_cancel']} timeout={stats['pending_cancel_timeout']} "
+        f"prior_hh={stats['pending_cancel_prior_hh']}"
     )
+    if eval_count:
+        print(f"[BACKTEST] {symbol} block_summary total_eval={eval_count}")
+        for reason, count in sorted(block_counts.items(), key=lambda x: x[1], reverse=True):
+            ratio = count / eval_count * 100.0
+            print(f"[BACKTEST] {symbol} block={reason} count={count} ratio={ratio:.2f}%")
+    if confirm_stats:
+        print(f"[BACKTEST] {symbol} confirm_type_stats")
+        for ctype, row in sorted(confirm_stats.items(), key=lambda x: x[0]):
+            trades = row["trades"]
+            win_rate = (row["wins"] / trades * 100.0) if trades else 0.0
+            avg_mfe_ct = (row["mfe_sum"] / trades) if trades else 0.0
+            avg_mae_ct = (row["mae_sum"] / trades) if trades else 0.0
+            avg_hold_ct = (row["hold_sum"] / trades) if trades else 0.0
+            sl_rate = (row["sl"] / trades * 100.0) if trades else 0.0
+            print(
+                "[BACKTEST] {sym} confirm={ctype} trades={trades} wins={wins} "
+                "winrate={win_rate:.2f}% sl_rate={sl_rate:.2f}% "
+                "avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}".format(
+                    sym=symbol,
+                    ctype=ctype,
+                    trades=trades,
+                    wins=row["wins"],
+                    win_rate=win_rate,
+                    sl_rate=sl_rate,
+                    avg_mfe=avg_mfe_ct,
+                    avg_mae=avg_mae_ct,
+                    avg_hold=avg_hold_ct,
+                )
+            )
     return stats
 
 
@@ -250,26 +460,85 @@ def main():
     cfg.tf_trigger = args.tf_trigger
     cfg.tf_confirm = args.tf_confirm
     cfg.confirm_use_5m = bool(args.use_5m_confirm)
+    cfg.aggressive_mode = bool(args.aggressive)
     engine = PumpFadeEngine(cfg)
 
     out_path = args.out
+    out_trades = args.out_trades
+    out_cancels = args.out_cancels
+    if out_path and not out_trades:
+        base, ext = os.path.splitext(out_path)
+        if not ext:
+            ext = ".csv"
+        out_trades = f"{base}_trades{ext}"
+    if out_path and not out_cancels:
+        base, ext = os.path.splitext(out_path)
+        if not ext:
+            ext = ".csv"
+        out_cancels = f"{base}_cancels{ext}"
     if out_path:
         _append_line(
             out_path,
-            "ts,symbol,entry,hh,failure_high,failure_low,confirm_close,confirm_type,vol_failure,vol_peak,rsi,rsi_turn,macd_increasing,reasons",
+            "ts,symbol,entry,hh,failure_high,failure_low,confirm_close,confirm_subtype,aggressive_mode,"
+            "entry_gap_high,entry_gap_ema7,vol_failure,vol_peak,rsi,rsi_turn,macd_increasing,reasons",
         )
+    _csv_header(
+        out_trades,
+        "entry_ts,exit_ts,symbol,entry_px,exit_px,exit_reason,pnl_pct,mfe,mae,hold_bars,confirm_subtype,"
+        "aggressive_mode,prior_hh,failure_high,failure_low,entry_gap_high,entry_gap_ema7",
+    )
+    _csv_header(
+        out_cancels,
+        "signal_ts,cancel_ts,symbol,entry_px,cancel_reason,confirm_subtype,aggressive_mode,"
+        "prior_hh,failure_high,failure_low,entry_gap_high,entry_gap_ema7",
+    )
 
-    total = {"trades": 0, "wins": 0, "losses": 0, "tp": 0, "sl": 0, "pending_cancel": 0}
+    total = {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "tp": 0,
+        "sl": 0,
+        "pending_cancel": 0,
+        "pending_cancel_timeout": 0,
+        "pending_cancel_prior_hh": 0,
+        "mfe_sum": 0.0,
+        "mae_sum": 0.0,
+        "hold_sum": 0.0,
+    }
     for symbol in symbols:
-        stats = run_symbol(symbol, tfs, args.days, exchange, engine, cfg, out_path, args.sl_pct, args.tp_pct)
+        stats = run_symbol(
+            symbol,
+            tfs,
+            args.days,
+            exchange,
+            engine,
+            cfg,
+            out_path,
+            out_trades,
+            out_cancels,
+            args.sl_pct,
+            args.tp_pct,
+        )
         if stats:
             for k in total:
-                total[k] += int(stats.get(k, 0))
+                val = stats.get(k, 0)
+                if isinstance(total[k], float):
+                    total[k] += float(val or 0.0)
+                else:
+                    total[k] += int(val or 0)
     winrate = (total["wins"] / total["trades"] * 100.0) if total["trades"] > 0 else 0.0
+    avg_mfe = (total["mfe_sum"] / total["trades"]) if total["trades"] > 0 else 0.0
+    avg_mae = (total["mae_sum"] / total["trades"]) if total["trades"] > 0 else 0.0
+    avg_hold = (total["hold_sum"] / total["trades"]) if total["trades"] > 0 else 0.0
     print(
         f"[BACKTEST] total trades={total['trades']} wins={total['wins']} losses={total['losses']} "
-        f"winrate={winrate:.2f}% tp={total['tp']} sl={total['sl']} pending_cancel={total['pending_cancel']}"
+        f"winrate={winrate:.2f}% tp={total['tp']} sl={total['sl']} "
+        f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f} "
+        f"pending_cancel={total['pending_cancel']} timeout={total['pending_cancel_timeout']} "
+        f"prior_hh={total['pending_cancel_prior_hh']}"
     )
+    print(f"[BACKTEST] total_winrate={winrate:.2f}%")
 
 
 if __name__ == "__main__":

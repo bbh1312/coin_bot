@@ -300,13 +300,13 @@ def _run_backtest_for_symbol(
     trade_cooldown_bars: int,
     out_signals: str,
     out_trades: str,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     atlas_cfg, fabio_cfg, fabio_cfg_mid = _build_atlasfabio_configs()
     ltf = fabio_cfg.timeframe_ltf
     ltf_data = data_by_tf.get((symbol, ltf)) or []
     if not ltf_data:
         print(f"[backtest] {symbol} skip: missing {ltf} data")
-        return
+        return None
 
     min_required = _min_required_bars(atlas_cfg, fabio_cfg)
     tfs = list({atlas_cfg.htf_tf, atlas_cfg.ltf_tf, fabio_cfg.timeframe_htf, fabio_cfg.timeframe_ltf,
@@ -655,6 +655,14 @@ def _run_backtest_for_symbol(
         f"win_rate={win_rate:.4f} skip_in_pos={trade_stats['skipped_in_pos']} "
         f"skip_cooldown={trade_stats['skipped_cooldown']} skip_no_next={trade_stats['skipped_no_next']}"
     )
+    return {
+        "symbol": symbol,
+        "trades": trade_stats["trades"],
+        "wins": trade_stats["wins"],
+        "losses": trade_stats["losses"],
+        "timeouts": trade_stats["timeouts"],
+        "win_rate": win_rate,
+    }
 
 
 def main() -> None:
@@ -765,12 +773,13 @@ def main() -> None:
         short_syms=[s.strip() for s in args.short.split(",") if s.strip()],
     )
 
+    summary_rows: List[Dict[str, Any]] = []
     for sym in symbols:
         hint = dir_hint.get(sym)
         if not hint:
             print(f"[backtest] {sym} skip: dir_hint missing")
             continue
-        _run_backtest_for_symbol(
+        row = _run_backtest_for_symbol(
             sym,
             data_by_tf,
             dir_hint={sym: hint},
@@ -793,6 +802,23 @@ def main() -> None:
             out_signals=args.out_signals,
             out_trades=args.out_trades,
         )
+        if row:
+            summary_rows.append(row)
+
+    if summary_rows:
+        summary_rows.sort(key=lambda r: (r.get("win_rate") or 0.0), reverse=True)
+        print("[atlasfabio-summary] per-symbol win_rate")
+        for row in summary_rows:
+            print(
+                "sym=%s trades=%s wins=%s losses=%s win_rate=%.4f"
+                % (
+                    row.get("symbol"),
+                    row.get("trades"),
+                    row.get("wins"),
+                    row.get("losses"),
+                    row.get("win_rate") or 0.0,
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -32,9 +32,16 @@ pip install ccxt pandas requests websocket-client
 - PumpFade 엔진
   - PumpFade 백테스트
     python3 -m engines.pumpfade.backtest_runner \
-    --symbols BTC/USDT:USDT,ETH/USDT:USDT \
+    --symbols PTB/USDT:USDT,HYPER/USDT:USDT,POL/USDT:USDT,RIVER/USDT:USDT,AKE/USDT:USDT \
     --days 7 \
-    --out reports/pumpfade_backtest.csv
+    --out logs/pumpfade/pumpfade_backtest.csv
+- 아틀라스 파비오
+  - 백테스트
+    python3 backtest_atlasfabio.py \
+      --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,HYPER/USDT:USDT \
+      --start 2026-01-01 \
+      --end 2026-01-11
+
 
 
 ## Live 전환

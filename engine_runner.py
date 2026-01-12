@@ -265,6 +265,18 @@ def _get_entry_lock(state: Dict[str, dict]) -> Dict[str, dict]:
         state["_entry_lock"] = lock
     return lock
 
+def _recent_auto_exit(state: Dict[str, dict], symbol: str, now_ts: float) -> bool:
+    st = state.get(symbol, {}) if isinstance(state, dict) else {}
+    if not isinstance(st, dict):
+        return False
+    last_exit_ts = st.get("last_exit_ts")
+    last_exit_reason = st.get("last_exit_reason")
+    if not isinstance(last_exit_ts, (int, float)):
+        return False
+    if last_exit_reason not in ("auto_exit_tp", "auto_exit_sl"):
+        return False
+    return (now_ts - float(last_exit_ts)) <= MANUAL_CLOSE_GRACE_SEC
+
 def _should_sample_short_position(symbol: str, st: Dict[str, Any], now_ts: float) -> bool:
     last_entry = float(st.get("last_entry", 0.0) or 0.0)
     if last_entry and (now_ts - last_entry) < SHORT_POS_SAMPLE_RECENT_SEC:
@@ -1044,6 +1056,10 @@ def _run_fabio_cycle(
         "blocked_reject": 0,
         "blocked_impulse": 0,
         "blocked_volume": 0,
+        "block_no_ema7_pullback_long": 0,
+        "block_no_ema7_pullback_short": 0,
+        "block_overext_long": 0,
+        "block_overext_short": 0,
         "blocked_ltf": 0,
         "blocked_cooldown": 0,
         "blocked_in_pos": 0,
@@ -1212,6 +1228,49 @@ def _run_fabio_cycle(
                     _fmt_float(bb_pos, 4),
                     _fmt_float(ema20, 6),
                     _fmt_float(atr_now, 6),
+                )
+            )
+        if fabio_res.get("block_reason") == "no_ema7_pullback":
+            side_disp = side_tag or "NA"
+            if side_disp == "LONG":
+                funnel["block_no_ema7_pullback_long"] += 1
+            elif side_disp == "SHORT":
+                funnel["block_no_ema7_pullback_short"] += 1
+            print(
+                "PULLBACK_CHECK side=%s prev_low=%s prev_high=%s ema7_prev=%s ema7_now=%s "
+                "ema20_prev=%s ema20_th=%s close_now=%s pass=N"
+                % (
+                    side_disp,
+                    _fmt_float(fabio_res.get("pullback_prev_low"), 6),
+                    _fmt_float(fabio_res.get("pullback_prev_high"), 6),
+                    _fmt_float(fabio_res.get("pullback_ema7_prev"), 6),
+                    _fmt_float(fabio_res.get("pullback_ema7_now"), 6),
+                    _fmt_float(fabio_res.get("pullback_ema20_prev"), 6),
+                    _fmt_float(fabio_res.get("pullback_ema20_th"), 6),
+                    _fmt_float(fabio_res.get("pullback_close_now"), 6),
+                )
+            )
+        if fabio_res.get("block_reason") == "overext":
+            side_disp = side_tag or "NA"
+            if side_disp == "LONG":
+                funnel["block_overext_long"] += 1
+            elif side_disp == "SHORT":
+                funnel["block_overext_short"] += 1
+            close_now = fabio_res.get("price_close")
+            ema7_now = fabio_res.get("price_ema7")
+            ext7 = None
+            if isinstance(close_now, (int, float)) and close_now > 0 and isinstance(ema7_now, (int, float)):
+                if side_disp == "SHORT":
+                    ext7 = (ema7_now - close_now) / close_now
+                else:
+                    ext7 = (close_now - ema7_now) / close_now
+            print(
+                "SKIP reason=OVEREXT side=%s close=%s ema7=%s ext7=%s"
+                % (
+                    side_disp,
+                    _fmt_float(close_now, 6),
+                    _fmt_float(ema7_now, 6),
+                    _fmt_float(ext7, 6),
                 )
             )
         funnel["evaluated"] += 1
@@ -1620,7 +1679,9 @@ def _run_fabio_cycle(
         "regime={blocked_regime} chase={blocked_chase} retest={blocked_retest} impulse={blocked_impulse} "
         "volume={blocked_volume} no_signal={no_signal} cooldown={blocked_cooldown} in_pos={blocked_in_pos} "
         "entry={entry_signal} order_ok={entry_order_ok} guard={entry_blocked_guard} lock={entry_lock_skip} "
-        "entry_ready_skip={entry_ready_skip}".format(ts=funnel_ts, **funnel)
+        "entry_ready_skip={entry_ready_skip} pullback_long={block_no_ema7_pullback_long} "
+        "pullback_short={block_no_ema7_pullback_short} overext_long={block_overext_long} "
+        "overext_short={block_overext_short}".format(ts=funnel_ts, **funnel)
     )
     print(funnel_line)
     funnel_long_line = (
@@ -3268,7 +3329,7 @@ def _run_pumpfade_cycle(
             _append_entry_log(
                 f"pumpfade/pumpfade_entries_{date_tag}.log",
                 "engine=pumpfade side=SHORT symbol=%s state=ENTRY_READY hh=%s prior_hh=%s retest=Y "
-                "failure_high=%s failure_low=%s confirm_close=%s confirm=%s vol_ok=%s vol_rel=%.2f "
+                "failure_high=%s failure_low=%s confirm_close=%s confirm=%s confirm_sub=%s aggr=%s vol_ok=%s vol_rel=%.2f "
                 "rsi=%s rsi_turn=%s macd_inc=%s entry=%.6g reasons=%s"
                 % (
                     symbol,
@@ -3278,6 +3339,8 @@ def _run_pumpfade_cycle(
                     f"{meta.get('failure_low'):.6g}" if isinstance(meta.get("failure_low"), (int, float)) else "N/A",
                     f"{meta.get('confirm_close'):.6g}" if isinstance(meta.get("confirm_close"), (int, float)) else "N/A",
                     f"{meta.get('confirm_type') or 'N/A'}",
+                    f"{meta.get('confirm_subtype') or meta.get('confirm_type') or 'N/A'}",
+                    "1" if meta.get("aggressive_mode") else "0",
                     "Y" if meta.get("vol_ok") else "N",
                     (
                         float(meta.get("vol_failure") or 0.0) / float(meta.get("vol_peak") or 1.0)
@@ -4000,6 +4063,7 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
             and not SUPPRESS_RECONCILE_ALERTS
             and engine_label != "UNKNOWN"
             and _trade_has_entry(tr)
+            and not _recent_auto_exit(state, symbol, exit_ts)
         ):
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
@@ -4189,6 +4253,7 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
             and not SUPPRESS_RECONCILE_ALERTS
             and engine_label != "UNKNOWN"
             and _trade_has_entry(tr)
+            and not _recent_auto_exit(state, symbol, exit_ts)
         ):
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
@@ -4291,7 +4356,12 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 if isinstance(st, dict):
                     st["swaggy_last_sl_ts"] = now
                     state[sym] = st
-            if isinstance(open_tr, dict) and engine_label != "UNKNOWN" and _trade_has_entry(open_tr):
+            if (
+                isinstance(open_tr, dict)
+                and engine_label != "UNKNOWN"
+                and _trade_has_entry(open_tr)
+                and not _recent_auto_exit(state, sym, now)
+            ):
                 order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
                 order_line = f"{order_block}\n" if order_block else ""
                 send_telegram(
@@ -4472,7 +4542,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 st["last_ok"] = False
                 st["dca_adds"] = 0
                 state[sym] = st
-                if engine_label != "UNKNOWN" and _trade_has_entry(open_tr):
+                if engine_label != "UNKNOWN" and _trade_has_entry(open_tr) and not _recent_auto_exit(state, sym, now):
                     order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
                     order_line = f"{order_block}\n" if order_block else ""
                     send_telegram(
@@ -5579,7 +5649,7 @@ MANAGE_LOOP_SLEEP_SEC: float = 2.0  # 관리 루프 주기(초)
 MANAGE_TICKER_TTL_SEC: float = 5.0  # 관리 루프 티커 캐시 TTL(초)
 RUNTIME_CONFIG_RELOAD_SEC: float = 5.0  # 런타임 설정 변경사항 반영 주기
 MANAGE_WS_MODE: bool = False  # WS 관리 모듈 사용 시 메인 리컨실/관리 비활성
-SUPPRESS_RECONCILE_ALERTS: bool = False  # 리컨실 알림 억제용(WS 관리 테스트)
+SUPPRESS_RECONCILE_ALERTS: bool = True  # 리컨실 알림 억제용(기본 ON)
 SHORT_POS_SAMPLE_DIV: int = 20  # 1/N 샘플링
 SHORT_POS_SAMPLE_RECENT_SEC: int = 120  # 최근 진입 심볼은 항상 샘플링
 
