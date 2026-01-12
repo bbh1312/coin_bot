@@ -57,6 +57,8 @@ try:
     from engines.dtfx.core.logger import write_dtfx_log
     from engines.pumpfade.engine import PumpFadeEngine
     from engines.pumpfade.config import PumpFadeConfig
+    from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
+    from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
 except Exception:
     SwaggyEngine = None
     SwaggyConfig = None
@@ -74,6 +76,8 @@ except Exception:
     write_dtfx_log = None
     PumpFadeEngine = None
     PumpFadeConfig = None
+    AtlasRsFailShortEngine = None
+    AtlasRsFailShortConfig = None
 
 from executor import (
     get_short_position_amount,
@@ -107,6 +111,7 @@ div15m_engine = None
 div15m_short_engine = None
 dtfx_engine = None
 pumpfade_engine = None
+atlas_rs_fail_short_engine = None
 
 load_env()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -468,6 +473,15 @@ def _append_entry_log(path: str, line: str) -> None:
     except Exception:
         pass
 
+def _ensure_log_file(path: str) -> None:
+    try:
+        full_path = os.path.join("logs", path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "a", encoding="utf-8"):
+            pass
+    except Exception:
+        pass
+
 def _append_atlas_route_log(engine: str, symbol: str, payload: Dict[str, Any]) -> None:
     try:
         os.makedirs(os.path.join("logs", "atlas"), exist_ok=True)
@@ -485,6 +499,7 @@ def _append_atlas_route_log(engine: str, symbol: str, payload: Dict[str, Any]) -
         parts = [f"ts={ts}", f"engine={engine}", f"symbol={symbol}"]
         for key in (
             "side",
+            "dir",
             "state",
             "regime",
             "reason",
@@ -521,6 +536,9 @@ def _append_rsi_detail_log(line: str) -> None:
             f.write(line.rstrip("\n") + "\n")
     except Exception:
         pass
+
+def _append_atlas_rs_fail_short_log(line: str) -> None:
+    _append_log_lines("atlas_rs_fail_short.log", [line])
 
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
     cycle_ts = state.get("_current_cycle_ts")
@@ -1834,6 +1852,7 @@ def _run_swaggy_cycle(
             symbol,
             {
                 "side": side,
+                "dir": atlas_local.get("symbol_direction"),
                 "state": atlas_local.get("state"),
                 "regime": atlas_gate.get("regime"),
                 "reason": atlas_gate.get("reason"),
@@ -2645,6 +2664,7 @@ def _run_atlas_fabio_cycle(
             symbol,
             {
                 "side": side,
+                "dir": gate.get("st_dir"),
                 "state": gate.get("state"),
                 "regime": gate.get("regime"),
                 "reason": gate.get("reason"),
@@ -3226,9 +3246,11 @@ def _run_pumpfade_cycle(
     now_ts = time.time()
     tf_sec = _pumpfade_tf_seconds(pumpfade_cfg.tf_trigger) or 900
     bucket = state.setdefault("_pumpfade", {})
+    date_tag = time.strftime("%Y%m%d")
+    _ensure_log_file(f"pumpfade/pumpfade_live_{date_tag}.log")
+    _ensure_log_file(f"pumpfade/pumpfade_entries_{date_tag}.log")
 
     def _pumpfade_log(msg: str) -> None:
-        date_tag = time.strftime("%Y%m%d")
         _append_entry_log(f"pumpfade/pumpfade_live_{date_tag}.log", msg)
 
     ctx = EngineContext(exchange=exchange, state=state, now_ts=now_ts, logger=_pumpfade_log, config=pumpfade_cfg)
@@ -3443,6 +3465,157 @@ def _run_pumpfade_cycle(
             tp=None,
         )
         result["hits"] += 1
+        time.sleep(PER_SYMBOL_SLEEP)
+    return result
+
+def _run_atlas_rs_fail_short_cycle(
+    arsf_engine,
+    arsf_universe,
+    state: Dict[str, dict],
+    send_alert,
+    arsf_cfg,
+):
+    result = {"hits": 0}
+    if not arsf_engine or not arsf_cfg:
+        return result
+    if not arsf_universe:
+        return result
+    now_ts = time.time()
+    _ensure_log_file("atlas_rs_fail_short.log")
+    ctx = EngineContext(
+        exchange=exchange,
+        state=state,
+        now_ts=now_ts,
+        logger=_append_atlas_rs_fail_short_log,
+        config=arsf_cfg,
+    )
+    for symbol in arsf_universe:
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if st.get("in_pos"):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        sig = arsf_engine.on_tick(ctx, symbol)
+        if not sig:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        result["hits"] += 1
+        entry_price = sig.entry_price
+        size_mult = sig.meta.get("size_mult", 1.0) if isinstance(sig.meta, dict) else 1.0
+        try:
+            date_tag = time.strftime("%Y%m%d")
+            meta = sig.meta if isinstance(sig.meta, dict) else {}
+            atlas = meta.get("atlas") if isinstance(meta.get("atlas"), dict) else {}
+            tech = meta.get("tech") if isinstance(meta.get("tech"), dict) else {}
+            _append_entry_log(
+                f"atlas_rs_fail_short/atlas_rs_fail_short_entries_{date_tag}.log",
+                "engine=atlas_rs_fail_short side=SHORT symbol=%s entry=%.6g size_mult=%.3f "
+                "confirm=%s atlas_regime=%s atlas_dir=%s score=%s rs_z=%s rs_z_slow=%s wick_ratio=%s"
+                % (
+                    symbol,
+                    float(entry_price or 0.0),
+                    float(size_mult or 1.0),
+                    tech.get("confirm_type") or "N/A",
+                    atlas.get("regime") or "N/A",
+                    atlas.get("dir") or "N/A",
+                    atlas.get("score") if atlas.get("score") is not None else "N/A",
+                    atlas.get("rs_z") if atlas.get("rs_z") is not None else "N/A",
+                    atlas.get("rs_z_slow") if atlas.get("rs_z_slow") is not None else "N/A",
+                    tech.get("wick_ratio") if tech.get("wick_ratio") is not None else "N/A",
+                ),
+            )
+        except Exception:
+            pass
+        if not ATLAS_RS_FAIL_SHORT_TRADE_ENABLED or ATLAS_RS_FAIL_SHORT_PAPER_ONLY or not LIVE_TRADING:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        bucket = state.get("_atlas_rs_fail_short") if isinstance(state, dict) else None
+        if isinstance(bucket, dict):
+            rec = bucket.get(symbol)
+            if isinstance(rec, dict):
+                cooldown_until = float(rec.get("cooldown_until_ts") or 0.0)
+                if cooldown_until and now_ts < cooldown_until:
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+        cur_total = count_open_positions(force=True)
+        if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        meta = sig.meta if isinstance(sig.meta, dict) else {}
+        atlas = meta.get("atlas") if isinstance(meta.get("atlas"), dict) else {}
+        if atlas.get("dir") != "BEAR":
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        ticker = state.get("_tickers", {}).get(symbol) if isinstance(state.get("_tickers"), dict) else None
+        cur_px = None
+        if isinstance(ticker, dict):
+            cur_px = ticker.get("last") or ticker.get("close")
+        try:
+            cur_px = float(cur_px) if cur_px is not None else None
+        except Exception:
+            cur_px = None
+        tech = meta.get("tech") if isinstance(meta.get("tech"), dict) else {}
+        atr = tech.get("atr")
+        try:
+            atr = float(atr) if atr is not None else None
+        except Exception:
+            atr = None
+        if cur_px is not None and entry_price is not None and atr is not None:
+            if abs(cur_px - float(entry_price)) > atr * 0.2:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="atlas_rs_fail_short")
+        if not lock_ok:
+            print(f"[ENTRY-LOCK] sym={symbol} owner=atlas_rs_fail_short ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            guard_key = _entry_guard_key(state, symbol, "SHORT")
+            if not _entry_guard_acquire(state, symbol, key=guard_key):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            try:
+                entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * float(size_mult or 1.0))
+                res = short_market(
+                    symbol,
+                    usdt_amount=entry_usdt,
+                    leverage=LEVERAGE,
+                    margin_mode=MARGIN_MODE,
+                )
+                entry_order_id = _order_id_from_res(res)
+                fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
+                qty = res.get("amount") or res.get("order", {}).get("amount")
+                st["in_pos"] = True
+                st["last_entry"] = time.time()
+                state[symbol] = st
+                _log_trade_entry(
+                    state,
+                    side="SHORT",
+                    symbol=symbol,
+                    entry_ts=time.time(),
+                    entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                    qty=qty if isinstance(qty, (int, float)) else None,
+                    usdt=entry_usdt,
+                    entry_order_id=entry_order_id,
+                    meta={"reason": "atlas_rs_fail_short"},
+                )
+                _send_entry_alert(
+                    send_alert,
+                    side="SHORT",
+                    symbol=symbol,
+                    engine="ATLAS_RS_FAIL_SHORT",
+                    entry_price=fill_price if fill_price is not None else entry_price,
+                    usdt=entry_usdt,
+                    reason="PULLBACK_FAIL",
+                    live=LIVE_TRADING,
+                    entry_order_id=entry_order_id,
+                    sl=_fmt_price_safe(fill_price or entry_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                )
+            except Exception as e:
+                print(f"[atlas-rs-fail-short] order error {symbol}: {e}")
+            finally:
+                _entry_guard_release(state, symbol, key=guard_key)
+        finally:
+            _entry_lock_release(state, symbol, owner="atlas_rs_fail_short")
         time.sleep(PER_SYMBOL_SLEEP)
     return result
 
@@ -4814,6 +4987,9 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_swaggy_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
+        "_atlas_rs_fail_short_enabled",
+        "_atlas_rs_fail_short_trade_enabled",
+        "_atlas_rs_fail_short_paper_only",
         "_chat_id",
         "_manage_ws_mode",
         "_entry_event_offset",
@@ -4823,7 +4999,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         if key in disk:
             state[key] = disk.get(key)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, ATLAS_RS_FAIL_SHORT_TRADE_ENABLED, ATLAS_RS_FAIL_SHORT_PAPER_ONLY
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE
     if isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
@@ -4854,6 +5030,12 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     if isinstance(state.get("_pumpfade_enabled"), bool):
         PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
+    if isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
+        ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
+    if isinstance(state.get("_atlas_rs_fail_short_trade_enabled"), bool):
+        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = bool(state.get("_atlas_rs_fail_short_trade_enabled"))
+    if isinstance(state.get("_atlas_rs_fail_short_paper_only"), bool):
+        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = bool(state.get("_atlas_rs_fail_short_paper_only"))
     if state.get("_chat_id"):
         CHAT_ID_RUNTIME = str(state.get("_chat_id"))
     if isinstance(state.get("_manage_ws_mode"), bool):
@@ -4877,6 +5059,9 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_swaggy_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
+        "_atlas_rs_fail_short_enabled",
+        "_atlas_rs_fail_short_trade_enabled",
+        "_atlas_rs_fail_short_paper_only",
         "_tg_offset",
         "_tg_queue_offset",
         "_chat_id",
@@ -5617,6 +5802,75 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] pumpfade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/atlas_rs_fail_short", "atlas_rs_fail_short")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        ATLAS_RS_FAIL_SHORT_ENABLED = True
+                        state["_atlas_rs_fail_short_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ atlas_rs_fail_short ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        ATLAS_RS_FAIL_SHORT_ENABLED = False
+                        state["_atlas_rs_fail_short_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ atlas_rs_fail_short OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ atlas_rs_fail_short 상태: {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
+                            "사용법: /atlas_rs_fail_short on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] atlas_rs_fail_short cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/atlas_rs_fail_short_trade", "atlas_rs_fail_short_trade")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = True
+                        state["_atlas_rs_fail_short_trade_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ atlas_rs_fail_short trade ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = False
+                        state["_atlas_rs_fail_short_trade_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ atlas_rs_fail_short trade OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ atlas_rs_fail_short trade 상태: {'ON' if ATLAS_RS_FAIL_SHORT_TRADE_ENABLED else 'OFF'}\n"
+                            "사용법: /atlas_rs_fail_short_trade on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] atlas_rs_fail_short_trade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/atlas_rs_fail_short_paper", "atlas_rs_fail_short_paper")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = True
+                        state["_atlas_rs_fail_short_paper_only"] = True
+                        state_dirty = True
+                        resp = "✅ atlas_rs_fail_short paper ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = False
+                        state["_atlas_rs_fail_short_paper_only"] = False
+                        state_dirty = True
+                        resp = "⛔ atlas_rs_fail_short paper OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ atlas_rs_fail_short paper 상태: {'ON' if ATLAS_RS_FAIL_SHORT_PAPER_ONLY else 'OFF'}\n"
+                            "사용법: /atlas_rs_fail_short_paper on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] atlas_rs_fail_short_paper cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/report", "report")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "today"
@@ -5823,6 +6077,9 @@ ATLAS_FABIO_PAPER = False
 SWAGGY_ENABLED = True
 DTFX_ENABLED = True
 PUMPFADE_ENABLED = False
+ATLAS_RS_FAIL_SHORT_ENABLED = False
+ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = False
+ATLAS_RS_FAIL_SHORT_PAPER_ONLY = False
 DIV15M_LONG_ENABLED = True
 DIV15M_SHORT_ENABLED = True
 ONLY_DIV15M_SHORT = False
@@ -6064,7 +6321,7 @@ def run():
     state = load_state()
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
-    global swaggy_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine
+    global swaggy_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     atlas_engine = AtlasEngine() if AtlasEngine else None
     atlas_swaggy_cfg = AtlasSwaggyConfig() if AtlasSwaggyConfig else None
@@ -6076,6 +6333,8 @@ def run():
     dtfx_cfg = DTFXConfig() if DTFXConfig else None
     pumpfade_engine = PumpFadeEngine() if PumpFadeEngine else None
     pumpfade_cfg = PumpFadeConfig() if PumpFadeConfig else None
+    atlas_rs_fail_short_engine = AtlasRsFailShortEngine() if AtlasRsFailShortEngine else None
+    atlas_rs_fail_short_cfg = AtlasRsFailShortConfig() if AtlasRsFailShortConfig else None
     if dtfx_engine and dtfx_cfg and EngineContext:
         try:
             dtfx_engine.on_start(
@@ -6085,7 +6344,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, ATLAS_RS_FAIL_SHORT_TRADE_ENABLED, ATLAS_RS_FAIL_SHORT_PAPER_ONLY, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
     global USDT_PER_TRADE
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
@@ -6131,6 +6390,18 @@ def run():
         PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
     else:
         state["_pumpfade_enabled"] = PUMPFADE_ENABLED
+    if isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
+        ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
+    else:
+        state["_atlas_rs_fail_short_enabled"] = ATLAS_RS_FAIL_SHORT_ENABLED
+    if isinstance(state.get("_atlas_rs_fail_short_trade_enabled"), bool):
+        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = bool(state.get("_atlas_rs_fail_short_trade_enabled"))
+    else:
+        state["_atlas_rs_fail_short_trade_enabled"] = ATLAS_RS_FAIL_SHORT_TRADE_ENABLED
+    if isinstance(state.get("_atlas_rs_fail_short_paper_only"), bool):
+        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = bool(state.get("_atlas_rs_fail_short_paper_only"))
+    else:
+        state["_atlas_rs_fail_short_paper_only"] = ATLAS_RS_FAIL_SHORT_PAPER_ONLY
     if "--only-div15m-short" in sys.argv:
         ONLY_DIV15M_SHORT = True
         DIV15M_LONG_ENABLED = False
@@ -6138,6 +6409,9 @@ def run():
         SWAGGY_ENABLED = False
         DTFX_ENABLED = False
         PUMPFADE_ENABLED = False
+        ATLAS_RS_FAIL_SHORT_ENABLED = False
+        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = False
+        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = False
         FABIO_ENABLED = False
         ATLAS_FABIO_ENABLED = False
         state["_div15m_long_enabled"] = False
@@ -6145,6 +6419,9 @@ def run():
         state["_swaggy_enabled"] = False
         state["_dtfx_enabled"] = False
         state["_pumpfade_enabled"] = False
+        state["_atlas_rs_fail_short_enabled"] = False
+        state["_atlas_rs_fail_short_trade_enabled"] = False
+        state["_atlas_rs_fail_short_paper_only"] = False
         state["_fabio_enabled"] = False
         state["_atlas_fabio_enabled"] = False
         print("[모드] ONLY_DIV15M_SHORT 활성화: div15m_short만 스캔")
@@ -6196,7 +6473,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /atlas_rs_fail_short_trade on|off|status, /atlas_rs_fail_short_paper on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -6485,6 +6762,18 @@ def run():
             pumpfade_universe = pumpfade_engine.build_universe(ctx)
             state["_pumpfade_universe"] = pumpfade_universe
 
+        atlas_rs_fail_short_universe = []
+        if ATLAS_RS_FAIL_SHORT_ENABLED and atlas_rs_fail_short_engine and atlas_rs_fail_short_cfg and EngineContext:
+            ctx = EngineContext(
+                exchange=exchange,
+                state=state,
+                now_ts=time.time(),
+                logger=print,
+                config=atlas_rs_fail_short_cfg,
+            )
+            atlas_rs_fail_short_universe = atlas_rs_fail_short_engine.build_universe(ctx)
+            state["_atlas_rs_fail_short_universe"] = atlas_rs_fail_short_universe
+
         if heavy_scan:
             universe_union = list(
                 set(
@@ -6494,6 +6783,7 @@ def run():
                     + (swaggy_universe or [])
                     + (dtfx_universe or [])
                     + (pumpfade_universe or [])
+                    + (atlas_rs_fail_short_universe or [])
                 )
             )
         else:
@@ -6501,7 +6791,7 @@ def run():
                 fabio_universe = list(state.get("_fabio_universe") or [])
                 fabio_label = str(state.get("_fabio_label") or "realtime_only")
                 fabio_dir_hint = dict(state.get("_fabio_dir_hint") or {})
-            universe_union = list(set(universe_momentum + (dtfx_universe or []) + (pumpfade_universe or [])))
+            universe_union = list(set(universe_momentum + (dtfx_universe or []) + (pumpfade_universe or []) + (atlas_rs_fail_short_universe or [])))
         if heavy_scan:
             long_cnt = 0
             short_cnt = 0
@@ -6554,6 +6844,7 @@ def run():
         swaggy_universe_len = len(swaggy_universe) if swaggy_universe else 0
         dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
         pumpfade_universe_len = len(pumpfade_universe) if pumpfade_universe else 0
+        atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
         universe_structure_len = len(universe_structure)
         universe_union_len = len(universe_union)
         rsi_ran = bool(run_rsi_short and universe_momentum)
@@ -6564,6 +6855,12 @@ def run():
         swaggy_ran = bool(heavy_scan and SWAGGY_ENABLED and swaggy_cfg and swaggy_engine)
         dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
         pumpfade_ran = bool(PUMPFADE_ENABLED and pumpfade_engine and pumpfade_cfg and pumpfade_universe)
+        atlas_rs_fail_short_ran = bool(
+            ATLAS_RS_FAIL_SHORT_ENABLED
+            and atlas_rs_fail_short_engine
+            and atlas_rs_fail_short_cfg
+            and atlas_rs_fail_short_universe
+        )
         # 공통 OHLCV 프리패치 (Tiered + TTL)
         watch_symbols = [
             s
@@ -6600,6 +6897,9 @@ def run():
         for s in pumpfade_universe or []:
             if s not in slow_symbols_ordered:
                 slow_symbols_ordered.append(s)
+        for s in atlas_rs_fail_short_universe or []:
+            if s not in slow_symbols_ordered:
+                slow_symbols_ordered.append(s)
         slow_symbols = slow_symbols_ordered
 
         fast_plan: Dict[str, int] = {}
@@ -6622,6 +6922,9 @@ def run():
         if pumpfade_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), int(max(80, pumpfade_cfg.lookback_hh + 10)))
             mid_plan["1h"] = max(mid_plan.get("1h", 0), 40)
+        if atlas_rs_fail_short_cfg:
+            mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
+            mid_plan["1h"] = max(mid_plan.get("1h", 0), int(atlas_rs_fail_short_cfg.htf_limit))
         if atlas_cfg:
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(atlas_cfg.htf_limit))
         mid_plan["15m"] = min(mid_plan.get("15m", 0), MID_LIMIT_CAP)
@@ -6836,6 +7139,8 @@ def run():
         dtfx_thread = None
         pumpfade_result = {}
         pumpfade_thread = None
+        atlas_rs_fail_short_result = {}
+        atlas_rs_fail_short_thread = None
         if heavy_scan and fabio_cfg:
             fabio_thread = threading.Thread(
                 target=lambda: fabio_result.update(
@@ -6920,6 +7225,20 @@ def run():
                 daemon=True,
             )
             pumpfade_thread.start()
+        if ATLAS_RS_FAIL_SHORT_ENABLED and atlas_rs_fail_short_cfg and atlas_rs_fail_short_engine:
+            atlas_rs_fail_short_thread = threading.Thread(
+                target=lambda: atlas_rs_fail_short_result.update(
+                    _run_atlas_rs_fail_short_cycle(
+                        atlas_rs_fail_short_engine,
+                        atlas_rs_fail_short_universe,
+                        state,
+                        send_telegram,
+                        atlas_rs_fail_short_cfg,
+                    )
+                ),
+                daemon=True,
+            )
+            atlas_rs_fail_short_thread.start()
         if not run_rsi_short:
             print("[모드] FABIO_ONLY 활성화: RSI 스캔 스킵")
         universe_total = len(universe_momentum)
@@ -7518,6 +7837,8 @@ def run():
             dtfx_thread.join()
         if pumpfade_thread:
             pumpfade_thread.join()
+        if atlas_rs_fail_short_thread:
+            atlas_rs_fail_short_thread.join()
         _set_thread_log_buffer(None)
 
         if (not MANAGE_LOOP_ENABLED) and (not MANAGE_WS_MODE):
@@ -7546,10 +7867,10 @@ def run():
             f"[universe] rule=qVol>={int(min_qv):,} sort=abs(pct) topN={top_n} anchors={anchors_disp} "
             f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
             f"fabio={fabio_universe_len} swaggy={swaggy_universe_len} dtfx={dtfx_universe_len} "
-            f"pumpfade={pumpfade_universe_len} union={universe_union_len}"
+            f"pumpfade={pumpfade_universe_len} arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
         )
         print(
-            "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) fabio=%s(%d) atlasfabio=%s(%d) swaggy=%s(%d) dtfx=%s(%d) pumpfade=%s(%d)"
+            "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) fabio=%s(%d) atlasfabio=%s(%d) swaggy=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
             % (
                 "ON" if rsi_ran else "OFF",
                 rsi_universe_len,
@@ -7567,6 +7888,8 @@ def run():
                 dtfx_universe_len,
                 "ON" if pumpfade_ran else "OFF",
                 pumpfade_universe_len,
+                "ON" if atlas_rs_fail_short_ran else "OFF",
+                atlas_rs_fail_short_universe_len,
             )
         )
         print(f"[cycle] heavy_scan={'Y' if heavy_scan else 'N'} elapsed={elapsed:.2f}s")

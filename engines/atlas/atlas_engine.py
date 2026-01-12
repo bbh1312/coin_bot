@@ -199,6 +199,7 @@ class AtlasEngine:
             "beta": None,
             "vol_ratio": None,
             "state": gate.get("regime"),
+            "symbol_direction": "UNKNOWN",
         }
         side = ""
         if decision is not None:
@@ -256,6 +257,13 @@ class AtlasEngine:
             "corr_slow": corr_slow,
             "beta_slow": beta_slow,
         })
+        if isinstance(rs_fast, (int, float)):
+            if rs_fast > 0:
+                out["symbol_direction"] = "BULL"
+            elif rs_fast < 0:
+                out["symbol_direction"] = "BEAR"
+            else:
+                out["symbol_direction"] = "NEUTRAL"
         rs_pass_fast = (rs_fast is not None and rs_fast >= cfg.rs_pass) or (rs_z_fast is not None and rs_z_fast >= cfg.rs_z_pass)
         rs_pass_slow = (rs_slow is not None and rs_slow >= cfg.rs_pass) or (rs_z_slow is not None and rs_z_slow >= cfg.rs_z_pass)
         rs_strong_fast = (rs_fast is not None and rs_fast >= cfg.rs_strong) or (rs_z_fast is not None and rs_z_fast >= cfg.rs_z_strong)

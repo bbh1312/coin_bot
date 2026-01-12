@@ -10,6 +10,7 @@ from engines.dtfx.engine import DTFXEngine
 from engines.div15m_long.engine import Div15mLongEngine
 from engines.div15m_short.engine import Div15mShortEngine
 from engines.pumpfade.engine import PumpFadeEngine
+from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
 
 
 _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
@@ -20,6 +21,7 @@ _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
     "div15m_long": Div15mLongEngine,
     "div15m_short": Div15mShortEngine,
     "pumpfade": PumpFadeEngine,
+    "atlas_rs_fail_short": AtlasRsFailShortEngine,
 }
 
 

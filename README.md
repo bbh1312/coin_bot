@@ -43,7 +43,12 @@ pip install ccxt pandas requests websocket-client
       --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,HYPER/USDT:USDT \
       --start 2026-01-01 \
       --end 2026-01-11
-
+- 아틀라스 일반 숏
+  - 백테스트
+     python -m engines.atlas_rs_fail_short.backtest_runner 
+     --symbols BTC/USDT:USDT,ETH/USDT:USDT 
+     --days 30
+     --out logs/atlas_rs_fail_short/arsf_signals.csv
 
 
 ## Live 전환
