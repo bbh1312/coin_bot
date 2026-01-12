@@ -3489,6 +3489,10 @@ def _run_atlas_rs_fail_short_cycle(
         logger=_append_atlas_rs_fail_short_log,
         config=arsf_cfg,
     )
+    def _arsf_skip(symbol: str, reason: str, entry_price: Optional[float] = None) -> None:
+        _append_atlas_rs_fail_short_log(
+            f"[atlas-rs-fail-short] skip sym={symbol} reason={reason} entry={_fmt_float(entry_price)}"
+        )
     for symbol in arsf_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
         if st.get("in_pos"):
@@ -3500,10 +3504,10 @@ def _run_atlas_rs_fail_short_cycle(
             continue
         result["hits"] += 1
         entry_price = sig.entry_price
-        size_mult = sig.meta.get("size_mult", 1.0) if isinstance(sig.meta, dict) else 1.0
+        meta = sig.meta if isinstance(sig.meta, dict) else {}
+        size_mult = meta.get("size_mult", 1.0)
         try:
             date_tag = time.strftime("%Y%m%d")
-            meta = sig.meta if isinstance(sig.meta, dict) else {}
             atlas = meta.get("atlas") if isinstance(meta.get("atlas"), dict) else {}
             tech = meta.get("tech") if isinstance(meta.get("tech"), dict) else {}
             _append_entry_log(
@@ -3534,15 +3538,29 @@ def _run_atlas_rs_fail_short_cycle(
             if isinstance(rec, dict):
                 cooldown_until = float(rec.get("cooldown_until_ts") or 0.0)
                 if cooldown_until and now_ts < cooldown_until:
+                    _arsf_skip(symbol, "COOLDOWN_RECHECK", entry_price)
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
+                last_entry_ts = float(rec.get("last_entry_ts") or 0.0)
+                if last_entry_ts:
+                    cooldown_sec = float(getattr(arsf_cfg, "cooldown_minutes", 0) or 0) * 60.0
+                    if cooldown_sec and now_ts < last_entry_ts + cooldown_sec:
+                        _arsf_skip(symbol, "COOLDOWN_RECHECK", entry_price)
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
         cur_total = count_open_positions(force=True)
         if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+            _arsf_skip(symbol, "MAX_POS", entry_price)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-        meta = sig.meta if isinstance(sig.meta, dict) else {}
-        atlas = meta.get("atlas") if isinstance(meta.get("atlas"), dict) else {}
-        if atlas.get("dir") != "BEAR":
+        snapshot = state.get("_atlas_rs_fail_short_snapshot") if isinstance(state.get("_atlas_rs_fail_short_snapshot"), dict) else {}
+        snap = snapshot.get(symbol) if isinstance(snapshot, dict) else None
+        if not isinstance(snap, dict):
+            _arsf_skip(symbol, "ATLAS_SNAPSHOT_MISSING", entry_price)
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if snap.get("dir") != "BEAR":
+            _arsf_skip(symbol, "ATLAS_DIR_FLIP", entry_price)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         ticker = state.get("_tickers", {}).get(symbol) if isinstance(state.get("_tickers"), dict) else None
@@ -3561,16 +3579,19 @@ def _run_atlas_rs_fail_short_cycle(
             atr = None
         if cur_px is not None and entry_price is not None and atr is not None:
             if abs(cur_px - float(entry_price)) > atr * 0.2:
+                _arsf_skip(symbol, "CHASE_SKIP", entry_price)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
         lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="atlas_rs_fail_short")
         if not lock_ok:
             print(f"[ENTRY-LOCK] sym={symbol} owner=atlas_rs_fail_short ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
+            _arsf_skip(symbol, "ENTRY_LOCK", entry_price)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         try:
             guard_key = _entry_guard_key(state, symbol, "SHORT")
             if not _entry_guard_acquire(state, symbol, key=guard_key):
+                _arsf_skip(symbol, "ENTRY_GUARD", entry_price)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             try:
@@ -3587,6 +3608,11 @@ def _run_atlas_rs_fail_short_cycle(
                 st["in_pos"] = True
                 st["last_entry"] = time.time()
                 state[symbol] = st
+                if isinstance(bucket, dict):
+                    rec = bucket.get(symbol)
+                    if isinstance(rec, dict):
+                        rec["last_entry_ts"] = time.time()
+                        bucket[symbol] = rec
                 _log_trade_entry(
                     state,
                     side="SHORT",
@@ -6856,7 +6882,6 @@ def run():
             mid_plan["1h"] = max(mid_plan.get("1h", 0), 40)
         if atlas_rs_fail_short_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
-            mid_plan["1h"] = max(mid_plan.get("1h", 0), int(atlas_rs_fail_short_cfg.htf_limit))
         if atlas_cfg:
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(atlas_cfg.htf_limit))
         mid_plan["15m"] = min(mid_plan.get("15m", 0), MID_LIMIT_CAP)

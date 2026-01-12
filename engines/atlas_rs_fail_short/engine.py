@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pandas as pd
 
 import cycle_cache
@@ -65,6 +66,17 @@ class AtlasRsFailShortEngine(BaseEngine):
         rec.setdefault("last_swing_high", None)
         rec.setdefault("cooldown_until_ts", 0)
         rec.setdefault("last_entry_pullback_id", None)
+        rec.setdefault("last_entry_ts", 0)
+        rec.setdefault("fade_id", None)
+        rec.setdefault("last_entry_fade_id", None)
+        state_transition = ""
+
+        def _set_state(new_state: str) -> None:
+            nonlocal state_transition
+            old_state = rec.get("state")
+            if old_state != new_state:
+                state_transition = f"{old_state}->{new_state}"
+                rec["state"] = new_state
 
         def _emit_log(
             entry_ready: int,
@@ -121,7 +133,7 @@ class AtlasRsFailShortEngine(BaseEngine):
             )
             logger(line)
 
-        def _blocked(reason: str, atlas_data: Optional[dict] = None, htf_ok: Optional[bool] = None) -> None:
+        def _blocked(reason: str, atlas_data: Optional[dict] = None, htf_ok: Optional[bool] = None) -> AtlasRsFailShortSignal:
             _emit_log(
                 entry_ready=0,
                 block_reason=reason,
@@ -132,64 +144,42 @@ class AtlasRsFailShortEngine(BaseEngine):
                 confirm_type="",
                 size_mult=1.0,
             )
+            meta = {
+                "block_reason": reason,
+                "atlas": atlas_data or {},
+                "state_transition": state_transition,
+                "pullback_id": rec.get("pullback_id"),
+            }
+            return AtlasRsFailShortSignal(
+                symbol=symbol,
+                entry_ready=False,
+                entry_price=None,
+                size_mult=1.0,
+                meta=meta,
+            )
 
         st = state.get(symbol, {}) if isinstance(state.get(symbol), dict) else {}
         if st.get("in_pos"):
-            rec["state"] = "IDLE"
+            _set_state("IDLE")
             rec["pullback_ts"] = 0
             rec["pullback_high"] = None
             rec["pullback_id"] = None
             bucket[symbol] = rec
-            _blocked("IN_POSITION")
-            return None
+            return _blocked("IN_POSITION")
 
         if now_ts < float(rec.get("cooldown_until_ts") or 0.0):
-            _blocked("COOLDOWN")
-            return None
+            return _blocked("COOLDOWN")
 
         df_ltf = cycle_cache.get_df(symbol, cfg.ltf_tf, cfg.ltf_limit)
-        if df_ltf.empty or len(df_ltf) < max(cfg.ltf_ema_slow + 5, 40):
-            _blocked("DATA_MISSING")
-            return None
+        if df_ltf.empty or len(df_ltf) < max(cfg.ema_len + 5, 40):
+            return _blocked("DATA_MISSING")
         df_ltf = df_ltf.iloc[:-1]
-        if df_ltf.empty or len(df_ltf) < max(cfg.ltf_ema_slow + 5, 40):
-            _blocked("DATA_MISSING")
-            return None
+        if df_ltf.empty or len(df_ltf) < max(cfg.ema_len + 5, 40):
+            return _blocked("DATA_MISSING")
         last_ts = int(df_ltf["ts"].iloc[-1])
         if last_ts == rec.get("last_bar_ts"):
             return None
         rec["last_bar_ts"] = last_ts
-
-        df_htf = cycle_cache.get_df(symbol, cfg.htf_tf, cfg.htf_limit)
-        if df_htf.empty or len(df_htf) < max(cfg.htf_ema_slow + 5, 40):
-            _blocked("HTF_DATA_MISSING")
-            bucket[symbol] = rec
-            return None
-        df_htf = df_htf.iloc[:-1]
-        if df_htf.empty or len(df_htf) < max(cfg.htf_ema_slow + 5, 40):
-            _blocked("HTF_DATA_MISSING")
-            bucket[symbol] = rec
-            return None
-
-        ema_fast_htf = _ema(df_htf["close"], cfg.htf_ema_fast)
-        ema_slow_htf = _ema(df_htf["close"], cfg.htf_ema_slow)
-        if ema_fast_htf is None or ema_slow_htf is None:
-            _blocked("HTF_DATA_MISSING")
-            bucket[symbol] = rec
-            return None
-        htf_fast_now = float(ema_fast_htf.iloc[-1])
-        htf_slow_now = float(ema_slow_htf.iloc[-1])
-        htf_ok = True
-        if cfg.htf_allow_fast_le_slow:
-            htf_ok = htf_fast_now <= htf_slow_now
-        if not htf_ok:
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
-            bucket[symbol] = rec
-            _blocked("HTF_UPTREND_BLOCK", htf_ok=htf_ok)
-            return None
 
         gate = compute_global_gate()
         atlas_local = compute_atlas_local(symbol, gate, atlas_swaggy_cfg)
@@ -210,84 +200,78 @@ class AtlasRsFailShortEngine(BaseEngine):
             "allow_long": atlas_local.get("allow_long"),
             "allow_short": atlas_local.get("allow_short"),
         }
-        if not atlas_data.get("dir") or atlas_data["dir"] != "BEAR":
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
+        snapshot = state.setdefault("_atlas_rs_fail_short_snapshot", {})
+        if isinstance(snapshot, dict):
+            snapshot[symbol] = {"dir": atlas_data.get("dir"), "ts": last_ts}
+        if not atlas_data.get("dir"):
+            _set_state("IDLE")
             bucket[symbol] = rec
-            _blocked("ATLAS_NOT_BEAR", atlas_data, htf_ok=htf_ok)
-            return None
-        if not atlas_data.get("regime") or atlas_data.get("rs_z") is None or atlas_data.get("score") is None:
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
+            return _blocked("ATLAS_DIR_MISSING", atlas_data)
+        if not atlas_data.get("regime") or atlas_data.get("score") is None:
+            _set_state("IDLE")
             bucket[symbol] = rec
-            _blocked("ATLAS_MISSING_REQUIRED", atlas_data, htf_ok=htf_ok)
-            return None
-        if float(atlas_data["score"]) < cfg.min_score:
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
+            return _blocked("ATLAS_MISSING_REQUIRED", atlas_data)
+        if atlas_data.get("regime") == "bull_extreme" and float(atlas_data["score"]) >= cfg.bull_extreme_score_max:
+            _set_state("IDLE")
             bucket[symbol] = rec
-            _blocked("SCORE_TOO_LOW", atlas_data, htf_ok=htf_ok)
-            return None
-        rsz = atlas_data.get("rs_z")
-        if rsz > cfg.rsz_enter:
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
-            bucket[symbol] = rec
-            _blocked("RSZ_TOO_HIGH", atlas_data, htf_ok=htf_ok)
-            return None
-        rsz_slow = atlas_data.get("rs_z_slow")
-        if isinstance(rsz_slow, (int, float)) and rsz_slow > cfg.rsz_slow_max:
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
-            bucket[symbol] = rec
-            _blocked("RSZ_SLOW_TOO_HIGH", atlas_data, htf_ok=htf_ok)
-            return None
+            return _blocked("REGIME_BULL_EXTREME", atlas_data)
         if atlas_data.get("regime") not in cfg.allow_regimes:
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
+            _set_state("IDLE")
             bucket[symbol] = rec
-            _blocked("REGIME_NOT_ALLOWED", atlas_data, htf_ok=htf_ok)
-            return None
-        beta = atlas_data.get("beta")
-        if beta is not None and abs(beta) > cfg.beta_abs_max:
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
+            return _blocked("REGIME_NOT_ALLOWED", atlas_data)
+        score_val = float(atlas_data["score"])
+        if not (atlas_data.get("dir") == "BEAR" or score_val <= cfg.dir_score_max):
+            _set_state("IDLE")
             bucket[symbol] = rec
-            _blocked("BETA_TOO_HIGH", atlas_data, htf_ok=htf_ok)
-            return None
-        vol_ratio = atlas_data.get("vol")
-        if vol_ratio is not None and vol_ratio < cfg.vol_min:
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
-            bucket[symbol] = rec
-            _blocked("VOL_TOO_LOW", atlas_data, htf_ok=htf_ok)
-            return None
+            return _blocked("ATLAS_DIR_SCORE_BLOCK", atlas_data)
 
-        ema_fast_ltf = _ema(df_ltf["close"], cfg.ltf_ema_fast)
-        ema_slow_ltf = _ema(df_ltf["close"], cfg.ltf_ema_slow)
-        atr_ltf = _atr(df_ltf, 14)
-        if ema_fast_ltf is None or ema_slow_ltf is None:
-            _blocked("DATA_MISSING", atlas_data, htf_ok=htf_ok)
-            return None
-        ema20 = float(ema_fast_ltf.iloc[-1])
-        ema60 = float(ema_slow_ltf.iloc[-1])
-        atr_now = float(atr_ltf.iloc[-1]) if atr_ltf is not None and not atr_ltf.empty else None
+        close_series = df_ltf["close"].astype(float)
+        high_series = df_ltf["high"].astype(float)
+        low_series = df_ltf["low"].astype(float)
+        open_series = df_ltf["open"].astype(float)
+        vol_series = df_ltf["volume"].astype(float)
+        min_bars = max(
+            cfg.ema_len,
+            cfg.atr_len + 2,
+            cfg.rsi_len + 2,
+            cfg.bb_len + 2,
+            cfg.macd_slow + cfg.macd_signal + 2,
+            cfg.vol_sma_len + 2,
+        )
+        if len(df_ltf) < (min_bars + 5):
+            return _blocked("DATA_MISSING", atlas_data)
+
+        ema20 = _ema(close_series, cfg.ema_len)
+        atr_ltf = _atr(df_ltf, cfg.atr_len)
+        rsi_series = _rsi_wilder(close_series, cfg.rsi_len)
+        macd_hist = _macd_hist(close_series, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
+        bb_vals = _bollinger(close_series, cfg.bb_len, cfg.bb_mult)
+        quote_vol = vol_series * close_series
+        vol_sma = _sma(quote_vol, cfg.vol_sma_len)
+        if (
+            ema20 is None
+            or atr_ltf is None
+            or rsi_series is None
+            or macd_hist is None
+            or bb_vals is None
+            or vol_sma is None
+        ):
+            return _blocked("DATA_MISSING", atlas_data)
+
+        ema20_now = float(ema20.iloc[-1])
+        atr_now = float(atr_ltf.iloc[-1])
+        rsi_now = float(rsi_series.iloc[-1])
+        rsi_prev = float(rsi_series.iloc[-2]) if len(rsi_series) > 1 else rsi_now
+        hist_now = float(macd_hist.iloc[-1])
+        hist_prev = float(macd_hist.iloc[-2]) if len(macd_hist) > 1 else hist_now
+        bb_mid, bb_upper, bb_lower = bb_vals
+        bb_width = bb_upper - bb_lower
+        vol_sma_now = float(vol_sma.iloc[-1])
+        if any(pd.isna(v) for v in (ema20_now, atr_now, rsi_now, rsi_prev, hist_now, hist_prev, bb_upper, bb_lower, vol_sma_now)):
+            return _blocked("DATA_MISSING", atlas_data)
+        if bb_width <= 0:
+            return _blocked("DATA_MISSING", atlas_data)
+
         last = df_ltf.iloc[-1]
         open_now = float(last["open"])
         high_now = float(last["high"])
@@ -295,187 +279,145 @@ class AtlasRsFailShortEngine(BaseEngine):
         close_now = float(last["close"])
         wick_ratio = _upper_wick_ratio(open_now, high_now, low_now, close_now)
 
-        pullback_anchor = None
-        pullback_hit = False
-        upper_zone = max(ema20, ema60)
-        if high_now >= upper_zone:
-            pullback_hit = True
-            pullback_anchor = "EMA60" if high_now >= ema60 else "EMA20"
-        pullback_active = rec.get("state") in ("PULLBACK", "FAIL_CONFIRM")
+        fade_id = f"{last_ts}:fade"
+        rec["fade_id"] = fade_id
+        rec["pullback_id"] = fade_id
 
-        if rec.get("state") == "IDLE" and pullback_hit:
-            rec["state"] = "PULLBACK"
-            rec["pullback_ts"] = last_ts
-            rec["pullback_high"] = high_now
-            rec["pullback_anchor"] = pullback_anchor
-            rec["pullback_id"] = f"{last_ts}:{pullback_anchor or 'EMA'}"
-            swing_lookback = max(5, int(cfg.pullback_swing_lookback))
-            highs_window = df_ltf["high"].astype(float).tolist()
-            if len(highs_window) > 1:
-                prior = highs_window[-(swing_lookback + 1):-1]
-                rec["last_swing_high"] = max(prior) if prior else None
-            else:
-                rec["last_swing_high"] = None
-            pullback_active = True
+        if close_now <= 0 or atr_now <= 0:
+            return _blocked("DATA_MISSING", atlas_data)
+        if atr_now / close_now < cfg.atr_min_ratio:
+            return _blocked("ATR_TOO_LOW", atlas_data)
+        if cfg.min_quote_volume > 0 and vol_sma_now < cfg.min_quote_volume:
+            return _blocked("VOLUME_TOO_LOW", atlas_data)
 
-        if pullback_active:
-            if rec.get("pullback_high") is None:
-                rec["pullback_high"] = high_now
-            else:
-                rec["pullback_high"] = max(float(rec.get("pullback_high") or 0.0), high_now)
-            last_swing_high = rec.get("last_swing_high")
-            if isinstance(last_swing_high, (int, float)) and high_now > last_swing_high * (1 + cfg.pullback_break_eps):
-                rec["state"] = "IDLE"
-                rec["pullback_ts"] = 0
-                rec["pullback_high"] = None
-                rec["pullback_id"] = None
-                rec["pullback_anchor"] = None
-                rec["last_swing_high"] = None
-                bucket[symbol] = rec
-                _blocked("PULLBACK_BREAKS_HIGH", atlas_data, htf_ok=htf_ok)
-                return None
+        high_minus_ema20 = high_now - ema20_now
+        location_ok = close_now > ema20_now and high_now >= (ema20_now + (atr_now * cfg.fade_atr_mult))
+        if (
+            high_minus_ema20 < (atr_now * cfg.fade_atr_min_mult)
+            or high_minus_ema20 > (atr_now * cfg.fade_atr_max_mult)
+        ):
+            return _blocked("LOCATION_RANGE_FAIL", atlas_data)
+        if not location_ok:
+            return _blocked("LOCATION_FAIL", atlas_data)
 
-        if pullback_active and rec.get("state") == "PULLBACK":
-            rec["state"] = "FAIL_CONFIRM"
+        bb_touch = False
+        if bb_width > 0:
+            bb_touch = high_now >= (bb_upper - (bb_width * cfg.bb_upper_eps))
+        if cfg.bb_touch_required and not bb_touch:
+            return _blocked("BB_TOUCH_MISSING", atlas_data)
 
-        timeout_bars = int(cfg.pullback_timeout_bars)
-        if pullback_active and timeout_bars > 0 and rec.get("pullback_ts"):
-            try:
-                idx = df_ltf.index[df_ltf["ts"] == rec.get("pullback_ts")]
-                if len(idx) > 0:
-                    bars_since = len(df_ltf) - 1 - int(idx[-1])
-                    if bars_since >= timeout_bars:
-                        rec["state"] = "IDLE"
-                        rec["pullback_ts"] = 0
-                        rec["pullback_high"] = None
-                        rec["pullback_id"] = None
-                        bucket[symbol] = rec
-                        _blocked("CONFIRM_TIMEOUT", atlas_data, htf_ok=htf_ok)
-                        return None
-            except Exception:
-                pass
+        if rsi_now >= cfg.rsi_block:
+            return _blocked("RSI_OVERHEATED", atlas_data)
+        if not (cfg.rsi_min <= rsi_now <= cfg.rsi_max):
+            return _blocked("RSI_RANGE_FAIL", atlas_data)
 
-        confirm_close_ok = close_now < ema20
-        confirm_wick_ok = wick_ratio >= cfg.wick_ratio_min
-        body_ratio = _body_ratio(open_now, high_now, low_now, close_now)
-        bearish_body_ok = close_now < open_now and body_ratio >= cfg.body_ratio_min
-        last_swing_high = rec.get("last_swing_high")
-        lower_high_ok = (
-            isinstance(last_swing_high, (int, float))
-            and isinstance(rec.get("pullback_high"), (int, float))
-            and float(rec.get("pullback_high")) <= float(last_swing_high) * (1 + cfg.pullback_anchor_eps)
+        rsi_down = rsi_now < rsi_prev
+        macd_decay = hist_now < hist_prev
+        bearish_body = close_now < open_now
+        wick_ok = wick_ratio >= cfg.wick_ratio_min
+        trigger_hits = sum(1 for v in (wick_ok, rsi_down, macd_decay, bearish_body) if v)
+        if trigger_hits < cfg.trigger_min:
+            return _blocked("TRIGGER_NOT_MET", atlas_data)
+        if cfg.trigger_exact and trigger_hits != cfg.trigger_min:
+            return _blocked("TRIGGER_COUNT_MISMATCH", atlas_data)
+
+        if rec.get("last_entry_fade_id") == fade_id:
+            return _blocked("DUP_FADE", atlas_data)
+
+        _set_state("ENTRY_READY")
+        entry_transition = state_transition
+        rec["cooldown_until_ts"] = now_ts + cfg.cooldown_minutes * 60
+        rec["last_entry_fade_id"] = fade_id
+        rec["last_entry_ts"] = now_ts
+        bucket[symbol] = rec
+
+        risk_tags = []
+        if score_val < cfg.min_score:
+            risk_tags.append("SCORE_LOW")
+        rsz = atlas_data.get("rs_z")
+        if isinstance(rsz, (int, float)) and rsz <= -3.0:
+            risk_tags.append("RS_EXTREME")
+        vol_ratio = atlas_data.get("vol")
+        if isinstance(vol_ratio, (int, float)) and vol_ratio >= 10:
+            risk_tags.append("VOL_HIGH")
+        if bb_touch:
+            risk_tags.append("BB_TOUCH")
+        if macd_decay:
+            risk_tags.append("MACD_DECAY")
+
+        triggers = []
+        if wick_ok:
+            triggers.append("WICK")
+        if rsi_down:
+            triggers.append("RSI_DOWN")
+        if macd_decay:
+            triggers.append("MACD_DECAY")
+        if bearish_body:
+            triggers.append("BEAR_BODY")
+        confirm_type = "+".join(triggers)
+        trigger_bits = "WICK={w};RSI={r};MACD={m};BEAR={b}".format(
+            w=int(wick_ok),
+            r=int(rsi_down),
+            m=int(macd_decay),
+            b=int(bearish_body),
         )
-        confirm_ok = pullback_active and confirm_close_ok and confirm_wick_ok and (lower_high_ok or bearish_body_ok)
-        confirm_type = ""
-        if confirm_ok:
-            confirm_type = "close_below_ema20+wick+lh" if lower_high_ok else "close_below_ema20+wick+body"
 
-        size_mult = 1.0
-        if isinstance(rsz, (int, float)) and rsz < -3.0:
-            size_mult *= 0.7
-        if isinstance(vol_ratio, (int, float)) and vol_ratio > 10:
-            size_mult *= 0.7
-
-        if confirm_ok:
-            pullback_id = rec.get("pullback_id")
-            if pullback_id and pullback_id == rec.get("last_entry_pullback_id"):
-                _emit_log(
-                    entry_ready=0,
-                    block_reason="DUP_PULLBACK",
-                    atlas_data=atlas_data,
-                    htf_ok=htf_ok,
-                    ltf_pullback=1,
-                    fail_confirm=0,
-                    confirm_type=confirm_type,
-                    size_mult=size_mult,
-                )
-                rec["state"] = "IDLE"
-                rec["pullback_ts"] = 0
-                rec["pullback_high"] = None
-                rec["pullback_id"] = None
-                bucket[symbol] = rec
-                return None
-            rec["last_entry_pullback_id"] = pullback_id
-            rec["state"] = "ENTRY_READY"
-            rec["cooldown_until_ts"] = now_ts + cfg.cooldown_minutes * 60
-            bucket[symbol] = rec
-            risk_tags = []
-            if isinstance(rsz, (int, float)) and rsz < -3.0:
-                risk_tags.append("RS_EXTREME")
-            if isinstance(vol_ratio, (int, float)) and vol_ratio > 10:
-                risk_tags.append("VOL_HIGH")
-            meta = {
-                "engine": "atlas_rs_fail_short",
-                "symbol": symbol,
-                "side": "SHORT",
-                "timeframe": cfg.ltf_tf,
-                "reason": "ATLAS_DIR_BEAR+RS_WEAK+PULLBACK_FAIL",
-                "entry_price": close_now,
-                "entry_ts": last_ts,
-                "size_mult": size_mult,
-                "risk_tags": risk_tags,
-                "atlas": {
-                    "regime": atlas_data.get("regime"),
-                    "dir": atlas_data.get("dir"),
-                    "score": atlas_data.get("score"),
-                    "rs_z": atlas_data.get("rs_z"),
-                    "rs_z_slow": atlas_data.get("rs_z_slow"),
-                    "beta": atlas_data.get("beta"),
-                    "vol": atlas_data.get("vol"),
-                },
-                "tech": {
-                    "ema20": ema20,
-                    "ema60": ema60,
-                    "pullback_high": rec.get("pullback_high"),
-                    "confirm_type": confirm_type,
-                    "wick_ratio": wick_ratio,
-                    "body_ratio": body_ratio,
-                    "atr": atr_now,
-                },
-            }
-            _emit_log(
-                entry_ready=1,
-                block_reason="",
-                atlas_data=atlas_data,
-                htf_ok=htf_ok,
-                ltf_pullback=1,
-                fail_confirm=1,
-                confirm_type=confirm_type,
-                size_mult=size_mult,
-            )
-            rec["state"] = "IDLE"
-            rec["pullback_ts"] = 0
-            rec["pullback_high"] = None
-            rec["pullback_id"] = None
-            bucket[symbol] = rec
-            return AtlasRsFailShortSignal(
-                symbol=symbol,
-                entry_ready=True,
-                entry_price=close_now,
-                size_mult=size_mult,
-                meta=meta,
-            )
-
-        block_reason = "NO_PULLBACK_TOUCH"
-        if pullback_active:
-            block_reason = "CONFIRM_NOT_MET"
+        meta = {
+            "engine": "atlas_rs_fail_short",
+            "symbol": symbol,
+            "side": "SHORT",
+            "timeframe": cfg.ltf_tf,
+            "reason": "INTRADAY_FADE",
+            "entry_price": close_now,
+            "entry_ts": last_ts,
+            "size_mult": 1.0,
+            "risk_tags": risk_tags,
+            "pullback_id": fade_id,
+            "state_transition": entry_transition,
+            "atlas": {
+                "regime": atlas_data.get("regime"),
+                "dir": atlas_data.get("dir"),
+                "score": atlas_data.get("score"),
+                "rs_z": atlas_data.get("rs_z"),
+                "rs_z_slow": atlas_data.get("rs_z_slow"),
+                "beta": atlas_data.get("beta"),
+                "vol": atlas_data.get("vol"),
+            },
+            "tech": {
+                "ema20": ema20_now,
+                "atr": atr_now,
+                "rsi": rsi_now,
+                "rsi_prev": rsi_prev,
+                "macd_hist": hist_now,
+                "macd_hist_prev": hist_prev,
+                "bb_upper": bb_upper,
+                "bb_lower": bb_lower,
+                "bb_width": bb_width,
+                "wick_ratio": wick_ratio,
+                "trigger_hits": trigger_hits,
+                "confirm_type": confirm_type,
+                "trigger_bits": trigger_bits,
+                "high_minus_ema20": high_minus_ema20,
+            },
+        }
         _emit_log(
-            entry_ready=0,
-            block_reason=block_reason,
+            entry_ready=1,
+            block_reason="",
             atlas_data=atlas_data,
-            htf_ok=htf_ok,
-            ltf_pullback=1 if pullback_active else 0,
-            fail_confirm=1 if pullback_active else 0,
+            htf_ok=None,
+            ltf_pullback=0,
+            fail_confirm=0,
             confirm_type=confirm_type,
-            size_mult=size_mult,
+            size_mult=1.0,
         )
+        rec["state"] = "IDLE"
         bucket[symbol] = rec
         return AtlasRsFailShortSignal(
             symbol=symbol,
-            entry_ready=False,
-            entry_price=None,
-            size_mult=size_mult,
-            meta={"block_reason": block_reason, "atlas": atlas_data},
+            entry_ready=True,
+            entry_price=close_now,
+            size_mult=1.0,
+            meta=meta,
         )
 
 
@@ -483,6 +425,43 @@ def _ema(series: pd.Series, span: int) -> Optional[pd.Series]:
     if series.empty or span <= 0:
         return None
     return series.ewm(span=span, adjust=False).mean()
+
+def _sma(series: pd.Series, window: int) -> Optional[pd.Series]:
+    if series.empty or window <= 0:
+        return None
+    return series.rolling(window).mean()
+
+def _rsi_wilder(close: pd.Series, period: int) -> Optional[pd.Series]:
+    if close.empty or period <= 0:
+        return None
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.astype(float).fillna(0.0)
+
+def _macd_hist(close: pd.Series, fast: int, slow: int, signal: int) -> Optional[pd.Series]:
+    if close.empty or fast <= 0 or slow <= 0 or signal <= 0:
+        return None
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    sig = macd.ewm(span=signal, adjust=False).mean()
+    return macd - sig
+
+def _bollinger(close: pd.Series, window: int, mult: float) -> Optional[tuple[float, float, float]]:
+    if close.empty or window <= 1:
+        return None
+    mean = close.rolling(window).mean()
+    std = close.rolling(window).std()
+    if mean.empty or std.empty:
+        return None
+    mid = float(mean.iloc[-1])
+    dev = float(std.iloc[-1]) * mult
+    return mid, mid + dev, mid - dev
 
 def _atr(df: pd.DataFrame, n: int = 14) -> Optional[pd.Series]:
     if df.empty or len(df) < (n + 2):

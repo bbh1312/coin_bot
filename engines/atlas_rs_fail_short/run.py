@@ -70,11 +70,8 @@ def _run_once(
             _set_cache(ref_symbol, cfg.ltf_tf, raw_ref)
     for sym in symbols:
         raw_ltf = _fetch_ohlcv(ex, sym, cfg.ltf_tf, cfg.ltf_limit)
-        raw_htf = _fetch_ohlcv(ex, sym, cfg.htf_tf, cfg.htf_limit)
         if raw_ltf:
             _set_cache(sym, cfg.ltf_tf, raw_ltf)
-        if raw_htf:
-            _set_cache(sym, cfg.htf_tf, raw_htf)
         sig = engine.on_tick(ctx, sym)
         if sig:
             print(
