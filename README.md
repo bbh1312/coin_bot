@@ -20,5 +20,16 @@ pip install ccxt pandas requests websocket-client
 - 메인+웹소켓관리 동시 : ./run_all.sh (기본 --no-manage-loop 포함)
 - 아틀라스 알림 : python -m atlas_test.main
 
+## 백테스트
+- RSI 엔진
+  - RSI 백테스트 
+    python3 -m engines.rsi.run_backtest \
+    --symbols PTB/USDT:USDT,RIVER/USDT:USDT,AKE/USDT:USDT,CLO/USDT:USDT,AVNT/USDT:USDT,GPS/USDT:USDT \
+    --start 2026-01-01 \
+    --end 2026-01-10  \
+    --sl-pct 0.04 \
+    --tp-pct 0.05
+
+
 ## Live 전환
 - `executor.py`에서 `DRY_RUN = False`로 변경 후 실행

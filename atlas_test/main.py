@@ -6,16 +6,24 @@ from env_loader import load_env
 
 from .atlas_config import Config
 from .atlas_engine import evaluate_atlas, set_cache, compute_global_gate, get_ref_symbol
+from engines.atlas.atlas_engine import AtlasSwaggyConfig
 from .data_feed import init_exchange, wait_with_backoff, fetch_ohlcv
 from .notifier_telegram import send_message
 from .state_store import load_state, save_state
 from engines.universe import build_universe_from_tickers
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _fmt_kst(ts_ms: int) -> str:
     kst = timezone(timedelta(hours=9))
     dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=kst)
     return dt.strftime("%Y-%m-%d %H:%M KST")
+
+
+def _fmt_now_kst() -> str:
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(tz=kst).strftime("%Y-%m-%d %H:%M:%S KST")
 
 
 def _fmt_val(v: object, fmt: str = "{:.4f}") -> str:
@@ -53,9 +61,11 @@ def _build_summary_message(cfg: Config, summary_ts: int, results: dict, universe
     bears = results.get("bears", [])
     exits = results.get("exits", [])
     counts = results.get("counts", {"STRONG_BULL": 0, "STRONG_BEAR": 0, "NO_TRADE": 0})
+    total = sum(int(v or 0) for v in counts.values())
     lines = [
         f"[ATLAS-TEST] 15m 요약 (KST {time_str})",
         f"Universe: {universe_label}",
+        f"Universe size: {total}",
         f"STRONG_BULL: {counts.get('STRONG_BULL', 0)} | STRONG_BEAR: {counts.get('STRONG_BEAR', 0)} | NO_TRADE: {counts.get('NO_TRADE', 0)}",
         "",
         "TOP BULL",
@@ -94,8 +104,71 @@ def _build_common_universe(cfg: Config, tickers: dict) -> tuple:
         top_n=int(cfg.fabio_universe_top_n or 0) or None,
         anchors=anchors,
     )
-    label = f"abs(pct) top {cfg.fabio_universe_top_n} + anchors(BTC/ETH)"
+    label = (
+        f"qVol>={int(cfg.min_quote_volume):,} abs(pct) top {cfg.fabio_universe_top_n} "
+        "anchors(BTC/ETH)"
+    )
     return universe, label
+
+
+def _score_breakdown(result: dict) -> dict:
+    atlas_gate = result.get("atlas_gate") or {}
+    atlas_local = result.get("atlas_local") or {}
+    regime = atlas_gate.get("regime")
+    score_regime = 25 if regime in ("bull", "bear") else (15 if regime == "chaos_vol" else 5)
+    cfg = AtlasSwaggyConfig()
+
+    rs = atlas_local.get("rs")
+    rs_z = atlas_local.get("rs_z")
+    rs_slow = atlas_local.get("rs_slow")
+    rs_z_slow = atlas_local.get("rs_z_slow")
+    rs_pass = (
+        (isinstance(rs, (int, float)) and rs >= cfg.rs_pass)
+        or (isinstance(rs_z, (int, float)) and rs_z >= cfg.rs_z_pass)
+        or (isinstance(rs_slow, (int, float)) and rs_slow >= cfg.rs_pass)
+        or (isinstance(rs_z_slow, (int, float)) and rs_z_slow >= cfg.rs_z_pass)
+    )
+
+    corr = atlas_local.get("corr")
+    beta = atlas_local.get("beta")
+    corr_slow = atlas_local.get("corr_slow")
+    beta_slow = atlas_local.get("beta_slow")
+    indep_pass = (
+        (isinstance(corr, (int, float)) and corr <= cfg.indep_corr)
+        or (isinstance(beta, (int, float)) and beta <= cfg.indep_beta)
+        or (isinstance(corr_slow, (int, float)) and corr_slow <= cfg.indep_corr)
+        or (isinstance(beta_slow, (int, float)) and beta_slow <= cfg.indep_beta)
+    )
+
+    vol_ratio = atlas_local.get("vol_ratio")
+    vol_pass = isinstance(vol_ratio, (int, float)) and vol_ratio >= cfg.vol_pass
+
+    return {
+        "regime": regime,
+        "score_regime": score_regime,
+        "score_rs": 25 if rs_pass else 0,
+        "score_indep": 25 if indep_pass else 0,
+        "score_vol": 25 if vol_pass else 0,
+        "rs": rs,
+        "rs_z": rs_z,
+        "rs_slow": rs_slow,
+        "rs_z_slow": rs_z_slow,
+        "corr": corr,
+        "beta": beta,
+        "corr_slow": corr_slow,
+        "beta_slow": beta_slow,
+        "vol_ratio": vol_ratio,
+    }
+
+
+def _append_detail_log(line: str) -> None:
+    try:
+        log_dir = os.path.join(ROOT_DIR, "logs", "atlas")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "atlas_test_detail.log"), "a", encoding="utf-8") as f:
+            f.write(line.rstrip("\n") + "\n")
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -151,7 +224,7 @@ def main() -> None:
         exits = []
         symbols_state = state.setdefault("symbols", {})
 
-        for sym in universe:
+        for idx, sym in enumerate(universe, start=1):
             sym_cfg = Config()
             sym_cfg.symbol = sym
             sym_cfg.ltf_tf = cfg.ltf_tf
@@ -163,6 +236,37 @@ def main() -> None:
             state_now = result.get("state") or "NO_TRADE"
             counts[state_now] = counts.get(state_now, 0) + 1
             atlas_local = result.get("atlas_local") or {}
+            breakdown = _score_breakdown(result)
+            detail_line = (
+                "[{ts}] [atlas-test] idx={idx} sym={sym} state={state} score={score} "
+                "regime={regime} dir={direction} part=R{sr}/RS{srsi}/I{sind}/V{svol} "
+                "rs={rs} rs_z={rsz} rs_slow={rsl} rs_z_slow={rszl} "
+                "corr={corr} beta={beta} corr_slow={corrs} beta_slow={betas} "
+                "vol={vol}"
+            ).format(
+                ts=_fmt_now_kst(),
+                idx=idx,
+                sym=sym.replace("/USDT:USDT", ""),
+                state=state_now,
+                score=int(result.get("score") or 0),
+                regime=breakdown.get("regime"),
+                direction=atlas_local.get("symbol_direction"),
+                sr=breakdown.get("score_regime"),
+                srsi=breakdown.get("score_rs"),
+                sind=breakdown.get("score_indep"),
+                svol=breakdown.get("score_vol"),
+                rs=_fmt_val(breakdown.get("rs")),
+                rsz=_fmt_val(breakdown.get("rs_z")),
+                rsl=_fmt_val(breakdown.get("rs_slow")),
+                rszl=_fmt_val(breakdown.get("rs_z_slow")),
+                corr=_fmt_val(breakdown.get("corr")),
+                beta=_fmt_val(breakdown.get("beta")),
+                corrs=_fmt_val(breakdown.get("corr_slow")),
+                betas=_fmt_val(breakdown.get("beta_slow")),
+                vol=_fmt_val(breakdown.get("vol_ratio"), "{:.2f}"),
+            )
+            print(detail_line)
+            _append_detail_log(detail_line)
             entry = {
                 "symbol": sym.replace("/USDT:USDT", ""),
                 "score": result.get("score") or 0,
@@ -205,6 +309,7 @@ def main() -> None:
             "exits": exits[: cfg.summary_top_n],
         }
         msg = _build_summary_message(cfg, summary_ts, summary, universe_label)
+        print(msg)
         ok = False
         for attempt in range(1, 4):
             ok = send_message(token, chat_id, msg)

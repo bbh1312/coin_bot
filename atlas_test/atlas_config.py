@@ -22,8 +22,8 @@ class Config:
     strong_score_threshold: int = 70
     instant_score_min: int = 85
     summary_top_n: int = 5
-    fabio_universe_top_n: int = 30
-    min_quote_volume: float = 20000000.0
+    fabio_universe_top_n: int = 40
+    min_quote_volume: float = 30000000.0
     trigger_symbol: str = "BTC/USDT:USDT"
     poll_sec: float = 15.0
     state_file: str = "atlas_state.json"

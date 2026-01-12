@@ -325,9 +325,10 @@ class RsiEngine(BaseEngine):
         rsis_prev["3m"] = r2
         rsis["3m"] = r1
         r3m_val = r3
+        thr_3m_downturn = float(cfg.rsi3m_downturn_threshold)
         rsi3m_downturn = (
-            (r2 is not None and r1 is not None and r2 >= 85.0 and r2 > r1)
-            or (r3 is not None and r2 is not None and r3 >= 85.0 and r3 > r2)
+            (r2 is not None and r1 is not None and r2 >= thr_3m_downturn and r2 > r1)
+            or (r3 is not None and r2 is not None and r3 >= thr_3m_downturn and r3 > r2)
         )
         check_status.append(("3m_downturn", rsi3m_downturn))
 
@@ -368,7 +369,7 @@ class RsiEngine(BaseEngine):
         trigger_ok = (rsi3m_downturn or struct_ok)
         spike_ready = (
             (rsis.get("3m") is not None)
-            and (rsis["3m"] >= 85.0)
+            and (rsis["3m"] >= cfg.rsi3m_spike_threshold)
             and rsi3m_downturn
             and vol_ok
             and passed_1h
