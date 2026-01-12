@@ -3525,7 +3525,7 @@ def _run_atlas_rs_fail_short_cycle(
             )
         except Exception:
             pass
-        if not ATLAS_RS_FAIL_SHORT_TRADE_ENABLED or ATLAS_RS_FAIL_SHORT_PAPER_ONLY or not LIVE_TRADING:
+        if not LIVE_TRADING:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         bucket = state.get("_atlas_rs_fail_short") if isinstance(state, dict) else None
@@ -4988,8 +4988,6 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_dtfx_enabled",
         "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
-        "_atlas_rs_fail_short_trade_enabled",
-        "_atlas_rs_fail_short_paper_only",
         "_chat_id",
         "_manage_ws_mode",
         "_entry_event_offset",
@@ -4999,7 +4997,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         if key in disk:
             state[key] = disk.get(key)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, ATLAS_RS_FAIL_SHORT_TRADE_ENABLED, ATLAS_RS_FAIL_SHORT_PAPER_ONLY
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE
     if isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
@@ -5032,10 +5030,6 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
     if isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
         ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
-    if isinstance(state.get("_atlas_rs_fail_short_trade_enabled"), bool):
-        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = bool(state.get("_atlas_rs_fail_short_trade_enabled"))
-    if isinstance(state.get("_atlas_rs_fail_short_paper_only"), bool):
-        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = bool(state.get("_atlas_rs_fail_short_paper_only"))
     if state.get("_chat_id"):
         CHAT_ID_RUNTIME = str(state.get("_chat_id"))
     if isinstance(state.get("_manage_ws_mode"), bool):
@@ -5060,8 +5054,6 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_dtfx_enabled",
         "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
-        "_atlas_rs_fail_short_trade_enabled",
-        "_atlas_rs_fail_short_paper_only",
         "_tg_offset",
         "_tg_queue_offset",
         "_chat_id",
@@ -5825,52 +5817,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] atlas_rs_fail_short cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
-                if (cmd in ("/atlas_rs_fail_short_trade", "atlas_rs_fail_short_trade")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = True
-                        state["_atlas_rs_fail_short_trade_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ atlas_rs_fail_short trade ON"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = False
-                        state["_atlas_rs_fail_short_trade_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ atlas_rs_fail_short trade OFF"
-                    else:
-                        resp = (
-                            f"ℹ️ atlas_rs_fail_short trade 상태: {'ON' if ATLAS_RS_FAIL_SHORT_TRADE_ENABLED else 'OFF'}\n"
-                            "사용법: /atlas_rs_fail_short_trade on|off|status"
-                        )
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] atlas_rs_fail_short_trade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
-                if (cmd in ("/atlas_rs_fail_short_paper", "atlas_rs_fail_short_paper")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = True
-                        state["_atlas_rs_fail_short_paper_only"] = True
-                        state_dirty = True
-                        resp = "✅ atlas_rs_fail_short paper ON"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = False
-                        state["_atlas_rs_fail_short_paper_only"] = False
-                        state_dirty = True
-                        resp = "⛔ atlas_rs_fail_short paper OFF"
-                    else:
-                        resp = (
-                            f"ℹ️ atlas_rs_fail_short paper 상태: {'ON' if ATLAS_RS_FAIL_SHORT_PAPER_ONLY else 'OFF'}\n"
-                            "사용법: /atlas_rs_fail_short_paper on|off|status"
-                        )
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] atlas_rs_fail_short_paper cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
                 if (cmd in ("/report", "report")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "today"
@@ -6078,8 +6024,6 @@ SWAGGY_ENABLED = True
 DTFX_ENABLED = True
 PUMPFADE_ENABLED = False
 ATLAS_RS_FAIL_SHORT_ENABLED = False
-ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = False
-ATLAS_RS_FAIL_SHORT_PAPER_ONLY = False
 DIV15M_LONG_ENABLED = True
 DIV15M_SHORT_ENABLED = True
 ONLY_DIV15M_SHORT = False
@@ -6344,7 +6288,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, ATLAS_RS_FAIL_SHORT_TRADE_ENABLED, ATLAS_RS_FAIL_SHORT_PAPER_ONLY, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
     global USDT_PER_TRADE
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
@@ -6394,14 +6338,6 @@ def run():
         ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
     else:
         state["_atlas_rs_fail_short_enabled"] = ATLAS_RS_FAIL_SHORT_ENABLED
-    if isinstance(state.get("_atlas_rs_fail_short_trade_enabled"), bool):
-        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = bool(state.get("_atlas_rs_fail_short_trade_enabled"))
-    else:
-        state["_atlas_rs_fail_short_trade_enabled"] = ATLAS_RS_FAIL_SHORT_TRADE_ENABLED
-    if isinstance(state.get("_atlas_rs_fail_short_paper_only"), bool):
-        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = bool(state.get("_atlas_rs_fail_short_paper_only"))
-    else:
-        state["_atlas_rs_fail_short_paper_only"] = ATLAS_RS_FAIL_SHORT_PAPER_ONLY
     if "--only-div15m-short" in sys.argv:
         ONLY_DIV15M_SHORT = True
         DIV15M_LONG_ENABLED = False
@@ -6410,8 +6346,6 @@ def run():
         DTFX_ENABLED = False
         PUMPFADE_ENABLED = False
         ATLAS_RS_FAIL_SHORT_ENABLED = False
-        ATLAS_RS_FAIL_SHORT_TRADE_ENABLED = False
-        ATLAS_RS_FAIL_SHORT_PAPER_ONLY = False
         FABIO_ENABLED = False
         ATLAS_FABIO_ENABLED = False
         state["_div15m_long_enabled"] = False
@@ -6420,8 +6354,6 @@ def run():
         state["_dtfx_enabled"] = False
         state["_pumpfade_enabled"] = False
         state["_atlas_rs_fail_short_enabled"] = False
-        state["_atlas_rs_fail_short_trade_enabled"] = False
-        state["_atlas_rs_fail_short_paper_only"] = False
         state["_fabio_enabled"] = False
         state["_atlas_fabio_enabled"] = False
         print("[모드] ONLY_DIV15M_SHORT 활성화: div15m_short만 스캔")
@@ -6473,7 +6405,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /atlas_rs_fail_short_trade on|off|status, /atlas_rs_fail_short_paper on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
