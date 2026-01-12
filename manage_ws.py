@@ -92,6 +92,7 @@ def _drain_entry_events(state) -> None:
                 continue
             tr = {
                 "entry_ts": float(entry_ts),
+                "entry_order_id": payload.get("entry_order_id"),
                 "symbol": payload.get("symbol"),
                 "side": payload.get("side"),
                 "entry_price": payload.get("entry_price"),
@@ -104,6 +105,14 @@ def _drain_entry_events(state) -> None:
                 "roi_pct": None,
             }
             er._update_report_csv(tr)
+            sym = tr.get("symbol")
+            side = (tr.get("side") or "").lower()
+            if sym and side:
+                st = state.get(sym, {})
+                if not isinstance(st, dict):
+                    st = {}
+                st[f"entry_order_id_{side}"] = tr.get("entry_order_id")
+                state[sym] = st
         state["_entry_event_offset"] = new_offset
     except Exception as e:
         print("[manage-ws] entry_events drain error:", e)
@@ -159,11 +168,14 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
     if report_ok:
         er._update_report_csv(open_tr)
     print(f"[manage-ws] long_manual_close sym={symbol} engine={engine_label}")
+    order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
+    order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
         f"🔴 <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {engine_label}\n"
-        f"사유: MANUAL"
+        f"사유: MANUAL\n"
+        f"{order_line}".rstrip()
     )
 
 
@@ -217,11 +229,14 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
     if report_ok:
         er._update_report_csv(open_tr)
     print(f"[manage-ws] short_manual_close sym={symbol} engine={engine_label}")
+    order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
+    order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
         f"🔴 <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {engine_label}\n"
-        f"사유: MANUAL"
+        f"사유: MANUAL\n"
+        f"{order_line}".rstrip()
     )
 
 
@@ -242,6 +257,9 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts):
         pass
     res = executor_mod.close_long_market(symbol)
     executor_mod.cancel_stop_orders(symbol)
+    exit_order_id = None
+    if isinstance(res, dict):
+        exit_order_id = res.get("order_id") or er._extract_order_id(res.get("order"))
     avg_price = (
         res.get("order", {}).get("average")
         or res.get("order", {}).get("price")
@@ -258,6 +276,7 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts):
         exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
         pnl_usdt=pnl_long,
         reason="auto_exit_tp",
+        exit_order_id=exit_order_id,
     )
     st = state.get(symbol, {}) if isinstance(state, dict) else {}
     if isinstance(st, dict):
@@ -266,11 +285,17 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts):
         state[symbol] = st
     er._append_report_line(symbol, "LONG", profit_unlev, pnl_long, engine_label)
     print(f"[manage-ws] long_tp_exit sym={symbol} roi={profit_unlev:.2f}% pnl={pnl_long}")
+    order_block = er._format_order_id_block(
+        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+        exit_order_id,
+    )
+    order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
         f"🟢 <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {engine_label}\n"
         f"사유: TP\n"
+        f"{order_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
         f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
@@ -294,6 +319,9 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
         pass
     res = executor_mod.close_short_market(symbol)
     executor_mod.cancel_stop_orders(symbol)
+    exit_order_id = None
+    if isinstance(res, dict):
+        exit_order_id = res.get("order_id") or er._extract_order_id(res.get("order"))
     avg_price = (
         res.get("order", {}).get("average")
         or res.get("order", {}).get("price")
@@ -310,6 +338,7 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
         exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
         pnl_usdt=pnl_short,
         reason="auto_exit_tp",
+        exit_order_id=exit_order_id,
     )
     st = state.get(symbol, {}) if isinstance(state, dict) else {}
     if isinstance(st, dict):
@@ -318,11 +347,17 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts):
         state[symbol] = st
     er._append_report_line(symbol, "SHORT", profit_unlev, pnl_short, engine_label)
     print(f"[manage-ws] short_tp_exit sym={symbol} roi={profit_unlev:.2f}% pnl={pnl_short}")
+    order_block = er._format_order_id_block(
+        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+        exit_order_id,
+    )
+    order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
         f"✅ <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {engine_label}\n"
         f"사유: TP\n"
+        f"{order_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
         f"{'' if pnl_short is None else f' 손익={pnl_short:+.3f} USDT'}"

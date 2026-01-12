@@ -55,6 +55,8 @@ try:
     from engines.universe import build_universe_from_tickers
     from engines.dtfx.engine import DTFXEngine, DTFXConfig
     from engines.dtfx.core.logger import write_dtfx_log
+    from engines.pumpfade.engine import PumpFadeEngine
+    from engines.pumpfade.config import PumpFadeConfig
 except Exception:
     SwaggyEngine = None
     SwaggyConfig = None
@@ -70,6 +72,8 @@ except Exception:
     DTFXEngine = None
     DTFXConfig = None
     write_dtfx_log = None
+    PumpFadeEngine = None
+    PumpFadeConfig = None
 
 from executor import (
     get_short_position_amount,
@@ -81,6 +85,7 @@ from executor import (
     list_open_position_symbols,
     is_hedge_mode,
     short_market,
+    short_limit,
     long_market,
     close_short_market,
     close_long_market,
@@ -91,6 +96,7 @@ from executor import (
     set_dry_run,
     get_global_backoff_until,
     refresh_positions_cache,
+    get_available_usdt,
 )
 
 swaggy_engine = None
@@ -100,6 +106,7 @@ rsi_engine = None
 div15m_engine = None
 div15m_short_engine = None
 dtfx_engine = None
+pumpfade_engine = None
 
 load_env()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -217,6 +224,39 @@ def _get_entry_guard(state: Dict[str, dict]) -> Dict[str, float]:
         state["_entry_guard"] = guard
     return guard
 
+_ENTRY_PCT_WARN_TS = 0.0
+
+def _resolve_entry_usdt(pct: Optional[float] = None) -> float:
+    """entry_usdt는 사용가능 USDT 대비 퍼센트로 해석한다."""
+    global _ENTRY_PCT_WARN_TS
+    try:
+        pct_val = float(USDT_PER_TRADE if pct is None else pct)
+    except Exception:
+        return 0.0
+    if pct_val <= 0:
+        return 0.0
+    avail = None
+    try:
+        avail = get_available_usdt()
+    except Exception:
+        avail = None
+    if not isinstance(avail, (int, float)) or avail <= 0:
+        if executor_mod and getattr(executor_mod, "DRY_RUN", False):
+            try:
+                avail = float(os.getenv("SIM_USDT_BALANCE", "1000"))
+            except Exception:
+                avail = 1000.0
+        else:
+            return 0.0
+    effective_pct = pct_val
+    if effective_pct > 100.0:
+        now = time.time()
+        if (now - _ENTRY_PCT_WARN_TS) > 60.0:
+            print(f"[entry_usdt] pct too high ({effective_pct:.2f}%), clamped to 100%")
+            _ENTRY_PCT_WARN_TS = now
+        effective_pct = 100.0
+    return max(0.0, float(avail) * (effective_pct / 100.0))
+
 
 def _get_entry_lock(state: Dict[str, dict]) -> Dict[str, dict]:
     lock = state.get("_entry_lock")
@@ -239,6 +279,26 @@ def _fmt_pct_safe(val: Any) -> str:
         return f"{float(val):.2f}%"
     except Exception:
         return "N/A"
+
+def _extract_order_id(order: Optional[dict]) -> Optional[str]:
+    if not isinstance(order, dict):
+        return None
+    oid = order.get("id") or order.get("orderId")
+    if oid:
+        return str(oid)
+    info = order.get("info") or {}
+    oid = info.get("orderId") or info.get("id")
+    if oid:
+        return str(oid)
+    return None
+
+def _order_id_from_res(res: Optional[dict]) -> Optional[str]:
+    if not isinstance(res, dict):
+        return None
+    oid = res.get("order_id") or res.get("orderId") or res.get("id")
+    if oid:
+        return str(oid)
+    return _extract_order_id(res.get("order"))
 
 def _fmt_float(val: Any, ndigits: int = 4) -> str:
     try:
@@ -266,6 +326,14 @@ def _fmt_entry_price(val: Any) -> str:
     except Exception:
         return "N/A"
 
+def _format_order_id_block(entry_order_id: Optional[str], exit_order_id: Optional[str] = None) -> str:
+    lines = []
+    if entry_order_id:
+        lines.append(f"entry_id={entry_order_id}")
+    if exit_order_id:
+        lines.append(f"exit_id={exit_order_id}")
+    return "\n".join(lines)
+
 def _send_entry_alert(
     send_alert,
     side: str,
@@ -278,6 +346,7 @@ def _send_entry_alert(
     tp: Optional[str] = None,
     live: Optional[bool] = None,
     order_info: Optional[str] = None,
+    entry_order_id: Optional[str] = None,
     extras: Optional[list] = None,
 ) -> None:
     if not send_alert:
@@ -286,6 +355,8 @@ def _send_entry_alert(
     icon = "🟢" if side_key == "LONG" else "🟣" if side_key == "SHORT" else "⚪"
     side_label = "롱" if side_key == "LONG" else "숏" if side_key == "SHORT" else side_key
     lines = [f"{icon} <b>{side_label} 시그널</b>", f"<b>{symbol}</b>"]
+    if entry_order_id:
+        lines.append(f"entry_id={entry_order_id}")
     if entry_price is not None or usdt is not None:
         entry_disp = _fmt_entry_price(entry_price)
         if usdt is not None:
@@ -532,6 +603,7 @@ def _log_trade_entry(
     entry_price: Optional[float],
     qty: Optional[float],
     usdt: Optional[float],
+    entry_order_id: Optional[str] = None,
     meta: Optional[dict] = None,
 ) -> None:
     log = _get_trade_log(state)
@@ -543,12 +615,19 @@ def _log_trade_entry(
         "entry_price": entry_price,
         "qty": qty,
         "usdt": usdt,
+        "entry_order_id": entry_order_id,
         "status": "open",
         "meta": meta or {},
     }
     tr["engine_label"] = _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
     log.append(tr)
     _append_entry_event(tr)
+    if entry_order_id:
+        st = state.get(symbol) if isinstance(state, dict) else {}
+        if not isinstance(st, dict):
+            st = {}
+        st[f"entry_order_id_{side.lower()}"] = entry_order_id
+        state[symbol] = st
 
 def _get_open_trade(state: Dict[str, dict], side: str, symbol: str) -> Optional[dict]:
     log = _get_trade_log(state)
@@ -603,6 +682,7 @@ def _close_trade(
     exit_price: Optional[float],
     pnl_usdt: Optional[float],
     reason: str,
+    exit_order_id: Optional[str] = None,
 ) -> None:
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     st["last_entry"] = float(exit_ts)
@@ -616,6 +696,13 @@ def _close_trade(
             tr["pnl_usdt"] = pnl_usdt
             tr["status"] = "closed"
             tr["exit_reason"] = reason
+            if exit_order_id:
+                tr["exit_order_id"] = exit_order_id
+            elif reason == "auto_exit_sl":
+                meta = tr.get("meta") or {}
+                sl_id = meta.get("sl_order_id")
+                if sl_id:
+                    tr["exit_order_id"] = sl_id
             try:
                 entry_px = tr.get("entry_price")
                 if isinstance(entry_px, (int, float)) and isinstance(exit_price, (int, float)) and entry_px > 0:
@@ -642,6 +729,7 @@ def _close_trade(
             "exit_price": exit_price,
             "pnl_usdt": pnl_usdt,
             "exit_reason": reason,
+            "exit_order_id": exit_order_id,
             "meta": {},
         }
     )
@@ -657,83 +745,229 @@ def _prune_trade_log(state: Dict[str, dict], keep_days: int = 14) -> None:
     state["_trade_log"] = kept
 
 def _build_daily_report(state: Dict[str, dict], report_date: str) -> str:
-    log = _get_trade_log(state)
+    records = _read_report_csv_records(report_date)
     totals = {
-        "LONG": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0},
-        "SHORT": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0},
+        "LONG": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
+        "SHORT": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
     }
     engine_totals = {"LONG": {}, "SHORT": {}}
-    for tr in log:
-        if tr.get("status") != "closed":
-            continue
-        exit_ts = tr.get("exit_ts")
-        if not exit_ts:
-            continue
-        if _date_str_kst(exit_ts) != report_date:
-            continue
-        side = str(tr.get("side") or "").upper()
-        if side not in totals:
-            continue
-        entry_price = tr.get("entry_price")
-        exit_price = tr.get("exit_price")
-        qty = tr.get("qty")
-        pnl = tr.get("pnl_usdt")
-        pnl_pct = None
-        if isinstance(pnl, (int, float)) and isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
-            notional = entry_price * qty
-            if notional > 0:
-                pnl_pct = (float(pnl) / notional) * 100.0
-        elif isinstance(entry_price, (int, float)) and isinstance(exit_price, (int, float)) and entry_price > 0:
-            if side == "LONG":
-                pnl_pct = (exit_price - entry_price) / entry_price * 100.0
-            elif side == "SHORT":
-                pnl_pct = (entry_price - exit_price) / entry_price * 100.0
-        pnl_str = f"{pnl_pct:+.2f}%" if isinstance(pnl_pct, (int, float)) else "N/A"
-        pnl_usdt_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
-        raw_reason = (tr.get("meta") or {}).get("reason") or tr.get("exit_reason") or "unknown"
-        reason_map = {
-            "fabio_long": "fabio",
-            "fabio_short": "fabio",
-            "atlasfabio_long": "atlas-fabio",
-            "atlasfabio_short": "atlas-fabio",
-            "swaggy_long": "atlas-swaggy",
-            "swaggy_short": "atlas-swaggy",
-            "dtfx_long": "dtfx",
-            "dtfx_short": "dtfx",
-            "short_entry": "rsi",
-            "long_entry": "scalp",
-            "manual_close": "manual",
-            "auto_exit_tp": "tp",
-            "auto_exit_sl": "sl",
-            "unknown": "rsi",
-        }
-        reason = reason_map.get(raw_reason, raw_reason)
-        exit_raw = tr.get("exit_reason") or "unknown"
-        exit_map = {
-            "manual_close": "manual",
-            "auto_exit_tp": "tp",
-            "auto_exit_sl": "sl",
-        }
-        exit_tag = exit_map.get(exit_raw, exit_raw)
-        totals[side]["count"] += 1
-        if isinstance(pnl, (int, float)):
-            totals[side]["pnl"] += float(pnl)
-            totals[side]["pnl_valid"] += 1
-        if isinstance(pnl_pct, (int, float)) and pnl_pct > 0:
-            totals[side]["wins"] += 1
-        if isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
-            totals[side]["notional"] += entry_price * qty
-        eng = engine_totals[side].setdefault(
-            reason, {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0}
-        )
-        eng["count"] += 1
-        if isinstance(pnl, (int, float)):
-            eng["pnl"] += float(pnl)
-            eng["pnl_valid"] += 1
-        if isinstance(pnl_pct, (int, float)) and pnl_pct > 0:
-            eng["wins"] += 1
-        if isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
-            eng["notional"] += entry_price * qty
+    symbol_rows = {"LONG": {}, "SHORT": {}}
+    def _update_symbol_row(
+        side_key: str,
+        symbol: str,
+        engine: str,
+        pnl_val: Optional[float],
+        win_flag: Optional[bool],
+        exec_ts: Optional[float],
+    ) -> None:
+        if not symbol:
+            return
+        key = (symbol, engine or "unknown")
+        bucket = symbol_rows.get(side_key)
+        if bucket is None:
+            return
+        rec = bucket.get(key)
+        if rec is None:
+            bucket[key] = {"pnl": pnl_val, "win": win_flag, "ts": exec_ts}
+            return
+        cur_pnl = rec.get("pnl")
+        if isinstance(cur_pnl, (int, float)) or isinstance(pnl_val, (int, float)):
+            if not isinstance(cur_pnl, (int, float)):
+                cur_pnl = 0.0
+            if not isinstance(pnl_val, (int, float)):
+                pnl_val = 0.0
+            rec["pnl"] = float(cur_pnl) + float(pnl_val)
+        cur_ts = rec.get("ts")
+        if isinstance(exec_ts, (int, float)):
+            if not isinstance(cur_ts, (int, float)) or exec_ts < float(cur_ts):
+                rec["ts"] = float(exec_ts)
+        cur_win = rec.get("win")
+        if cur_win is True:
+            return
+        if cur_win is False and win_flag is None:
+            return
+        if win_flag is True:
+            rec["win"] = True
+        elif win_flag is False and cur_win is None:
+            rec["win"] = False
+
+    def _fmt_symbol_row(symbol: str, engine: str, pnl_val: Optional[float], win_flag: Optional[bool]) -> str:
+        pnl_str = f"{pnl_val:+.3f} USDT" if isinstance(pnl_val, (int, float)) else "N/A"
+        if win_flag is True:
+            wl = "W"
+        elif win_flag is False:
+            wl = "L"
+        else:
+            wl = "N/A"
+        return f"{symbol} | {engine} | {pnl_str} | {wl}"
+    if records is not None:
+        for rec in records:
+            if not rec.get("exit_ts"):
+                continue
+            if rec.get("pnl") == "":
+                continue
+            side = str(rec.get("side") or "").upper()
+            if side not in totals:
+                continue
+            try:
+                entry_price = float(rec.get("entry_price")) if rec.get("entry_price") != "" else None
+            except Exception:
+                entry_price = None
+            try:
+                exit_price = float(rec.get("exit_price")) if rec.get("exit_price") != "" else None
+            except Exception:
+                exit_price = None
+            try:
+                qty = float(rec.get("qty")) if rec.get("qty") != "" else None
+            except Exception:
+                qty = None
+            try:
+                pnl = float(rec.get("pnl")) if rec.get("pnl") != "" else None
+            except Exception:
+                pnl = None
+            pnl_pct = None
+            win_flag = None
+            if isinstance(pnl, (int, float)) and isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
+                notional = entry_price * qty
+                if notional > 0:
+                    pnl_pct = (float(pnl) / notional) * 100.0
+            elif isinstance(entry_price, (int, float)) and isinstance(exit_price, (int, float)) and entry_price > 0:
+                if side == "LONG":
+                    pnl_pct = (exit_price - entry_price) / entry_price * 100.0
+                elif side == "SHORT":
+                    pnl_pct = (entry_price - exit_price) / entry_price * 100.0
+            engine = rec.get("engine") or "unknown"
+            totals[side]["count"] += 1
+            if isinstance(pnl, (int, float)):
+                totals[side]["pnl"] += float(pnl)
+                totals[side]["pnl_valid"] += 1
+                win_flag = pnl > 0
+                if pnl < 0:
+                    win_flag = False
+            if isinstance(pnl_pct, (int, float)):
+                win_flag = pnl_pct > 0
+                totals[side]["pnl_valid"] += 1 if win_flag is None else 0
+            if win_flag is True:
+                totals[side]["wins"] += 1
+            elif win_flag is False:
+                totals[side]["losses"] += 1
+            if isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
+                totals[side]["notional"] += entry_price * qty
+            eng = engine_totals[side].setdefault(
+                engine, {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0}
+            )
+            eng["count"] += 1
+            win_flag = None
+            if isinstance(pnl, (int, float)):
+                eng["pnl"] += float(pnl)
+                eng["pnl_valid"] += 1
+                win_flag = pnl > 0
+                if pnl < 0:
+                    win_flag = False
+            if isinstance(pnl_pct, (int, float)):
+                win_flag = pnl_pct > 0
+                eng["pnl_valid"] += 1 if win_flag is None else 0
+            if win_flag is True:
+                eng["wins"] += 1
+            elif win_flag is False:
+                eng["losses"] += 1
+            if isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
+                eng["notional"] += entry_price * qty
+            symbol = rec.get("symbol") or ""
+            exec_ts = None
+            exit_ts_str = rec.get("exit_ts")
+            if exit_ts_str:
+                try:
+                    exec_ts = datetime.strptime(exit_ts_str, "%Y-%m-%d %H:%M:%S").timestamp()
+                except Exception:
+                    exec_ts = None
+            _update_symbol_row(side, symbol, engine, pnl, win_flag, exec_ts)
+    else:
+        log = _get_trade_log(state)
+        for tr in log:
+            if tr.get("status") != "closed":
+                continue
+            exit_ts = tr.get("exit_ts")
+            if not exit_ts:
+                continue
+            if _date_str_kst(exit_ts) != report_date:
+                continue
+            side = str(tr.get("side") or "").upper()
+            if side not in totals:
+                continue
+            entry_price = tr.get("entry_price")
+            exit_price = tr.get("exit_price")
+            qty = tr.get("qty")
+            pnl = tr.get("pnl_usdt")
+            pnl_pct = None
+            win_flag = None
+            if isinstance(pnl, (int, float)) and isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
+                notional = entry_price * qty
+                if notional > 0:
+                    pnl_pct = (float(pnl) / notional) * 100.0
+            elif isinstance(entry_price, (int, float)) and isinstance(exit_price, (int, float)) and entry_price > 0:
+                if side == "LONG":
+                    pnl_pct = (exit_price - entry_price) / entry_price * 100.0
+                elif side == "SHORT":
+                    pnl_pct = (entry_price - exit_price) / entry_price * 100.0
+            raw_reason = (tr.get("meta") or {}).get("reason") or tr.get("exit_reason") or "unknown"
+            reason_map = {
+                "fabio_long": "fabio",
+                "fabio_short": "fabio",
+                "atlasfabio_long": "atlas-fabio",
+                "atlasfabio_short": "atlas-fabio",
+                "swaggy_long": "atlas-swaggy",
+                "swaggy_short": "atlas-swaggy",
+                "dtfx_long": "dtfx",
+                "dtfx_short": "dtfx",
+                "short_entry": "rsi",
+                "long_entry": "scalp",
+                "manual_close": "manual",
+                "auto_exit_tp": "tp",
+                "auto_exit_sl": "sl",
+                "unknown": "rsi",
+            }
+            reason = reason_map.get(raw_reason, raw_reason)
+            totals[side]["count"] += 1
+            if isinstance(pnl, (int, float)):
+                totals[side]["pnl"] += float(pnl)
+                totals[side]["pnl_valid"] += 1
+                win_flag = pnl > 0
+                if pnl < 0:
+                    win_flag = False
+            if isinstance(pnl_pct, (int, float)):
+                win_flag = pnl_pct > 0
+                totals[side]["pnl_valid"] += 1 if win_flag is None else 0
+            if win_flag is True:
+                totals[side]["wins"] += 1
+            elif win_flag is False:
+                totals[side]["losses"] += 1
+            if isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
+                totals[side]["notional"] += entry_price * qty
+            eng = engine_totals[side].setdefault(
+                reason, {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0}
+            )
+            eng["count"] += 1
+            win_flag = None
+            if isinstance(pnl, (int, float)):
+                eng["pnl"] += float(pnl)
+                eng["pnl_valid"] += 1
+                win_flag = pnl > 0
+                if pnl < 0:
+                    win_flag = False
+            if isinstance(pnl_pct, (int, float)):
+                win_flag = pnl_pct > 0
+                eng["pnl_valid"] += 1 if win_flag is None else 0
+            if win_flag is True:
+                eng["wins"] += 1
+            elif win_flag is False:
+                eng["losses"] += 1
+            if isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
+                eng["notional"] += entry_price * qty
+            symbol = tr.get("symbol") or ""
+            exec_ts = tr.get("exit_ts") if isinstance(tr.get("exit_ts"), (int, float)) else None
+            _update_symbol_row(side, symbol, reason, pnl, win_flag, exec_ts)
+
     def _format_total(t: dict) -> str:
         if t["pnl_valid"] > 0 and t["notional"] > 0:
             total_pct = (t["pnl"] / t["notional"]) * 100.0
@@ -741,8 +975,9 @@ def _build_daily_report(state: Dict[str, dict], report_date: str) -> str:
         else:
             pnl_part = "N/A"
         pnl_usdt_part = f"{t['pnl']:+.3f} USDT" if t["pnl_valid"] > 0 else "N/A"
-        win_rate = (t["wins"] / t["count"] * 100.0) if t["count"] > 0 else 0.0
-        losses = t["count"] - t["wins"]
+        total_outcomes = t["wins"] + t["losses"]
+        win_rate = (t["wins"] / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
+        losses = t["losses"]
         return (
             f"total_entries={t['count']} total_pnl={pnl_part} ({pnl_usdt_part}) "
             f"win_rate={win_rate:.1f}% wins={t['wins']} losses={losses}"
@@ -753,12 +988,32 @@ def _build_daily_report(state: Dict[str, dict], report_date: str) -> str:
 
     def engine_lines(side: str) -> list:
         return [f"- {eng} {_format_total(t)}" for eng, t in sorted(engine_totals[side].items())]
+    def symbol_lines(side: str) -> list:
+        bucket = symbol_rows.get(side) or {}
+        if not bucket:
+            return [f"- (symbols) none"]
+        lines = []
+        ordered = sorted(
+            bucket.items(),
+            key=lambda item: (
+                item[1].get("ts") if isinstance(item[1].get("ts"), (int, float)) else float("inf"),
+                item[0][0],
+                item[0][1],
+            ),
+        )
+        for (symbol, engine), rec in ordered:
+            lines.append(f"- {_fmt_symbol_row(symbol, engine, rec.get('pnl'), rec.get('win'))}")
+        return lines
     lines = [f"📊 일일 리포트 (KST, {report_date})", "🔴 SHORT"]
     lines.append(total_line("SHORT"))
     lines.extend(engine_lines("SHORT"))
+    lines.append("🔎 SHORT SYMBOLS")
+    lines.extend(symbol_lines("SHORT"))
     lines.append("🟢 LONG")
     lines.append(total_line("LONG"))
     lines.extend(engine_lines("LONG"))
+    lines.append("🔎 LONG SYMBOLS")
+    lines.extend(symbol_lines("LONG"))
     return "\n".join(lines)
 
 def _run_fabio_cycle(
@@ -1086,10 +1341,11 @@ def _run_fabio_cycle(
                                     try:
                                         res = long_market(
                                             symbol,
-                                            usdt_amount=USDT_PER_TRADE,
+                                            usdt_amount=_resolve_entry_usdt(),
                                             leverage=LEVERAGE,
                                             margin_mode=MARGIN_MODE,
                                         )
+                                        entry_order_id = _order_id_from_res(res)
                                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                                         qty = res.get("amount") or res.get("order", {}).get("amount")
                                         sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
@@ -1109,7 +1365,8 @@ def _run_fabio_cycle(
                                             entry_ts=time.time(),
                                             entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                                             qty=qty if isinstance(qty, (int, float)) else None,
-                                            usdt=USDT_PER_TRADE,
+                                            usdt=_resolve_entry_usdt(),
+                                            entry_order_id=entry_order_id,
                                             meta={
                                                 "reason": "fabio_long",
                                                 "sl_order_id": sl_id,
@@ -1130,7 +1387,7 @@ def _run_fabio_cycle(
                             symbol=symbol,
                             engine="FABIO",
                             entry_price=None,
-                            usdt=USDT_PER_TRADE,
+                            usdt=_resolve_entry_usdt(),
                             reason="조건 충족",
                             live=LONG_LIVE_TRADING,
                             order_info="(알림 전용)",
@@ -1193,6 +1450,7 @@ def _run_fabio_cycle(
                     continue
                 order_info = "(알림 전용)"
                 entry_price_disp = None
+                entry_order_id = None
                 early_bucket = state.get("_fabio_early", {})
                 had_early = symbol in early_bucket
                 if had_early:
@@ -1219,7 +1477,8 @@ def _run_fabio_cycle(
                             time.sleep(PER_SYMBOL_SLEEP)
                             continue
                         try:
-                            res = short_market(symbol, usdt_amount=USDT_PER_TRADE, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                            res = short_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                            entry_order_id = _order_id_from_res(res)
                             fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                             qty = res.get("amount") or res.get("order", {}).get("amount")
                             sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
@@ -1229,7 +1488,7 @@ def _run_fabio_cycle(
                             if isinstance(sl_order, dict):
                                 sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                             order_info = (
-                                f"entry_price={fill_price} qty={qty} usdt={USDT_PER_TRADE} "
+                                f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()} "
                                 f"sl={'ok' if sl_ok else f'skip({sl_reason})'}"
                             )
                             entry_price_disp = fill_price
@@ -1245,7 +1504,8 @@ def _run_fabio_cycle(
                                 entry_ts=time.time(),
                                 entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                                 qty=qty if isinstance(qty, (int, float)) else None,
-                                usdt=USDT_PER_TRADE,
+                                usdt=_resolve_entry_usdt(),
+                                entry_order_id=entry_order_id,
                                 meta={"reason": "fabio_short", "sl_order_id": sl_id},
                             )
                             active_positions_total += 1
@@ -1267,7 +1527,7 @@ def _run_fabio_cycle(
                     symbol=symbol,
                     engine="FABIO",
                     entry_price=entry_price_disp,
-                    usdt=USDT_PER_TRADE,
+                    usdt=_resolve_entry_usdt(),
                     reason=reason,
                     live=LIVE_TRADING,
                     order_info=order_info,
@@ -1580,16 +1840,18 @@ def _run_swaggy_cycle(
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
                     try:
-                        entry_usdt = USDT_PER_TRADE * float(atlas_local.get("long_size_mult", 1.0) or 1.0)
+                        size_mult = float(atlas_local.get("long_size_mult", 1.0) or 1.0)
                         regime = (decision.debug or {}).get("regime")
                         if regime == "range":
-                            entry_usdt *= 0.5
+                            size_mult *= 0.5
+                        entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
                         res = long_market(
                             symbol,
                             usdt_amount=entry_usdt,
                             leverage=LEVERAGE,
                             margin_mode=MARGIN_MODE,
                         )
+                        entry_order_id = _order_id_from_res(res)
                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                         qty = res.get("amount") or res.get("order", {}).get("amount")
                         entry_price_disp = fill_price
@@ -1614,6 +1876,7 @@ def _run_swaggy_cycle(
                             entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                             qty=qty if isinstance(qty, (int, float)) else None,
                             usdt=entry_usdt,
+                            entry_order_id=entry_order_id,
                             meta={
                                 "reason": "swaggy_long",
                                 "sl_order_id": sl_id,
@@ -1624,9 +1887,10 @@ def _run_swaggy_cycle(
                         _entry_guard_release(state, symbol, key=guard_key)
                 finally:
                     _entry_lock_release(state, symbol, owner="swaggy")
-                entry_usdt = USDT_PER_TRADE * float(atlas_local.get("long_size_mult", 1.0) or 1.0)
+                size_mult = float(atlas_local.get("long_size_mult", 1.0) or 1.0)
                 if (decision.debug or {}).get("regime") == "range":
-                    entry_usdt *= 0.5
+                    size_mult *= 0.5
+                entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
                 tp_disp = None
                 if isinstance(decision.tp1_px, (int, float)):
                     tp_disp = f"{float(decision.tp1_px):.6g}"
@@ -1643,13 +1907,15 @@ def _run_swaggy_cycle(
                     reason=reason_full,
                     live=LONG_LIVE_TRADING,
                     order_info=order_info,
+                    entry_order_id=entry_order_id,
                     sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
                     tp=tp_disp,
                 )
             else:
-                entry_usdt = USDT_PER_TRADE * float(atlas_local.get("long_size_mult", 1.0) or 1.0)
+                size_mult = float(atlas_local.get("long_size_mult", 1.0) or 1.0)
                 if (decision.debug or {}).get("regime") == "range":
-                    entry_usdt *= 0.5
+                    size_mult *= 0.5
+                entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
                 entry_price_disp = decision.entry_px
                 order_info = "(알림 전용)"
                 tp_disp = None
@@ -1704,8 +1970,10 @@ def _run_swaggy_cycle(
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
                     try:
-                        entry_usdt = USDT_PER_TRADE * float(atlas_local.get("short_size_mult", 1.0) or 1.0)
+                        size_mult = float(atlas_local.get("short_size_mult", 1.0) or 1.0)
+                        entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
                         res = short_market(symbol, usdt_amount=entry_usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                        entry_order_id = _order_id_from_res(res)
                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                         qty = res.get("amount") or res.get("order", {}).get("amount")
                         try:
@@ -1735,7 +2003,8 @@ def _run_swaggy_cycle(
                             entry_ts=time.time(),
                             entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                             qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=USDT_PER_TRADE,
+                            usdt=_resolve_entry_usdt(),
+                            entry_order_id=entry_order_id,
                             meta={"reason": "swaggy_short", "sl_order_id": sl_id},
                         )
                         active_positions_total += 1
@@ -1744,7 +2013,8 @@ def _run_swaggy_cycle(
                 finally:
                     _entry_lock_release(state, symbol, owner="swaggy")
             entry_disp = f"{entry_price_disp:.6g}" if entry_price_disp is not None else "N/A"
-            entry_usdt = USDT_PER_TRADE * float(atlas_local.get("short_size_mult", 1.0) or 1.0)
+            size_mult = float(atlas_local.get("short_size_mult", 1.0) or 1.0)
+            entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
             atlas_info = (
                 f"atlas={atlas_local.get('state')} conf={atlas_gate.get('confidence')} "
                 f"reason={atlas_gate.get('reason')} rs={_fmt_float(atlas_local.get('rs'))} "
@@ -1763,6 +2033,7 @@ def _run_swaggy_cycle(
                 reason=reason_full,
                 live=LIVE_TRADING,
                 order_info=order_info,
+                entry_order_id=entry_order_id if LIVE_TRADING else None,
                 sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
                 tp=None,
             )
@@ -2313,7 +2584,7 @@ def _run_atlas_fabio_cycle(
             continue
 
         strength_mult = _strength_mult(strength)
-        final_usdt = USDT_PER_TRADE * size_mult * strength_mult
+        final_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult * strength_mult)
         ltf_mode = "5m_or_3m"
         hit5m, hit3m, ltf_ok = _atlasfabio_ltf_hit(symbol, side, mode=ltf_mode)
         if not ltf_ok and best_res.get("trend_cont_trigger"):
@@ -2445,6 +2716,7 @@ def _run_atlas_fabio_cycle(
                             leverage=LEVERAGE,
                             margin_mode=MARGIN_MODE,
                         )
+                        entry_order_id = _order_id_from_res(res)
                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                         qty = res.get("amount") or res.get("order", {}).get("amount")
                         sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
@@ -2465,6 +2737,7 @@ def _run_atlas_fabio_cycle(
                             entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                             qty=qty if isinstance(qty, (int, float)) else None,
                             usdt=final_usdt,
+                            entry_order_id=entry_order_id,
                             meta={
                                 "reason": "atlasfabio_long",
                                 "sl_order_id": sl_id,
@@ -2481,6 +2754,7 @@ def _run_atlas_fabio_cycle(
                                 usdt=final_usdt,
                                 reason="ATLAS + FABIO",
                                 live=LONG_LIVE_TRADING,
+                                entry_order_id=entry_order_id,
                                 sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
                                 tp=None,
                             )
@@ -2509,6 +2783,7 @@ def _run_atlas_fabio_cycle(
         else:
             order_info = "(알림 전용)"
             entry_price_disp = None
+            entry_order_id = None
             if LIVE_TRADING:
                 guard_key = _entry_guard_key(state, symbol, "SHORT")
                 if not _entry_guard_acquire(state, symbol, key=guard_key):
@@ -2524,6 +2799,7 @@ def _run_atlas_fabio_cycle(
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
                     res = short_market(symbol, usdt_amount=final_usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                    entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
                     sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
@@ -2549,6 +2825,7 @@ def _run_atlas_fabio_cycle(
                         entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                         qty=qty if isinstance(qty, (int, float)) else None,
                         usdt=final_usdt,
+                        entry_order_id=entry_order_id,
                         meta={"reason": "atlasfabio_short", "sl_order_id": sl_id},
                     )
                     active_positions_total += 1
@@ -2563,6 +2840,7 @@ def _run_atlas_fabio_cycle(
                             reason=reasons,
                             live=LIVE_TRADING,
                             order_info=order_info,
+                            entry_order_id=entry_order_id,
                             sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
                             tp=None,
                         )
@@ -2709,7 +2987,8 @@ def _run_dtfx_cycle(
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
                 if side == "LONG":
-                    res = long_market(symbol, usdt_amount=USDT_PER_TRADE, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                    res = long_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                    entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
                     sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
@@ -2723,7 +3002,8 @@ def _run_dtfx_cycle(
                         entry_ts=time.time(),
                         entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                         qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=USDT_PER_TRADE,
+                        usdt=_resolve_entry_usdt(),
+                        entry_order_id=entry_order_id,
                         meta={"reason": "dtfx_long", "event": sig.pattern},
                     )
                     active_positions_total += 1
@@ -2746,7 +3026,7 @@ def _run_dtfx_cycle(
                                 "side": "LONG",
                                 "entry_price": fill_price,
                                 "qty": qty,
-                                "usdt": USDT_PER_TRADE,
+                                "usdt": _resolve_entry_usdt(),
                                 "sl_order": sl_order,
                                 "dtfx": (sig.meta or {}).get("dtfx", {}),
                             },
@@ -2759,13 +3039,15 @@ def _run_dtfx_cycle(
                             symbol=symbol,
                             engine="DTFX",
                             entry_price=fill_price,
-                            usdt=USDT_PER_TRADE,
+                            usdt=_resolve_entry_usdt(),
                             reason=f"event={sig.pattern}",
                             live=LONG_LIVE_TRADING,
+                            entry_order_id=entry_order_id,
                             sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
                         )
                 else:
-                    res = short_market(symbol, usdt_amount=USDT_PER_TRADE, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                    res = short_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                    entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
                     sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
@@ -2783,7 +3065,8 @@ def _run_dtfx_cycle(
                         entry_ts=time.time(),
                         entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                         qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=USDT_PER_TRADE,
+                        usdt=_resolve_entry_usdt(),
+                        entry_order_id=entry_order_id,
                         meta={"reason": "dtfx_short", "event": sig.pattern, "sl_order_id": sl_id},
                     )
                     active_positions_total += 1
@@ -2806,7 +3089,7 @@ def _run_dtfx_cycle(
                                 "side": "SHORT",
                                 "entry_price": fill_price,
                                 "qty": qty,
-                                "usdt": USDT_PER_TRADE,
+                                "usdt": _resolve_entry_usdt(),
                                 "sl_order": sl_order,
                                 "dtfx": (sig.meta or {}).get("dtfx", {}),
                             },
@@ -2819,9 +3102,10 @@ def _run_dtfx_cycle(
                             symbol=symbol,
                             engine="DTFX",
                             entry_price=fill_price,
-                            usdt=USDT_PER_TRADE,
+                            usdt=_resolve_entry_usdt(),
                             reason=f"event={sig.pattern}",
                             live=LIVE_TRADING,
+                            entry_order_id=entry_order_id,
                             sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
                         )
             except Exception as e:
@@ -2832,6 +3116,254 @@ def _run_dtfx_cycle(
         time.sleep(PER_SYMBOL_SLEEP)
     _set_thread_log_buffer(None)
     result["log"] = buf
+    return result
+
+def _pumpfade_tf_seconds(tf: str) -> int:
+    try:
+        unit = tf[-1]
+        val = int(tf[:-1])
+    except Exception:
+        return 0
+    if unit == "m":
+        return val * 60
+    if unit == "h":
+        return val * 3600
+    if unit == "d":
+        return val * 86400
+    return 0
+
+def _run_pumpfade_cycle(
+    pumpfade_engine,
+    pumpfade_universe,
+    state: Dict[str, dict],
+    send_alert,
+    pumpfade_cfg,
+):
+    result = {"hits": 0}
+    if not pumpfade_engine or not pumpfade_cfg:
+        return result
+    if not pumpfade_universe:
+        print("[pumpfade] 스캔 대상 없음")
+        return result
+    now_ts = time.time()
+    tf_sec = _pumpfade_tf_seconds(pumpfade_cfg.tf_trigger) or 900
+    bucket = state.setdefault("_pumpfade", {})
+
+    def _pumpfade_log(msg: str) -> None:
+        date_tag = time.strftime("%Y%m%d")
+        _append_entry_log(f"pumpfade/pumpfade_live_{date_tag}.log", msg)
+
+    ctx = EngineContext(exchange=exchange, state=state, now_ts=now_ts, logger=_pumpfade_log, config=pumpfade_cfg)
+
+    for symbol in pumpfade_universe:
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        pf = bucket.get(symbol, {})
+        pending_id = pf.get("pending_order_id")
+        pending_deadline = float(pf.get("pending_deadline_ts") or 0.0)
+        pending_prior_hh = pf.get("pending_prior_hh")
+        in_pos = bool(st.get("in_pos"))
+
+        try:
+            existing_amt = get_short_position_amount(symbol)
+        except Exception:
+            existing_amt = 0.0
+
+        if pending_id:
+            if existing_amt > 0:
+                st["in_pos"] = True
+                st["last_entry"] = time.time()
+                state[symbol] = st
+                detail = get_short_position_detail(symbol)
+                _log_trade_entry(
+                    state,
+                    side="SHORT",
+                    symbol=symbol,
+                    entry_ts=time.time(),
+                    entry_price=detail.get("entry") if isinstance(detail.get("entry"), (int, float)) else None,
+                    qty=detail.get("qty") if isinstance(detail.get("qty"), (int, float)) else None,
+                    usdt=_resolve_entry_usdt(),
+                    meta={"reason": "pumpfade_short", "pending_order_id": pending_id},
+                )
+                pf["pending_order_id"] = None
+                pf["pending_deadline_ts"] = None
+                bucket[symbol] = pf
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if pending_deadline and now_ts >= pending_deadline:
+                cancel_open_orders(symbol)
+                pf["pending_order_id"] = None
+                pf["pending_deadline_ts"] = None
+                pf["last_attempt_ts"] = time.time()
+                bucket[symbol] = pf
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if isinstance(pending_prior_hh, (int, float)):
+                df15 = cycle_cache.get_df(symbol, pumpfade_cfg.tf_trigger, limit=3)
+                if not df15.empty and len(df15) >= 2:
+                    try:
+                        last_high = float(df15["high"].iloc[-1])
+                        if last_high >= float(pending_prior_hh) * (1 + pumpfade_cfg.failure_eps):
+                            cancel_open_orders(symbol)
+                            pf["pending_order_id"] = None
+                            pf["pending_deadline_ts"] = None
+                            pf["last_attempt_ts"] = time.time()
+                            bucket[symbol] = pf
+                            time.sleep(PER_SYMBOL_SLEEP)
+                            continue
+                    except Exception:
+                        pass
+
+        if in_pos and existing_amt <= 0:
+            st["in_pos"] = False
+            state[symbol] = st
+            pf["cooldown_until_ts"] = now_ts + tf_sec * int(pumpfade_cfg.cooldown_bars)
+            bucket[symbol] = pf
+
+        if existing_amt > 0:
+            st["in_pos"] = True
+            state[symbol] = st
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        cooldown_until = float(pf.get("cooldown_until_ts") or 0.0)
+        if cooldown_until and now_ts < cooldown_until:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        if pending_id:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        sig = pumpfade_engine.on_tick(ctx, symbol)
+        if not sig:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        meta = sig.meta or {}
+        hh_n = meta.get("hh_n")
+        atr15 = meta.get("atr15")
+        last_hh = pf.get("last_retest_hh")
+        last_prior_hh = pf.get("last_prior_hh")
+        if isinstance(hh_n, (int, float)) and isinstance(last_hh, (int, float)) and isinstance(atr15, (int, float)):
+            if abs(float(hh_n) - float(last_hh)) <= float(atr15) * 0.2:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+        cur_total = count_open_positions(force=True)
+        if not isinstance(cur_total, int):
+            cur_total = 0
+        if cur_total >= MAX_OPEN_POSITIONS:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        entry_price = float(sig.entry_price or 0.0)
+        if entry_price <= 0:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        order_info = "(알림 전용)"
+        entry_usdt = _resolve_entry_usdt()
+        try:
+            date_tag = time.strftime("%Y%m%d")
+            _append_entry_log(
+                f"pumpfade/pumpfade_entries_{date_tag}.log",
+                "engine=pumpfade side=SHORT symbol=%s state=ENTRY_READY hh=%s prior_hh=%s retest=Y "
+                "failure_high=%s failure_low=%s confirm_close=%s confirm=%s vol_ok=%s vol_rel=%.2f "
+                "rsi=%s rsi_turn=%s macd_inc=%s entry=%.6g reasons=%s"
+                % (
+                    symbol,
+                    f"{meta.get('hh_n'):.6g}" if isinstance(meta.get("hh_n"), (int, float)) else "N/A",
+                    f"{meta.get('prior_hh'):.6g}" if isinstance(meta.get("prior_hh"), (int, float)) else "N/A",
+                    f"{meta.get('failure_high'):.6g}" if isinstance(meta.get("failure_high"), (int, float)) else "N/A",
+                    f"{meta.get('failure_low'):.6g}" if isinstance(meta.get("failure_low"), (int, float)) else "N/A",
+                    f"{meta.get('confirm_close'):.6g}" if isinstance(meta.get("confirm_close"), (int, float)) else "N/A",
+                    f"{meta.get('confirm_type') or 'N/A'}",
+                    "Y" if meta.get("vol_ok") else "N",
+                    (
+                        float(meta.get("vol_failure") or 0.0) / float(meta.get("vol_peak") or 1.0)
+                        if isinstance(meta.get("vol_failure"), (int, float)) and isinstance(meta.get("vol_peak"), (int, float)) and meta.get("vol_peak")
+                        else 0.0
+                    ),
+                    f"{meta.get('rsi'):.2f}" if isinstance(meta.get("rsi"), (int, float)) else "N/A",
+                    "Y" if meta.get("rsi_turn") else "N",
+                    "Y" if meta.get("macd_hist_increasing") else "N",
+                    entry_price,
+                    ",".join(meta.get("reasons") or []),
+                ),
+            )
+        except Exception:
+            pass
+        if LIVE_TRADING:
+            lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="pumpfade")
+            if not lock_ok:
+                print(f"[ENTRY-LOCK] sym={symbol} owner=pumpfade ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            try:
+                guard_key = _entry_guard_key(state, symbol, "SHORT")
+                if not _entry_guard_acquire(state, symbol, key=guard_key):
+                    print(f"[pumpfade] 숏 중복 차단 ({symbol})")
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "pumpfade")
+                if not seen_ok:
+                    print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=pumpfade blocked_by={seen_by}")
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                try:
+                    res = short_limit(
+                        symbol,
+                        price=entry_price,
+                        usdt_amount=entry_usdt,
+                        leverage=LEVERAGE,
+                        margin_mode=MARGIN_MODE,
+                    )
+                    order_id = _order_id_from_res(res)
+                    status = res.get("status")
+                    order_info = f"limit_price={entry_price} usdt={entry_usdt} status={status}"
+                    if status in ("ok",) and order_id:
+                        pf["pending_order_id"] = order_id
+                        pf["pending_deadline_ts"] = now_ts + tf_sec * int(pumpfade_cfg.entry_timeout_bars)
+                        pf["last_retest_hh"] = hh_n if isinstance(hh_n, (int, float)) else last_hh
+                        prior_hh = meta.get("prior_hh")
+                        if isinstance(prior_hh, (int, float)):
+                            pf["pending_prior_hh"] = prior_hh
+                            pf["last_prior_hh"] = prior_hh
+                        bucket[symbol] = pf
+                    elif status == "dry_run":
+                        st["in_pos"] = True
+                        st["last_entry"] = time.time()
+                        state[symbol] = st
+                        _log_trade_entry(
+                            state,
+                            side="SHORT",
+                            symbol=symbol,
+                            entry_ts=time.time(),
+                            entry_price=entry_price,
+                            qty=None,
+                            usdt=entry_usdt,
+                            meta={"reason": "pumpfade_short", "dry_run": True},
+                        )
+                finally:
+                    _entry_guard_release(state, symbol, key=guard_key)
+            finally:
+                _entry_lock_release(state, symbol, owner="pumpfade")
+        reason = ",".join(meta.get("reasons") or [])
+        _send_entry_alert(
+            send_alert,
+            side="SHORT",
+            symbol=symbol,
+            engine="PUMPFADE",
+            entry_price=entry_price,
+            usdt=entry_usdt,
+            reason=reason or "ENTRY_READY",
+            live=LIVE_TRADING,
+            order_info=order_info,
+            sl=_fmt_price_safe(meta.get("failure_high"), AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+            tp=None,
+        )
+        result["hits"] += 1
+        time.sleep(PER_SYMBOL_SLEEP)
     return result
 
 
@@ -2853,6 +3385,442 @@ def _calc_realized_pnl_from_trades(ex, symbol: str, since_ms: int) -> Optional[f
         except Exception:
             continue
     return pnl if found else None
+
+def _trade_order_id(trade: dict) -> Optional[str]:
+    if not isinstance(trade, dict):
+        return None
+    oid = trade.get("order") or trade.get("orderId")
+    if oid:
+        return str(oid)
+    info = trade.get("info") or {}
+    oid = info.get("orderId") or info.get("orderID") or info.get("order_id")
+    if oid:
+        return str(oid)
+    return None
+
+def _trade_price_amount(trade: dict) -> tuple[Optional[float], Optional[float]]:
+    info = trade.get("info") or {}
+    price = trade.get("price") or info.get("price")
+    amount = trade.get("amount") or info.get("qty") or info.get("executedQty")
+    try:
+        price = float(price)
+    except Exception:
+        price = None
+    try:
+        amount = float(amount)
+    except Exception:
+        amount = None
+    return price, amount
+
+def _trade_realized_pnl(trade: dict) -> Optional[float]:
+    info = trade.get("info") or {}
+    rp = info.get("realizedPnl")
+    if rp is None:
+        rp = info.get("realizedProfit")
+    try:
+        return float(rp)
+    except Exception:
+        return None
+
+def _fetch_my_trades_range(ex, symbol: str, start_ms: int, end_ms: int, limit: int = 500) -> list:
+    since = start_ms
+    out = []
+    last_ts = None
+    while True:
+        try:
+            batch = ex.fetch_my_trades(symbol, since=since, limit=limit)
+        except Exception as e:
+            print(f"[report-api] fetch_my_trades failed sym={symbol} err={e}")
+            break
+        if not batch:
+            break
+        progressed = False
+        for t in batch:
+            ts = t.get("timestamp")
+            if not isinstance(ts, (int, float)):
+                continue
+            ts = int(ts)
+            if ts < start_ms:
+                continue
+            if ts >= end_ms:
+                continue
+            out.append(t)
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+                progressed = True
+        if not progressed:
+            break
+        since = (last_ts or since) + 1
+        if last_ts is not None and last_ts >= end_ms:
+            break
+    return out
+
+def _read_report_csv_records(report_date: str) -> Optional[list]:
+    report_path = os.path.join("reports", f"{report_date}.csv")
+    if not os.path.exists(report_path):
+        return None
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            rows = [line.rstrip("\n") for line in f.readlines()]
+        if not rows:
+            return None
+        header = rows[0].split(",")
+        records = []
+        for row in rows[1:]:
+            if not row:
+                continue
+            parts = row.split(",")
+            if len(parts) < len(header):
+                parts += [""] * (len(header) - len(parts))
+            records.append({header[i]: parts[i] for i in range(len(header))})
+        return records
+    except Exception:
+        return None
+
+def _load_entry_events_map(report_date: str) -> tuple[dict, dict]:
+    path = os.path.join("logs", "entry_events.log")
+    by_id = {}
+    by_symbol_side = {}
+    if not os.path.exists(path):
+        return by_id, by_symbol_side
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                entry_ts = payload.get("entry_ts")
+                if not isinstance(entry_ts, (int, float)):
+                    continue
+                if _date_str_kst(float(entry_ts)) != report_date:
+                    continue
+                entry_id = payload.get("entry_order_id")
+                symbol = payload.get("symbol") or ""
+                side = payload.get("side") or ""
+                engine = payload.get("engine") or "unknown"
+                record = {
+                    "entry_ts": float(entry_ts),
+                    "entry_order_id": entry_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "engine": engine,
+                }
+                if entry_id:
+                    by_id[str(entry_id)] = record
+                key = (symbol, side)
+                by_symbol_side.setdefault(key, []).append(record)
+    except Exception:
+        return by_id, by_symbol_side
+    return by_id, by_symbol_side
+
+def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
+    if executor_mod is None or not hasattr(executor_mod, "exchange"):
+        return False
+    ex = executor_mod.exchange
+    try:
+        executor_mod.ensure_ready()
+    except Exception as e:
+        print(f"[report-api] ensure_ready failed: {e}")
+        return False
+    try:
+        kst = timezone(timedelta(hours=9))
+        day = datetime.strptime(report_date, "%Y-%m-%d").replace(tzinfo=kst)
+        start_ms = int(day.astimezone(timezone.utc).timestamp() * 1000)
+        end_ms = int((day + timedelta(days=1)).astimezone(timezone.utc).timestamp() * 1000)
+    except Exception as e:
+        print(f"[report-api] bad report_date={report_date} err={e}")
+        return False
+
+    log = _get_trade_log(state)
+    targets = []
+    for tr in log:
+        if tr.get("status") != "closed":
+            continue
+        exit_ts = tr.get("exit_ts")
+        if not isinstance(exit_ts, (int, float)):
+            continue
+        if _date_str_kst(exit_ts) != report_date:
+            continue
+        if tr.get("symbol"):
+            targets.append(tr)
+    if not targets:
+        try:
+            os.makedirs("reports", exist_ok=True)
+            report_path = os.path.join("reports", f"{report_date}.csv")
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "entry_ts,entry_order_id,symbol,side,engine,entry_price,qty,exit_ts,exit_order_id,exit_price,roi,pnl,exit_reason,win,loss\n"
+                )
+            return True
+        except Exception as e:
+            print(f"[report-api] write empty failed report_date={report_date} err={e}")
+            return False
+
+    entry_map, entry_by_symbol = _load_entry_events_map(report_date)
+    symbols = sorted({tr.get("symbol") for tr in targets if tr.get("symbol")})
+    order_map = {}
+    for sym in symbols:
+        trades = _fetch_my_trades_range(ex, sym, start_ms, end_ms)
+        for t in trades:
+            oid = _trade_order_id(t)
+            if not oid:
+                continue
+            order_map.setdefault(oid, []).append(t)
+
+    expected_cols = [
+        "entry_ts",
+        "entry_order_id",
+        "symbol",
+        "side",
+        "engine",
+        "entry_price",
+        "qty",
+        "exit_ts",
+        "exit_order_id",
+        "exit_price",
+        "roi",
+        "pnl",
+        "exit_reason",
+        "win",
+        "loss",
+    ]
+    records = []
+    used_exit_ids = set()
+    used_entry_ids = set()
+    for tr in targets:
+        updated_tr = False
+        entry_id = tr.get("entry_order_id")
+        exit_id = tr.get("exit_order_id")
+        if not exit_id or exit_id not in order_map:
+            continue
+        used_exit_ids.add(str(exit_id))
+        entry_ts_str = ""
+        exit_reason = tr.get("exit_reason") or ""
+        engine = tr.get("engine_label") or _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
+        entry_event = entry_map.get(str(entry_id)) if entry_id else None
+        if entry_event:
+            engine = entry_event.get("engine") or engine
+            if entry_event.get("entry_order_id"):
+                used_entry_ids.add(str(entry_event.get("entry_order_id")))
+        else:
+            key = (symbol, side)
+            candidates = entry_by_symbol.get(key) or []
+            if len(candidates) == 1:
+                engine = candidates[0].get("engine") or "unknown"
+                entry_id = candidates[0].get("entry_order_id") or entry_id
+            else:
+                engine = "unknown"
+        side = tr.get("side") or ""
+        symbol = tr.get("symbol") or ""
+        entry_price = tr.get("entry_price")
+        qty = tr.get("qty")
+
+        if entry_id and entry_id in order_map:
+            e_trades = order_map.get(entry_id) or []
+            total_qty = 0.0
+            total_notional = 0.0
+            entry_latest_ts = None
+            for t in e_trades:
+                price, amount = _trade_price_amount(t)
+                if price is None or amount is None:
+                    continue
+                q = abs(amount)
+                total_qty += q
+                total_notional += price * q
+                ts = t.get("timestamp")
+                if isinstance(ts, (int, float)):
+                    ts = int(ts)
+                    if entry_latest_ts is None or ts > entry_latest_ts:
+                        entry_latest_ts = ts
+            if total_qty > 0:
+                entry_price = total_notional / total_qty
+                qty = total_qty
+            if entry_latest_ts is not None:
+                entry_ts_str = datetime.fromtimestamp(entry_latest_ts / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+
+        x_trades = order_map.get(exit_id) or []
+        total_qty = 0.0
+        total_notional = 0.0
+        pnl_sum = 0.0
+        pnl_found = False
+        latest_ts = None
+        for t in x_trades:
+            price, amount = _trade_price_amount(t)
+            if price is not None and amount is not None:
+                q = abs(amount)
+                total_qty += q
+                total_notional += price * q
+            rp = _trade_realized_pnl(t)
+            if rp is not None:
+                pnl_sum += rp
+                pnl_found = True
+            ts = t.get("timestamp")
+            if isinstance(ts, (int, float)):
+                ts = int(ts)
+                if latest_ts is None or ts > latest_ts:
+                    latest_ts = ts
+        if total_qty > 0 and (not isinstance(qty, (int, float)) or qty <= 0):
+            qty = total_qty
+        exit_price = (total_notional / total_qty) if total_qty > 0 else None
+        exit_ts_str = ""
+        if latest_ts is not None:
+            exit_ts_str = datetime.fromtimestamp(latest_ts / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        pnl_val = pnl_sum if pnl_found else None
+        if not pnl_found:
+            continue
+
+        roi_val = None
+        if isinstance(pnl_val, (int, float)) and isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
+            notional = entry_price * qty
+            if notional > 0:
+                roi_val = (float(pnl_val) / notional) * 100.0
+        win = ""
+        loss = ""
+        if isinstance(pnl_val, (int, float)) or isinstance(roi_val, (int, float)):
+            base = pnl_val if isinstance(pnl_val, (int, float)) else roi_val
+            if base is not None:
+                if base > 0:
+                    win, loss = "1", "0"
+                elif base < 0:
+                    win, loss = "0", "1"
+                else:
+                    win, loss = "0", "0"
+
+        records.append(
+            {
+                "entry_ts": entry_ts_str,
+                "entry_order_id": entry_id or "",
+                "symbol": symbol,
+                "side": side,
+                "engine": engine,
+                "entry_price": entry_price if entry_price is not None else "",
+                "qty": qty if qty is not None else "",
+                "exit_ts": exit_ts_str,
+                "exit_order_id": exit_id or "",
+                "exit_price": exit_price if exit_price is not None else "",
+                "roi": roi_val if roi_val is not None else "",
+                "pnl": pnl_val if pnl_val is not None else "",
+                "exit_reason": exit_reason,
+                "win": win,
+                "loss": loss,
+            }
+        )
+        updated_tr = True
+        if updated_tr:
+            pass
+
+    for oid, trades in order_map.items():
+        oid_str = str(oid)
+        if oid_str in used_exit_ids:
+            continue
+        pnl_sum = 0.0
+        pnl_found = False
+        total_qty = 0.0
+        total_notional = 0.0
+        latest_ts = None
+        side = ""
+        symbol = ""
+        for t in trades or []:
+            info = t.get("info") or {}
+            if not symbol:
+                symbol = t.get("symbol") or info.get("symbol") or ""
+            if not side:
+                pos_side = info.get("positionSide")
+                if pos_side:
+                    side = str(pos_side).upper()
+                else:
+                    raw_side = t.get("side") or info.get("side")
+                    if raw_side:
+                        raw = str(raw_side).upper()
+                        side = "LONG" if raw == "BUY" else "SHORT" if raw == "SELL" else raw
+            price, amount = _trade_price_amount(t)
+            if price is not None and amount is not None:
+                q = abs(amount)
+                total_qty += q
+                total_notional += price * q
+            rp = _trade_realized_pnl(t)
+            if rp is not None:
+                pnl_sum += rp
+                pnl_found = True
+            ts = t.get("timestamp")
+            if isinstance(ts, (int, float)):
+                ts = int(ts)
+                if latest_ts is None or ts > latest_ts:
+                    latest_ts = ts
+        if not pnl_found:
+            continue
+        if abs(pnl_sum) < 1e-12:
+            continue
+        exit_price = (total_notional / total_qty) if total_qty > 0 else None
+        exit_ts_str = ""
+        exit_ts_val = None
+        if latest_ts is not None:
+            exit_ts_val = latest_ts / 1000.0
+            exit_ts_str = datetime.fromtimestamp(exit_ts_val).strftime("%Y-%m-%d %H:%M:%S")
+        pnl_val = pnl_sum if pnl_found else None
+        entry_order_id = ""
+        entry_ts_str = ""
+        entry_price = ""
+        entry_qty = total_qty if total_qty > 0 else ""
+        engine = "unknown"
+        entry_order_id = ""
+        roi_val = None
+        if isinstance(pnl_val, (int, float)) and isinstance(entry_price, (int, float)) and isinstance(entry_qty, (int, float)) and entry_price > 0:
+            entry_notional = entry_price * entry_qty
+            if entry_notional > 0:
+                roi_val = (float(pnl_val) / entry_notional) * 100.0
+        win = ""
+        loss = ""
+        if isinstance(pnl_val, (int, float)) or isinstance(roi_val, (int, float)):
+            base = pnl_val if isinstance(pnl_val, (int, float)) else roi_val
+            if base is not None:
+                if base > 0:
+                    win, loss = "1", "0"
+                elif base < 0:
+                    win, loss = "0", "1"
+                else:
+                    win, loss = "0", "0"
+        key = (symbol, side)
+        candidates = entry_by_symbol.get(key) or []
+        if len(candidates) == 1:
+            engine = candidates[0].get("engine") or engine
+            entry_order_id = str(candidates[0].get("entry_order_id") or "")
+        records.append(
+            {
+                "entry_ts": entry_ts_str,
+                "entry_order_id": entry_order_id,
+                "symbol": symbol,
+                "side": side,
+                "engine": engine,
+                "entry_price": entry_price if entry_price != "" else "",
+                "qty": entry_qty if entry_qty != "" else "",
+                "exit_ts": exit_ts_str,
+                "exit_order_id": oid_str,
+                "exit_price": exit_price if exit_price is not None else "",
+                "roi": roi_val if roi_val is not None else "",
+                "pnl": pnl_val if pnl_val is not None else "",
+                "exit_reason": "api_unmatched",
+                "win": win,
+                "loss": loss,
+            }
+        )
+
+    try:
+        os.makedirs("reports", exist_ok=True)
+        report_path = os.path.join("reports", f"{report_date}.csv")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(",".join(expected_cols) + "\n")
+            for rec in records:
+                line = ",".join(str(rec.get(col, "")) for col in expected_cols)
+                f.write(line + "\n")
+        return True
+    except Exception as e:
+        print(f"[report-api] write failed report_date={report_date} err={e}")
+        return False
 
 def _place_short_sl_order(
     symbol: str,
@@ -3035,10 +4003,13 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
         ):
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
+            order_block = _format_order_id_block(tr.get("entry_order_id"), tr.get("exit_order_id"))
+            order_line = f"{order_block}\n" if order_block else ""
             send_telegram(
                 f"🔴 <b>롱 청산</b>\n"
                 f"<b>{symbol}</b>\n"
                 f"엔진: {engine_label}\n"
+                f"{order_line}"
                 f"청산가={price_str}\n"
                 f"손익={pnl_str}"
             )
@@ -3222,11 +4193,14 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
             exit_tag = "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
+            order_block = _format_order_id_block(tr.get("entry_order_id"), tr.get("exit_order_id"))
+            order_line = f"{order_block}\n" if order_block else ""
             send_telegram(
                 f"🔴 <b>숏 청산</b>\n"
                 f"<b>{symbol}</b>\n"
                 f"엔진: {engine_label}\n"
                 f"사유: {exit_tag}\n"
+                f"{order_line}"
                 f"청산가={price_str}\n"
                 f"손익={pnl_str}"
             )
@@ -3318,11 +4292,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     st["swaggy_last_sl_ts"] = now
                     state[sym] = st
             if isinstance(open_tr, dict) and engine_label != "UNKNOWN" and _trade_has_entry(open_tr):
+                order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
+                order_line = f"{order_block}\n" if order_block else ""
                 send_telegram(
                     f"🔴 <b>숏 청산</b>\n"
                     f"<b>{sym}</b>\n"
                     f"엔진: {engine_label}\n"
-                    f"사유: {exit_tag}"
+                    f"사유: {exit_tag}\n"
+                    f"{order_line}".rstrip()
                 )
             time.sleep(0.1)
             continue
@@ -3389,6 +4366,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     except Exception:
                         pass
                     res = close_short_market(sym)
+                    exit_order_id = _order_id_from_res(res)
                     cancel_stop_orders(sym)
                     last_entry_val = float(st.get("last_entry", 0))
                     state[sym] = {"in_pos": False, "last_ok": False, "last_entry": last_entry_val, "dca_adds": 0}
@@ -3413,13 +4391,20 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
                         pnl_usdt=pnl_usdt,
                         reason="auto_exit_tp",
+                        exit_order_id=exit_order_id,
                     )
                     _append_report_line(sym, "SHORT", profit_unlev, pnl_usdt, engine_label)
+                    order_block = _format_order_id_block(
+                        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+                        exit_order_id,
+                    )
+                    order_line = f"{order_block}\n" if order_block else ""
                     send_telegram(
                         f"✅ <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {engine_label}\n"
                         f"사유: {exit_tag}\n"
+                        f"{order_line}"
                         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                         f"{'' if pnl_usdt is None else f' 손익={pnl_usdt:+.3f} USDT'}"
@@ -3488,11 +4473,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 st["dca_adds"] = 0
                 state[sym] = st
                 if engine_label != "UNKNOWN" and _trade_has_entry(open_tr):
+                    order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
+                    order_line = f"{order_block}\n" if order_block else ""
                     send_telegram(
                         f"🔴 <b>롱 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {engine_label}\n"
-                        f"사유: MANUAL"
+                        f"사유: MANUAL\n"
+                        f"{order_line}".rstrip()
                     )
                 time.sleep(0.1)
                 continue
@@ -3528,6 +4516,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         except Exception:
             pass
         res = close_long_market(sym)
+        exit_order_id = _order_id_from_res(res)
         cancel_stop_orders(sym)
         avg_price = (
             res.get("order", {}).get("average")
@@ -3546,13 +4535,20 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
             pnl_usdt=pnl_long,
             reason="auto_exit_tp",
+            exit_order_id=exit_order_id,
         )
         _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
+        order_block = _format_order_id_block(
+            open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
+            exit_order_id,
+        )
+        order_line = f"{order_block}\n" if order_block else ""
         send_telegram(
             f"🟢 <b>롱 청산</b>\n"
             f"<b>{sym}</b>\n"
             f"엔진: {engine_label}\n"
             f"사유: {exit_tag}\n"
+            f"{order_line}"
             f"체결가={avg_price} 수량={filled} 비용={cost}\n"
             f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
             f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
@@ -3597,6 +4593,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_atlas_fabio_enabled",
         "_swaggy_enabled",
         "_dtfx_enabled",
+        "_pumpfade_enabled",
         "_chat_id",
         "_manage_ws_mode",
         "_entry_event_offset",
@@ -3605,7 +4602,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         if key in disk:
             state[key] = disk.get(key)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE
     if isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
@@ -3634,6 +4631,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         SWAGGY_ENABLED = bool(state.get("_swaggy_enabled"))
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
+    if isinstance(state.get("_pumpfade_enabled"), bool):
+        PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
     if state.get("_chat_id"):
         CHAT_ID_RUNTIME = str(state.get("_chat_id"))
     if isinstance(state.get("_manage_ws_mode"), bool):
@@ -3656,6 +4655,7 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_atlas_fabio_enabled",
         "_swaggy_enabled",
         "_dtfx_enabled",
+        "_pumpfade_enabled",
         "_tg_offset",
         "_tg_queue_offset",
         "_chat_id",
@@ -3719,12 +4719,14 @@ def _update_report_csv(tr: dict) -> None:
 
         expected_cols = [
             "entry_ts",
+            "entry_order_id",
             "symbol",
             "side",
             "engine",
             "entry_price",
             "qty",
             "exit_ts",
+            "exit_order_id",
             "exit_price",
             "roi",
             "pnl",
@@ -3745,20 +4747,25 @@ def _update_report_csv(tr: dict) -> None:
                     rec = {header_cols[i]: parts[i] for i in range(len(header_cols))}
                     records.append(rec)
 
-        key = f"{entry_ts_str}|{symbol}|{side}"
+        entry_order_id = tr.get("entry_order_id") or ""
+        exit_order_id = tr.get("exit_order_id") or ""
+        key = f"order:{entry_order_id}" if entry_order_id else f"{entry_ts_str}|{symbol}|{side}"
         updated = False
         for rec in records:
-            row_key = f"{rec.get('entry_ts','')}|{rec.get('symbol','')}|{rec.get('side','')}"
+            row_entry_order_id = rec.get("entry_order_id") or ""
+            row_key = f"order:{row_entry_order_id}" if row_entry_order_id else f"{rec.get('entry_ts','')}|{rec.get('symbol','')}|{rec.get('side','')}"
             if row_key == key:
                 rec.update(
                     {
                         "entry_ts": entry_ts_str,
+                        "entry_order_id": entry_order_id,
                         "symbol": symbol,
                         "side": side,
                         "engine": engine,
                         "entry_price": entry_price if entry_price is not None else "",
                         "qty": qty if qty is not None else "",
                         "exit_ts": exit_ts_str,
+                        "exit_order_id": exit_order_id,
                         "exit_price": exit_price if exit_price is not None else "",
                         "roi": roi if roi is not None else "",
                         "pnl": pnl if pnl is not None else "",
@@ -3775,12 +4782,14 @@ def _update_report_csv(tr: dict) -> None:
             records.append(
                 {
                     "entry_ts": entry_ts_str,
+                    "entry_order_id": entry_order_id,
                     "symbol": symbol,
                     "side": side,
                     "engine": engine,
                     "entry_price": entry_price if entry_price is not None else "",
                     "qty": qty if qty is not None else "",
                     "exit_ts": exit_ts_str,
+                    "exit_order_id": exit_order_id,
                     "exit_price": exit_price if exit_price is not None else "",
                     "roi": roi if roi is not None else "",
                     "pnl": pnl if pnl is not None else "",
@@ -3808,6 +4817,7 @@ def _append_entry_event(tr: dict) -> None:
         os.makedirs("logs", exist_ok=True)
         payload = {
             "entry_ts": tr.get("entry_ts"),
+            "entry_order_id": tr.get("entry_order_id"),
             "symbol": tr.get("symbol"),
             "side": tr.get("side"),
             "entry_price": tr.get("entry_price"),
@@ -3947,7 +4957,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, USDT_PER_TRADE
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, USDT_PER_TRADE
     if not BOT_TOKEN:
         return
     last_update_id = int(state.get("_tg_offset", 0) or 0)
@@ -4097,10 +5107,11 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                             f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                             f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
-                            f"/entry_usdt(진입금액): {USDT_PER_TRADE:.0f}\n"
+                            f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                             f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                             f"/swaggy(추가진입): {'ON' if SWAGGY_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
+                            f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                             f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
                             "/report(리포트): /report today|yesterday|YYYY-MM-DD\n"
                             f"open positions: {open_pos} (over_limit={over_limit})"
@@ -4133,10 +5144,11 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                         f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                         f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
-                        f"/entry_usdt(진입금액): {USDT_PER_TRADE:.0f}\n"
+                        f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                         f"/swaggy(추가진입): {'ON' if SWAGGY_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
+                        f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                         f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
                         "/report(리포트): /report today|yesterday|YYYY-MM-DD\n"
                         f"open positions: {open_pos} (over_limit={over_limit})"
@@ -4254,7 +5266,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     arg = parts[1] if len(parts) >= 2 else "status"
                     resp = None
                     if arg in ("status", "help"):
-                        resp = f"ℹ️ entry_usdt: {USDT_PER_TRADE:.0f}\n사용법: /entry_usdt 30"
+                        resp = f"ℹ️ entry_usdt: {USDT_PER_TRADE:.2f}%\n사용법: /entry_usdt 3 (사용가능 금액의 3%)"
                     else:
                         try:
                             val = float(arg)
@@ -4263,9 +5275,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             USDT_PER_TRADE = float(val)
                             state["_entry_usdt"] = USDT_PER_TRADE
                             state_dirty = True
-                            resp = f"✅ entry_usdt set to {USDT_PER_TRADE:.0f}"
+                            resp = f"✅ entry_usdt set to {USDT_PER_TRADE:.2f}%"
                         except Exception:
-                            resp = "⛔ 사용법: /entry_usdt 30"
+                            resp = "⛔ 사용법: /entry_usdt 3 (사용가능 금액의 3%)"
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] entry_usdt cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
@@ -4362,6 +5374,26 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] dtfx cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/pumpfade", "pumpfade")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        PUMPFADE_ENABLED = True
+                        state["_pumpfade_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ pumpfade ON (PumpFade 엔진)"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        PUMPFADE_ENABLED = False
+                        state["_pumpfade_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ pumpfade OFF"
+                    else:
+                        resp = f"ℹ️ pumpfade 상태: {'ON' if PUMPFADE_ENABLED else 'OFF'}\n사용법: /pumpfade on|off|status"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] pumpfade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/report", "report")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "today"
@@ -4371,6 +5403,10 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         report_date = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
                     else:
                         report_date = arg
+                    try:
+                        _sync_report_with_api(state, report_date)
+                    except Exception as e:
+                        print(f"[report-api] sync failed report_date={report_date} err={e}")
                     report_msg = _build_daily_report(state, report_date)
                     ok = _reply(report_msg)
                     print(f"[telegram] report cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
@@ -4494,7 +5530,7 @@ FABIO_LONG_BB_PERIOD = 20
 FABIO_LONG_DIST_MAX = 0.8
 FABIO_RSI_OVERHEAT = 68.0
 
-USDT_PER_TRADE = 30.0
+USDT_PER_TRADE = 30.0  # 사용가능 USDT 대비 퍼센트
 LEVERAGE = 10
 MARGIN_MODE = "cross"
 MAX_OPEN_POSITIONS = 12
@@ -4563,6 +5599,7 @@ ATLAS_FABIO_ENABLED = True
 ATLAS_FABIO_PAPER = False
 SWAGGY_ENABLED = True
 DTFX_ENABLED = True
+PUMPFADE_ENABLED = False
 DIV15M_LONG_ENABLED = True
 DIV15M_SHORT_ENABLED = True
 ONLY_DIV15M_SHORT = False
@@ -4773,7 +5810,7 @@ def run():
     state = load_state()
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
-    global swaggy_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, div15m_engine, div15m_short_engine
+    global swaggy_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     atlas_engine = AtlasEngine() if AtlasEngine else None
     atlas_swaggy_cfg = AtlasSwaggyConfig() if AtlasSwaggyConfig else None
@@ -4783,6 +5820,8 @@ def run():
     div15m_short_engine = Div15mShortEngine() if Div15mShortEngine else None
     dtfx_engine = DTFXEngine() if DTFXEngine else None
     dtfx_cfg = DTFXConfig() if DTFXConfig else None
+    pumpfade_engine = PumpFadeEngine() if PumpFadeEngine else None
+    pumpfade_cfg = PumpFadeConfig() if PumpFadeConfig else None
     if dtfx_engine and dtfx_cfg and EngineContext:
         try:
             dtfx_engine.on_start(
@@ -4792,7 +5831,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
     global USDT_PER_TRADE
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
@@ -4834,18 +5873,24 @@ def run():
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
         state["_dtfx_enabled"] = DTFX_ENABLED
+    if isinstance(state.get("_pumpfade_enabled"), bool):
+        PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
+    else:
+        state["_pumpfade_enabled"] = PUMPFADE_ENABLED
     if "--only-div15m-short" in sys.argv:
         ONLY_DIV15M_SHORT = True
         DIV15M_LONG_ENABLED = False
         DIV15M_SHORT_ENABLED = True
         SWAGGY_ENABLED = False
         DTFX_ENABLED = False
+        PUMPFADE_ENABLED = False
         FABIO_ENABLED = False
         ATLAS_FABIO_ENABLED = False
         state["_div15m_long_enabled"] = False
         state["_div15m_short_enabled"] = True
         state["_swaggy_enabled"] = False
         state["_dtfx_enabled"] = False
+        state["_pumpfade_enabled"] = False
         state["_fabio_enabled"] = False
         state["_atlas_fabio_enabled"] = False
         print("[모드] ONLY_DIV15M_SHORT 활성화: div15m_short만 스캔")
@@ -4897,7 +5942,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt n, /atlasfabio on|off|status, /swaggy on|off|status, /dtfx on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -5174,16 +6219,35 @@ def run():
             dtfx_universe = dtfx_engine.build_universe(ctx)
             state["_dtfx_universe"] = dtfx_universe
 
+        pumpfade_universe = []
+        if PUMPFADE_ENABLED and pumpfade_engine and pumpfade_cfg and EngineContext:
+            ctx = EngineContext(
+                exchange=exchange,
+                state=state,
+                now_ts=time.time(),
+                logger=print,
+                config=pumpfade_cfg,
+            )
+            pumpfade_universe = pumpfade_engine.build_universe(ctx)
+            state["_pumpfade_universe"] = pumpfade_universe
+
         if heavy_scan:
             universe_union = list(
-                set(universe_momentum + universe_structure + fabio_universe + (swaggy_universe or []) + (dtfx_universe or []))
+                set(
+                    universe_momentum
+                    + universe_structure
+                    + fabio_universe
+                    + (swaggy_universe or [])
+                    + (dtfx_universe or [])
+                    + (pumpfade_universe or [])
+                )
             )
         else:
             if not fabio_universe:
                 fabio_universe = list(state.get("_fabio_universe") or [])
                 fabio_label = str(state.get("_fabio_label") or "realtime_only")
                 fabio_dir_hint = dict(state.get("_fabio_dir_hint") or {})
-            universe_union = list(set(universe_momentum + (dtfx_universe or [])))
+            universe_union = list(set(universe_momentum + (dtfx_universe or []) + (pumpfade_universe or [])))
         if heavy_scan:
             long_cnt = 0
             short_cnt = 0
@@ -5235,13 +6299,17 @@ def run():
         fabio_universe_len = len(fabio_universe)
         swaggy_universe_len = len(swaggy_universe) if swaggy_universe else 0
         dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
+        pumpfade_universe_len = len(pumpfade_universe) if pumpfade_universe else 0
         universe_structure_len = len(universe_structure)
         universe_union_len = len(universe_union)
         rsi_ran = bool(run_rsi_short and universe_momentum)
+        div15m_long_ran = bool(run_div15m_long and div15m_universe)
+        div15m_short_ran = bool(run_div15m_short and div15m_short_universe)
         fabio_ran = bool(heavy_scan and fabio_cfg)
         atlasfabio_ran = bool(heavy_scan and ATLAS_FABIO_ENABLED and atlas_cfg and fabio_cfg_atlas)
         swaggy_ran = bool(heavy_scan and SWAGGY_ENABLED and swaggy_cfg and swaggy_engine)
         dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
+        pumpfade_ran = bool(PUMPFADE_ENABLED and pumpfade_engine and pumpfade_cfg and pumpfade_universe)
         # 공통 OHLCV 프리패치 (Tiered + TTL)
         watch_symbols = [
             s
@@ -5275,6 +6343,9 @@ def run():
         for s in swaggy_universe or []:
             if s not in slow_symbols_ordered:
                 slow_symbols_ordered.append(s)
+        for s in pumpfade_universe or []:
+            if s not in slow_symbols_ordered:
+                slow_symbols_ordered.append(s)
         slow_symbols = slow_symbols_ordered
 
         fast_plan: Dict[str, int] = {}
@@ -5294,6 +6365,9 @@ def run():
         if swaggy_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_cfg.vp_lookback_1h))
+        if pumpfade_cfg:
+            mid_plan["15m"] = max(mid_plan.get("15m", 0), int(max(80, pumpfade_cfg.lookback_hh + 10)))
+            mid_plan["1h"] = max(mid_plan.get("1h", 0), 40)
         if atlas_cfg:
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(atlas_cfg.htf_limit))
         mid_plan["15m"] = min(mid_plan.get("15m", 0), MID_LIMIT_CAP)
@@ -5506,6 +6580,8 @@ def run():
         swaggy_thread = None
         dtfx_result = {}
         dtfx_thread = None
+        pumpfade_result = {}
+        pumpfade_thread = None
         if heavy_scan and fabio_cfg:
             fabio_thread = threading.Thread(
                 target=lambda: fabio_result.update(
@@ -5576,6 +6652,20 @@ def run():
                 daemon=True,
             )
             dtfx_thread.start()
+        if PUMPFADE_ENABLED and pumpfade_cfg and pumpfade_engine:
+            pumpfade_thread = threading.Thread(
+                target=lambda: pumpfade_result.update(
+                    _run_pumpfade_cycle(
+                        pumpfade_engine,
+                        pumpfade_universe,
+                        state,
+                        send_telegram,
+                        pumpfade_cfg,
+                    )
+                ),
+                daemon=True,
+            )
+            pumpfade_thread.start()
         if not run_rsi_short:
             print("[모드] FABIO_ONLY 활성화: RSI 스캔 스킵")
         universe_total = len(universe_momentum)
@@ -5738,7 +6828,8 @@ def run():
                             print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=rsi blocked_by={seen_by}")
                             time.sleep(PER_SYMBOL_SLEEP)
                             continue
-                        res = short_market(symbol, usdt_amount=USDT_PER_TRADE, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                        res = short_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                        entry_order_id = _order_id_from_res(res)
                         # 알림용 간략 정보
                         fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                         qty = res.get("amount") or res.get("order", {}).get("amount")
@@ -5747,7 +6838,7 @@ def run():
                         if isinstance(sl_order, dict):
                             sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                         order_info = (
-                            f"entry_price={fill_price} qty={qty} usdt={USDT_PER_TRADE} "
+                            f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()} "
                             f"sl={'ok' if sl_order else 'skip'}"
                         )
                         entry_price_disp = fill_price
@@ -5760,7 +6851,8 @@ def run():
                             entry_ts=time.time(),
                             entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                             qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=USDT_PER_TRADE,
+                            usdt=_resolve_entry_usdt(),
+                            entry_order_id=entry_order_id,
                             meta={"reason": "short_entry", "sl_order_id": sl_id},
                         )
                         _append_entry_log(
@@ -5772,7 +6864,7 @@ def run():
                                 symbol,
                                 f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
                                 f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
-                                f"{USDT_PER_TRADE:.2f}",
+                                f"{_resolve_entry_usdt():.2f}",
                                 f"{rsis.get('1h', 0):.2f}" if isinstance(rsis.get("1h"), (int, float)) else "N/A",
                                 f"{rsis.get('15m', 0):.2f}" if isinstance(rsis.get("15m"), (int, float)) else "N/A",
                                 f"{rsis.get('5m', 0):.2f}" if isinstance(rsis.get("5m"), (int, float)) else "N/A",
@@ -5818,10 +6910,11 @@ def run():
                     symbol=symbol,
                     engine="RSI",
                     entry_price=entry_price_disp,
-                    usdt=USDT_PER_TRADE,
+                    usdt=_resolve_entry_usdt(),
                     reason=reason_full,
                     live=LIVE_TRADING,
                     order_info=order_info,
+                    entry_order_id=entry_order_id,
                     sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
                     tp=None,
                 )
@@ -5905,6 +6998,7 @@ def run():
 
             order_info = "(알림 전용)"
             entry_price_disp = None
+            entry_order_id = None
             if LONG_LIVE_TRADING:
                 guard_key = _entry_guard_key(state, symbol, "LONG")
                 if not _entry_guard_acquire(state, symbol, key=guard_key):
@@ -5919,10 +7013,11 @@ def run():
                         continue
                     res = long_market(
                         symbol,
-                        usdt_amount=USDT_PER_TRADE,
+                        usdt_amount=_resolve_entry_usdt(),
                         leverage=LEVERAGE,
                         margin_mode=MARGIN_MODE,
                     )
+                    entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
                     sl_order = _place_long_sl_order(symbol, fill_price, AUTO_EXIT_LONG_SL_PCT, qty=qty)
@@ -5930,7 +7025,7 @@ def run():
                     if isinstance(sl_order, dict):
                         sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                     order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={USDT_PER_TRADE} "
+                        f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()} "
                         f"sl={'ok' if sl_order else 'skip'}"
                     )
                     entry_price_disp = fill_price
@@ -5944,7 +7039,8 @@ def run():
                         entry_ts=time.time(),
                         entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                         qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=USDT_PER_TRADE,
+                        usdt=_resolve_entry_usdt(),
+                        entry_order_id=entry_order_id,
                         meta={"reason": "div15m_long", "sl_order_id": sl_id},
                     )
                     date_tag = time.strftime("%Y%m%d")
@@ -5955,7 +7051,7 @@ def run():
                             symbol,
                             f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
                             f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
-                            f"{USDT_PER_TRADE:.2f}",
+                            f"{_resolve_entry_usdt():.2f}",
                             event.p1_idx,
                             event.p2_idx,
                             float(event.score or 0.0),
@@ -5975,10 +7071,11 @@ def run():
                 symbol=symbol,
                 engine="DIV15M_LONG",
                 entry_price=entry_price_disp,
-                usdt=USDT_PER_TRADE,
+                usdt=_resolve_entry_usdt(),
                 reason=f"trigger={event.reasons or 'ENTRY_READY'}",
                 live=LONG_LIVE_TRADING,
                 order_info=order_info,
+                entry_order_id=entry_order_id,
                 sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
                 tp=None,
             )
@@ -6079,7 +7176,7 @@ def run():
                     symbol,
                     f"{event.entry_px:.6g}" if isinstance(event.entry_px, (int, float)) else "N/A",
                     "N/A",
-                    f"{USDT_PER_TRADE:.2f}",
+                    f"{_resolve_entry_usdt():.2f}",
                     event.p1_idx,
                     event.p2_idx,
                     float(event.score or 0.0),
@@ -6102,10 +7199,11 @@ def run():
                         continue
                     res = short_market(
                         symbol,
-                        usdt_amount=USDT_PER_TRADE,
+                        usdt_amount=_resolve_entry_usdt(),
                         leverage=LEVERAGE,
                         margin_mode=MARGIN_MODE,
                     )
+                    entry_order_id = _order_id_from_res(res)
                     fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
                     qty = res.get("amount") or res.get("order", {}).get("amount")
                     sl_order = _place_short_sl_order(symbol, fill_price, AUTO_EXIT_SHORT_SL_PCT, qty=qty)
@@ -6113,7 +7211,7 @@ def run():
                     if isinstance(sl_order, dict):
                         sl_id = (sl_order.get("order") or {}).get("id") or (sl_order.get("order") or {}).get("info", {}).get("orderId")
                     order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={USDT_PER_TRADE} "
+                        f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()} "
                         f"sl={'ok' if sl_order else 'skip'}"
                     )
                     entry_price_disp = fill_price
@@ -6125,7 +7223,8 @@ def run():
                         entry_ts=time.time(),
                         entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
                         qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=USDT_PER_TRADE,
+                        usdt=_resolve_entry_usdt(),
+                        entry_order_id=entry_order_id,
                         meta={"reason": "div15m_short", "sl_order_id": sl_id},
                     )
                     _append_entry_log(
@@ -6135,7 +7234,7 @@ def run():
                             symbol,
                             f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
                             f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
-                            f"{USDT_PER_TRADE:.2f}",
+                            f"{_resolve_entry_usdt():.2f}",
                             event.p1_idx,
                             event.p2_idx,
                             float(event.score or 0.0),
@@ -6155,10 +7254,11 @@ def run():
                 symbol=symbol,
                 engine="DIV15M_SHORT",
                 entry_price=entry_price_disp,
-                usdt=USDT_PER_TRADE,
+                usdt=_resolve_entry_usdt(),
                 reason=f"trigger={event.reasons or 'ENTRY_READY'}",
                 live=LIVE_TRADING,
                 order_info=order_info,
+                entry_order_id=entry_order_id,
                 sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
                 tp=None,
             )
@@ -6177,6 +7277,8 @@ def run():
             swaggy_thread.join()
         if dtfx_thread:
             dtfx_thread.join()
+        if pumpfade_thread:
+            pumpfade_thread.join()
         _set_thread_log_buffer(None)
 
         if (not MANAGE_LOOP_ENABLED) and (not MANAGE_WS_MODE):
@@ -6204,13 +7306,18 @@ def run():
         print(
             f"[universe] rule=qVol>={int(min_qv):,} sort=abs(pct) topN={top_n} anchors={anchors_disp} "
             f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
-            f"fabio={fabio_universe_len} swaggy={swaggy_universe_len} dtfx={dtfx_universe_len} union={universe_union_len}"
+            f"fabio={fabio_universe_len} swaggy={swaggy_universe_len} dtfx={dtfx_universe_len} "
+            f"pumpfade={pumpfade_universe_len} union={universe_union_len}"
         )
         print(
-            "[engines] rsi=%s(%d) fabio=%s(%d) atlasfabio=%s(%d) swaggy=%s(%d) dtfx=%s(%d)"
+            "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) fabio=%s(%d) atlasfabio=%s(%d) swaggy=%s(%d) dtfx=%s(%d) pumpfade=%s(%d)"
             % (
                 "ON" if rsi_ran else "OFF",
                 rsi_universe_len,
+                "ON" if div15m_long_ran else "OFF",
+                div15m_universe_len,
+                "ON" if div15m_short_ran else "OFF",
+                div15m_short_universe_len,
                 "ON" if fabio_ran else "OFF",
                 fabio_universe_len,
                 "ON" if atlasfabio_ran else "OFF",
@@ -6219,6 +7326,8 @@ def run():
                 swaggy_universe_len,
                 "ON" if dtfx_ran else "OFF",
                 dtfx_universe_len,
+                "ON" if pumpfade_ran else "OFF",
+                pumpfade_universe_len,
             )
         )
         print(f"[cycle] heavy_scan={'Y' if heavy_scan else 'N'} elapsed={elapsed:.2f}s")
@@ -6238,6 +7347,10 @@ def run():
         last_report_date = state.get("_daily_report_date")
         if now_kst.hour >= 9 and last_report_date != today_kst:
             report_date = (now_kst - timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                _sync_report_with_api(state, report_date)
+            except Exception as e:
+                print(f"[report-api] daily sync failed report_date={report_date} err={e}")
             report_msg = _build_daily_report(state, report_date)
             send_telegram(report_msg)
             state["_daily_report_date"] = today_kst

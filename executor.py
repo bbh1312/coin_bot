@@ -20,6 +20,7 @@ Security:
 import os
 import random
 import time
+import threading
 from typing import Optional, Dict
 
 import ccxt
@@ -48,6 +49,11 @@ _POS_CACHE = {}
 _POS_LONG_CACHE = {}
 _POS_ALL_CACHE = {"ts": 0.0, "positions_by_symbol": {}}
 
+# --- Balance TTL cache (USDT available) ---
+_BAL_TTL_SEC = 5.0
+_BAL_CACHE = {"ts": 0.0, "available": None}
+_BAL_LOCK = threading.Lock()
+
 # 전역 레이트리밋 백오프 (engine_runner와 공유 목적)
 GLOBAL_BACKOFF_UNTIL = 0.0
 _BACKOFF_SECS = 0.0
@@ -61,6 +67,76 @@ def trigger_rate_limit_backoff(msg: str = ""):
 
 def get_global_backoff_until() -> float:
     return float(GLOBAL_BACKOFF_UNTIL or 0.0)
+
+def _extract_usdt_available(balance: dict) -> Optional[float]:
+    if not isinstance(balance, dict):
+        return None
+    try:
+        usdt = balance.get("USDT") or {}
+        if isinstance(usdt, dict):
+            for key in ("free", "available", "total"):
+                val = usdt.get(key)
+                if isinstance(val, (int, float)) and val > 0:
+                    return float(val)
+    except Exception:
+        pass
+    try:
+        free_map = balance.get("free") or {}
+        val = free_map.get("USDT")
+        if isinstance(val, (int, float)) and val > 0:
+            return float(val)
+    except Exception:
+        pass
+    info = balance.get("info")
+    if isinstance(info, dict):
+        for key in ("availableBalance", "available_balance", "available"):
+            val = info.get(key)
+            try:
+                val = float(val)
+            except Exception:
+                val = None
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+    if isinstance(info, list):
+        for row in info:
+            if not isinstance(row, dict):
+                continue
+            asset = str(row.get("asset") or row.get("currency") or "").upper()
+            if asset != "USDT":
+                continue
+            for key in ("availableBalance", "available", "free", "balance"):
+                val = row.get(key)
+                try:
+                    val = float(val)
+                except Exception:
+                    val = None
+                if isinstance(val, (int, float)) and val > 0:
+                    return float(val)
+    return None
+
+def get_available_usdt(ttl_sec: float = _BAL_TTL_SEC) -> Optional[float]:
+    now = time.time()
+    with _BAL_LOCK:
+        ts = float(_BAL_CACHE.get("ts", 0.0) or 0.0)
+        cached = _BAL_CACHE.get("available")
+        if cached is not None and (now - ts) <= ttl_sec:
+            return float(cached)
+    try:
+        balance = exchange.fetch_balance({"type": "swap"})
+    except Exception:
+        try:
+            balance = exchange.fetch_balance({"type": "future"})
+        except Exception:
+            try:
+                balance = exchange.fetch_balance()
+            except Exception:
+                return None
+    available = _extract_usdt_available(balance)
+    if isinstance(available, (int, float)) and available > 0:
+        with _BAL_LOCK:
+            _BAL_CACHE["ts"] = now
+            _BAL_CACHE["available"] = float(available)
+    return available
 
 exchange = ccxt.binance({
     "apiKey": API_KEY,
@@ -578,12 +654,115 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
             "min_notional": min_notional,
         }
     if DRY_RUN:
-        return {"status": "dry_run", "action": "short_market", "symbol": symbol, "amount": amount, "last": last, "usdt": usdt_amount, "lev": leverage}
+        return {
+            "status": "dry_run",
+            "action": "short_market",
+            "symbol": symbol,
+            "amount": amount,
+            "last": last,
+            "usdt": usdt_amount,
+            "lev": leverage,
+            "order_id": None,
+        }
     params = {}
     if is_hedge_mode():
         params["positionSide"] = "SHORT"
     order = exchange.create_market_sell_order(symbol, amount, params=params)
-    return {"status": "ok", "action": "short_market", "order": order, "amount": amount, "last": last, "usdt": usdt_amount, "lev": leverage}
+    order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+    return {
+        "status": "ok",
+        "action": "short_market",
+        "order": order,
+        "order_id": order_id,
+        "amount": amount,
+        "last": last,
+        "usdt": usdt_amount,
+        "lev": leverage,
+    }
+
+def short_limit(
+    symbol: str,
+    price: float,
+    usdt_amount: float = BASE_ENTRY_USDT,
+    leverage: int = DEFAULT_LEVERAGE,
+    margin_mode: str = "isolated",
+) -> dict:
+    ensure_ready()
+    if price <= 0:
+        return {"status": "skip", "reason": "price_unavailable", "symbol": symbol}
+    set_leverage_and_margin(symbol, leverage=leverage, margin_mode=margin_mode)
+    market = exchange.market(symbol)
+    notional = float(usdt_amount) * float(leverage)
+    amount = float(exchange.amount_to_precision(symbol, notional / float(price)))
+
+    limits = market.get("limits") or {}
+    min_qty = None
+    min_notional = None
+    try:
+        min_qty = float((limits.get("amount") or {}).get("min"))
+    except Exception:
+        min_qty = None
+    try:
+        min_notional = float((limits.get("cost") or {}).get("min"))
+    except Exception:
+        min_notional = None
+    try:
+        for f in market.get("info", {}).get("filters", []) or []:
+            ftype = str(f.get("filterType") or "").upper()
+            if min_notional is None and ftype in ("MIN_NOTIONAL", "MIN_NOTIONAL_FILTER", "NOTIONAL"):
+                val = f.get("notional") or f.get("minNotional")
+                try:
+                    min_notional = float(val)
+                except Exception:
+                    pass
+            if min_qty is None and ftype in ("MARKET_LOT_SIZE", "LOT_SIZE"):
+                val = f.get("minQty")
+                try:
+                    min_qty = float(val)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    notional_after = amount * float(price)
+    if amount <= 0:
+        return {"status": "skip", "reason": "amount_zero", "symbol": symbol}
+    if min_qty is not None and amount < min_qty:
+        return {"status": "skip", "reason": "below_min_qty", "symbol": symbol, "amount": amount, "min_qty": min_qty}
+    if min_notional is not None and notional_after < min_notional:
+        return {
+            "status": "skip",
+            "reason": "below_min_notional",
+            "symbol": symbol,
+            "notional": notional_after,
+            "min_notional": min_notional,
+        }
+    if DRY_RUN:
+        return {
+            "status": "dry_run",
+            "action": "short_limit",
+            "symbol": symbol,
+            "amount": amount,
+            "price": price,
+            "usdt": usdt_amount,
+            "lev": leverage,
+            "order_id": None,
+        }
+    params = {}
+    if is_hedge_mode():
+        params["positionSide"] = "SHORT"
+    order = exchange.create_limit_sell_order(symbol, amount, price, params=params)
+    order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+    return {
+        "status": "ok",
+        "action": "short_limit",
+        "order": order,
+        "order_id": order_id,
+        "amount": amount,
+        "price": price,
+        "usdt": usdt_amount,
+        "lev": leverage,
+    }
 
 def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated") -> dict:
     ensure_ready()
@@ -636,12 +815,31 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
             "min_notional": min_notional,
         }
     if DRY_RUN:
-        return {"status": "dry_run", "action": "long_market", "symbol": symbol, "amount": amount, "last": last, "usdt": usdt_amount, "lev": leverage}
+        return {
+            "status": "dry_run",
+            "action": "long_market",
+            "symbol": symbol,
+            "amount": amount,
+            "last": last,
+            "usdt": usdt_amount,
+            "lev": leverage,
+            "order_id": None,
+        }
     params = {}
     if is_hedge_mode():
         params["positionSide"] = "LONG"
     order = exchange.create_market_buy_order(symbol, amount, params=params)
-    return {"status": "ok", "action": "long_market", "order": order, "amount": amount, "last": last, "usdt": usdt_amount, "lev": leverage}
+    order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+    return {
+        "status": "ok",
+        "action": "long_market",
+        "order": order,
+        "order_id": order_id,
+        "amount": amount,
+        "last": last,
+        "usdt": usdt_amount,
+        "lev": leverage,
+    }
 
 def close_short_market(symbol: str) -> dict:
     ensure_ready()
@@ -650,7 +848,7 @@ def close_short_market(symbol: str) -> dict:
         return {"status": "skip", "reason": "no_short_position", "symbol": symbol}
     amount = float(exchange.amount_to_precision(symbol, amount))
     if DRY_RUN:
-        return {"status": "dry_run", "action": "close_short_market", "symbol": symbol, "amount": amount}
+        return {"status": "dry_run", "action": "close_short_market", "symbol": symbol, "amount": amount, "order_id": None}
     hedge = False
     try:
         hedge = is_hedge_mode()
@@ -659,7 +857,8 @@ def close_short_market(symbol: str) -> dict:
     # hedge 모드에서는 reduceOnly를 보내지 않고 positionSide만 지정
     params = {"positionSide": "SHORT"} if hedge else {"reduceOnly": True}
     order = exchange.create_market_buy_order(symbol, amount, params=params)
-    return {"status": "ok", "action": "close_short_market", "order": order, "amount": amount}
+    order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+    return {"status": "ok", "action": "close_short_market", "order": order, "order_id": order_id, "amount": amount}
 
 def close_long_market(symbol: str) -> dict:
     ensure_ready()
@@ -668,7 +867,7 @@ def close_long_market(symbol: str) -> dict:
         return {"status": "skip", "reason": "no_long_position", "symbol": symbol}
     amount = float(exchange.amount_to_precision(symbol, amount))
     if DRY_RUN:
-        return {"status": "dry_run", "action": "close_long_market", "symbol": symbol, "amount": amount}
+        return {"status": "dry_run", "action": "close_long_market", "symbol": symbol, "amount": amount, "order_id": None}
     hedge = False
     try:
         hedge = is_hedge_mode()
@@ -676,7 +875,8 @@ def close_long_market(symbol: str) -> dict:
         hedge = False
     params = {"positionSide": "LONG"} if hedge else {"reduceOnly": True}
     order = exchange.create_market_sell_order(symbol, amount, params=params)
-    return {"status": "ok", "action": "close_long_market", "order": order, "amount": amount}
+    order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+    return {"status": "ok", "action": "close_long_market", "order": order, "order_id": order_id, "amount": amount}
 
 def cancel_open_orders(symbol: str) -> dict:
     ensure_ready()
