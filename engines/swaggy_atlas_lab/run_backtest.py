@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from typing import Dict, List
 
 import ccxt
 
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from engines.base import EngineContext
+from engines.swaggy.swaggy_engine import SwaggyConfig as SwaggyBaseConfig, SwaggyEngine
 from engines.swaggy_atlas_lab.atlas_eval import evaluate_global_gate, evaluate_local
 from engines.swaggy_atlas_lab.broker_sim import BrokerSim
 from engines.swaggy_atlas_lab.config import AtlasConfig, BacktestConfig, SwaggyConfig
@@ -59,9 +66,10 @@ def parse_args():
     parser.add_argument("--symbols", default="", help="comma-separated symbols")
     parser.add_argument("--symbols-file", default="", help="path to fixed symbol list")
     parser.add_argument("--universe", default="top50", help="topN (e.g. top50) or 'symbols'")
+    parser.add_argument("--max-symbols", type=int, default=7)
     parser.add_argument("--anchor", default="BTC,ETH")
     parser.add_argument("--tp-pct", type=float, default=0.02)
-    parser.add_argument("--sl-pct", type=float, default=0.02)
+    parser.add_argument("--sl-pct", type=float, default=0.0)
     parser.add_argument("--fee", type=float, default=0.0)
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
@@ -97,6 +105,8 @@ def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
 
 def main() -> None:
     args = parse_args()
+    if args.sl_pct <= 0:
+        raise SystemExit("--sl-pct is required")
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - int(args.days) * 24 * 60 * 60 * 1000
     if end_ms <= start_ms:
@@ -135,10 +145,19 @@ def main() -> None:
     elif args.symbols.strip():
         symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     else:
-        top_n = _parse_universe_arg(args.universe)
         tickers = ex.fetch_tickers()
-        symbols = build_universe_from_tickers(tickers, top_n or 50, anchor_symbols)
-    source = "symbols_file" if args.symbols_file.strip() else ("symbols_arg" if args.symbols.strip() else "live_tickers")
+        swaggy_engine = SwaggyEngine(SwaggyBaseConfig())
+        ctx = EngineContext(
+            exchange=ex,
+            state={"_tickers": tickers, "_symbols": list(tickers.keys())},
+            now_ts=time.time(),
+            logger=lambda *_: None,
+            config=swaggy_engine.config,
+        )
+        symbols = swaggy_engine.build_universe(ctx)
+    source = "symbols_file" if args.symbols_file.strip() else ("symbols_arg" if args.symbols.strip() else "engine_universe")
+    if isinstance(args.max_symbols, int) and args.max_symbols > 0:
+        symbols = symbols[: args.max_symbols]
     save_universe(
         universe_path,
         symbols,

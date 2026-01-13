@@ -2,6 +2,7 @@
 import argparse
 import csv
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,18 +11,13 @@ from typing import Dict, List, Optional, Tuple
 import ccxt
 import pandas as pd
 
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from engines.base import EngineContext
 from engines.rsi.engine import RsiEngine
 from engines.rsi.config import RsiConfig
-
-
-def _parse_ts(text: str) -> int:
-    if text.isdigit():
-        return int(text)
-    t = text.strip().replace("T", " ")
-    dt = datetime.fromisoformat(t)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
 
 
 def _fetch_ohlcv_all(
@@ -205,13 +201,13 @@ def _slice_until(df: pd.DataFrame, idx: int) -> pd.DataFrame:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RSI Short Backtest Runner")
-    parser.add_argument("--symbols", type=str, default="BTC/USDT:USDT")
-    parser.add_argument("--start", type=str, required=True)
-    parser.add_argument("--end", type=str, required=True)
+    parser.add_argument("--symbols", type=str, default="")
+    parser.add_argument("--max-symbols", type=int, default=7)
+    parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--tf-base", type=str, default="3m")
-    parser.add_argument("--out-signals", type=str, default="logs/rsi/rsi_signals.csv")
-    parser.add_argument("--out-trades", type=str, default="logs/rsi/rsi_trades.csv")
-    parser.add_argument("--log-path", type=str, default="logs/rsi/backtest.log")
+    parser.add_argument("--out-signals", type=str, default="rsi_signals.csv")
+    parser.add_argument("--out-trades", type=str, default="rsi_trades.csv")
+    parser.add_argument("--log-path", type=str, default="backtest.log")
     parser.add_argument("--entry-mode", type=str, default="NEXT_OPEN", choices=["NEXT_OPEN", "SIGNAL_CLOSE"])
     parser.add_argument("--sl-pct", type=float, default=0.02)
     parser.add_argument("--tp-pct", type=float, default=0.02)
@@ -224,12 +220,24 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    start_ms = _parse_ts(args.start)
-    end_ms = _parse_ts(args.end)
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = end_ms - int(args.days) * 24 * 60 * 60 * 1000
+    if end_ms <= start_ms:
+        raise SystemExit("end must be after start")
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
-    _ensure_dir(os.path.dirname(args.log_path))
-    log_fp = open(args.log_path, "a", encoding="utf-8")
+    base_dir = os.path.join("logs", "rsi", "backtest")
+    _ensure_dir(base_dir)
+    out_signals = os.path.join(base_dir, os.path.basename(args.out_signals)) if args.out_signals else ""
+    out_trades = os.path.join(base_dir, os.path.basename(args.out_trades)) if args.out_trades else ""
+    log_path = os.path.join(base_dir, os.path.basename(args.log_path)) if args.log_path else ""
+    if out_signals:
+        _ensure_dir(os.path.dirname(out_signals))
+    if out_trades:
+        _ensure_dir(os.path.dirname(out_trades))
+    if log_path:
+        _ensure_dir(os.path.dirname(log_path))
+    log_fp = open(log_path, "a", encoding="utf-8") if log_path else open(os.devnull, "w", encoding="utf-8")
 
     signal_cols = [
         "ts",
@@ -260,16 +268,28 @@ def main() -> None:
         "sl_px",
         "tp_px",
     ]
-    if args.out_signals:
-        _write_csv_header(args.out_signals, signal_cols)
-    if args.out_trades:
-        _write_csv_header(args.out_trades, trade_cols)
+    if out_signals:
+        _write_csv_header(out_signals, signal_cols)
+    if out_trades:
+        _write_csv_header(out_trades, trade_cols)
 
     exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
 
     cfg = RsiConfig()
     engine = RsiEngine(cfg)
+    if not symbols:
+        tickers = exchange.fetch_tickers()
+        state = {"_tickers": tickers, "_symbols": list(tickers.keys())}
+        ctx = EngineContext(exchange=exchange, state=state, now_ts=time.time(), logger=lambda *_: None, config=cfg)
+        engine.on_start(ctx)
+        symbols = engine.build_universe(ctx)
+        if not symbols:
+            log_fp.write("[BACKTEST] No symbols from build_universe().\n")
+            log_fp.flush()
+            return
+    if isinstance(args.max_symbols, int) and args.max_symbols > 0:
+        symbols = symbols[: args.max_symbols]
 
     tfs = {
         "1h": "1h",
@@ -278,6 +298,17 @@ def main() -> None:
         "3m": args.tf_base,
     }
 
+    total = {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "tp": 0,
+        "sl": 0,
+        "mfe_sum": 0.0,
+        "mae_sum": 0.0,
+        "hold_sum": 0.0,
+    }
+    tf_minutes = float(exchange.parse_timeframe(args.tf_base)) / 60.0
     for symbol in symbols:
         log_fp.write(f"[rsi] fetch sym={symbol} start={start_ms} end={end_ms}\n")
         log_fp.flush()
@@ -301,8 +332,11 @@ def main() -> None:
             "trades": 0,
             "wins": 0,
             "losses": 0,
-            "timeouts": 0,
-            "pnl_sum": 0.0,
+            "tp": 0,
+            "sl": 0,
+            "mfe_sum": 0.0,
+            "mae_sum": 0.0,
+            "hold_sum": 0.0,
         }
 
         for i in range(len(df_3m)):
@@ -352,10 +386,11 @@ def main() -> None:
                     pnl_usdt = pnl_pct * args.position_usdt
                     holding_bars = i - trade.entry_idx + 1
                     mfe = (trade.entry_px - trade.low_min) / trade.entry_px if trade.entry_px > 0 else 0.0
-                    mae = (trade.entry_px - trade.high_max) / trade.entry_px if trade.entry_px > 0 else 0.0
-                    if args.out_trades:
+                    mae = (trade.high_max - trade.entry_px) / trade.entry_px if trade.entry_px > 0 else 0.0
+                    hold_min = holding_bars * tf_minutes
+                    if out_trades:
                         _append_csv(
-                            args.out_trades,
+                            out_trades,
                             [
                                 symbol,
                                 trade.entry_ts,
@@ -373,13 +408,16 @@ def main() -> None:
                             ],
                         )
                     trade_stats["trades"] += 1
-                    trade_stats["pnl_sum"] += pnl_pct
-                    if exit_reason == "TIMEOUT":
-                        trade_stats["timeouts"] += 1
-                    if pnl_pct >= 0:
+                    trade_stats["mfe_sum"] += mfe
+                    trade_stats["mae_sum"] += mae
+                    trade_stats["hold_sum"] += hold_min
+                    if exit_reason == "TP":
                         trade_stats["wins"] += 1
+                        trade_stats["tp"] += 1
                     else:
                         trade_stats["losses"] += 1
+                        if exit_reason == "SL":
+                            trade_stats["sl"] += 1
                     trade = None
 
             if pending is not None and i == pending.entry_idx:
@@ -440,9 +478,9 @@ def main() -> None:
 
             if ready_entry and trade is None and pending is None:
                 reason = "spike_ready" if spike_ready else "struct_ready"
-                if args.out_signals:
+                if out_signals:
                     _append_csv(
-                        args.out_signals,
+                        out_signals,
                         [
                             ts,
                             symbol,
@@ -475,18 +513,19 @@ def main() -> None:
                     if (i + 1) < len(df_3m):
                         pending = PendingEntry(entry_idx=i + 1, signal_idx=i, entry_ts=ts, entry_px=c)
 
-            if trade is not None:
-                last_idx = len(df_3m) - 1
-                last_ts = int(df_3m["ts"].iloc[last_idx])
-                last_close = float(df_3m["close"].iloc[last_idx])
-                pnl_pct = _calc_pnl_short(trade.entry_px, last_close, args.fee_rate, args.slippage_pct)
-                pnl_usdt = pnl_pct * args.position_usdt
-                holding_bars = last_idx - trade.entry_idx + 1
-                mfe = (trade.entry_px - trade.low_min) / trade.entry_px if trade.entry_px > 0 else 0.0
-                mae = (trade.entry_px - trade.high_max) / trade.entry_px if trade.entry_px > 0 else 0.0
-                if args.out_trades:
-                    _append_csv(
-                        args.out_trades,
+        if trade is not None:
+            last_idx = len(df_3m) - 1
+            last_ts = int(df_3m["ts"].iloc[last_idx])
+            last_close = float(df_3m["close"].iloc[last_idx])
+            pnl_pct = _calc_pnl_short(trade.entry_px, last_close, args.fee_rate, args.slippage_pct)
+            pnl_usdt = pnl_pct * args.position_usdt
+            holding_bars = last_idx - trade.entry_idx + 1
+            mfe = (trade.entry_px - trade.low_min) / trade.entry_px if trade.entry_px > 0 else 0.0
+            mae = (trade.high_max - trade.entry_px) / trade.entry_px if trade.entry_px > 0 else 0.0
+            hold_min = holding_bars * tf_minutes
+            if out_trades:
+                _append_csv(
+                    out_trades,
                     [
                         symbol,
                         trade.entry_ts,
@@ -501,30 +540,53 @@ def main() -> None:
                         f"{mae:.6f}",
                         f"{trade.sl_px:.6g}",
                         f"{trade.tp_px:.6g}",
-                        ],
-                    )
-                trade_stats["trades"] += 1
-                trade_stats["pnl_sum"] += pnl_pct
-                if pnl_pct >= 0:
-                    trade_stats["wins"] += 1
-                else:
-                    trade_stats["losses"] += 1
+                    ],
+                )
+            trade_stats["trades"] += 1
+            trade_stats["mfe_sum"] += mfe
+            trade_stats["mae_sum"] += mae
+            trade_stats["hold_sum"] += hold_min
+            trade_stats["losses"] += 1
 
-        if trade_stats["trades"] > 0:
-            win_rate = (trade_stats["wins"] / trade_stats["trades"]) * 100.0
-            avg_pnl = trade_stats["pnl_sum"] / trade_stats["trades"]
-        else:
-            win_rate = 0.0
-            avg_pnl = 0.0
+        trades = int(trade_stats["trades"])
+        wins = int(trade_stats["wins"])
+        losses = int(trade_stats["losses"])
+        tp = int(trade_stats["tp"])
+        sl = int(trade_stats["sl"])
+        win_rate = (wins / trades * 100.0) if trades > 0 else 0.0
+        avg_mfe = (trade_stats["mfe_sum"] / trades) if trades > 0 else 0.0
+        avg_mae = (trade_stats["mae_sum"] / trades) if trades > 0 else 0.0
+        avg_hold = (trade_stats["hold_sum"] / trades) if trades > 0 else 0.0
         summary_line = (
-            "[rsi-summary] "
-            f"sym={symbol} trades={int(trade_stats['trades'])} wins={int(trade_stats['wins'])} "
-            f"losses={int(trade_stats['losses'])} timeouts={int(trade_stats['timeouts'])} "
-            f"win_rate={win_rate:.2f}% avg_pnl={avg_pnl:.6f} pnl_sum={trade_stats['pnl_sum']:.6f}"
+            f"[BACKTEST] {symbol} trades={trades} wins={wins} losses={losses} "
+            f"winrate={win_rate:.2f}% tp={tp} sl={sl} "
+            f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}"
         )
         log_fp.write(summary_line + "\n")
         log_fp.flush()
         print(summary_line)
+        total["trades"] += trades
+        total["wins"] += wins
+        total["losses"] += losses
+        total["tp"] += tp
+        total["sl"] += sl
+        total["mfe_sum"] += trade_stats["mfe_sum"]
+        total["mae_sum"] += trade_stats["mae_sum"]
+        total["hold_sum"] += trade_stats["hold_sum"]
+
+    total_trades = total["trades"]
+    total_winrate = (total["wins"] / total_trades * 100.0) if total_trades > 0 else 0.0
+    total_avg_mfe = (total["mfe_sum"] / total_trades) if total_trades > 0 else 0.0
+    total_avg_mae = (total["mae_sum"] / total_trades) if total_trades > 0 else 0.0
+    total_avg_hold = (total["hold_sum"] / total_trades) if total_trades > 0 else 0.0
+    total_line = (
+        f"[BACKTEST] TOTAL trades={total_trades} wins={total['wins']} losses={total['losses']} "
+        f"winrate={total_winrate:.2f}% tp={total['tp']} sl={total['sl']} "
+        f"avg_mfe={total_avg_mfe:.4f} avg_mae={total_avg_mae:.4f} avg_hold={total_avg_hold:.1f}"
+    )
+    log_fp.write(total_line + "\n")
+    log_fp.flush()
+    print(total_line)
 
     log_fp.close()
 

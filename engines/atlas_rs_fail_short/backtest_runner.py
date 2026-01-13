@@ -3,11 +3,17 @@ Atlas RS Fail Short backtest runner.
 """
 import argparse
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import ccxt
+from ccxt.base.errors import DDoSProtection, NetworkError, RateLimitExceeded
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 import cycle_cache
 from atlas_test.atlas_engine import atlas_swaggy_cfg
@@ -16,9 +22,9 @@ from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
 from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
 
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Atlas RS Fail Short Backtest Runner")
-    parser.add_argument("--symbols", type=str, default="BTC/USDT:USDT,ETH/USDT:USDT")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--ltf", type=str, default="15m")
     parser.add_argument("--sl-pct", type=float, default=0.03)
@@ -27,6 +33,9 @@ def parse_args():
     parser.add_argument("--out-trades", type=str, default="")
     parser.add_argument("--out-decisions", type=str, default="")
     parser.add_argument("--log-path", type=str, default="")
+    parser.add_argument("--max-symbols", type=int, default=7)
+    parser.add_argument("--sleep-ms", type=int, default=200)
+    parser.add_argument("--retry", type=int, default=3)
     return parser.parse_args()
 
 
@@ -38,13 +47,29 @@ def _since_ms(days: int) -> int:
     return int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
 
 
-def fetch_ohlcv_all(exchange: ccxt.Exchange, symbol: str, timeframe: str, since_ms: int, end_ms: int) -> List[list]:
+def fetch_ohlcv_all(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    end_ms: int,
+    sleep_ms: int,
+    max_retries: int,
+) -> List[list]:
     tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
     since = since_ms
     out = []
     last_ts = None
     while since < end_ms:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1500)
+        attempt = 0
+        ohlcv = None
+        while attempt <= max_retries:
+            try:
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1500)
+                break
+            except (DDoSProtection, RateLimitExceeded, NetworkError):
+                attempt += 1
+                time.sleep(min(10, 2 + attempt * 2))
         if not ohlcv:
             break
         for row in ohlcv:
@@ -61,7 +86,7 @@ def fetch_ohlcv_all(exchange: ccxt.Exchange, symbol: str, timeframe: str, since_
             since = last_ts + tf_ms
         if len(ohlcv) < 2:
             break
-        time.sleep(exchange.rateLimit / 1000.0)
+        time.sleep(max(exchange.rateLimit, sleep_ms) / 1000.0)
     if out:
         out = out[:-1]
     return out
@@ -107,8 +132,8 @@ def _log_summary(line: str, path: str) -> None:
     _log_file(line, path)
 
 
-def run_symbol(
-    symbol: str,
+def run_backtest(
+    symbols: List[str],
     days: int,
     exchange: ccxt.Exchange,
     engine: AtlasRsFailShortEngine,
@@ -119,60 +144,86 @@ def run_symbol(
     sl_pct: float,
     tp_pct: float,
     log_path: str,
-) -> Dict[str, float]:
+    sleep_ms: int,
+    max_retries: int,
+) -> Dict[str, Dict[str, float]]:
     end_ms = _now_ms()
     since_ms = _since_ms(days)
     ref_symbol = getattr(atlas_swaggy_cfg, "ref_symbol", "BTC/USDT:USDT")
-    sym_tag = symbol.replace("/", "_").replace(":", "_")
-    signal_log_path = ""
-    if log_path:
-        base_dir = os.path.dirname(log_path)
-        signal_log_path = os.path.join(base_dir, f"signals_{sym_tag}.log")
-    signal_console = []
-    _log_file(
-        f"[BACKTEST] Fetching {symbol} LTF={cfg.ltf_tf} from last {days} days",
-        log_path,
-    )
-    ltf_raw = fetch_ohlcv_all(exchange, symbol, cfg.ltf_tf, since_ms, end_ms)
-    ref_raw = fetch_ohlcv_all(exchange, ref_symbol, cfg.ltf_tf, since_ms, end_ms)
-    if not ltf_raw or not ref_raw:
-        _log_file(f"[BACKTEST] Missing data for {symbol}. Skipping.", log_path)
+    ref_raw = fetch_ohlcv_all(exchange, ref_symbol, cfg.ltf_tf, since_ms, end_ms, sleep_ms, max_retries)
+    if not ref_raw:
+        _log_file(f"[BACKTEST] Missing ref data for {ref_symbol}. Skipping.", log_path)
         return {}
     ltf_minutes = float(exchange.parse_timeframe(cfg.ltf_tf)) / 60.0
 
-    state: Dict[str, dict] = {"_universe": [symbol]}
+    state: Dict[str, dict] = {"_universe": list(symbols)}
     ctx = EngineContext(exchange=exchange, state=state, now_ts=time.time(), logger=None, config=cfg)
+    symbol_data: Dict[str, List[list]] = {}
+    block_counts: Dict[str, Dict[str, int]] = {}
+    eval_counts: Dict[str, int] = {}
+    signal_logs: Dict[str, str] = {}
+    stats_map: Dict[str, Dict[str, float]] = {}
+    trades: Dict[str, Optional[dict]] = {}
     idx_ref = -1
-    trade = None
-    stats = {
-        "trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "tp": 0,
-        "sl": 0,
-        "mfe_sum": 0.0,
-        "mae_sum": 0.0,
-        "hold_sum": 0.0,
-    }
-    block_counts: Dict[str, int] = {}
-    eval_count = 0
-    for idx in range(len(ltf_raw) - 1):
-        ts = int(ltf_raw[idx][0])
+
+    for symbol in symbols:
+        sym_tag = symbol.replace("/", "_").replace(":", "_")
+        signal_log_path = ""
+        if log_path:
+            base_dir = os.path.dirname(log_path)
+            signal_log_path = os.path.join(base_dir, f"signals_{sym_tag}.log")
+        signal_logs[symbol] = signal_log_path
+        _log_file(
+            f"[BACKTEST] Fetching {symbol} LTF={cfg.ltf_tf} from last {days} days",
+            log_path,
+        )
+        ltf_raw = fetch_ohlcv_all(exchange, symbol, cfg.ltf_tf, since_ms, end_ms, sleep_ms, max_retries)
+        if not ltf_raw:
+            _log_file(f"[BACKTEST] Missing data for {symbol}. Skipping.", log_path)
+            continue
+        symbol_data[symbol] = ltf_raw
+        stats_map[symbol] = {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "tp": 0,
+            "sl": 0,
+            "mfe_sum": 0.0,
+            "mae_sum": 0.0,
+            "hold_sum": 0.0,
+        }
+        block_counts[symbol] = {}
+        eval_counts[symbol] = 0
+        trades[symbol] = None
+
+    if not symbol_data:
+        return stats_map
+
+    events = []
+    for symbol, rows in symbol_data.items():
+        for idx in range(len(rows) - 1):
+            ts = int(rows[idx][0])
+            events.append((ts, symbol, idx))
+    events.sort(key=lambda x: x[0])
+
+    for ts, symbol, idx in events:
+        rows = symbol_data[symbol]
         while (idx_ref + 1) < len(ref_raw) and int(ref_raw[idx_ref + 1][0]) <= ts:
             idx_ref += 1
+        if idx_ref < 0:
+            continue
 
         cycle_cache.clear_cycle_cache(keep_raw=True)
-        cycle_cache.set_raw(symbol, cfg.ltf_tf, _slice_to_idx(ltf_raw, idx))
+        cycle_cache.set_raw(symbol, cfg.ltf_tf, _slice_to_idx(rows, idx))
         cycle_cache.set_raw(ref_symbol, cfg.ltf_tf, _slice_to_idx(ref_raw, idx_ref))
-
         state.pop("_atlas_swaggy_gate", None)
         ctx.now_ts = ts / 1000.0
 
-        o = float(ltf_raw[idx][1])
-        h = float(ltf_raw[idx][2])
-        l = float(ltf_raw[idx][3])
-        c = float(ltf_raw[idx][4])
+        h = float(rows[idx][2])
+        l = float(rows[idx][3])
+        c = float(rows[idx][4])
 
+        trade = trades.get(symbol)
         if trade is not None:
             entry_px = trade["entry_px"]
             if entry_px > 0:
@@ -195,6 +246,7 @@ def run_symbol(
                 exit_px = trade["tp_px"]
             if exit_reason:
                 pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
+                stats = stats_map[symbol]
                 stats["trades"] += 1
                 if pnl_pct >= 0:
                     stats["wins"] += 1
@@ -208,31 +260,22 @@ def run_symbol(
                 stats["mfe_sum"] += trade["mfe"]
                 stats["mae_sum"] += trade["mae"]
                 stats["hold_sum"] += holding_bars * ltf_minutes
+                hold_minutes = holding_bars * ltf_minutes
                 if log_path:
-                    hold_minutes = holding_bars * ltf_minutes
                     _log_file(
                         "[BACKTEST] TRADE symbol=%s entry=%s exit=%s pnl_pct=%.4f hold_min=%.1f reason=%s"
                         % (symbol, trade.get("entry_dt"), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
                            pnl_pct, hold_minutes, exit_reason),
                         log_path,
                     )
+                signal_log_path = signal_logs.get(symbol)
                 if signal_log_path:
-                    hold_minutes = holding_bars * ltf_minutes
                     _log_file(
                         "TRADE entry=%s exit=%s pnl_pct=%.4f hold_min=%.1f reason=%s"
                         % (trade.get("entry_dt"), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
                            pnl_pct, hold_minutes, exit_reason),
                         signal_log_path,
                     )
-                hold_minutes = holding_bars * ltf_minutes
-                signal_console.append(
-                    "  - SIGNAL entry=%s exit=%s hold_min=%.1f"
-                    % (
-                        trade.get("entry_dt"),
-                        datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                        hold_minutes,
-                    )
-                )
                 _append_line(
                     out_trades,
                     ",".join(
@@ -262,23 +305,22 @@ def run_symbol(
                         ]
                     ),
                 )
-                trade = None
+                trades[symbol] = None
                 st = state.get(symbol, {})
                 if isinstance(st, dict):
                     st["in_pos"] = False
                     state[symbol] = st
-
-        if trade is not None:
             continue
 
         sig = engine.evaluate_symbol(ctx, symbol)
         if not sig:
             continue
-        eval_count += 1
+        eval_counts[symbol] += 1
         meta = sig.meta or {}
         reason = meta.get("block_reason")
         if reason:
-            block_counts[reason] = block_counts.get(reason, 0) + 1
+            bc = block_counts[symbol]
+            bc[reason] = bc.get(reason, 0) + 1
         dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         atlas = meta.get("atlas") if isinstance(meta.get("atlas"), dict) else {}
         tech = meta.get("tech") if isinstance(meta.get("tech"), dict) else {}
@@ -302,6 +344,7 @@ def run_symbol(
         _append_line(out_decisions, ",".join(decision_row))
         if not sig.entry_ready or sig.entry_price is None:
             continue
+
         _append_line(
             out_path,
             ",".join(
@@ -329,6 +372,7 @@ def run_symbol(
                 ]
             ),
         )
+        signal_log_path = signal_logs.get(symbol)
         if signal_log_path:
             _log_file(
                 "SIGNAL entry=%s entry_px=%.6g confirm=%s rsi=%s atr=%s trigger=%s"
@@ -342,7 +386,7 @@ def run_symbol(
                 ),
                 signal_log_path,
             )
-        trade = {
+        trades[symbol] = {
             "entry_px": sig.entry_price,
             "entry_ts": ts,
             "entry_dt": dt,
@@ -367,28 +411,28 @@ def run_symbol(
             st["in_pos"] = True
             state[symbol] = st
 
-    winrate = (stats["wins"] / stats["trades"] * 100.0) if stats["trades"] > 0 else 0.0
-    avg_mfe = (stats["mfe_sum"] / stats["trades"]) if stats["trades"] > 0 else 0.0
-    avg_mae = (stats["mae_sum"] / stats["trades"]) if stats["trades"] > 0 else 0.0
-    avg_hold = (stats["hold_sum"] / stats["trades"]) if stats["trades"] > 0 else 0.0
-    _log_summary(
-        f"[BACKTEST] {symbol} trades={stats['trades']} wins={stats['wins']} losses={stats['losses']} "
-        f"winrate={winrate:.2f}% tp={stats['tp']} sl={stats['sl']} "
-        f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}",
-        log_path,
-    )
-    for line in signal_console:
-        print(line)
-    if eval_count:
-        for reason, count in sorted(block_counts.items(), key=lambda x: x[1], reverse=True):
-            ratio = count / eval_count * 100.0
-            _log_file(f"[BACKTEST] {symbol} block={reason} count={count} ratio={ratio:.2f}%", log_path)
-    return stats
+    for symbol, stats in stats_map.items():
+        trades_count = stats.get("trades", 0) or 0
+        winrate = (stats["wins"] / trades_count * 100.0) if trades_count > 0 else 0.0
+        avg_mfe = (stats["mfe_sum"] / trades_count) if trades_count > 0 else 0.0
+        avg_mae = (stats["mae_sum"] / trades_count) if trades_count > 0 else 0.0
+        avg_hold = (stats["hold_sum"] / trades_count) if trades_count > 0 else 0.0
+        _log_summary(
+            f"[BACKTEST] {symbol} trades={trades_count} wins={stats['wins']} losses={stats['losses']} "
+            f"winrate={winrate:.2f}% tp={stats['tp']} sl={stats['sl']} "
+            f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}",
+            log_path,
+        )
+        eval_count = eval_counts.get(symbol, 0)
+        if eval_count:
+            for reason, count in sorted(block_counts[symbol].items(), key=lambda x: x[1], reverse=True):
+                ratio = count / eval_count * 100.0
+                _log_file(f"[BACKTEST] {symbol} block={reason} count={count} ratio={ratio:.2f}%", log_path)
+    return stats_map
 
 
 def main():
     args = parse_args()
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
 
@@ -403,6 +447,16 @@ def main():
             log_path,
         )
     engine = AtlasRsFailShortEngine(cfg)
+    tickers = exchange.fetch_tickers()
+    state = {"_tickers": tickers, "_symbols": list(tickers.keys())}
+    ctx = EngineContext(exchange=exchange, state=state, now_ts=time.time(), logger=lambda *_: None, config=cfg)
+    engine.on_start(ctx)
+    symbols = engine.build_universe(ctx)
+    if not symbols:
+        _log_summary("[BACKTEST] No symbols from build_universe().", log_path)
+        return
+    if isinstance(args.max_symbols, int) and args.max_symbols > 0:
+        symbols = symbols[: args.max_symbols]
 
     def _normalize_out(path: str) -> str:
         if not path:
@@ -450,27 +504,28 @@ def main():
         "mae_sum": 0.0,
         "hold_sum": 0.0,
     }
-    for symbol in symbols:
-        stats = run_symbol(
-            symbol,
-            args.days,
-            exchange,
-            engine,
-            cfg,
-            out_path,
-            out_trades,
-            out_decisions,
-            args.sl_pct,
-            args.tp_pct,
-            log_path,
-        )
-        if stats:
-            for k in total:
-                val = stats.get(k, 0)
-                if isinstance(total[k], float):
-                    total[k] += float(val or 0.0)
-                else:
-                    total[k] += int(val or 0)
+    stats_map = run_backtest(
+        symbols,
+        args.days,
+        exchange,
+        engine,
+        cfg,
+        out_path,
+        out_trades,
+        out_decisions,
+        args.sl_pct,
+        args.tp_pct,
+        log_path,
+        args.sleep_ms,
+        args.retry,
+    )
+    for stats in stats_map.values():
+        for k in total:
+            val = stats.get(k, 0)
+            if isinstance(total[k], float):
+                total[k] += float(val or 0.0)
+            else:
+                total[k] += int(val or 0)
     winrate = (total["wins"] / total["trades"] * 100.0) if total["trades"] > 0 else 0.0
     avg_mfe = (total["mfe_sum"] / total["trades"]) if total["trades"] > 0 else 0.0
     avg_mae = (total["mae_sum"] / total["trades"]) if total["trades"] > 0 else 0.0

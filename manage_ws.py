@@ -8,6 +8,7 @@ WebSocket 기반 관리 모듈(테스트용).
 import time
 import os
 import json
+from typing import Optional
 
 import ws_manager
 import executor as executor_mod
@@ -90,6 +91,7 @@ def _drain_entry_events(state) -> None:
             entry_ts = payload.get("entry_ts")
             if not isinstance(entry_ts, (int, float)):
                 continue
+            payload_engine = payload.get("engine") or "UNKNOWN"
             tr = {
                 "entry_ts": float(entry_ts),
                 "entry_order_id": payload.get("entry_order_id"),
@@ -97,7 +99,7 @@ def _drain_entry_events(state) -> None:
                 "side": payload.get("side"),
                 "entry_price": payload.get("entry_price"),
                 "qty": payload.get("qty"),
-                "engine_label": payload.get("engine") or "UNKNOWN",
+                "engine_label": payload_engine,
                 "exit_ts": None,
                 "exit_price": None,
                 "pnl_usdt": None,
@@ -106,16 +108,81 @@ def _drain_entry_events(state) -> None:
             }
             er._update_report_csv(tr)
             sym = tr.get("symbol")
-            side = (tr.get("side") or "").lower()
+            side = (tr.get("side") or "").upper()
             if sym and side:
                 st = state.get(sym, {})
                 if not isinstance(st, dict):
                     st = {}
-                st[f"entry_order_id_{side}"] = tr.get("entry_order_id")
+                st[f"entry_order_id_{side.lower()}"] = tr.get("entry_order_id")
                 state[sym] = st
+                open_tr = er._get_open_trade(state, side, sym)
+                if open_tr:
+                    cur_label = _trade_engine_label(open_tr)
+                    if payload_engine != "UNKNOWN" and cur_label in ("UNKNOWN", "MANUAL"):
+                        open_tr["engine_label"] = payload_engine
+                        reason = _reason_from_engine_label(payload_engine, side)
+                        if reason:
+                            meta = open_tr.get("meta") if isinstance(open_tr.get("meta"), dict) else {}
+                            meta["reason"] = reason
+                            open_tr["meta"] = meta
+                else:
+                    log = er._get_trade_log(state)
+                    reason = _reason_from_engine_label(payload_engine, side)
+                    log.append(
+                        {
+                            "side": side,
+                            "symbol": sym,
+                            "entry_ts": float(entry_ts),
+                            "entry_ts_ms": int(float(entry_ts) * 1000),
+                            "entry_price": payload.get("entry_price"),
+                            "qty": payload.get("qty"),
+                            "usdt": None,
+                            "entry_order_id": payload.get("entry_order_id"),
+                            "status": "open",
+                            "meta": {"reason": reason} if reason else {},
+                            "engine_label": payload_engine,
+                        }
+                    )
         state["_entry_event_offset"] = new_offset
     except Exception as e:
         print("[manage-ws] entry_events drain error:", e)
+
+
+def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
+    label = (engine_label or "").upper()
+    if label == "SWAGGY_ATLAS_LAB":
+        return "swaggy_atlas_lab"
+    if label == "SWAGGY":
+        return "swaggy_long" if side == "LONG" else "swaggy_short"
+    if label == "ATLASFABIO":
+        return "atlasfabio_long" if side == "LONG" else "atlasfabio_short"
+    if label == "FABIO":
+        return "fabio_long" if side == "LONG" else "fabio_short"
+    if label == "DIV15M_LONG":
+        return "div15m_long"
+    if label == "DIV15M_SHORT":
+        return "div15m_short"
+    if label == "PUMPFADE":
+        return "pumpfade_short"
+    if label == "ATLAS_RS_FAIL_SHORT":
+        return "atlas_rs_fail_short"
+    if label == "RSI":
+        return "short_entry"
+    if label == "SCALP":
+        return "long_entry"
+    if label == "MANUAL":
+        return "manual_entry"
+    return None
+
+
+def _trade_engine_label(tr: Optional[dict]) -> str:
+    if isinstance(tr, dict):
+        label = tr.get("engine_label")
+        if isinstance(label, str) and label:
+            return label
+        reason = (tr.get("meta") or {}).get("reason")
+        return er._engine_label_from_reason(reason)
+    return "UNKNOWN"
 
 
 def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
@@ -131,26 +198,10 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
         and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
     ):
         return
-    engine_label = er._engine_label_from_reason((open_tr.get("meta") or {}).get("reason"))
-    if engine_label == "UNKNOWN":
-        return
-    if not open_tr.get("entry_ts") and not open_tr.get("entry_ts_ms") and not open_tr.get("entry_price"):
-        return
+    engine_label = _trade_engine_label(open_tr)
     st = state.get(symbol, {})
     seen_ts = st.get("long_pos_seen_ts") if isinstance(st, dict) else None
-    recent_seen = False
-    if isinstance(seen_ts, (int, float)):
-        recent_seen = (now_ts - float(seen_ts)) <= er.SHORT_RECONCILE_SEEN_TTL_SEC
-    last_fill_ts = open_tr.get("entry_ts_ms") or (open_tr.get("meta") or {}).get("last_fill_ts")
-    recent_fill = False
-    if isinstance(last_fill_ts, (int, float)) and last_fill_ts > 0:
-        ts_val = float(last_fill_ts)
-        if ts_val > 10_000_000_000:
-            ts_val = ts_val / 1000.0
-        if (now_ts - ts_val) <= er.SHORT_RECONCILE_SEEN_TTL_SEC:
-            recent_fill = True
-    if not (recent_seen or recent_fill):
-        return
+    # WS 감지 기반 수동 청산은 최근 확인 여부와 무관하게 알림
     er._close_trade(
         state,
         side="LONG",
@@ -194,26 +245,10 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
         and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
     ):
         return
-    engine_label = er._engine_label_from_reason((open_tr.get("meta") or {}).get("reason"))
-    if engine_label == "UNKNOWN":
-        return
-    if not open_tr.get("entry_ts") and not open_tr.get("entry_ts_ms") and not open_tr.get("entry_price"):
-        return
+    engine_label = _trade_engine_label(open_tr)
     st = state.get(symbol, {})
     seen_ts = st.get("short_pos_seen_ts") if isinstance(st, dict) else None
-    recent_seen = False
-    if isinstance(seen_ts, (int, float)):
-        recent_seen = (now_ts - float(seen_ts)) <= er.SHORT_RECONCILE_SEEN_TTL_SEC
-    last_fill_ts = open_tr.get("entry_ts_ms") or (open_tr.get("meta") or {}).get("last_fill_ts")
-    recent_fill = False
-    if isinstance(last_fill_ts, (int, float)) and last_fill_ts > 0:
-        ts_val = float(last_fill_ts)
-        if ts_val > 10_000_000_000:
-            ts_val = ts_val / 1000.0
-        if (now_ts - ts_val) <= er.SHORT_RECONCILE_SEEN_TTL_SEC:
-            recent_fill = True
-    if not (recent_seen or recent_fill):
-        return
+    # WS 감지 기반 수동 청산은 최근 확인 여부와 무관하게 알림
     er._close_trade(
         state,
         side="SHORT",
@@ -252,9 +287,7 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
     if profit_unlev < er.AUTO_EXIT_LONG_TP_PCT:
         return False
     open_tr = er._get_open_trade(state, "LONG", symbol)
-    engine_label = er._engine_label_from_reason(
-        (open_tr.get("meta") or {}).get("reason") if open_tr else None
-    )
+    engine_label = _trade_engine_label(open_tr)
     try:
         executor_mod.set_dry_run(False if er.LONG_LIVE_TRADING else True)
     except Exception:
@@ -315,9 +348,7 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts) -> bool:
     if profit_unlev < er.AUTO_EXIT_SHORT_TP_PCT:
         return False
     open_tr = er._get_open_trade(state, "SHORT", symbol)
-    engine_label = er._engine_label_from_reason(
-        (open_tr.get("meta") or {}).get("reason") if open_tr else None
-    )
+    engine_label = _trade_engine_label(open_tr)
     try:
         executor_mod.set_dry_run(False if er.LIVE_TRADING else True)
     except Exception:
@@ -378,9 +409,7 @@ def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
     if profit_unlev > -er.AUTO_EXIT_LONG_SL_PCT:
         return False
     open_tr = er._get_open_trade(state, "LONG", symbol)
-    engine_label = er._engine_label_from_reason(
-        (open_tr.get("meta") or {}).get("reason") if open_tr else None
-    )
+    engine_label = _trade_engine_label(open_tr)
     try:
         executor_mod.set_dry_run(False if er.LONG_LIVE_TRADING else True)
     except Exception:
@@ -439,9 +468,7 @@ def _handle_short_sl(state, symbol, detail, mark_px, now_ts) -> bool:
     if profit_unlev > -er.AUTO_EXIT_SHORT_SL_PCT:
         return False
     open_tr = er._get_open_trade(state, "SHORT", symbol)
-    engine_label = er._engine_label_from_reason(
-        (open_tr.get("meta") or {}).get("reason") if open_tr else None
-    )
+    engine_label = _trade_engine_label(open_tr)
     try:
         executor_mod.set_dry_run(False if er.LIVE_TRADING else True)
     except Exception:
@@ -553,6 +580,42 @@ def main():
             st = state.get(symbol, {}) if isinstance(state, dict) else {}
             prev_long_amt = float(last_amt.get((symbol, "long"), 0.0) or 0.0)
             prev_short_amt = float(last_amt.get((symbol, "short"), 0.0) or 0.0)
+            if long_amt > 0:
+                open_tr = er._get_open_trade(state, "LONG", symbol)
+                if not open_tr:
+                    detail = executor_mod.get_long_position_detail(symbol) or {}
+                    entry_price = detail.get("entry") if isinstance(detail, dict) else None
+                    qty = detail.get("qty") if isinstance(detail, dict) else None
+                    er._log_trade_entry(
+                        state,
+                        side="LONG",
+                        symbol=symbol,
+                        entry_ts=now_ts,
+                        entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+                        qty=qty if isinstance(qty, (int, float)) else None,
+                        usdt=None,
+                        meta={"reason": "manual_entry"},
+                    )
+                    st["in_pos"] = True
+                    st["last_entry"] = now_ts
+            if short_amt > 0:
+                open_tr = er._get_open_trade(state, "SHORT", symbol)
+                if not open_tr:
+                    detail = executor_mod.get_short_position_detail(symbol) or {}
+                    entry_price = detail.get("entry") if isinstance(detail, dict) else None
+                    qty = detail.get("qty") if isinstance(detail, dict) else None
+                    er._log_trade_entry(
+                        state,
+                        side="SHORT",
+                        symbol=symbol,
+                        entry_ts=now_ts,
+                        entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+                        qty=qty if isinstance(qty, (int, float)) else None,
+                        usdt=None,
+                        meta={"reason": "manual_entry"},
+                    )
+                    st["in_pos"] = True
+                    st["last_entry"] = now_ts
             if long_amt > 0:
                 st["long_pos_seen_ts"] = now_ts
             if short_amt > 0:

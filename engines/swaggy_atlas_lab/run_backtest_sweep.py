@@ -21,11 +21,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Swaggy x Atlas Lab backtest sweep")
     parser.add_argument("--symbols", default="", help="comma-separated symbols")
     parser.add_argument("--symbols-file", default="", help="path to fixed symbol list")
+    parser.add_argument("--max-symbols", type=int, default=7)
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--mode", default="shadow", choices=("hard", "soft", "shadow", "off", "hybrid", "all"))
     parser.add_argument("--tp-pct", type=float, default=0.03)
     parser.add_argument("--sl-pct", type=float, default=0.0)
-    parser.add_argument("--sl-sweep", default="0.10,0.15,0.20")
+    parser.add_argument("--sl-sweep", default="")
     parser.add_argument("--universe", default="top50")
     parser.add_argument("--anchor", default="BTC,ETH")
     parser.add_argument("--fee", type=float, default=0.0)
@@ -39,7 +40,7 @@ def main() -> None:
     else:
         sl_values = _parse_floats(args.sl_sweep)
         if not sl_values:
-            raise SystemExit("sl-sweep must contain at least one value")
+            raise SystemExit("sl-pct or sl-sweep must be provided")
 
     base_cmd = [
         sys.executable,
@@ -66,6 +67,8 @@ def main() -> None:
         base_cmd.extend(["--symbols", args.symbols])
     if args.symbols_file:
         base_cmd.extend(["--symbols-file", args.symbols_file])
+    if args.max_symbols:
+        base_cmd.extend(["--max-symbols", str(args.max_symbols)])
     if args.verbose:
         base_cmd.append("--verbose")
 

@@ -12,6 +12,7 @@ import cycle_cache
 import engine_runner
 from engines.fabio import fabio_entry_engine, atlas_fabio_engine
 from engines.rsi.engine import RsiEngine
+from engines.universe import build_universe_from_tickers
 
 
 def _parse_datetime(value: str) -> int:
@@ -147,7 +148,7 @@ def _write_trade_header(path: str) -> None:
                 "exit_reason",
                 "pnl_pct",
                 "pnl_usdt",
-                "holding_bars",
+                "hold_min",
                 "mfe",
                 "mae",
                 "sl_px",
@@ -412,6 +413,7 @@ def _run_backtest_for_symbol(
                 pnl_pct = _calc_pnl(trade.side, trade.entry_px, trade.exit_px, fee_rate, slippage_pct)
                 pnl_usdt = pnl_pct * position_size_usdt
                 holding_bars = idx - trade.entry_idx + 1
+                hold_min = holding_bars * ltf_minutes
                 mfe = (
                     (trade.entry_px - trade.low_min) / trade.entry_px
                     if trade.side == "SHORT"
@@ -426,7 +428,7 @@ def _run_backtest_for_symbol(
                     "ATLASFABIO_TRADE_EXIT "
                     f"sym={symbol} side={trade.side} reason={trade.exit_reason} exit_px={trade.exit_px} "
                     f"exit_ts={trade.exit_ts} pnl_pct={pnl_pct:.4f} mfe={mfe:.4f} "
-                    f"mae={mae:.4f} hold={holding_bars}"
+                    f"mae={mae:.4f} hold={hold_min:.1f}"
                 )
                 trade_stats["trades"] += 1
                 if exit_reason == "TIMEOUT":
@@ -441,7 +443,7 @@ def _run_backtest_for_symbol(
                     trade_stats["losses"] += 1
                 trade_stats["mfe_sum"] += mfe
                 trade_stats["mae_sum"] += mae
-                trade_stats["hold_sum"] += holding_bars * ltf_minutes
+                trade_stats["hold_sum"] += hold_min
                 _append_trade(
                     out_trades,
                     [
@@ -454,7 +456,7 @@ def _run_backtest_for_symbol(
                         trade.exit_reason,
                         f"{pnl_pct:.6f}",
                         f"{pnl_usdt:.6f}",
-                        holding_bars,
+                        f"{hold_min:.1f}",
                         f"{mfe:.6f}",
                         f"{mae:.6f}",
                         f"{trade.sl_px:.6g}",
@@ -636,6 +638,7 @@ def _run_backtest_for_symbol(
         pnl_pct = _calc_pnl(trade.side, trade.entry_px, last_close, fee_rate, slippage_pct)
         pnl_usdt = pnl_pct * position_size_usdt
         holding_bars = last_idx - trade.entry_idx + 1
+        hold_min = holding_bars * ltf_minutes
         mfe = (
             (trade.entry_px - trade.low_min) / trade.entry_px
             if trade.side == "SHORT"
@@ -649,7 +652,7 @@ def _run_backtest_for_symbol(
         _log(
             "ATLASFABIO_TRADE_EXIT "
             f"sym={symbol} side={trade.side} reason=EOT exit_px={last_close} exit_ts={last_ts} "
-            f"pnl_pct={pnl_pct:.4f} mfe={mfe:.4f} mae={mae:.4f} hold={holding_bars}"
+            f"pnl_pct={pnl_pct:.4f} mfe={mfe:.4f} mae={mae:.4f} hold={hold_min:.1f}"
         )
         trade_stats["trades"] += 1
         if pnl_pct >= 0:
@@ -658,7 +661,7 @@ def _run_backtest_for_symbol(
             trade_stats["losses"] += 1
         trade_stats["mfe_sum"] += mfe
         trade_stats["mae_sum"] += mae
-        trade_stats["hold_sum"] += holding_bars * ltf_minutes
+        trade_stats["hold_sum"] += hold_min
         _append_trade(
             out_trades,
             [
@@ -671,7 +674,7 @@ def _run_backtest_for_symbol(
                 trade.exit_reason,
                 f"{pnl_pct:.6f}",
                 f"{pnl_usdt:.6f}",
-                holding_bars,
+                f"{hold_min:.1f}",
                 f"{mfe:.6f}",
                 f"{mae:.6f}",
                 f"{trade.sl_px:.6g}",
@@ -707,14 +710,15 @@ def _run_backtest_for_symbol(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AtlasFabio backtest runner")
-    parser.add_argument("--symbols", required=True, help="comma-separated symbols")
+    parser.add_argument("--symbols", default="", help="comma-separated symbols")
+    parser.add_argument("--max-symbols", type=int, default=7)
     parser.add_argument("--days", type=int, default=7, help="lookback days from now")
     parser.add_argument("--direction", default="auto", choices=("auto", "long", "short"))
     parser.add_argument("--long", default="", help="comma-separated long symbols override")
     parser.add_argument("--short", default="", help="comma-separated short symbols override")
-    parser.add_argument("--log-file", default="", help="backtest funnel log path")
-    parser.add_argument("--out-signals", default="logs/fabio/backtest_atlasfabio_signals.csv")
-    parser.add_argument("--out-trades", default="logs/fabio/backtest_atlasfabio_trades.csv")
+    parser.add_argument("--log-file", default="backtest.log", help="backtest funnel log path")
+    parser.add_argument("--out-signals", default="atlasfabio_signals.csv")
+    parser.add_argument("--out-trades", default="atlasfabio_trades.csv")
     parser.add_argument("--entry-mode", default="NEXT_OPEN", choices=("NEXT_OPEN", "SIGNAL_CLOSE"))
     parser.add_argument("--exit-mode", default="PCT", choices=("R_MULT", "PCT"))
     parser.add_argument("--risk-pct", type=float, default=0.01)
@@ -733,20 +737,10 @@ def main() -> None:
     if engine_runner.rsi_engine is None:
         engine_runner.rsi_engine = RsiEngine()
 
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    if not symbols:
-        raise SystemExit("symbols is required")
     end_ms = _now_ms()
     start_ms = _since_ms(args.days)
     if end_ms <= start_ms:
         raise SystemExit("invalid days range")
-
-    log_path = args.log_file.strip() or os.path.join("logs", "fabio", "atlasfabio_funnel_backtest.log")
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"[backtest] days={args.days} start_ms={start_ms} end_ms={end_ms} symbols={symbols}\n")
-    _write_signal_header(args.out_signals)
-    _write_trade_header(args.out_trades)
 
     exchange = ccxt.binance(
         {
@@ -754,6 +748,26 @@ def main() -> None:
             "options": {"defaultType": "swap"},
         }
     )
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if not symbols:
+        tickers = exchange.fetch_tickers()
+        symbols = build_universe_from_tickers(tickers)
+    if isinstance(args.max_symbols, int) and args.max_symbols > 0:
+        symbols = symbols[: args.max_symbols]
+    if not symbols:
+        raise SystemExit("symbols is required")
+
+    base_dir = os.path.join("logs", "fabio", "backtest")
+    os.makedirs(base_dir, exist_ok=True)
+    log_path = os.path.join(base_dir, os.path.basename(args.log_file.strip() or "backtest.log"))
+    out_signals = os.path.join(base_dir, os.path.basename(args.out_signals))
+    out_trades = os.path.join(base_dir, os.path.basename(args.out_trades))
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[backtest] days={args.days} start_ms={start_ms} end_ms={end_ms} symbols={symbols}\n")
+    _write_signal_header(out_signals)
+    _write_trade_header(out_trades)
 
     cycle_cache.set_fetcher(None)
 
@@ -847,8 +861,8 @@ def main() -> None:
             slippage_pct=args.slippage_pct,
             position_size_usdt=args.position_size_usdt,
             trade_cooldown_bars=args.trade_cooldown_bars,
-            out_signals=args.out_signals,
-            out_trades=args.out_trades,
+            out_signals=out_signals,
+            out_trades=out_trades,
             verbose=args.verbose,
         )
         if row:

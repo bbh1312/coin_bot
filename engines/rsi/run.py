@@ -33,7 +33,8 @@ def _fmt_float(val: Any, ndigits: int = 2) -> str:
 
 def _append_rsi_detail_log(line: str) -> None:
     try:
-        full_path = os.path.join("logs", "rsi", "rsi_detail.log")
+        date_tag = time.strftime("%Y%m%d")
+        full_path = os.path.join("logs", "rsi", f"rsi_detail_{date_tag}.log")
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, "a", encoding="utf-8") as f:
             f.write(line.rstrip("\n") + "\n")

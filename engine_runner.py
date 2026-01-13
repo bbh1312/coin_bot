@@ -476,7 +476,9 @@ def _entry_seen_acquire(
             if isinstance(rec, dict):
                 ts = float(rec.get("ts", 0.0) or 0.0)
                 if (now - ts) < ttl_sec:
-                    return False, str(rec.get("engine") or "unknown")
+                    blocked_by = str(rec.get("engine") or "unknown")
+                    _append_entry_gate_log(engine, symbol, f"entry_seen_by={blocked_by} side={side}")
+                    return False, blocked_by
         seen[key_side] = {"ts": now, "engine": engine}
         seen[key_engine] = {"ts": now, "engine": engine}
     return True, "ok"
@@ -488,6 +490,16 @@ def _append_entry_log(path: str, line: str) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         with open(full_path, "a", encoding="utf-8") as f:
             f.write(f"{ts} {line}\n")
+    except Exception:
+        pass
+
+def _append_entry_gate_log(engine: str, symbol: str, reason: str) -> None:
+    try:
+        date_tag = time.strftime("%Y-%m-%d")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        path = os.path.join("entry_gate", f"entry_gate-{date_tag}.log")
+        line = f"{ts} engine={engine or 'unknown'} symbol={symbol} reason={reason or 'unknown'}"
+        _append_log_lines(path, [line])
     except Exception:
         pass
 
@@ -548,7 +560,8 @@ def _append_log_lines(path: str, lines: list) -> None:
 
 def _append_rsi_detail_log(line: str) -> None:
     try:
-        full_path = os.path.join("logs", "rsi", "rsi_detail.log")
+        date_tag = time.strftime("%Y%m%d")
+        full_path = os.path.join("logs", "rsi", f"rsi_detail_{date_tag}.log")
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, "a", encoding="utf-8") as f:
             f.write(line.rstrip("\n") + "\n")
@@ -607,12 +620,20 @@ def _atlas_tier_from_score(score: Optional[float]) -> str:
     return "NO"
 
 
-def _entry_guard_acquire(state: Dict[str, dict], symbol: str, ttl_sec: float = 5.0, key: Optional[str] = None) -> bool:
+def _entry_guard_acquire(
+    state: Dict[str, dict],
+    symbol: str,
+    ttl_sec: float = 5.0,
+    key: Optional[str] = None,
+    engine: Optional[str] = None,
+    side: Optional[str] = None,
+) -> bool:
     guard = _get_entry_guard(state)
     now = time.time()
     gkey = key or symbol
     ts = float(guard.get(gkey, 0.0) or 0.0)
     if (now - ts) < ttl_sec:
+        _append_entry_gate_log(engine or "unknown", symbol, f"entry_guard_ttl side={side or 'N/A'}")
         return False
     guard[gkey] = now
     return True
@@ -636,7 +657,9 @@ def _entry_lock_acquire(state: Dict[str, dict], symbol: str, owner: str, ttl_sec
         if isinstance(cur, dict):
             expires = float(cur.get("expires", 0.0) or 0.0)
             if now < expires and cur.get("owner"):
-                return False, str(cur.get("owner")), expires - now
+                held_by = str(cur.get("owner"))
+                _append_entry_gate_log(owner, symbol, f"entry_lock_held_by={held_by}")
+                return False, held_by, expires - now
         lock[symbol] = {"owner": owner, "expires": now + ttl_sec, "ts": now}
     return True, None, None
 
@@ -722,6 +745,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "ATLASFABIO"
     if key in ("swaggy_long", "swaggy_short"):
         return "SWAGGY"
+    if key == "swaggy_atlas_lab":
+        return "SWAGGY_ATLAS_LAB"
     if key in ("dtfx_long", "dtfx_short"):
         return "DTFX"
     if key == "div15m_long":
@@ -736,6 +761,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "RSI"
     if key == "long_entry":
         return "SCALP"
+    if key in ("manual", "manual_entry"):
+        return "MANUAL"
     return "UNKNOWN"
 
 def _close_trade(
@@ -1504,7 +1531,7 @@ def _run_fabio_cycle(
                         else:
                             try:
                                 guard_key = _entry_guard_key(state, symbol, "LONG")
-                                if not _entry_guard_acquire(state, symbol, key=guard_key):
+                                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="fabio", side="LONG"):
                                     print(f"[fabio] 롱 중복 차단 ({symbol})")
                                     funnel["entry_blocked_guard"] += 1
                                 else:
@@ -1639,7 +1666,7 @@ def _run_fabio_cycle(
                         continue
                     try:
                         guard_key = _entry_guard_key(state, symbol, "SHORT")
-                        if not _entry_guard_acquire(state, symbol, key=guard_key):
+                        if not _entry_guard_acquire(state, symbol, key=guard_key, engine="fabio", side="SHORT"):
                             print(f"[fabio] 숏 중복 차단 ({symbol})")
                             funnel["entry_blocked_guard"] += 1
                             time.sleep(PER_SYMBOL_SLEEP)
@@ -1994,7 +2021,7 @@ def _run_swaggy_cycle(
                     continue
                 try:
                     guard_key = _entry_guard_key(state, symbol, "LONG")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key):
+                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy", side="LONG"):
                         print(f"[swaggy] 롱 중복 차단 ({symbol})")
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
@@ -2114,7 +2141,7 @@ def _run_swaggy_cycle(
                     continue
                 try:
                     guard_key = _entry_guard_key(state, symbol, "SHORT")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key):
+                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy", side="SHORT"):
                         print(f"[swaggy] 숏 중복 차단 ({symbol})")
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
@@ -2298,7 +2325,7 @@ def _run_swaggy_atlas_lab_cycle(
                     continue
                 try:
                     guard_key = _entry_guard_key(state, symbol, "LONG")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key):
+                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_atlas_lab", side="LONG"):
                         print(f"[swaggy_atlas_lab] 롱 중복 차단 ({symbol})")
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
@@ -2395,7 +2422,7 @@ def _run_swaggy_atlas_lab_cycle(
                     continue
                 try:
                     guard_key = _entry_guard_key(state, symbol, "SHORT")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key):
+                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_atlas_lab", side="SHORT"):
                         print(f"[swaggy_atlas_lab] 숏 중복 차단 ({symbol})")
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
@@ -3107,7 +3134,7 @@ def _run_atlas_fabio_cycle(
         if side == "LONG":
             if LONG_LIVE_TRADING:
                 guard_key = _entry_guard_key(state, symbol, "LONG")
-                if not _entry_guard_acquire(state, symbol, key=guard_key):
+                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
                     funnel["entry_blocked_guard"] += 1
                     _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
                     _entry_lock_release(state, symbol, owner="atlasfabio")
@@ -3182,7 +3209,7 @@ def _run_atlas_fabio_cycle(
             entry_order_id = None
             if LIVE_TRADING:
                 guard_key = _entry_guard_key(state, symbol, "SHORT")
-                if not _entry_guard_acquire(state, symbol, key=guard_key):
+                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
                     funnel["entry_blocked_guard"] += 1
                     _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
                     _entry_lock_release(state, symbol, owner="atlasfabio")
@@ -3365,7 +3392,7 @@ def _run_dtfx_cycle(
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             guard_key = _entry_guard_key(state, symbol, side)
-            if not _entry_guard_acquire(state, symbol, key=guard_key):
+            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="dtfx", side=side):
                 print(f"[dtfx] {side} 중복 차단 ({symbol})")
                 _entry_lock_release(state, symbol, owner="dtfx")
                 time.sleep(PER_SYMBOL_SLEEP)
@@ -3688,7 +3715,7 @@ def _run_pumpfade_cycle(
                 continue
             try:
                 guard_key = _entry_guard_key(state, symbol, "SHORT")
-                if not _entry_guard_acquire(state, symbol, key=guard_key):
+                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="pumpfade", side="SHORT"):
                     print(f"[pumpfade] 숏 중복 차단 ({symbol})")
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
@@ -3698,19 +3725,18 @@ def _run_pumpfade_cycle(
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
                 try:
-                    res = short_limit(
+                    res = short_market(
                         symbol,
-                        price=entry_price,
                         usdt_amount=entry_usdt,
                         leverage=LEVERAGE,
                         margin_mode=MARGIN_MODE,
                     )
                     order_id = _order_id_from_res(res)
                     status = res.get("status")
-                    order_info = f"limit_price={entry_price} usdt={entry_usdt} status={status}"
+                    order_info = f"market usdt={entry_usdt} status={status}"
                     if status in ("ok",) and order_id:
-                        pf["pending_order_id"] = order_id
-                        pf["pending_deadline_ts"] = now_ts + tf_sec * int(pumpfade_cfg.entry_timeout_bars)
+                        pf["pending_order_id"] = None
+                        pf["pending_deadline_ts"] = None
                         pf["last_retest_hh"] = hh_n if isinstance(hh_n, (int, float)) else last_hh
                         prior_hh = meta.get("prior_hh")
                         if isinstance(prior_hh, (int, float)):
@@ -3889,7 +3915,7 @@ def _run_atlas_rs_fail_short_cycle(
             continue
         try:
             guard_key = _entry_guard_key(state, symbol, "SHORT")
-            if not _entry_guard_acquire(state, symbol, key=guard_key):
+            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlas_rs_fail_short", side="SHORT"):
                 _arsf_skip(symbol, "ENTRY_GUARD", entry_price)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -7087,7 +7113,17 @@ def run():
                 fabio_universe = list(state.get("_fabio_universe") or [])
                 fabio_label = str(state.get("_fabio_label") or "realtime_only")
                 fabio_dir_hint = dict(state.get("_fabio_dir_hint") or {})
-            universe_union = list(set(universe_momentum + (dtfx_universe or []) + (pumpfade_universe or []) + (atlas_rs_fail_short_universe or [])))
+            universe_union = list(
+                set(
+                    universe_momentum
+                    + universe_structure
+                    + fabio_universe
+                    + (swaggy_universe or [])
+                    + (dtfx_universe or [])
+                    + (pumpfade_universe or [])
+                    + (atlas_rs_fail_short_universe or [])
+                )
+            )
         if heavy_scan:
             long_cnt = 0
             short_cnt = 0
@@ -7721,7 +7757,7 @@ def run():
                 entry_price_disp = None
                 if LIVE_TRADING:
                     guard_key = _entry_guard_key(state, symbol, "SHORT")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key):
+                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="rsi", side="SHORT"):
                         print(f"[entry] 숏 중복 차단 ({symbol})")
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
@@ -7753,8 +7789,9 @@ def run():
                             entry_order_id=entry_order_id,
                             meta={"reason": "short_entry"},
                         )
+                        date_tag = time.strftime("%Y%m%d")
                         _append_entry_log(
-                            "rsi_entries.log",
+                            f"rsi/rsi_entries_{date_tag}.log",
                             "engine=rsi side=SHORT symbol=%s price=%s qty=%s usdt=%s "
                             "rsi1h=%s rsi15=%s rsi5=%s rsi3=%s "
                             "down5=%s down3=%s vol=%s struct=%s spike=%s structr=%s"
@@ -7901,7 +7938,7 @@ def run():
             entry_order_id = None
             if LONG_LIVE_TRADING:
                 guard_key = _entry_guard_key(state, symbol, "LONG")
-                if not _entry_guard_acquire(state, symbol, key=guard_key):
+                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="div15m", side="LONG"):
                     print(f"[entry] 롱 중복 차단 ({symbol})")
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
@@ -8082,7 +8119,7 @@ def run():
             entry_price_disp = None
             if LIVE_TRADING:
                 guard_key = _entry_guard_key(state, symbol, "SHORT")
-                if not _entry_guard_acquire(state, symbol, key=guard_key):
+                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="div15m_short", side="SHORT"):
                     print(f"[entry] 숏 중복 차단 ({symbol})")
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue

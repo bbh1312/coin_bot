@@ -93,14 +93,15 @@ class JsonlLogger:
             pass
 
     def log(self, signal: Signal):
-        # Add a print statement to console for every logged signal
-        filters = signal.context.get("filters", {}) if isinstance(signal.context, dict) else {}
-        symbol_base = filters.get("symbol_base") or signal.symbol.split("/")[0].split(":")[0]
-        is_anchor = filters.get("is_anchor")
-        print(
-            f"[SIGNAL LOGGED] Engine: {signal.engine} | Event: {signal.event} | Symbol: {signal.symbol} "
-            f"| State: {signal.state} base={symbol_base} is_anchor={bool(is_anchor)}"
-        )
+        quiet = self.mode == "backtest" and _env_or_default("DTFX_LOG_QUIET", "1") != "0"
+        if not quiet:
+            filters = signal.context.get("filters", {}) if isinstance(signal.context, dict) else {}
+            symbol_base = filters.get("symbol_base") or signal.symbol.split("/")[0].split(":")[0]
+            is_anchor = filters.get("is_anchor")
+            print(
+                f"[SIGNAL LOGGED] Engine: {signal.engine} | Event: {signal.event} | Symbol: {signal.symbol} "
+                f"| State: {signal.state} base={symbol_base} is_anchor={bool(is_anchor)}"
+            )
 
         if self.mode == "backtest":
             if not self.log_file_path.endswith(f"{datetime.utcnow().strftime('%Y%m%d')}.jsonl"):

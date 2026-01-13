@@ -23,42 +23,71 @@ pip install ccxt pandas requests websocket-client
 
 ## 백테스트
 - RSI 엔진
-  - RSI 백테스트 
-    python3 -m engines.rsi.run_backtest \
-    --symbols PTB/USDT:USDT,RIVER/USDT:USDT,AKE/USDT:USDT,CLO/USDT:USDT,AVNT/USDT:USDT,GPS/USDT:USDT \
-    --start 2026-01-01 \
-    --end 2026-01-10  \
-    --sl-pct 0.04 \
-    --tp-pct 0.05
-
-- PumpFade 엔진
-  - PumpFade 백테스트
-    python3 -m engines.pumpfade.backtest_runner \
-    --symbols PTB/USDT:USDT,HYPER/USDT:USDT,POL/USDT:USDT,RIVER/USDT:USDT,AKE/USDT:USDT \
-    --days 7 \
-    --out logs/pumpfade/pumpfade_backtest.csv
-- 아틀라스 파비오
   - 백테스트
-    python3 backtest_atlasfabio.py \
-      --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,HYPER/USDT:USDT \
-      --days 10 \
-      --sl-pct 0.02 \
-      --tp-pct 0.03
+    ```
+     python3 engines/rsi/run_backtest.py \
+    --days 3 \
+    --sl-pct 0.30 \
+    --tp-pct 0.03 \
+    --max-symbols 7
+
+    ```
   - 예시
     ```
+    [BACKTEST] BTC/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] ETH/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] ALPACA/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] BNX/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] PLAY/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0645 avg_mae=0.0579 avg_hold=51.0
+    [BACKTEST] DOLO/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0351 avg_mae=0.0172 avg_hold=9.0
+    [BACKTEST] ALPHA/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] TOTAL trades=2 wins=2 losses=0 winrate=100.00% tp=2 sl=0 avg_mfe=0.0498 avg_mae=0.0375 avg_hold=30.0
+
+    ```
+
+- PumpFade 엔진
+  - 백테스트
+    ```
+    python3 engines/pumpfade/backtest_runner.py \
+    --days 3 \
+    --sl-pct 0.03 \
+    --tp-pct 0.03 \
+    --max-symbols 7
+    ```
+  - 예시
+    ```
+    [BACKTEST] DRIFT/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] TRUST/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] 1000000MOG/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] DEXE/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] TAC/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] 1000BONK/USDC:USDC trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0364 avg_mae=0.0132 avg_hold=210.0
+    [BACKTEST] PHA/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] TOTAL trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0364 avg_mae=0.0132 avg_hold=210.0
+
+    ```
+- 아틀라스 파비오
+  - 백테스트
+    ```
     python3 backtest_atlasfabio.py \
-      --symbols PROM/USDT:USDT,B/USDT:USDT,PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT \       
-      --days 7 \
-      --sl-pct 0.03 \
-      --tp-pct 0.05
-      [BACKTEST] AKE/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0671 avg_mae=0.0197 avg_hold=165.0
-      [BACKTEST] POL/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=0 sl=0 avg_mfe=0.0469 avg_mae=0.0263 avg_hold=495.0
-      [BACKTEST] TRUTH/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0531 avg_mae=0.0217 avg_hold=270.0
-      [BACKTEST] PROM/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-      [BACKTEST] B/USDT:USDT trades=1 wins=0 losses=1 winrate=0.00% tp=0 sl=1 avg_mfe=0.0146 avg_mae=0.0304 avg_hold=435.0
-      [BACKTEST] PTB/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-      [BACKTEST] TOTAL trades=4 wins=3 losses=1 winrate=75.00% tp=2 sl=1 avg_mfe=0.0454 avg_mae=0.0245 avg_hold=341.2
-  ```
+    --days 7 \
+    --sl-pct 0.03 \
+    --tp-pct 0.03 \
+    --max-symbols 7
+    ```    
+  - 예시
+    ```
+    [BACKTEST] DOLO/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0327 avg_mae=0.0092 avg_hold=30.0
+    [BACKTEST] IP/USDC:USDC trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0482 avg_mae=0.0088 avg_hold=180.0
+    [BACKTEST] IP/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0481 avg_mae=0.0093 avg_hold=180.0
+    [BACKTEST] XVG/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=0 sl=0 avg_mfe=0.0248 avg_mae=0.0251 avg_hold=495.0
+    [BACKTEST] DUSK/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0431 avg_mae=0.0067 avg_hold=285.0
+    [BACKTEST] NEIROETH/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] AMB/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] DGB/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] TOTAL trades=5 wins=5 losses=0 winrate=100.00% tp=4 sl=0 avg_mfe=0.0394 avg_mae=0.0118 avg_hold=234.0
+
+    ```
 - 스웨기
   - 백테스트
     python3 engines/swaggy/run_backtest.py \
@@ -82,14 +111,15 @@ pip install ccxt pandas requests websocket-client
   [BACKTEST] B/USDT:USDT trades=105 wins=51 losses=54 winrate=48.57% tp=0 sl=2 avg_mfe=0.0169 avg_mae=0.0132 avg_hold=64.9
   [BACKTEST] TOTAL trades=683 wins=341 losses=342 winrate=49.93% tp=0 sl=10 avg_mfe=0.0128 avg_mae=0.0124 avg_hold=64.6
   ```
-- 아틀라스 스웨기
+- swaggy_atlas_lab
   - 백테스트
-    python33 -m engines.swaggy_atlas_lab.run_backtest \
-    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
-    --days 10 \
+    ```
+    python3 engines/swaggy_atlas_lab/run_backtest.py \
+    --days 7 \
     --sl-pct 0.30 \
     --tp-pct 0.03 \
-    --mode all
+    --max-symbols 7
+    ```
   - 예시
     ```
      python3 engines/swaggy_atlas_lab/run_backtest_sweep.py \
@@ -108,14 +138,29 @@ pip install ccxt pandas requests websocket-client
     [BACKTEST] TOTAL@shadow trades=77 wins=75 losses=2 winrate=97.40% tp=75 sl=2 avg_mfe=0.0377 avg_mae=0.0453 avg_hold=916.9
     [BACKTEST] TOTAL trades=77 wins=75 losses=2 winrate=97.40% tp=75 sl=2 avg_mfe=0.0377 avg_mae=0.0453 avg_hold=916.9    
     ```
-- 아틀라스 일반 숏
+- DTFX     
   - 백테스트
-     python3 -m engines.atlas_rs_fail_short.backtest_runner \
-    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
-    --days 30 \
+    ```
+    python3 engines/dtfx/backtest_runner.py \
+    --days 2 \
+    --sl-pct 0.30 \
+    --tp-pct 0.03 \
+    --max-symbols 10
+    ```
+  - 예시
+    ```
+    
+    ```
+- atlas_rs_fail_short(숏 전용)
+  - 백테스트
+    ```
+    python3 engines/atlas_rs_fail_short/backtest_runner.py \
+    --days 2 \
     --sl-pct 0.03 \
     --tp-pct 0.03 \
-    --out logs/atlas_rs_fail_short/arsf_signals.csv
+    --max-symbols 10
+
+    ```
   - 예시
   ```
   python3 -m engines.atlas_rs_fail_short.backtest_runner \

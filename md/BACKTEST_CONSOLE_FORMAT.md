@@ -49,4 +49,27 @@ hold_minutes = holding_bars * ltf_minutes
 
 - 백테스트 모드에서는 사이클 단위 funnel 로그를 출력하지 않는다.
 - CSV/로그 파일은 저장하되, 기본 콘솔에는 출력하지 않는다.
+
+## 로그/CSV 저장 위치
+
+- 백테스트 로그와 CSV는 `logs/<엔진>/backtest/` 하위에 저장한다.
+
+## 라이브와 동일 조건 (엔진별 백테스트)
+
+- 엔진별 백테스트는 **라이브와 동일한 조건**으로 맞춘다.
+  - 미완성봉 제외(라이브에서 `iloc[:-1]`와 동일)
+  - 동일한 캔들 window limit 적용
+  - 라이브와 동일한 유니버스 산출 방식 사용
+
+### 공통 게이트(라이브 전용) 참고
+
+라이브에서만 engine_runner가 추가로 적용하는 공통 게이트가 있다:
+
+- in_position(다른 엔진 포지션 보유 시 차단)
+- 엔트리 락/중복 방지
+- MAX_OPEN_POSITIONS 제한
+- LIVE_TRADING/LONG_LIVE_TRADING off면 차단
+
+백테스트에는 공통 게이트가 기본으로 존재하지 않으며,
+**라이브와 동일 비교가 필요한 엔진은 해당 게이트를 백테스트에 직접 반영**한다.
 *** End Patch}/** END of assistant to=functions.apply_patch code **/
