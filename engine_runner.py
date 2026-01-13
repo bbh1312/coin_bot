@@ -624,6 +624,14 @@ def _atlasfabio_entry_gate(
     last_entry = float(st.get("last_entry", 0.0) or 0.0)
     if (now_ts - last_entry) < COOLDOWN_SEC:
         return False, "cooldown"
+    last_exit_ts = st.get("last_exit_ts")
+    if isinstance(last_exit_ts, (int, float)) and (now_ts - float(last_exit_ts)) < EXIT_COOLDOWN_SEC:
+        _append_entry_gate_log(
+            "atlasfabio",
+            symbol,
+            f"청산쿨다운={int(EXIT_COOLDOWN_SEC)}s side={side}",
+        )
+        return False, "exit_cooldown"
     if isinstance(max_positions, int) and isinstance(active_positions, int):
         if active_positions >= max_positions:
             _append_entry_gate_log(
@@ -661,6 +669,28 @@ def _entry_guard_acquire(
         return False
     guard[gkey] = now
     return True
+
+
+def _exit_cooldown_blocked(
+    state: Dict[str, dict],
+    symbol: str,
+    engine: str,
+    side: str,
+    ttl_sec: float = EXIT_COOLDOWN_SEC,
+) -> bool:
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    last_exit_ts = st.get("last_exit_ts")
+    if not isinstance(last_exit_ts, (int, float)):
+        return False
+    now = time.time()
+    if (now - float(last_exit_ts)) < ttl_sec:
+        _append_entry_gate_log(
+            engine,
+            symbol,
+            f"청산쿨다운={int(ttl_sec)}s side={side}",
+        )
+        return True
+    return False
 
 def _entry_guard_release(state: Dict[str, dict], symbol: str, key: Optional[str] = None) -> None:
     guard = _get_entry_guard(state)
@@ -801,6 +831,8 @@ def _close_trade(
 ) -> None:
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     st["last_entry"] = float(exit_ts)
+    st["last_exit_ts"] = float(exit_ts)
+    st["last_exit_reason"] = reason
     st["in_pos"] = False
     state[symbol] = st
     log = _get_trade_log(state)
@@ -1551,6 +1583,9 @@ def _run_fabio_cycle(
                         f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=LONG",
                     )
                 else:
+                    if _exit_cooldown_blocked(state, symbol, "fabio", "LONG"):
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
                     if LONG_LIVE_TRADING:
                         lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="fabio")
                         if not lock_ok:
@@ -1675,6 +1710,9 @@ def _run_fabio_cycle(
                         symbol,
                         f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
                     )
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                if _exit_cooldown_blocked(state, symbol, "fabio", "SHORT"):
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
                 order_info = "(알림 전용)"
@@ -1993,6 +2031,9 @@ def _run_swaggy_cycle(
                 symbol,
                 f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
             )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if _exit_cooldown_blocked(state, symbol, "swaggy", side):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         reason_codes = ",".join(decision.reason_codes or []) if isinstance(decision.reason_codes, list) else ""
@@ -2330,6 +2371,9 @@ def _run_swaggy_atlas_lab_cycle(
                 symbol,
                 f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
             )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if _exit_cooldown_blocked(state, symbol, "swaggy_atlas_lab", side):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         _append_entry_log(
@@ -3434,6 +3478,9 @@ def _run_dtfx_cycle(
                 )
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
+            if _exit_cooldown_blocked(state, symbol, "dtfx", side):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
             if side == "LONG" and not LONG_LIVE_TRADING:
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -3726,6 +3773,9 @@ def _run_pumpfade_cycle(
             )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
+        if _exit_cooldown_blocked(state, symbol, "pumpfade", "SHORT"):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
 
         entry_price = float(sig.entry_price or 0.0)
         if entry_price <= 0:
@@ -3940,6 +3990,10 @@ def _run_atlas_rs_fail_short_cycle(
                 f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
             )
             _arsf_skip(symbol, "MAX_POS", entry_price)
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if _exit_cooldown_blocked(state, symbol, "atlas_rs_fail_short", "SHORT"):
+            _arsf_skip(symbol, "EXIT_COOLDOWN", entry_price)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         snapshot = state.get("_atlas_rs_fail_short_snapshot") if isinstance(state.get("_atlas_rs_fail_short_snapshot"), dict) else {}
@@ -5392,6 +5446,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_entry_usdt",
         "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
+        "_div15m_long_enabled",
+        "_div15m_short_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -5404,7 +5460,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         if key in disk:
             state[key] = disk.get(key)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE
     if isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
@@ -5431,6 +5487,10 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
     if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
+    if isinstance(state.get("_div15m_long_enabled"), bool):
+        DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
+    if isinstance(state.get("_div15m_short_enabled"), bool):
+        DIV15M_SHORT_ENABLED = bool(state.get("_div15m_short_enabled"))
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     if isinstance(state.get("_pumpfade_enabled"), bool):
@@ -5458,6 +5518,8 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_entry_usdt",
         "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
+        "_div15m_long_enabled",
+        "_div15m_short_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -5769,7 +5831,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, USDT_PER_TRADE
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, USDT_PER_TRADE
     if not BOT_TOKEN:
         return
     last_update_id = int(state.get("_tg_offset", 0) or 0)
@@ -5924,6 +5986,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
+                            f"/div15m_long(추가진입): {'ON' if DIV15M_LONG_ENABLED else 'OFF'}\n"
+                            f"/div15m_short(추가진입): {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
                             f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                             f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -5961,6 +6025,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                         f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
+                        f"/div15m_long(추가진입): {'ON' if DIV15M_LONG_ENABLED else 'OFF'}\n"
+                        f"/div15m_short(추가진입): {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
                         f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                         f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -6170,6 +6236,46 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_atlas_lab cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/div15m_long", "div15m_long")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        DIV15M_LONG_ENABLED = True
+                        state["_div15m_long_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ div15m_long ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        DIV15M_LONG_ENABLED = False
+                        state["_div15m_long_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ div15m_long OFF"
+                    else:
+                        resp = f"ℹ️ div15m_long 상태: {'ON' if DIV15M_LONG_ENABLED else 'OFF'}\n사용법: /div15m_long on|off|status"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] div15m_long cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/div15m_short", "div15m_short")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        DIV15M_SHORT_ENABLED = True
+                        state["_div15m_short_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ div15m_short ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        DIV15M_SHORT_ENABLED = False
+                        state["_div15m_short_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ div15m_short OFF"
+                    else:
+                        resp = f"ℹ️ div15m_short 상태: {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n사용법: /div15m_short on|off|status"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] div15m_short cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/dtfx", "dtfx")) and not responded:
                     parts = lower.split()
@@ -6414,6 +6520,7 @@ MANAGE_EXIT_COOLDOWN_SEC: int = 5  # auto-exit 전용 최소 평가 주기(초)
 MANAGE_PING_COOLDOWN_SEC: int = 7200  # manage 알림 주기(초) - 2시간
 MANUAL_CLOSE_GRACE_SEC: int = 60  # 진입 직후 포지션 캐시 오차로 인한 오탐 방지
 AUTO_EXIT_GRACE_SEC: int = 30     # 진입 직후 자동청산 금지 구간
+EXIT_COOLDOWN_SEC: int = 7200     # 청산 후 재진입 쿨다운(초)
 MANAGE_LOOP_ENABLED: bool = True  # 관리 루프 분리 실행 여부
 MANAGE_LOOP_SLEEP_SEC: float = 2.0  # 관리 루프 주기(초)
 MANAGE_TICKER_TTL_SEC: float = 5.0  # 관리 루프 티커 캐시 TTL(초)
@@ -6824,7 +6931,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -7687,6 +7794,10 @@ def run():
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
 
+            if _exit_cooldown_blocked(state, symbol, "rsi", "SHORT"):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
             if now - last_entry < COOLDOWN_SEC:
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -7926,14 +8037,17 @@ def run():
             cur_total = count_open_positions(force=True)
             if not isinstance(cur_total, int):
                 cur_total = active_positions
-        if cur_total >= MAX_OPEN_POSITIONS:
-            _append_entry_gate_log(
-                "div15m",
-                symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=LONG",
-            )
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
+            if cur_total >= MAX_OPEN_POSITIONS:
+                _append_entry_gate_log(
+                    "div15m",
+                    symbol,
+                    f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=LONG",
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if _exit_cooldown_blocked(state, symbol, "div15m", "LONG"):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
 
             if now - last_entry < COOLDOWN_SEC:
                 time.sleep(PER_SYMBOL_SLEEP)
@@ -8097,14 +8211,17 @@ def run():
             cur_total = count_open_positions(force=True)
             if not isinstance(cur_total, int):
                 cur_total = active_positions
-        if cur_total >= MAX_OPEN_POSITIONS:
-            _append_entry_gate_log(
-                "div15m_short",
-                symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
-            )
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
+            if cur_total >= MAX_OPEN_POSITIONS:
+                _append_entry_gate_log(
+                    "div15m_short",
+                    symbol,
+                    f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if _exit_cooldown_blocked(state, symbol, "div15m_short", "SHORT"):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
 
             if now - last_entry < COOLDOWN_SEC:
                 time.sleep(PER_SYMBOL_SLEEP)

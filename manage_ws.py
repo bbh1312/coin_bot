@@ -14,6 +14,32 @@ import ws_manager
 import executor as executor_mod
 import engine_runner as er
 
+_ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
+_ENTRY_EVENTS_TTL_SEC = 5.0
+
+
+def _get_entry_event_engine(entry_order_id: Optional[str]) -> Optional[str]:
+    if not entry_order_id:
+        return None
+    path = os.path.join("logs", "entry_events.log")
+    try:
+        mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
+    except Exception:
+        mtime = 0.0
+    now = time.time()
+    cached = _ENTRY_EVENTS_CACHE
+    if (
+        cached.get("map")
+        and (now - float(cached.get("ts", 0.0) or 0.0)) <= _ENTRY_EVENTS_TTL_SEC
+        and float(cached.get("mtime", 0.0) or 0.0) == float(mtime or 0.0)
+    ):
+        return cached["map"].get(str(entry_order_id), {}).get("engine")
+    entry_map, _ = er._load_entry_events_map(None)
+    _ENTRY_EVENTS_CACHE["ts"] = now
+    _ENTRY_EVENTS_CACHE["mtime"] = float(mtime or 0.0)
+    _ENTRY_EVENTS_CACHE["map"] = entry_map
+    return entry_map.get(str(entry_order_id), {}).get("engine")
+
 
 def _last_ws_close(symbol: str):
     df = ws_manager.get_5m_df(symbol, limit=2)
@@ -697,28 +723,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-_ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
-_ENTRY_EVENTS_TTL_SEC = 5.0
-
-
-def _get_entry_event_engine(entry_order_id: Optional[str]) -> Optional[str]:
-    if not entry_order_id:
-        return None
-    path = os.path.join("logs", "entry_events.log")
-    try:
-        mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
-    except Exception:
-        mtime = 0.0
-    now = time.time()
-    cached = _ENTRY_EVENTS_CACHE
-    if (
-        cached.get("map")
-        and (now - float(cached.get("ts", 0.0) or 0.0)) <= _ENTRY_EVENTS_TTL_SEC
-        and float(cached.get("mtime", 0.0) or 0.0) == float(mtime or 0.0)
-    ):
-        return cached["map"].get(str(entry_order_id), {}).get("engine")
-    entry_map, _ = er._load_entry_events_map(None)
-    _ENTRY_EVENTS_CACHE["ts"] = now
-    _ENTRY_EVENTS_CACHE["mtime"] = float(mtime or 0.0)
-    _ENTRY_EVENTS_CACHE["map"] = entry_map
-    return entry_map.get(str(entry_order_id), {}).get("engine")
