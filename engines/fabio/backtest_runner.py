@@ -1,12 +1,17 @@
 import argparse
 import csv
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
 import ccxt
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 import cycle_cache
 import engine_runner

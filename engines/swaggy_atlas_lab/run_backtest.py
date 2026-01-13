@@ -13,8 +13,6 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from engines.base import EngineContext
-from engines.swaggy.swaggy_engine import SwaggyConfig as SwaggyBaseConfig, SwaggyEngine
 from engines.swaggy_atlas_lab.atlas_eval import evaluate_global_gate, evaluate_local
 from engines.swaggy_atlas_lab.broker_sim import BrokerSim
 from engines.swaggy_atlas_lab.config import AtlasConfig, BacktestConfig, SwaggyConfig
@@ -146,16 +144,11 @@ def main() -> None:
         symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     else:
         tickers = ex.fetch_tickers()
-        swaggy_engine = SwaggyEngine(SwaggyBaseConfig())
-        ctx = EngineContext(
-            exchange=ex,
-            state={"_tickers": tickers, "_symbols": list(tickers.keys())},
-            now_ts=time.time(),
-            logger=lambda *_: None,
-            config=swaggy_engine.config,
-        )
-        symbols = swaggy_engine.build_universe(ctx)
-    source = "symbols_file" if args.symbols_file.strip() else ("symbols_arg" if args.symbols.strip() else "engine_universe")
+        top_n = _parse_universe_arg(args.universe)
+        if top_n <= 0:
+            top_n = 50
+        symbols = build_universe_from_tickers(tickers, top_n, anchor_symbols)
+    source = "symbols_file" if args.symbols_file.strip() else ("symbols_arg" if args.symbols.strip() else "ticker_universe")
     if isinstance(args.max_symbols, int) and args.max_symbols > 0:
         symbols = symbols[: args.max_symbols]
     save_universe(

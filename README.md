@@ -69,8 +69,8 @@ pip install ccxt pandas requests websocket-client
 - 아틀라스 파비오
   - 백테스트
     ```
-    python3 backtest_atlasfabio.py \
-    --days 7 \
+    python3 engines/fabio/backtest_runner.py \
+    --days 1 \
     --sl-pct 0.03 \
     --tp-pct 0.03 \
     --max-symbols 7
@@ -88,29 +88,6 @@ pip install ccxt pandas requests websocket-client
     [BACKTEST] TOTAL trades=5 wins=5 losses=0 winrate=100.00% tp=4 sl=0 avg_mfe=0.0394 avg_mae=0.0118 avg_hold=234.0
 
     ```
-- 스웨기
-  - 백테스트
-    python3 engines/swaggy/run_backtest.py \
-    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
-    --sl-pct 0.03 \
-    --tp-pct 0.03 \
-    --days 10
-  - 예시
-  ```
-  python3 engines/swaggy/run_backtest.py \
-    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
-    --sl-pct 0.30 \
-    --tp-pct 0.03 \
-    --days 10
-  [BACKTEST] PTB/USDT:USDT trades=97 wins=54 losses=43 winrate=55.67% tp=0 sl=0 avg_mfe=0.0123 avg_mae=0.0144 avg_hold=64.5
-  [BACKTEST] AKE/USDT:USDT trades=93 wins=48 losses=45 winrate=51.61% tp=0 sl=3 avg_mfe=0.0131 avg_mae=0.0138 avg_hold=63.9
-  [BACKTEST] POL/USDT:USDT trades=87 wins=38 losses=49 winrate=43.68% tp=0 sl=0 avg_mfe=0.0102 avg_mae=0.0113 avg_hold=65.1
-  [BACKTEST] TRUTH/USDT:USDT trades=98 wins=50 losses=48 winrate=51.02% tp=0 sl=3 avg_mfe=0.0167 avg_mae=0.0134 avg_hold=64.6
-  [BACKTEST] ALCH/USDT:USDT trades=93 wins=51 losses=42 winrate=54.84% tp=0 sl=1 avg_mfe=0.0092 avg_mae=0.0082 avg_hold=64.7
-  [BACKTEST] ARC/USDT:USDT trades=110 wins=49 losses=61 winrate=44.55% tp=0 sl=1 avg_mfe=0.0109 avg_mae=0.0120 avg_hold=64.8
-  [BACKTEST] B/USDT:USDT trades=105 wins=51 losses=54 winrate=48.57% tp=0 sl=2 avg_mfe=0.0169 avg_mae=0.0132 avg_hold=64.9
-  [BACKTEST] TOTAL trades=683 wins=341 losses=342 winrate=49.93% tp=0 sl=10 avg_mfe=0.0128 avg_mae=0.0124 avg_hold=64.6
-  ```
 - swaggy_atlas_lab
   - 백테스트
     ```
@@ -142,14 +119,24 @@ pip install ccxt pandas requests websocket-client
   - 백테스트
     ```
     python3 engines/dtfx/backtest_runner.py \
-    --days 2 \
+    --days 5 \
     --sl-pct 0.30 \
     --tp-pct 0.03 \
     --max-symbols 10
     ```
   - 예시
     ```
-    
+    [BACKTEST] BTC/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] ETH/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] ALPACA/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] PORT3/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] BNX/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] BSW/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] PLAY/USDT:USDT trades=2 wins=1 losses=1 winrate=50.00% tp=1 sl=1 avg_mfe=0.0312 avg_mae=0.1935 avg_hold=3165.5
+    [BACKTEST] DOLO/USDT:USDT trades=5 wins=5 losses=0 winrate=100.00% tp=5 sl=0 avg_mfe=0.0332 avg_mae=0.0138 avg_hold=921.0
+    [BACKTEST] NEIROETH/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] VIDT/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+    [BACKTEST] TOTAL trades=7 wins=6 losses=1 winrate=85.71% tp=6 sl=1 avg_mfe=0.0326 avg_mae=0.0652 avg_hold=1562.3
     ```
 - atlas_rs_fail_short(숏 전용)
   - 백테스트
@@ -195,10 +182,6 @@ pip install ccxt pandas requests websocket-client
 ### AtlasFabio 엔진
 - 엔진개요: Fabio 시그널에 Atlas 게이트(HTF Supertrend + LTF ATR/볼륨 강도)를 결합한 추가 진입 엔진.
 - 엔트리 기준: 1h Supertrend 방향이 롱/숏을 허용(UP=롱, DOWN=숏)하고 15m ATR/거래량이 SMA 대비 기준 이상일 때 사이즈 보정, Fabio 시그널이 entry_ready 및 trigger 강도를 통과하며 5m/3m RSI 히트 조건을 만족해야 ENTRY_READY.
-
-### Swaggy 엔진
-- 엔진개요: 1h/15m/5m 스윙 레벨과 볼륨 프로파일(POC/VAH/VAL, HVN/LVN)로 레벨을 만들고 RECLAIM/RETEST/SWEEP/REJECTION 트리거를 평가하는 레벨 기반 엔진.
-- 엔트리 기준: 레벨 터치 범위 내에서 트리거 발생, 트리거 강도≥regime별 entry_min, 거리/확장바/쿨다운/LVN 갭/레짐 필터 통과 시 ENTRY_READY.
 
 ### Atlas 게이트(Swaggy)
 - 엔진개요: BTC 15m EMA20/60과 ATR 비율로 시장 레짐(bull/bear/chaos)을 판단해 Swaggy의 전역 방향/허용도를 제어하는 게이트 엔진.

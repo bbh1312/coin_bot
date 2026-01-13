@@ -4,7 +4,10 @@ from typing import Dict, Type
 
 from engines.base import BaseEngine
 from engines.rsi.engine import RsiEngine
-from engines.swaggy.swaggy_engine import SwaggyEngine
+try:
+    from engines.swaggy.swaggy_engine import SwaggyEngine
+except Exception:
+    SwaggyEngine = None
 from engines.atlas.atlas_engine import AtlasEngine
 from engines.dtfx.engine import DTFXEngine
 from engines.div15m_long.engine import Div15mLongEngine
@@ -15,7 +18,6 @@ from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
 
 _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
     "rsi": RsiEngine,
-    "swaggy": SwaggyEngine,
     "atlas": AtlasEngine,
     "dtfx": DTFXEngine,
     "div15m_long": Div15mLongEngine,
@@ -23,6 +25,8 @@ _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
     "pumpfade": PumpFadeEngine,
     "atlas_rs_fail_short": AtlasRsFailShortEngine,
 }
+if SwaggyEngine:
+    _ENGINE_REGISTRY["swaggy"] = SwaggyEngine
 
 
 def get_engine(name: str) -> BaseEngine:

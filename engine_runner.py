@@ -46,8 +46,14 @@ except Exception:
     atlas_fabio_engine = None
 try:
     from engines.base import EngineContext
-    from engines.swaggy.swaggy_engine import SwaggyEngine, SwaggyConfig
-    from engines.swaggy.logs import format_cut_top, format_zone_stats
+    try:
+        from engines.swaggy.swaggy_engine import SwaggyEngine, SwaggyConfig
+        from engines.swaggy.logs import format_cut_top, format_zone_stats
+    except Exception:
+        SwaggyEngine = None
+        SwaggyConfig = None
+        format_cut_top = None
+        format_zone_stats = None
     from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine as SwaggyAtlasLabEngine
     from engines.swaggy_atlas_lab.config import SwaggyConfig as SwaggyAtlasLabConfig
     from engines.swaggy_atlas_lab.config import AtlasConfig as SwaggyAtlasLabAtlasConfig
@@ -4318,7 +4324,6 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
         if tr:
             entry_order_id = str(tr.get("entry_order_id") or "")
             exit_reason = tr.get("exit_reason") or exit_reason
-            engine = tr.get("engine_label") or _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
         if entry_order_id:
             entry_event = entry_map.get(entry_order_id)
             if entry_event:
@@ -5328,7 +5333,6 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_max_open_positions",
         "_entry_usdt",
         "_atlas_fabio_enabled",
-        "_swaggy_enabled",
         "_swaggy_atlas_lab_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
@@ -5342,7 +5346,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         if key in disk:
             state[key] = disk.get(key)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE
     if isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
@@ -5367,8 +5371,6 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         USDT_PER_TRADE = float(state.get("_entry_usdt"))
     if isinstance(state.get("_atlas_fabio_enabled"), bool):
         ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
-    if isinstance(state.get("_swaggy_enabled"), bool):
-        SWAGGY_ENABLED = bool(state.get("_swaggy_enabled"))
     if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     if isinstance(state.get("_dtfx_enabled"), bool):
@@ -5397,7 +5399,6 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_max_open_positions",
         "_entry_usdt",
         "_atlas_fabio_enabled",
-        "_swaggy_enabled",
         "_swaggy_atlas_lab_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
@@ -5425,6 +5426,8 @@ def _append_report_line(
 
 def _update_report_csv(tr: dict) -> None:
     try:
+        if REPORT_API_ONLY:
+            return
         os.makedirs("reports", exist_ok=True)
         entry_ts = tr.get("entry_ts")
         if not isinstance(entry_ts, (int, float)):
@@ -5862,7 +5865,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                             f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
-                            f"/swaggy(추가진입): {'ON' if SWAGGY_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
                             f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
@@ -5900,7 +5902,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
-                        f"/swaggy(추가진입): {'ON' if SWAGGY_ENABLED else 'OFF'}\n"
                         f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
                         f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
@@ -6088,26 +6089,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] atlasfabio cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
-                if (cmd in ("/swaggy", "swaggy")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        SWAGGY_ENABLED = True
-                        state["_swaggy_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ swaggy ON (스왁기 엔진)"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        SWAGGY_ENABLED = False
-                        state["_swaggy_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ swaggy OFF"
-                    else:
-                        resp = f"ℹ️ swaggy 상태: {'ON' if SWAGGY_ENABLED else 'OFF'}\n사용법: /swaggy on|off|status"
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] swaggy cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/swaggy_atlas_lab", "swaggy_atlas_lab")) and not responded:
                     parts = lower.split()
@@ -6381,6 +6362,7 @@ MANAGE_TICKER_TTL_SEC: float = 5.0  # 관리 루프 티커 캐시 TTL(초)
 RUNTIME_CONFIG_RELOAD_SEC: float = 5.0  # 런타임 설정 변경사항 반영 주기
 MANAGE_WS_MODE: bool = False  # WS 관리 모듈 사용 시 메인 리컨실/관리 비활성
 SUPPRESS_RECONCILE_ALERTS: bool = True  # 리컨실 알림 억제용(기본 ON)
+REPORT_API_ONLY: bool = True  # 리포트는 API sync 결과만 사용
 SHORT_POS_SAMPLE_DIV: int = 20  # 1/N 샘플링
 SHORT_POS_SAMPLE_RECENT_SEC: int = 120  # 최근 진입 심볼은 항상 샘플링
 
@@ -6398,7 +6380,7 @@ LONG_LIVE_TRADING = True
 FABIO_ENABLED = False
 ATLAS_FABIO_ENABLED = True
 ATLAS_FABIO_PAPER = False
-SWAGGY_ENABLED = True
+SWAGGY_ENABLED = False
 SWAGGY_ATLAS_LAB_ENABLED = False
 DTFX_ENABLED = True
 PUMPFADE_ENABLED = False
@@ -6669,7 +6651,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
     global USDT_PER_TRADE
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
@@ -6703,10 +6685,6 @@ def run():
         ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
     else:
         state["_atlas_fabio_enabled"] = ATLAS_FABIO_ENABLED
-    if isinstance(state.get("_swaggy_enabled"), bool):
-        SWAGGY_ENABLED = bool(state.get("_swaggy_enabled"))
-    else:
-        state["_swaggy_enabled"] = SWAGGY_ENABLED
     if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     else:
@@ -6727,7 +6705,6 @@ def run():
         ONLY_DIV15M_SHORT = True
         DIV15M_LONG_ENABLED = False
         DIV15M_SHORT_ENABLED = True
-        SWAGGY_ENABLED = False
         DTFX_ENABLED = False
         PUMPFADE_ENABLED = False
         ATLAS_RS_FAIL_SHORT_ENABLED = False
@@ -6735,7 +6712,6 @@ def run():
         ATLAS_FABIO_ENABLED = False
         state["_div15m_long_enabled"] = False
         state["_div15m_short_enabled"] = True
-        state["_swaggy_enabled"] = False
         state["_dtfx_enabled"] = False
         state["_pumpfade_enabled"] = False
         state["_atlas_rs_fail_short_enabled"] = False
@@ -6790,7 +6766,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy on|off|status, /swaggy_atlas_lab on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -7041,6 +7017,9 @@ def run():
                 config=swaggy_cfg,
             )
             swaggy_universe = swaggy_engine.build_universe(ctx)
+            state["_swaggy_universe"] = swaggy_universe
+        elif SWAGGY_ATLAS_LAB_ENABLED:
+            swaggy_universe = list(shared_universe)
             state["_swaggy_universe"] = swaggy_universe
         if SWAGGY_ATLAS_LAB_ENABLED and SwaggyAtlasLabConfig and SwaggyAtlasLabAtlasConfig:
             swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig()
@@ -8237,12 +8216,12 @@ def run():
         print(
             f"[universe] rule=qVol>={int(min_qv):,} sort=abs(pct) topN={top_n} anchors={anchors_disp} "
             f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
-            f"fabio={fabio_universe_len} swaggy={swaggy_universe_len} dtfx={dtfx_universe_len} "
+            f"fabio={fabio_universe_len} dtfx={dtfx_universe_len} "
             f"pumpfade={pumpfade_universe_len} arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
         )
         print(
             "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) fabio=%s(%d) atlasfabio=%s(%d) "
-            "swaggy=%s(%d) swaggy_atlas_lab=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
+            "swaggy_atlas_lab=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
             % (
                 "ON" if rsi_ran else "OFF",
                 rsi_universe_len,
@@ -8254,8 +8233,6 @@ def run():
                 fabio_universe_len,
                 "ON" if atlasfabio_ran else "OFF",
                 fabio_universe_len,
-                "ON" if swaggy_ran else "OFF",
-                swaggy_universe_len,
                 "ON" if swaggy_atlas_lab_ran else "OFF",
                 swaggy_atlas_lab_universe_len,
                 "ON" if dtfx_ran else "OFF",

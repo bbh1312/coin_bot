@@ -179,9 +179,17 @@ def _trade_engine_label(tr: Optional[dict]) -> str:
     if isinstance(tr, dict):
         label = tr.get("engine_label")
         if isinstance(label, str) and label:
-            return label
+            if label not in ("UNKNOWN", "MANUAL"):
+                return label
         reason = (tr.get("meta") or {}).get("reason")
-        return er._engine_label_from_reason(reason)
+        base_label = er._engine_label_from_reason(reason)
+        if base_label not in ("UNKNOWN", "MANUAL"):
+            return base_label
+        entry_order_id = tr.get("entry_order_id")
+        entry_engine = _get_entry_event_engine(str(entry_order_id) if entry_order_id else None)
+        if entry_engine and str(entry_engine).lower() != "unknown":
+            return str(entry_engine)
+        return base_label
     return "UNKNOWN"
 
 
@@ -689,3 +697,28 @@ def main():
 
 if __name__ == "__main__":
     main()
+_ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
+_ENTRY_EVENTS_TTL_SEC = 5.0
+
+
+def _get_entry_event_engine(entry_order_id: Optional[str]) -> Optional[str]:
+    if not entry_order_id:
+        return None
+    path = os.path.join("logs", "entry_events.log")
+    try:
+        mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
+    except Exception:
+        mtime = 0.0
+    now = time.time()
+    cached = _ENTRY_EVENTS_CACHE
+    if (
+        cached.get("map")
+        and (now - float(cached.get("ts", 0.0) or 0.0)) <= _ENTRY_EVENTS_TTL_SEC
+        and float(cached.get("mtime", 0.0) or 0.0) == float(mtime or 0.0)
+    ):
+        return cached["map"].get(str(entry_order_id), {}).get("engine")
+    entry_map, _ = er._load_entry_events_map(None)
+    _ENTRY_EVENTS_CACHE["ts"] = now
+    _ENTRY_EVENTS_CACHE["mtime"] = float(mtime or 0.0)
+    _ENTRY_EVENTS_CACHE["map"] = entry_map
+    return entry_map.get(str(entry_order_id), {}).get("engine")
