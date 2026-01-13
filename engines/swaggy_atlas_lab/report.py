@@ -8,6 +8,43 @@ from typing import Dict, List
 from engines.swaggy_atlas_lab.metrics import compute_metrics
 
 
+def _shadow_metrics(rows: List[Dict]) -> Dict[str, float]:
+    if not rows:
+        return {
+            "trades": 0,
+            "winrate": 0.0,
+            "avg_mae": 0.0,
+            "mae_ge_10": 0,
+            "mae_ge_20": 0,
+            "mae_ge_10_rate": 0.0,
+            "mae_ge_20_rate": 0.0,
+            "sl_hit_count": 0,
+            "sl_hit_rate": 0.0,
+            "timeout_count": 0,
+            "timeout_rate": 0.0,
+        }
+    wins = sum(1 for r in rows if float(r.get("pnl_pct") or 0.0) > 0)
+    trades = len(rows)
+    maes = [abs(float(r.get("mae") or 0.0)) for r in rows]
+    mae_ge_10 = sum(1 for m in maes if m >= 0.10)
+    mae_ge_20 = sum(1 for m in maes if m >= 0.20)
+    sl_hits = sum(1 for r in rows if (r.get("exit_reason") or "") == "SL")
+    timeouts = sum(1 for r in rows if (r.get("exit_reason") or "") == "TIME")
+    return {
+        "trades": trades,
+        "winrate": wins / trades if trades else 0.0,
+        "avg_mae": sum(maes) / trades if trades else 0.0,
+        "mae_ge_10": mae_ge_10,
+        "mae_ge_20": mae_ge_20,
+        "sl_hit_count": sl_hits,
+        "mae_ge_10_rate": mae_ge_10 / trades if trades else 0.0,
+        "mae_ge_20_rate": mae_ge_20 / trades if trades else 0.0,
+        "sl_hit_rate": sl_hits / trades if trades else 0.0,
+        "timeout_count": timeouts,
+        "timeout_rate": timeouts / trades if trades else 0.0,
+    }
+
+
 def _ensure_dir(path: str) -> None:
     if not path:
         return
@@ -28,10 +65,16 @@ def write_trades_csv(path: str, trades: List[Dict]) -> None:
                 "entry_price",
                 "exit_ts",
                 "exit_price",
+                "exit_reason",
                 "pnl_usdt",
                 "pnl_pct",
+                "policy_action",
+                "overext_dist_at_entry",
+                "overext_blocked",
                 "fee",
                 "duration_bars",
+                "mfe",
+                "mae",
                 "sw_strength",
                 "sw_reasons",
                 "atlas_pass",
@@ -51,10 +94,16 @@ def write_trades_csv(path: str, trades: List[Dict]) -> None:
                     t.get("entry_price"),
                     t.get("exit_ts"),
                     t.get("exit_price"),
+                    t.get("exit_reason"),
                     t.get("pnl_usdt"),
                     t.get("pnl_pct"),
+                    t.get("policy_action"),
+                    t.get("overext_dist_at_entry"),
+                    t.get("overext_blocked"),
                     t.get("fee"),
                     t.get("duration_bars"),
+                    t.get("mfe"),
+                    t.get("mae"),
                     t.get("sw_strength"),
                     ",".join(t.get("sw_reasons") or []),
                     t.get("atlas_pass"),
@@ -77,6 +126,10 @@ def build_summary(run_id: str, trades: List[Dict]) -> Dict:
             shadow_fail = [r for r in rows if r.get("atlas_shadow_pass") is False]
             summary["modes"][mode]["shadow_pass"] = compute_metrics(shadow_pass)
             summary["modes"][mode]["shadow_fail"] = compute_metrics(shadow_fail)
+            summary["modes"][mode]["shadow_ab"] = {
+                "pass": _shadow_metrics(shadow_pass),
+                "fail": _shadow_metrics(shadow_fail),
+            }
             reason_map: Dict[str, List[Dict]] = {}
             for r in shadow_fail:
                 reasons = r.get("atlas_shadow_reasons") or []
@@ -85,6 +138,14 @@ def build_summary(run_id: str, trades: List[Dict]) -> Dict:
             summary["modes"][mode]["shadow_fail_by_reason"] = {
                 reason: compute_metrics(rows) for reason, rows in reason_map.items()
             }
+        if mode == "hybrid":
+            action_map: Dict[str, List[Dict]] = {}
+            for r in rows:
+                action = r.get("policy_action") or "N/A"
+                action_map.setdefault(action, []).append(r)
+            summary["modes"][mode]["hybrid_by_action"] = {
+                action: compute_metrics(group) for action, group in action_map.items()
+            }
     return summary
 
 
@@ -92,3 +153,9 @@ def write_summary_json(path: str, summary: Dict) -> None:
     _ensure_dir(os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+
+def write_shadow_summary_json(path: str, payload: Dict) -> None:
+    _ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)

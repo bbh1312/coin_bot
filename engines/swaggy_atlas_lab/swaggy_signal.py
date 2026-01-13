@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from engines.swaggy_atlas_lab.config import SwaggyConfig
-from engines.swaggy_atlas_lab.indicators import VPLevels, atr, build_vp_levels, detect_regime
+from engines.swaggy_atlas_lab.indicators import VPLevels, atr, build_vp_levels, detect_regime, ema
 
 
 @dataclass
@@ -423,6 +423,11 @@ class SwaggySignalEngine:
             return SwaggySignal(False, None, 0.0, ["NO_LEVEL"], "-", None, debug={"regime": regime_state.regime})
 
         phase = state.get("phase") or "WAIT_TOUCH"
+        if phase == "CHASE":
+            chase_ok, _ = _overextension_ok(candles_5m, state.get("chase_side"), cfg)
+            if not chase_ok:
+                return SwaggySignal(False, None, 0.0, ["CHASE"], "-", None, debug={"regime": regime_state.regime})
+            state["phase"] = "WAIT_TRIGGER"
         if phase == "WAIT_TOUCH":
             touch_hit, _ = _is_level_touch(candles_5m, target_level, cfg, regime_state.regime)
             if not touch_hit:
@@ -471,6 +476,20 @@ class SwaggySignalEngine:
         if not ok_dist:
             return SwaggySignal(False, side, strength, ["DIST_FAIL"], best.kind, None, debug={"regime": regime_state.regime})
 
+        chase_ok, chase_dist = _overextension_ok(candles_5m, side, cfg)
+        if not chase_ok:
+            state["phase"] = "CHASE"
+            state["chase_side"] = side
+            return SwaggySignal(
+                False,
+                side,
+                strength,
+                ["CHASE"],
+                best.kind,
+                None,
+                debug={"regime": regime_state.regime, "chase_dist": chase_dist},
+            )
+
         state["last_signal_ts"] = now_ts
         state["phase"] = "COOLDOWN"
         state["cooldown_until"] = now_ts + cfg.cooldown_min * 60
@@ -498,6 +517,27 @@ def _entry_min_for_regime(regime: str, cfg: SwaggyConfig) -> float:
     if regime == "bull":
         return cfg.entry_min_bull
     return cfg.entry_min
+
+
+def _overextension_ok(df: pd.DataFrame, side: Optional[str], cfg: SwaggyConfig) -> tuple[bool, float]:
+    if cfg.overext_atr_mult <= 0:
+        return True, 0.0
+    if df.empty or len(df) < cfg.overext_ema_len + 2:
+        return True, 0.0
+    last_price = float(df["close"].iloc[-1])
+    ema_series = ema(df["close"], cfg.overext_ema_len)
+    if ema_series.empty:
+        return True, 0.0
+    ema_val = float(ema_series.iloc[-1])
+    atr_val = atr(df, cfg.touch_atr_len)
+    if atr_val <= 0:
+        return True, 0.0
+    side = (side or "").upper()
+    if side == "SHORT":
+        dist = (ema_val - last_price) / atr_val
+    else:
+        dist = (last_price - ema_val) / atr_val
+    return (dist <= cfg.overext_atr_mult), float(dist)
 
 
 def _is_level_touch(

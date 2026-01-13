@@ -15,14 +15,37 @@ from engines.swaggy_atlas_lab.data import (
     build_universe_from_tickers,
     ensure_dir,
     fetch_ohlcv_all,
-    parse_ts,
     slice_df,
     to_df,
     save_universe,
 )
 from engines.swaggy_atlas_lab.policy import AtlasMode, apply_policy
-from engines.swaggy_atlas_lab.report import build_summary, write_summary_json, write_trades_csv
+from engines.swaggy_atlas_lab.report import (
+    build_summary,
+    write_shadow_summary_json,
+    write_summary_json,
+    write_trades_csv,
+)
+from engines.swaggy_atlas_lab.indicators import atr, ema
 from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine
+
+
+def _append_backtest_log(line: str) -> None:
+    date_tag = time.strftime("%Y%m%d")
+    path = os.path.join("logs", "swaggy_atlas_lab", "backtest", f"backtest_{date_tag}.log")
+    ensure_dir(os.path.dirname(path))
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{ts} {line}\n")
+
+
+def _append_backtest_entry_log(line: str) -> None:
+    date_tag = time.strftime("%Y%m%d")
+    path = os.path.join("logs", "swaggy_atlas_lab", "backtest", f"backtest_entries_{date_tag}.log")
+    ensure_dir(os.path.dirname(path))
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{ts} {line}\n")
 
 
 def _make_exchange() -> ccxt.Exchange:
@@ -31,18 +54,18 @@ def _make_exchange() -> ccxt.Exchange:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Swaggy x Atlas Lab backtest")
-    parser.add_argument("--start", required=True)
-    parser.add_argument("--end", required=True)
-    parser.add_argument("--mode", default="all", choices=("hard", "soft", "shadow", "off", "all"))
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--mode", default="all", choices=("hard", "soft", "shadow", "off", "hybrid", "all"))
     parser.add_argument("--symbols", default="", help="comma-separated symbols")
     parser.add_argument("--symbols-file", default="", help="path to fixed symbol list")
     parser.add_argument("--universe", default="top50", help="topN (e.g. top50) or 'symbols'")
     parser.add_argument("--anchor", default="BTC,ETH")
-    parser.add_argument("--tp", type=float, default=0.02)
-    parser.add_argument("--sl", type=float, default=0.02)
+    parser.add_argument("--tp-pct", type=float, default=0.02)
+    parser.add_argument("--sl-pct", type=float, default=0.02)
     parser.add_argument("--fee", type=float, default=0.0)
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
@@ -55,29 +78,55 @@ def _parse_universe_arg(text: str) -> int:
     return 0
 
 
+def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
+    if df.empty or len(df) < cfg.overext_ema_len + 2:
+        return 0.0
+    ema_series = ema(df["close"], cfg.overext_ema_len)
+    if ema_series.empty:
+        return 0.0
+    ema_val = float(ema_series.iloc[-1])
+    last_price = float(df["close"].iloc[-1])
+    atr_val = atr(df, cfg.touch_atr_len)
+    if atr_val <= 0:
+        return 0.0
+    side = (side or "").upper()
+    if side == "SHORT":
+        return (ema_val - last_price) / atr_val
+    return (last_price - ema_val) / atr_val
+
+
 def main() -> None:
     args = parse_args()
-    start_ms = parse_ts(args.start)
-    end_ms = parse_ts(args.end)
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - int(args.days) * 24 * 60 * 60 * 1000
     if end_ms <= start_ms:
         raise SystemExit("end must be after start")
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join("logs", "swaggy_atlas_lab")
+    log_dir = os.path.join("logs", "swaggy_atlas_lab", "backtest")
     rep_dir = os.path.join("reports", "swaggy_atlas_lab")
     ensure_dir(log_dir)
     ensure_dir(rep_dir)
     log_path = os.path.join(log_dir, f"bt_{run_id}.log")
     trades_path = os.path.join(rep_dir, f"trades_{run_id}.csv")
     summary_path = os.path.join(rep_dir, f"summary_{run_id}.json")
+    shadow_path = os.path.join(rep_dir, f"shadow_{run_id}.json")
     universe_path = os.path.join(rep_dir, f"universe_{run_id}.json")
 
-    bt_cfg = BacktestConfig(tp_pct=args.tp, sl_pct=args.sl, fee_rate=args.fee, slippage_pct=args.slippage, timeout_bars=args.timeout_bars, mode=args.mode)
+    bt_cfg = BacktestConfig(
+        tp_pct=args.tp_pct,
+        sl_pct=args.sl_pct,
+        fee_rate=args.fee,
+        slippage_pct=args.slippage,
+        timeout_bars=args.timeout_bars,
+        mode=args.mode,
+    )
     sw_cfg = SwaggyConfig()
     at_cfg = AtlasConfig()
 
     ex = _make_exchange()
     ex.load_markets()
+    ltf_minutes = float(ex.parse_timeframe(sw_cfg.tf_ltf)) / 60.0
     anchor_symbols = [s.strip() for s in args.anchor.split(",") if s.strip()]
     symbols: List[str] = []
     if args.symbols_file.strip():
@@ -90,7 +139,16 @@ def main() -> None:
         tickers = ex.fetch_tickers()
         symbols = build_universe_from_tickers(tickers, top_n or 50, anchor_symbols)
     source = "symbols_file" if args.symbols_file.strip() else ("symbols_arg" if args.symbols.strip() else "live_tickers")
-    save_universe(universe_path, symbols, {"source": source, "start": args.start, "end": args.end})
+    save_universe(
+        universe_path,
+        symbols,
+        {
+            "source": source,
+            "days": str(args.days),
+            "start_ms": str(start_ms),
+            "end_ms": str(end_ms),
+        },
+    )
 
     data_by_sym: Dict[str, Dict[str, object]] = {}
     tfs = [sw_cfg.tf_ltf, sw_cfg.tf_mtf, sw_cfg.tf_htf, sw_cfg.tf_htf2]
@@ -104,15 +162,26 @@ def main() -> None:
     btc_data = fetch_ohlcv_all(ex, at_cfg.ref_symbol, sw_cfg.tf_mtf, start_ms, end_ms)
     btc_df = to_df(btc_data)
 
-    modes = [AtlasMode.HARD, AtlasMode.SOFT, AtlasMode.SHADOW, AtlasMode.OFF] if args.mode == "all" else [AtlasMode(args.mode)]
+    modes = [
+        AtlasMode.HARD,
+        AtlasMode.SOFT,
+        AtlasMode.SHADOW,
+        AtlasMode.OFF,
+        AtlasMode.HYBRID,
+    ] if args.mode == "all" else [AtlasMode(args.mode)]
     trades: List[Dict] = []
+    stats_by_key: Dict[tuple[str, str], Dict[str, float]] = {}
+    overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
 
     with open(log_path, "a", encoding="utf-8") as log_fp:
         for mode in modes:
-            log_fp.write(f"[run] mode={mode.value} start={args.start} end={args.end}\n")
+            run_line = f"[run] mode={mode.value} days={args.days} start_ms={start_ms} end_ms={end_ms}"
+            log_fp.write(run_line + "\n")
+            _append_backtest_log(run_line)
             engine = SwaggySignalEngine(sw_cfg)
             broker = BrokerSim(bt_cfg.tp_pct, bt_cfg.sl_pct, bt_cfg.fee_rate, bt_cfg.slippage_pct, bt_cfg.timeout_bars)
             for sym in symbols:
+                sym_state = engine._state.setdefault(sym, {})
                 df_ltf = data_by_sym[sym][sw_cfg.tf_ltf]
                 df_mtf = data_by_sym[sym][sw_cfg.tf_mtf]
                 df_htf = data_by_sym[sym][sw_cfg.tf_htf]
@@ -125,7 +194,42 @@ def main() -> None:
                     d15 = slice_df(df_mtf, ts_ms)
                     d1h = slice_df(df_htf, ts_ms)
                     d4h = slice_df(df_htf2, ts_ms)
+                    prev_phase = sym_state.get("phase")
                     signal = engine.evaluate_symbol(sym, d4h, d1h, d15, d5, now_ts)
+                    new_phase = sym_state.get("phase")
+                    key = (mode.value, sym)
+                    overext_stats = overext_by_key.setdefault(
+                        key,
+                        {
+                            "entry_ready_seen": 0,
+                            "overext_block_count": 0,
+                            "overext_recover_count": 0,
+                        },
+                    )
+                    if isinstance(signal.reasons, list) and ("ENTRY_READY" in signal.reasons or "CHASE" in signal.reasons):
+                        overext_stats["entry_ready_seen"] += 1
+                    if prev_phase != "CHASE" and new_phase == "CHASE":
+                        dist = _overext_dist(d5, signal.side or "", sw_cfg)
+                        thresh = sw_cfg.overext_atr_mult
+                        sym_state["overext_blocked"] = True
+                        line = (
+                            f"OVEREXT_BLOCK ts={ts_ms} sym={sym} side={signal.side} "
+                            f"dist={dist:.4f} thresh={thresh:.2f} state=ENTRY_READY->CHASE"
+                        )
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        overext_stats["overext_block_count"] += 1
+                    if prev_phase == "CHASE" and new_phase == "WAIT_TRIGGER":
+                        chase_side = sym_state.get("chase_side") or signal.side or ""
+                        dist = _overext_dist(d5, chase_side, sw_cfg)
+                        thresh = sw_cfg.overext_atr_mult
+                        line = (
+                            f"OVEREXT_RECOVER ts={ts_ms} sym={sym} side={chase_side} "
+                            f"dist={dist:.4f} thresh={thresh:.2f} state=CHASE->WAIT_TRIGGER"
+                        )
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        overext_stats["overext_recover_count"] += 1
                     side = signal.side or ""
                     entry_px = signal.entry_px
 
@@ -145,10 +249,16 @@ def main() -> None:
                                     "entry_price": trade.entry_price,
                                     "exit_ts": trade.exit_ts,
                                     "exit_price": trade.exit_price,
+                                    "exit_reason": trade.exit_reason,
                                     "pnl_usdt": pnl_usdt,
                                     "pnl_pct": pnl_pct,
+                                    "policy_action": trade.policy_action,
+                                    "overext_dist_at_entry": trade.overext_dist_at_entry,
+                                    "overext_blocked": "Y" if trade.overext_blocked else "N",
                                     "fee": fee,
                                     "duration_bars": trade.bars,
+                                    "mfe": trade.mfe,
+                                    "mae": abs(trade.mae),
                                     "sw_strength": trade.sw_strength,
                                     "sw_reasons": trade.sw_reasons,
                                     "atlas_pass": trade.atlas_pass,
@@ -162,6 +272,35 @@ def main() -> None:
                                 f"EXIT ts={trade.exit_ts} sym={sym} pnl_usdt={pnl_usdt:.4f} "
                                 f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars}\n"
                             )
+                            _append_backtest_log(
+                                f"EXIT ts={trade.exit_ts} sym={sym} pnl_usdt={pnl_usdt:.4f} "
+                                f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars}"
+                            )
+                            stats = stats_by_key.setdefault(
+                                key,
+                                {
+                                    "trades": 0,
+                                    "wins": 0,
+                                    "losses": 0,
+                                    "tp": 0,
+                                    "sl": 0,
+                                    "mfe_sum": 0.0,
+                                    "mae_sum": 0.0,
+                                    "hold_sum": 0.0,
+                                },
+                            )
+                            stats["trades"] += 1
+                            if pnl_pct >= 0:
+                                stats["wins"] += 1
+                            else:
+                                stats["losses"] += 1
+                            if trade.exit_reason == "TP":
+                                stats["tp"] += 1
+                            elif trade.exit_reason == "SL":
+                                stats["sl"] += 1
+                            stats["mfe_sum"] += trade.mfe
+                            stats["mae_sum"] += abs(trade.mae)
+                            stats["hold_sum"] += float(trade.bars) * ltf_minutes
                         continue
 
                     if not signal.entry_ok or not side or entry_px is None:
@@ -173,11 +312,15 @@ def main() -> None:
                         gate = evaluate_global_gate(btc_slice, at_cfg)
                         atlas = evaluate_local(sym, side, d15, btc_slice, gate, at_cfg)
 
+                    shadow_pass = atlas.pass_hard if atlas else None
+                    shadow_mult = atlas.atlas_mult if atlas else None
+                    shadow_reasons = atlas.reasons if atlas else None
+
                     policy = apply_policy(mode, bt_cfg.base_usdt, atlas)
-                    log_fp.write(
+                    entry_line = (
                         "ENTRY ts=%d sym=%s side=%s mode=%s sw_ok=%s sw_strength=%.3f sw_reasons=%s "
                         "base_usdt=%.2f final_usdt=%.2f atlas_pass=%s atlas_mult=%s atlas_reasons=%s "
-                        "atlas_shadow_pass=%s atlas_shadow_mult=%s atlas_shadow_reasons=%s\n"
+                        "atlas_shadow_pass=%s atlas_shadow_mult=%s atlas_shadow_reasons=%s policy_action=%s"
                         % (
                             ts_ms,
                             sym,
@@ -191,13 +334,40 @@ def main() -> None:
                             policy.atlas_pass if policy.atlas_pass is not None else "N/A",
                             policy.atlas_mult if policy.atlas_mult is not None else "N/A",
                             policy.atlas_reasons if policy.atlas_reasons is not None else "N/A",
-                            policy.shadow_pass if policy.shadow_pass is not None else "N/A",
-                            policy.shadow_mult if policy.shadow_mult is not None else "N/A",
-                            policy.shadow_reasons if policy.shadow_reasons is not None else "N/A",
+                            shadow_pass if shadow_pass is not None else "N/A",
+                            shadow_mult if shadow_mult is not None else "N/A",
+                            shadow_reasons if shadow_reasons is not None else "N/A",
+                            policy.policy_action if policy.policy_action is not None else "N/A",
                         )
                     )
+                    log_fp.write(entry_line + "\n")
+                    _append_backtest_log(entry_line)
                     if not policy.allow:
                         continue
+                    dist_at_entry = _overext_dist(d5, side, sw_cfg)
+                    overext_blocked = bool(sym_state.get("overext_blocked"))
+                    sym_state["overext_blocked"] = False
+                    _append_backtest_entry_log(
+                        "engine=swaggy_atlas_lab mode=%s symbol=%s side=%s entry=%.6g "
+                        "final_usdt=%.2f sw_strength=%.3f sw_reasons=%s atlas_pass=%s atlas_mult=%s "
+                        "atlas_reasons=%s atlas_shadow_pass=%s atlas_shadow_mult=%s atlas_shadow_reasons=%s policy_action=%s"
+                        % (
+                            mode.value,
+                            sym,
+                            side,
+                            float(entry_px or 0.0),
+                            float(policy.final_usdt or 0.0),
+                            float(signal.strength or 0.0),
+                            ",".join(signal.reasons or []),
+                            policy.atlas_pass if policy.atlas_pass is not None else "N/A",
+                            policy.atlas_mult if policy.atlas_mult is not None else "N/A",
+                            ",".join(policy.atlas_reasons or []),
+                            shadow_pass if shadow_pass is not None else "N/A",
+                            shadow_mult if shadow_mult is not None else "N/A",
+                            ",".join(shadow_reasons or []),
+                            policy.policy_action if policy.policy_action is not None else "N/A",
+                        )
+                    )
                     broker.enter(
                         sym,
                         side,
@@ -210,14 +380,170 @@ def main() -> None:
                         atlas_pass=policy.atlas_pass,
                         atlas_mult=policy.atlas_mult,
                         atlas_reasons=policy.atlas_reasons,
-                        atlas_shadow_pass=policy.shadow_pass,
-                        atlas_shadow_reasons=policy.shadow_reasons,
+                        atlas_shadow_pass=shadow_pass if mode == AtlasMode.SHADOW else None,
+                        atlas_shadow_reasons=shadow_reasons if mode == AtlasMode.SHADOW else None,
+                        policy_action=policy.policy_action,
+                        overext_dist_at_entry=dist_at_entry,
+                        overext_blocked=overext_blocked,
                     )
 
     write_trades_csv(trades_path, trades)
     summary = build_summary(run_id, trades)
+    if overext_by_key:
+        by_mode: Dict[str, Dict[str, int]] = {}
+        total = {"entry_ready_seen": 0, "overext_block_count": 0, "overext_recover_count": 0}
+        for (mode, _sym), stats in overext_by_key.items():
+            bucket = by_mode.setdefault(mode, {"entry_ready_seen": 0, "overext_block_count": 0, "overext_recover_count": 0})
+            for key in ("entry_ready_seen", "overext_block_count", "overext_recover_count"):
+                bucket[key] += int(stats.get(key) or 0)
+                total[key] += int(stats.get(key) or 0)
+        for bucket in list(by_mode.values()) + [total]:
+            denom = float(bucket.get("entry_ready_seen") or 0)
+            bucket["overext_block_rate"] = (bucket.get("overext_block_count", 0) / denom) if denom else 0.0
+        summary["overext"] = {"by_mode": by_mode, "total": total}
     write_summary_json(summary_path, summary)
-    print(f"[done] trades={trades_path} summary={summary_path} log={log_path}")
+    shadow_payload = {}
+    if isinstance(summary.get("modes"), dict) and "shadow" in summary["modes"]:
+        shadow_payload = {
+            "run_id": run_id,
+            "shadow_ab": summary["modes"]["shadow"].get("shadow_ab"),
+            "shadow_fail_by_reason": summary["modes"]["shadow"].get("shadow_fail_by_reason"),
+        }
+        write_shadow_summary_json(shadow_path, shadow_payload)
+    if args.verbose:
+        msg = f"[done] trades={trades_path} summary={summary_path} log={log_path}"
+        if shadow_payload:
+            msg = f"{msg} shadow={shadow_path}"
+        print(msg)
+    if stats_by_key:
+        trades_by_key: Dict[tuple[str, str], List[Dict]] = {}
+        for t in trades:
+            key = (t.get("mode") or "", t.get("sym") or "")
+            trades_by_key.setdefault(key, []).append(t)
+        total_by_mode: Dict[str, Dict[str, float]] = {}
+        for (mode, sym), stats in stats_by_key.items():
+            trades_count = int(stats.get("trades") or 0)
+            wins = int(stats.get("wins") or 0)
+            losses = int(stats.get("losses") or 0)
+            tp = int(stats.get("tp") or 0)
+            sl = int(stats.get("sl") or 0)
+            win_rate = (wins / trades_count * 100.0) if trades_count else 0.0
+            avg_mfe = (stats.get("mfe_sum", 0.0) / trades_count) if trades_count else 0.0
+            avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
+            avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
+            print(
+                "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                % (
+                    f"{sym}@{mode}",
+                    trades_count,
+                    wins,
+                    losses,
+                    win_rate,
+                    tp,
+                    sl,
+                    avg_mfe,
+                    avg_mae,
+                    avg_hold,
+                )
+            )
+            for t in trades_by_key.get((mode, sym), []):
+                hold_min = float(t.get("duration_bars") or 0) * ltf_minutes
+                print(
+                    "[ENTRY] sym=%s mode=%s entry_ts=%s exit_ts=%s reason=%s pnl_pct=%.4f hold_min=%.1f"
+                    % (
+                        t.get("sym"),
+                        t.get("mode"),
+                        t.get("entry_ts"),
+                        t.get("exit_ts"),
+                        t.get("exit_reason"),
+                        float(t.get("pnl_pct") or 0.0),
+                        hold_min,
+                    )
+                )
+            mode_total = total_by_mode.setdefault(
+                mode,
+                {
+                    "trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "tp": 0,
+                    "sl": 0,
+                    "mfe_sum": 0.0,
+                    "mae_sum": 0.0,
+                    "hold_sum": 0.0,
+                },
+            )
+            for key in ("trades", "wins", "losses", "tp", "sl"):
+                mode_total[key] += int(stats.get(key) or 0)
+            mode_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
+            mode_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
+            mode_total["hold_sum"] += float(stats.get("hold_sum") or 0.0)
+        grand_total = {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "tp": 0,
+            "sl": 0,
+            "mfe_sum": 0.0,
+            "mae_sum": 0.0,
+            "hold_sum": 0.0,
+        }
+        for mode, stats in total_by_mode.items():
+            trades_count = int(stats.get("trades") or 0)
+            wins = int(stats.get("wins") or 0)
+            losses = int(stats.get("losses") or 0)
+            tp = int(stats.get("tp") or 0)
+            sl = int(stats.get("sl") or 0)
+            win_rate = (wins / trades_count * 100.0) if trades_count else 0.0
+            avg_mfe = (stats.get("mfe_sum", 0.0) / trades_count) if trades_count else 0.0
+            avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
+            avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
+            print(
+                "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                % (
+                    f"TOTAL@{mode}",
+                    trades_count,
+                    wins,
+                    losses,
+                    win_rate,
+                    tp,
+                    sl,
+                    avg_mfe,
+                    avg_mae,
+                    avg_hold,
+                )
+            )
+            for key in ("trades", "wins", "losses", "tp", "sl"):
+                grand_total[key] += int(stats.get(key) or 0)
+            grand_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
+            grand_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
+            grand_total["hold_sum"] += float(stats.get("hold_sum") or 0.0)
+        total_trades = int(grand_total.get("trades") or 0)
+        total_wins = int(grand_total.get("wins") or 0)
+        total_losses = int(grand_total.get("losses") or 0)
+        total_tp = int(grand_total.get("tp") or 0)
+        total_sl = int(grand_total.get("sl") or 0)
+        total_win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
+        total_avg_mfe = (grand_total.get("mfe_sum", 0.0) / total_trades) if total_trades else 0.0
+        total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
+        total_avg_hold = (grand_total.get("hold_sum", 0.0) / total_trades) if total_trades else 0.0
+        print(
+            "[BACKTEST] TOTAL trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+            "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+            % (
+                total_trades,
+                total_wins,
+                total_losses,
+                total_win_rate,
+                total_tp,
+                total_sl,
+                total_avg_mfe,
+                total_avg_mae,
+                total_avg_hold,
+            )
+        )
 
 
 if __name__ == "__main__":

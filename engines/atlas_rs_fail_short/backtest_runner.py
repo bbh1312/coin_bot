@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument("--out", type=str, default="")
     parser.add_argument("--out-trades", type=str, default="")
     parser.add_argument("--out-decisions", type=str, default="")
-    parser.add_argument("--log-path", type=str, default="logs/atlas_rs_fail_short/backtest.log")
+    parser.add_argument("--log-path", type=str, default="")
     return parser.parse_args()
 
 
@@ -123,6 +123,12 @@ def run_symbol(
     end_ms = _now_ms()
     since_ms = _since_ms(days)
     ref_symbol = getattr(atlas_swaggy_cfg, "ref_symbol", "BTC/USDT:USDT")
+    sym_tag = symbol.replace("/", "_").replace(":", "_")
+    signal_log_path = ""
+    if log_path:
+        base_dir = os.path.dirname(log_path)
+        signal_log_path = os.path.join(base_dir, f"signals_{sym_tag}.log")
+    signal_console = []
     _log_file(
         f"[BACKTEST] Fetching {symbol} LTF={cfg.ltf_tf} from last {days} days",
         log_path,
@@ -132,6 +138,7 @@ def run_symbol(
     if not ltf_raw or not ref_raw:
         _log_file(f"[BACKTEST] Missing data for {symbol}. Skipping.", log_path)
         return {}
+    ltf_minutes = float(exchange.parse_timeframe(cfg.ltf_tf)) / 60.0
 
     state: Dict[str, dict] = {"_universe": [symbol]}
     ctx = EngineContext(exchange=exchange, state=state, now_ts=time.time(), logger=None, config=cfg)
@@ -200,7 +207,32 @@ def run_symbol(
                 holding_bars = max(1, idx - trade["entry_idx"] + 1)
                 stats["mfe_sum"] += trade["mfe"]
                 stats["mae_sum"] += trade["mae"]
-                stats["hold_sum"] += holding_bars
+                stats["hold_sum"] += holding_bars * ltf_minutes
+                if log_path:
+                    hold_minutes = holding_bars * ltf_minutes
+                    _log_file(
+                        "[BACKTEST] TRADE symbol=%s entry=%s exit=%s pnl_pct=%.4f hold_min=%.1f reason=%s"
+                        % (symbol, trade.get("entry_dt"), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                           pnl_pct, hold_minutes, exit_reason),
+                        log_path,
+                    )
+                if signal_log_path:
+                    hold_minutes = holding_bars * ltf_minutes
+                    _log_file(
+                        "TRADE entry=%s exit=%s pnl_pct=%.4f hold_min=%.1f reason=%s"
+                        % (trade.get("entry_dt"), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                           pnl_pct, hold_minutes, exit_reason),
+                        signal_log_path,
+                    )
+                hold_minutes = holding_bars * ltf_minutes
+                signal_console.append(
+                    "  - SIGNAL entry=%s exit=%s hold_min=%.1f"
+                    % (
+                        trade.get("entry_dt"),
+                        datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                        hold_minutes,
+                    )
+                )
                 _append_line(
                     out_trades,
                     ",".join(
@@ -297,6 +329,19 @@ def run_symbol(
                 ]
             ),
         )
+        if signal_log_path:
+            _log_file(
+                "SIGNAL entry=%s entry_px=%.6g confirm=%s rsi=%s atr=%s trigger=%s"
+                % (
+                    dt,
+                    float(sig.entry_price or 0.0),
+                    str(tech.get("confirm_type") or ""),
+                    str(tech.get("rsi") or ""),
+                    str(tech.get("atr") or ""),
+                    str(tech.get("trigger_bits") or ""),
+                ),
+                signal_log_path,
+            )
         trade = {
             "entry_px": sig.entry_price,
             "entry_ts": ts,
@@ -332,6 +377,8 @@ def run_symbol(
         f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}",
         log_path,
     )
+    for line in signal_console:
+        print(line)
     if eval_count:
         for reason, count in sorted(block_counts.items(), key=lambda x: x[1], reverse=True):
             ratio = count / eval_count * 100.0
@@ -345,14 +392,26 @@ def main():
     exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
 
+    base_dir = os.path.join("logs", "atlas_rs_fail_short", "backtest")
+    os.makedirs(base_dir, exist_ok=True)
+    log_path = os.path.join(base_dir, os.path.basename(args.log_path)) if args.log_path else os.path.join(base_dir, "backtest.log")
+
     cfg = AtlasRsFailShortConfig()
-    cfg.ltf_tf = args.ltf
+    if args.ltf and args.ltf != cfg.ltf_tf:
+        _log_summary(
+            f"[BACKTEST] match-live enforced: ignoring --ltf={args.ltf}, using cfg.ltf_tf={cfg.ltf_tf}",
+            log_path,
+        )
     engine = AtlasRsFailShortEngine(cfg)
 
-    out_path = args.out
-    out_trades = args.out_trades
-    out_decisions = args.out_decisions
-    log_path = args.log_path
+    def _normalize_out(path: str) -> str:
+        if not path:
+            return path
+        return os.path.join(base_dir, os.path.basename(path))
+
+    out_path = _normalize_out(args.out)
+    out_trades = _normalize_out(args.out_trades)
+    out_decisions = _normalize_out(args.out_decisions)
     if out_path and not out_trades:
         base, ext = os.path.splitext(out_path)
         if not ext:
@@ -368,6 +427,10 @@ def main():
             out_path,
             "ts,symbol,atlas_dir,atlas_regime,entry_px,size_mult,score,rs_z,rs_z_slow,confirm_type,wick_ratio,pullback_id,risk_tags,state_transition,block_reason,rsi,atr,ema20,high_minus_ema20,trigger_bits",
         )
+    _log_summary(
+        f"[BACKTEST] match-live config ltf_tf={cfg.ltf_tf} ref_symbol={atlas_swaggy_cfg.ref_symbol}",
+        log_path,
+    )
     _csv_header(
         out_trades,
         "entry_ts,exit_ts,symbol,entry_px,exit_px,exit_reason,pnl_pct,mfe,mae,hold_bars,confirm_type,size_mult,rs_z,pullback_id,risk_tags,entry_ts_ms,skip_reason,rsi,atr,ema20,high_minus_ema20,trigger_bits",

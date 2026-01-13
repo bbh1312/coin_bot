@@ -3,7 +3,7 @@ import csv
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
 import ccxt
@@ -30,6 +30,14 @@ def _parse_datetime(value: str) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _since_ms(days: int) -> int:
+    return int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
 
 
 def _tf_to_ms(tf: str) -> int:
@@ -208,6 +216,7 @@ def _build_dir_hint(
     mode: str,
     long_syms: Optional[List[str]] = None,
     short_syms: Optional[List[str]] = None,
+    verbose: bool = False,
 ) -> Dict[str, str]:
     hint: Dict[str, str] = {}
     mode = (mode or "auto").lower()
@@ -228,7 +237,8 @@ def _build_dir_hint(
         data = data_by_tf.get((sym, ltf)) or []
         if len(data) < 2:
             hint[sym] = "LONG"
-            print(f"[backtest] {sym} dir_hint fallback=LONG (insufficient {ltf} data)")
+            if verbose:
+                print(f"[backtest] {sym} dir_hint fallback=LONG (insufficient {ltf} data)")
             continue
         first = float(data[0][4])
         last = float(data[-1][4])
@@ -300,12 +310,14 @@ def _run_backtest_for_symbol(
     trade_cooldown_bars: int,
     out_signals: str,
     out_trades: str,
+    verbose: bool,
 ) -> Optional[Dict[str, Any]]:
     atlas_cfg, fabio_cfg, fabio_cfg_mid = _build_atlasfabio_configs()
     ltf = fabio_cfg.timeframe_ltf
     ltf_data = data_by_tf.get((symbol, ltf)) or []
     if not ltf_data:
-        print(f"[backtest] {symbol} skip: missing {ltf} data")
+        if verbose:
+            print(f"[backtest] {symbol} skip: missing {ltf} data")
         return None
 
     min_required = _min_required_bars(atlas_cfg, fabio_cfg)
@@ -318,6 +330,7 @@ def _run_backtest_for_symbol(
         "_atlasfabio_funnel_log_path": log_path,
         "_atlasfabio_confirm_entry_mode": "confirm_only",
         "_atlasfabio_backtest_mode": True,
+        "_atlasfabio_backtest_quiet": True,
     }
     cached_ex = engine_runner.CachedExchange(exchange)
     def _log(msg: str) -> None:
@@ -327,17 +340,25 @@ def _run_backtest_for_symbol(
                 f.write(msg + "\n")
         except Exception:
             pass
-        print(msg)
+        if verbose:
+            print(msg)
 
     cycles_run = 0
     pending: Optional[PendingEntry] = None
     trade: Optional[TradeState] = None
     cooldown_until = -10**9
-    trade_stats: Dict[str, int] = {
+    ltf_ms = _tf_to_ms(fabio_cfg.timeframe_ltf)
+    ltf_minutes = (ltf_ms / 60000.0) if ltf_ms > 0 else 0.0
+    trade_stats: Dict[str, float] = {
         "trades": 0,
         "wins": 0,
         "losses": 0,
         "timeouts": 0,
+        "tp": 0,
+        "sl": 0,
+        "mfe_sum": 0.0,
+        "mae_sum": 0.0,
+        "hold_sum": 0.0,
         "skipped_in_pos": 0,
         "skipped_cooldown": 0,
         "skipped_no_next": 0,
@@ -410,10 +431,17 @@ def _run_backtest_for_symbol(
                 trade_stats["trades"] += 1
                 if exit_reason == "TIMEOUT":
                     trade_stats["timeouts"] += 1
+                if exit_reason == "TP":
+                    trade_stats["tp"] += 1
+                elif exit_reason == "SL":
+                    trade_stats["sl"] += 1
                 if pnl_pct >= 0:
                     trade_stats["wins"] += 1
                 else:
                     trade_stats["losses"] += 1
+                trade_stats["mfe_sum"] += mfe
+                trade_stats["mae_sum"] += mae
+                trade_stats["hold_sum"] += holding_bars * ltf_minutes
                 _append_trade(
                     out_trades,
                     [
@@ -595,7 +623,8 @@ def _run_backtest_for_symbol(
                     reasons=reasons,
                 )
     if cycles_run == 0:
-        print(f"[backtest] {symbol} skip: insufficient warmup data in range")
+        if verbose:
+            print(f"[backtest] {symbol} skip: insufficient warmup data in range")
     if trade is not None:
         last_idx = len(ltf_data) - 1
         last_ts = int(ltf_data[last_idx][0])
@@ -627,6 +656,9 @@ def _run_backtest_for_symbol(
             trade_stats["wins"] += 1
         else:
             trade_stats["losses"] += 1
+        trade_stats["mfe_sum"] += mfe
+        trade_stats["mae_sum"] += mae
+        trade_stats["hold_sum"] += holding_bars * ltf_minutes
         _append_trade(
             out_trades,
             [
@@ -648,6 +680,9 @@ def _run_backtest_for_symbol(
         )
         trade = None
     win_rate = (trade_stats["wins"] / trade_stats["trades"]) if trade_stats["trades"] else 0.0
+    avg_mfe = (trade_stats["mfe_sum"] / trade_stats["trades"]) if trade_stats["trades"] else 0.0
+    avg_mae = (trade_stats["mae_sum"] / trade_stats["trades"]) if trade_stats["trades"] else 0.0
+    avg_hold = (trade_stats["hold_sum"] / trade_stats["trades"]) if trade_stats["trades"] else 0.0
     _log(
         "[atlasfabio-trades] "
         f"sym={symbol} trades={trade_stats['trades']} wins={trade_stats['wins']} "
@@ -661,15 +696,19 @@ def _run_backtest_for_symbol(
         "wins": trade_stats["wins"],
         "losses": trade_stats["losses"],
         "timeouts": trade_stats["timeouts"],
+        "tp": trade_stats["tp"],
+        "sl": trade_stats["sl"],
         "win_rate": win_rate,
+        "avg_mfe": avg_mfe,
+        "avg_mae": avg_mae,
+        "avg_hold": avg_hold,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AtlasFabio backtest runner")
     parser.add_argument("--symbols", required=True, help="comma-separated symbols")
-    parser.add_argument("--start", required=True, help="start datetime (YYYY-MM-DD or ISO)")
-    parser.add_argument("--end", required=True, help="end datetime (YYYY-MM-DD or ISO)")
+    parser.add_argument("--days", type=int, default=7, help="lookback days from now")
     parser.add_argument("--direction", default="auto", choices=("auto", "long", "short"))
     parser.add_argument("--long", default="", help="comma-separated long symbols override")
     parser.add_argument("--short", default="", help="comma-separated short symbols override")
@@ -689,6 +728,7 @@ def main() -> None:
     parser.add_argument("--position-size-usdt", type=float, default=100.0)
     parser.add_argument("--trade-cooldown-bars", type=int, default=12)
     parser.add_argument("--auto-range", action="store_true", help="auto clamp to available data range")
+    parser.add_argument("--verbose", action="store_true", help="print debug logs")
     args = parser.parse_args()
     if engine_runner.rsi_engine is None:
         engine_runner.rsi_engine = RsiEngine()
@@ -696,15 +736,15 @@ def main() -> None:
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     if not symbols:
         raise SystemExit("symbols is required")
-    start_ms = _parse_datetime(args.start)
-    end_ms = _parse_datetime(args.end)
+    end_ms = _now_ms()
+    start_ms = _since_ms(args.days)
     if end_ms <= start_ms:
-        raise SystemExit("end must be after start")
+        raise SystemExit("invalid days range")
 
     log_path = args.log_file.strip() or os.path.join("logs", "fabio", "atlasfabio_funnel_backtest.log")
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"[backtest] start={args.start} end={args.end} symbols={symbols}\n")
+        f.write(f"[backtest] days={args.days} start_ms={start_ms} end_ms={end_ms} symbols={symbols}\n")
     _write_signal_header(args.out_signals)
     _write_trade_header(args.out_trades)
 
@@ -733,7 +773,8 @@ def main() -> None:
     for sym in symbols:
         for tf in tfs:
             fetch_start = _warmup_start_ms(start_ms, tf, min_required.get(tf, 0))
-            print(f"[backtest] fetching {sym} {tf}")
+            if args.verbose:
+                print(f"[backtest] fetching {sym} {tf}")
             data_by_tf[(sym, tf)] = _fetch_ohlcv_range(exchange, sym, tf, fetch_start, end_ms)
         ltf = fabio_cfg.timeframe_ltf
         ltf_data = data_by_tf.get((sym, ltf)) or []
@@ -742,27 +783,32 @@ def main() -> None:
             if avail_start and avail_end:
                 start_str = datetime.fromtimestamp(avail_start / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
                 end_str = datetime.fromtimestamp(avail_end / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-                print(f"[backtest] {sym} {ltf} available={start_str}~{end_str}")
+                if args.verbose:
+                    print(f"[backtest] {sym} {ltf} available={start_str}~{end_str}")
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write(f"[backtest] {sym} {ltf} available={start_str}~{end_str}\n")
                 if args.auto_range:
                     new_start = max(start_ms, avail_start)
                     new_end = min(end_ms, avail_end)
                     if new_end > new_start:
-                        print(f"[backtest] {sym} auto-range applied")
+                        if args.verbose:
+                            print(f"[backtest] {sym} auto-range applied")
                         for tf in tfs:
                             fetch_start = _warmup_start_ms(new_start, tf, min_required.get(tf, 0))
                             data_by_tf[(sym, tf)] = _fetch_ohlcv_range(
                                 exchange, sym, tf, fetch_start, new_end
                             )
                     else:
-                        print(f"[backtest] {sym} auto-range skipped: no overlap")
+                        if args.verbose:
+                            print(f"[backtest] {sym} auto-range skipped: no overlap")
             else:
-                print(f"[backtest] {sym} {ltf} available=unknown")
+                if args.verbose:
+                    print(f"[backtest] {sym} {ltf} available=unknown")
         for tf in tfs:
             data = data_by_tf.get((sym, tf)) or []
             req = min_required.get(tf, 0)
-            print(f"[backtest] {sym} {tf} bars={len(data)} min_required={req}")
+            if args.verbose:
+                print(f"[backtest] {sym} {tf} bars={len(data)} min_required={req}")
 
     dir_hint = _build_dir_hint(
         symbols,
@@ -771,13 +817,15 @@ def main() -> None:
         args.direction,
         long_syms=[s.strip() for s in args.long.split(",") if s.strip()],
         short_syms=[s.strip() for s in args.short.split(",") if s.strip()],
+        verbose=args.verbose,
     )
 
     summary_rows: List[Dict[str, Any]] = []
     for sym in symbols:
         hint = dir_hint.get(sym)
         if not hint:
-            print(f"[backtest] {sym} skip: dir_hint missing")
+            if args.verbose:
+                print(f"[backtest] {sym} skip: dir_hint missing")
             continue
         row = _run_backtest_for_symbol(
             sym,
@@ -801,24 +849,74 @@ def main() -> None:
             trade_cooldown_bars=args.trade_cooldown_bars,
             out_signals=args.out_signals,
             out_trades=args.out_trades,
+            verbose=args.verbose,
         )
         if row:
             summary_rows.append(row)
 
     if summary_rows:
         summary_rows.sort(key=lambda r: (r.get("win_rate") or 0.0), reverse=True)
-        print("[atlasfabio-summary] per-symbol win_rate")
+        total_trades = 0
+        total_wins = 0
+        total_losses = 0
+        total_tp = 0
+        total_sl = 0
+        total_mfe = 0.0
+        total_mae = 0.0
+        total_hold = 0.0
         for row in summary_rows:
+            trades = int(row.get("trades") or 0)
+            wins = int(row.get("wins") or 0)
+            losses = int(row.get("losses") or 0)
+            tp = int(row.get("tp") or 0)
+            sl = int(row.get("sl") or 0)
+            win_rate = (wins / trades * 100.0) if trades else 0.0
+            avg_mfe = float(row.get("avg_mfe") or 0.0)
+            avg_mae = float(row.get("avg_mae") or 0.0)
+            avg_hold = float(row.get("avg_hold") or 0.0)
+            total_trades += trades
+            total_wins += wins
+            total_losses += losses
+            total_tp += tp
+            total_sl += sl
+            total_mfe += avg_mfe * trades
+            total_mae += avg_mae * trades
+            total_hold += avg_hold * trades
             print(
-                "sym=%s trades=%s wins=%s losses=%s win_rate=%.4f"
+                "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
                 % (
                     row.get("symbol"),
-                    row.get("trades"),
-                    row.get("wins"),
-                    row.get("losses"),
-                    row.get("win_rate") or 0.0,
+                    trades,
+                    wins,
+                    losses,
+                    win_rate,
+                    tp,
+                    sl,
+                    avg_mfe,
+                    avg_mae,
+                    avg_hold,
                 )
             )
+        total_win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
+        total_avg_mfe = (total_mfe / total_trades) if total_trades else 0.0
+        total_avg_mae = (total_mae / total_trades) if total_trades else 0.0
+        total_avg_hold = (total_hold / total_trades) if total_trades else 0.0
+        print(
+            "[BACKTEST] TOTAL trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+            "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+            % (
+                total_trades,
+                total_wins,
+                total_losses,
+                total_win_rate,
+                total_tp,
+                total_sl,
+                total_avg_mfe,
+                total_avg_mae,
+                total_avg_hold,
+            )
+        )
 
 
 if __name__ == "__main__":

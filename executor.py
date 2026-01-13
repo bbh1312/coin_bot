@@ -599,6 +599,17 @@ def should_dca_by_price(entry: float, mark: float, adds_done: int) -> bool:
         return adverse_pct >= DCA_SECOND_PCT
     return adverse_pct >= DCA_THIRD_PCT
 
+def should_dca_by_price_long(entry: float, mark: float, adds_done: int) -> bool:
+    """Adverse move vs entry for long. Triggers when mark price falls by configured %."""
+    if entry <= 0:
+        return False
+    adverse_pct = (entry - mark) / entry * 100.0
+    if adds_done <= 0:
+        return adverse_pct >= DCA_FIRST_PCT
+    if adds_done == 1:
+        return adverse_pct >= DCA_SECOND_PCT
+    return adverse_pct >= DCA_THIRD_PCT
+
 def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated") -> dict:
     ensure_ready()
     set_leverage_and_margin(symbol, leverage=leverage, margin_mode=margin_mode)
@@ -1080,6 +1091,43 @@ def dca_short_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolate
         }
 
     res = short_market(symbol, usdt_amount=DCA_USDT, leverage=DEFAULT_LEVERAGE, margin_mode=margin_mode)
+    res.update({
+        "adds_done_before": adds_done,
+        "adds_done_after": adds_done + 1,
+        "dca_usdt": DCA_USDT,
+        "entry": entry,
+        "mark": mark,
+    })
+    return res
+
+def dca_long_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolated") -> dict:
+    if adds_done >= DCA_MAX_ADDS:
+        return {"status": "skip", "reason": "max_adds_reached", "symbol": symbol, "adds_done": adds_done}
+    p = _find_long_position(symbol)
+    if not p:
+        return {"status": "skip", "reason": "no_long_position", "symbol": symbol}
+    if not _is_long_position(p):
+        return {"status": "skip", "reason": "not_long_position", "symbol": symbol}
+    info = p.get("info") or {}
+
+    entry = info.get("entryPrice") or info.get("avgPrice") or p.get("entryPrice")
+    mark = info.get("markPrice") or p.get("markPrice")
+    try:
+        entry = float(entry); mark = float(mark)
+    except Exception:
+        return {"status": "skip", "reason": "price_unavailable", "symbol": symbol}
+
+    if not should_dca_by_price_long(entry, mark, adds_done):
+        return {
+            "status": "skip",
+            "reason": "not_triggered",
+            "symbol": symbol,
+            "adds_done": adds_done,
+            "entry": entry,
+            "mark": mark,
+        }
+
+    res = long_market(symbol, usdt_amount=DCA_USDT, leverage=DEFAULT_LEVERAGE, margin_mode=margin_mode)
     res.update({
         "adds_done_before": adds_done,
         "adds_done_after": adds_done + 1,

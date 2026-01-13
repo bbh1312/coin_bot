@@ -164,6 +164,8 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
     st["in_pos"] = False
     st["last_ok"] = False
     st["dca_adds"] = 0
+    st["dca_adds_long"] = 0
+    st["dca_adds_short"] = 0
     state[symbol] = st
     if report_ok:
         er._update_report_csv(open_tr)
@@ -225,6 +227,8 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
     st["in_pos"] = False
     st["last_ok"] = False
     st["dca_adds"] = 0
+    st["dca_adds_long"] = 0
+    st["dca_adds_short"] = 0
     state[symbol] = st
     if report_ok:
         er._update_report_csv(open_tr)
@@ -571,6 +575,22 @@ def main():
                     closed = _handle_long_tp(state, symbol, detail, mark_px, now_ts)
                     if not closed:
                         _handle_long_sl(state, symbol, detail, mark_px, now_ts)
+                st = state.get(symbol, {})
+                last_eval = float(st.get("manage_eval_long_ts", 0.0) or 0.0)
+                if (now_ts - last_eval) >= er.MANAGE_EVAL_COOLDOWN_SEC:
+                    st["manage_eval_long_ts"] = now_ts
+                    state[symbol] = st
+                    adds_done = int(st.get("dca_adds_long", st.get("dca_adds", 0)))
+                    dca_res = executor_mod.dca_long_if_needed(
+                        symbol, adds_done=adds_done, margin_mode=er.MARGIN_MODE
+                    )
+                    if dca_res.get("status") not in ("skip", "warn"):
+                        st["dca_adds_long"] = adds_done + 1
+                        state[symbol] = st
+                        er.send_telegram(
+                            f"➕ <b>DCA</b> {symbol} LONG adds {adds_done}->{adds_done+1} "
+                            f"mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
+                        )
                 # TODO(manage-ws): 추가 롱 청산 조건(현재 주석 처리)
                 # - SL/보호 조건
                 # - 추가 리스크 기반 exit
@@ -590,12 +610,12 @@ def main():
                 if (now_ts - last_eval) >= er.MANAGE_EVAL_COOLDOWN_SEC:
                     st["manage_eval_ts"] = now_ts
                     state[symbol] = st
-                    adds_done = int(st.get("dca_adds", 0))
+                    adds_done = int(st.get("dca_adds_short", st.get("dca_adds", 0)))
                     dca_res = executor_mod.dca_short_if_needed(
                         symbol, adds_done=adds_done, margin_mode=er.MARGIN_MODE
                     )
                     if dca_res.get("status") not in ("skip", "warn"):
-                        st["dca_adds"] = adds_done + 1
+                        st["dca_adds_short"] = adds_done + 1
                         state[symbol] = st
                         er.send_telegram(
                             f"➕ <b>DCA</b> {symbol} adds {adds_done}->{adds_done+1} "

@@ -21,6 +21,9 @@ class Trade:
     atlas_reasons: Optional[list[str]] = None
     atlas_shadow_pass: Optional[bool] = None
     atlas_shadow_reasons: Optional[list[str]] = None
+    policy_action: Optional[str] = None
+    overext_dist_at_entry: Optional[float] = None
+    overext_blocked: Optional[bool] = None
     exit_ts: Optional[int] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
@@ -56,6 +59,9 @@ class BrokerSim:
         atlas_reasons: Optional[list[str]] = None,
         atlas_shadow_pass: Optional[bool] = None,
         atlas_shadow_reasons: Optional[list[str]] = None,
+        policy_action: Optional[str] = None,
+        overext_dist_at_entry: Optional[float] = None,
+        overext_blocked: Optional[bool] = None,
     ) -> Trade:
         side = side.upper()
         if side == "LONG":
@@ -80,6 +86,9 @@ class BrokerSim:
             atlas_reasons=atlas_reasons,
             atlas_shadow_pass=atlas_shadow_pass,
             atlas_shadow_reasons=atlas_shadow_reasons,
+            policy_action=policy_action,
+            overext_dist_at_entry=overext_dist_at_entry,
+            overext_blocked=overext_blocked,
         )
         self.positions[sym] = trade
         return trade

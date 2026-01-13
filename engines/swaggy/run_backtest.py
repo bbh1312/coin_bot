@@ -75,14 +75,15 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def _log_factory(log_path: str):
+def _log_factory(log_path: str, verbose: bool):
     _ensure_dir(os.path.dirname(log_path))
     fp = open(log_path, "a", encoding="utf-8")
 
     def _log(msg: str) -> None:
         fp.write(msg + "\n")
         fp.flush()
-        print(msg)
+        if verbose:
+            print(msg)
 
     return _log, fp
 
@@ -175,6 +176,8 @@ class PendingEntry:
     sl_px: float
     tp1_px: Optional[float]
     tp2_px: Optional[float]
+    sl_pct: float = 0.0
+    tp_pct: float = 0.0
 
 
 @dataclass
@@ -199,9 +202,12 @@ class TradeState:
 def parse_args():
     parser = argparse.ArgumentParser(description="Swaggy backtest with trade simulation")
     parser.add_argument("--symbols", type=str, default="BTC/USDT:USDT")
-    parser.add_argument("--start", type=str, required=True)
-    parser.add_argument("--end", type=str, required=True)
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--start", type=str, default="")
+    parser.add_argument("--end", type=str, default="")
     parser.add_argument("--entry-mode", type=str, default="NEXT_OPEN", choices=["NEXT_OPEN", "SIGNAL_CLOSE"])
+    parser.add_argument("--sl-pct", type=float, default=0.0)
+    parser.add_argument("--tp-pct", type=float, default=0.0)
     parser.add_argument("--out-signals", type=str, default="logs/swaggy/backtest_swaggy_signals.csv")
     parser.add_argument("--out-trades", type=str, default="logs/swaggy/backtest_swaggy_trades.csv")
     parser.add_argument("--log-path", type=str, default="logs/swaggy/backtest_swaggy.log")
@@ -210,6 +216,7 @@ def parse_args():
     parser.add_argument("--fee-rate", type=float, default=0.0)
     parser.add_argument("--slippage-pct", type=float, default=0.0)
     parser.add_argument("--position-size-usdt", type=float, default=100.0)
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
@@ -291,11 +298,17 @@ def _apply_exit_logic(
 
 def main() -> None:
     args = parse_args()
-    start_ms = _parse_ts(args.start)
-    end_ms = _parse_ts(args.end)
+    if args.start and args.end:
+        start_ms = _parse_ts(args.start)
+        end_ms = _parse_ts(args.end)
+    else:
+        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ms = int((datetime.now(timezone.utc) - pd.Timedelta(days=args.days)).timestamp() * 1000)
+    if end_ms <= start_ms:
+        raise SystemExit("end must be after start")
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
-    log_fn, log_fp = _log_factory(args.log_path)
+    log_fn, log_fp = _log_factory(args.log_path, args.verbose)
     if args.out_signals:
         _write_signal_header(args.out_signals)
     if args.out_trades:
@@ -306,6 +319,17 @@ def main() -> None:
 
     cfg = SwaggyConfig()
     time_stop_bars = args.time_stop_bars if args.time_stop_bars > 0 else cfg.time_stop_bars_5m
+    ltf_minutes = float(exchange.parse_timeframe(cfg.tf_ltf)) / 60.0
+    total_stats = {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "tp": 0,
+        "sl": 0,
+        "mfe_sum": 0.0,
+        "mae_sum": 0.0,
+        "hold_sum": 0.0,
+    }
 
     for symbol in symbols:
         log_fn(f"[swaggy] fetch sym={symbol} start={start_ms} end={end_ms}")
@@ -324,6 +348,7 @@ def main() -> None:
         engine = SwaggyEngine(cfg)
         engine.begin_cycle()
         state: Dict[str, Any] = engine._state.setdefault(symbol, {})
+        state["_swaggy_quiet"] = True
         pending: Optional[PendingEntry] = None
         trade: Optional[TradeState] = None
         cooldown_until = -10**9
@@ -332,6 +357,11 @@ def main() -> None:
             "wins": 0,
             "losses": 0,
             "timeouts": 0,
+            "tp": 0,
+            "sl": 0,
+            "mfe_sum": 0.0,
+            "mae_sum": 0.0,
+            "hold_sum": 0.0,
             "skipped_in_pos": 0,
             "skipped_cooldown": 0,
             "skipped_no_next": 0,
@@ -369,10 +399,17 @@ def main() -> None:
                     trade_stats["trades"] += 1
                     if trade.exit_reason == "TIME_STOP":
                         trade_stats["timeouts"] += 1
+                    if trade.exit_reason == "TP2":
+                        trade_stats["tp"] += 1
+                    elif trade.exit_reason == "SL":
+                        trade_stats["sl"] += 1
                     if pnl_pct >= 0:
                         trade_stats["wins"] += 1
                     else:
                         trade_stats["losses"] += 1
+                    trade_stats["mfe_sum"] += mfe
+                    trade_stats["mae_sum"] += mae
+                    trade_stats["hold_sum"] += holding_bars * ltf_minutes
                     if args.out_trades:
                         _append_trade(
                             args.out_trades,
@@ -403,15 +440,19 @@ def main() -> None:
             if pending is not None and idx == pending.entry_idx:
                 if trade is None:
                     entry_px = o if args.entry_mode == "NEXT_OPEN" else pending.entry_px
+                    side = pending.side.upper()
+                    sl_px = pending.sl_px
+                    tp1_px = pending.tp1_px
+                    tp2_px = pending.tp2_px
                     trade = _open_trade(
                         symbol,
                         pending.side,
                         idx,
                         ts,
                         entry_px,
-                        pending.sl_px,
-                        pending.tp1_px,
-                        pending.tp2_px,
+                        sl_px,
+                        tp1_px,
+                        tp2_px,
                         h,
                         l,
                     )
@@ -458,14 +499,17 @@ def main() -> None:
                 bars_left = ""
                 if isinstance(decision.evidence, dict):
                     bars_left = decision.evidence.get("bars_left", "")
-                log_fn(f"[swaggy] ENTRY_SKIP reason=COOLDOWN sym={symbol} bars_left={bars_left}")
+                if args.verbose:
+                    log_fn(f"[swaggy] ENTRY_SKIP reason=COOLDOWN sym={symbol} bars_left={bars_left}")
             elif reason == "ZONE_REENTRY":
-                log_fn(f"[swaggy] ENTRY_SKIP reason=ZONE_REENTRY sym={symbol}")
+                if args.verbose:
+                    log_fn(f"[swaggy] ENTRY_SKIP reason=ZONE_REENTRY sym={symbol}")
             elif reason == "SL_COOLDOWN":
                 bars_left = ""
                 if isinstance(decision.evidence, dict):
                     bars_left = decision.evidence.get("bars_left", "")
-                log_fn(f"[swaggy] SL_COOLDOWN_ACTIVE sym={symbol} bars_left={bars_left}")
+                if args.verbose:
+                    log_fn(f"[swaggy] SL_COOLDOWN_ACTIVE sym={symbol} bars_left={bars_left}")
             if _decision_entry_ready(decision):
                 if trade is not None:
                     trade_stats["skipped_in_pos"] += 1
@@ -477,18 +521,24 @@ def main() -> None:
                     trade_stats["skipped_no_next"] += 1
                     continue
                 entry_px = float(decision.entry_px or c)
-                sl_px = float(decision.sl_px or 0.0)
-                if sl_px <= 0:
+                sl_pct = float(args.sl_pct or 0.0)
+                tp_pct = float(args.tp_pct or 0.0)
+                if sl_pct <= 0 or tp_pct <= 0:
                     continue
+                side = str(decision.side or "").upper()
+                sl_px = entry_px * (1 + sl_pct) if side == "SHORT" else entry_px * (1 - sl_pct)
+                tp1_px = entry_px * (1 - tp_pct) if side == "SHORT" else entry_px * (1 + tp_pct)
                 pending = PendingEntry(
                     symbol=symbol,
-                    side=str(decision.side or "").upper(),
+                    side=side,
                     signal_idx=idx,
                     entry_idx=(idx + 1) if args.entry_mode == "NEXT_OPEN" else idx,
                     entry_px=entry_px,
                     sl_px=sl_px,
-                    tp1_px=decision.tp1_px,
-                    tp2_px=decision.tp2_px,
+                    tp1_px=tp1_px,
+                    tp2_px=None,
+                    sl_pct=sl_pct,
+                    tp_pct=tp_pct,
                 )
                 if args.out_signals:
                     _append_signal(
@@ -500,7 +550,7 @@ def main() -> None:
                             f"{pending.entry_px:.6g}",
                             f"{pending.sl_px:.6g}",
                             f"{pending.tp1_px:.6g}" if pending.tp1_px is not None else "",
-                            f"{pending.tp2_px:.6g}" if pending.tp2_px is not None else "",
+                            "",
                             "ENTRY_READY",
                         ],
                     )
@@ -536,6 +586,9 @@ def main() -> None:
                 trade_stats["wins"] += 1
             else:
                 trade_stats["losses"] += 1
+            trade_stats["mfe_sum"] += mfe
+            trade_stats["mae_sum"] += mae
+            trade_stats["hold_sum"] += holding_bars * ltf_minutes
             if args.out_trades:
                 _append_trade(
                     args.out_trades,
@@ -560,16 +613,65 @@ def main() -> None:
             trade = None
             state["in_pos"] = False
 
-        win_rate = (trade_stats["wins"] / trade_stats["trades"]) if trade_stats["trades"] else 0.0
-        log_fn(
-            "[swaggy-trades] "
-            f"sym={symbol} trades={trade_stats['trades']} wins={trade_stats['wins']} "
-            f"losses={trade_stats['losses']} timeouts={trade_stats['timeouts']} "
-            f"win_rate={win_rate:.4f} skip_in_pos={trade_stats['skipped_in_pos']} "
-            f"skip_cooldown={trade_stats['skipped_cooldown']} skip_no_next={trade_stats['skipped_no_next']}"
+        trades = int(trade_stats["trades"] or 0)
+        wins = int(trade_stats["wins"] or 0)
+        losses = int(trade_stats["losses"] or 0)
+        tp = int(trade_stats["tp"] or 0)
+        sl = int(trade_stats["sl"] or 0)
+        win_rate = (wins / trades * 100.0) if trades else 0.0
+        avg_mfe = (trade_stats["mfe_sum"] / trades) if trades else 0.0
+        avg_mae = (trade_stats["mae_sum"] / trades) if trades else 0.0
+        avg_hold = (trade_stats["hold_sum"] / trades) if trades else 0.0
+        print(
+            "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+            "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+            % (
+                symbol,
+                trades,
+                wins,
+                losses,
+                win_rate,
+                tp,
+                sl,
+                avg_mfe,
+                avg_mae,
+                avg_hold,
+            )
         )
+        total_stats["trades"] += trades
+        total_stats["wins"] += wins
+        total_stats["losses"] += losses
+        total_stats["tp"] += tp
+        total_stats["sl"] += sl
+        total_stats["mfe_sum"] += trade_stats["mfe_sum"]
+        total_stats["mae_sum"] += trade_stats["mae_sum"]
+        total_stats["hold_sum"] += trade_stats["hold_sum"]
 
     log_fp.close()
+    total_trades = int(total_stats["trades"] or 0)
+    total_wins = int(total_stats["wins"] or 0)
+    total_losses = int(total_stats["losses"] or 0)
+    total_tp = int(total_stats["tp"] or 0)
+    total_sl = int(total_stats["sl"] or 0)
+    total_win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
+    total_avg_mfe = (total_stats["mfe_sum"] / total_trades) if total_trades else 0.0
+    total_avg_mae = (total_stats["mae_sum"] / total_trades) if total_trades else 0.0
+    total_avg_hold = (total_stats["hold_sum"] / total_trades) if total_trades else 0.0
+    print(
+        "[BACKTEST] TOTAL trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+        "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+        % (
+            total_trades,
+            total_wins,
+            total_losses,
+            total_win_rate,
+            total_tp,
+            total_sl,
+            total_avg_mfe,
+            total_avg_mae,
+            total_avg_hold,
+        )
+    )
 
 
 if __name__ == "__main__":

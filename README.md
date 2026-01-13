@@ -41,17 +41,98 @@ pip install ccxt pandas requests websocket-client
   - 백테스트
     python3 backtest_atlasfabio.py \
       --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,HYPER/USDT:USDT \
-      --start 2026-01-01 \
-      --end 2026-01-11
+      --days 10 \
+      --sl-pct 0.02 \
+      --tp-pct 0.03
+  - 예시
+    ```
+    python3 backtest_atlasfabio.py \
+      --symbols PROM/USDT:USDT,B/USDT:USDT,PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT \       
+      --days 7 \
+      --sl-pct 0.03 \
+      --tp-pct 0.05
+      [BACKTEST] AKE/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0671 avg_mae=0.0197 avg_hold=165.0
+      [BACKTEST] POL/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=0 sl=0 avg_mfe=0.0469 avg_mae=0.0263 avg_hold=495.0
+      [BACKTEST] TRUTH/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0531 avg_mae=0.0217 avg_hold=270.0
+      [BACKTEST] PROM/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+      [BACKTEST] B/USDT:USDT trades=1 wins=0 losses=1 winrate=0.00% tp=0 sl=1 avg_mfe=0.0146 avg_mae=0.0304 avg_hold=435.0
+      [BACKTEST] PTB/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+      [BACKTEST] TOTAL trades=4 wins=3 losses=1 winrate=75.00% tp=2 sl=1 avg_mfe=0.0454 avg_mae=0.0245 avg_hold=341.2
+  ```
+- 스웨기
+  - 백테스트
+    python3 engines/swaggy/run_backtest.py \
+    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
+    --sl-pct 0.03 \
+    --tp-pct 0.03 \
+    --days 10
+  - 예시
+  ```
+  python3 engines/swaggy/run_backtest.py \
+    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
+    --sl-pct 0.30 \
+    --tp-pct 0.03 \
+    --days 10
+  [BACKTEST] PTB/USDT:USDT trades=97 wins=54 losses=43 winrate=55.67% tp=0 sl=0 avg_mfe=0.0123 avg_mae=0.0144 avg_hold=64.5
+  [BACKTEST] AKE/USDT:USDT trades=93 wins=48 losses=45 winrate=51.61% tp=0 sl=3 avg_mfe=0.0131 avg_mae=0.0138 avg_hold=63.9
+  [BACKTEST] POL/USDT:USDT trades=87 wins=38 losses=49 winrate=43.68% tp=0 sl=0 avg_mfe=0.0102 avg_mae=0.0113 avg_hold=65.1
+  [BACKTEST] TRUTH/USDT:USDT trades=98 wins=50 losses=48 winrate=51.02% tp=0 sl=3 avg_mfe=0.0167 avg_mae=0.0134 avg_hold=64.6
+  [BACKTEST] ALCH/USDT:USDT trades=93 wins=51 losses=42 winrate=54.84% tp=0 sl=1 avg_mfe=0.0092 avg_mae=0.0082 avg_hold=64.7
+  [BACKTEST] ARC/USDT:USDT trades=110 wins=49 losses=61 winrate=44.55% tp=0 sl=1 avg_mfe=0.0109 avg_mae=0.0120 avg_hold=64.8
+  [BACKTEST] B/USDT:USDT trades=105 wins=51 losses=54 winrate=48.57% tp=0 sl=2 avg_mfe=0.0169 avg_mae=0.0132 avg_hold=64.9
+  [BACKTEST] TOTAL trades=683 wins=341 losses=342 winrate=49.93% tp=0 sl=10 avg_mfe=0.0128 avg_mae=0.0124 avg_hold=64.6
+  ```
+- 아틀라스 스웨기
+  - 백테스트
+    python33 -m engines.swaggy_atlas_lab.run_backtest \
+    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
+    --days 10 \
+    --sl-pct 0.30 \
+    --tp-pct 0.03 \
+    --mode all
+  - 예시
+    ```
+     python3 engines/swaggy_atlas_lab/run_backtest_sweep.py \
+    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
+    --days 10 \
+    --mode shadow \
+    --tp-pct 0.03 \
+    --sl-pct 0.30 
+    [BACKTEST] PTB/USDT:USDT@shadow trades=6 wins=6 losses=0 winrate=100.00% tp=6 sl=0 avg_mfe=0.0354 avg_mae=0.0365 avg_hold=562.5
+    [BACKTEST] AKE/USDT:USDT@shadow trades=13 wins=13 losses=0 winrate=100.00% tp=13 sl=0 avg_mfe=0.0377 avg_mae=0.0266 avg_hold=486.2
+    [BACKTEST] POL/USDT:USDT@shadow trades=10 wins=9 losses=1 winrate=90.00% tp=9 sl=1 avg_mfe=0.0301 avg_mae=0.0501 avg_hold=1152.0
+    [BACKTEST] TRUTH/USDT:USDT@shadow trades=21 wins=21 losses=0 winrate=100.00% tp=21 sl=0 avg_mfe=0.0348 avg_mae=0.0284 avg_hold=561.7
+    [BACKTEST] ALCH/USDT:USDT@shadow trades=7 wins=7 losses=0 winrate=100.00% tp=7 sl=0 avg_mfe=0.0356 avg_mae=0.0598 avg_hold=1857.1
+    [BACKTEST] ARC/USDT:USDT@shadow trades=5 wins=4 losses=1 winrate=80.00% tp=4 sl=1 avg_mfe=0.0301 avg_mae=0.1097 avg_hold=2450.0
+    [BACKTEST] B/USDT:USDT@shadow trades=15 wins=15 losses=0 winrate=100.00% tp=15 sl=0 avg_mfe=0.0513 avg_mae=0.0572 avg_hold=823.0
+    [BACKTEST] TOTAL@shadow trades=77 wins=75 losses=2 winrate=97.40% tp=75 sl=2 avg_mfe=0.0377 avg_mae=0.0453 avg_hold=916.9
+    [BACKTEST] TOTAL trades=77 wins=75 losses=2 winrate=97.40% tp=75 sl=2 avg_mfe=0.0377 avg_mae=0.0453 avg_hold=916.9    
+    ```
 - 아틀라스 일반 숏
   - 백테스트
      python3 -m engines.atlas_rs_fail_short.backtest_runner \
-    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT \
+    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
     --days 30 \
     --sl-pct 0.03 \
     --tp-pct 0.03 \
     --out logs/atlas_rs_fail_short/arsf_signals.csv
-
+  - 예시
+  ```
+  python3 -m engines.atlas_rs_fail_short.backtest_runner \
+    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
+    --days 10 \
+    --sl-pct 0.30 \
+    --tp-pct 0.02 \
+    --out logs/atlas_rs_fail_short/arsf_signals.csv
+    [BACKTEST] PTB/USDT:USDT trades=9 wins=8 losses=1 winrate=88.89% tp=8 sl=1 avg_mfe=0.0268 avg_mae=0.0488 avg_hold=475.0
+    [BACKTEST] AKE/USDT:USDT trades=3 wins=2 losses=1 winrate=66.67% tp=2 sl=1 avg_mfe=0.0214 avg_mae=0.1188 avg_hold=2250.0
+    [BACKTEST] POL/USDT:USDT trades=3 wins=2 losses=1 winrate=66.67% tp=2 sl=1 avg_mfe=0.0186 avg_mae=0.1740 avg_hold=4230.0
+    [BACKTEST] TRUTH/USDT:USDT trades=11 wins=10 losses=1 winrate=90.91% tp=10 sl=1 avg_mfe=0.0286 avg_mae=0.0430 avg_hold=469.1
+    [BACKTEST] ALCH/USDT:USDT trades=2 wins=2 losses=0 winrate=100.00% tp=2 sl=0 avg_mfe=0.0282 avg_mae=0.0506 avg_hold=2310.0
+    [BACKTEST] ARC/USDT:USDT trades=8 wins=7 losses=1 winrate=87.50% tp=7 sl=1 avg_mfe=0.0263 avg_mae=0.0543 avg_hold=930.0
+    [BACKTEST] B/USDT:USDT trades=6 wins=6 losses=0 winrate=100.00% tp=6 sl=0 avg_mfe=0.0306 avg_mae=0.0513 avg_hold=835.0
+    [BACKTEST] total trades=42 wins=37 losses=5 winrate=88.10% tp=37 sl=5 avg_mfe=0.0268 avg_mae=0.0627 avg_hold=1093.9
+  ```
 
 ## Live 전환
 - `executor.py`에서 `DRY_RUN = False`로 변경 후 실행

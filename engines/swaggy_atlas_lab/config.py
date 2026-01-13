@@ -60,6 +60,8 @@ class SwaggyConfig:
     short_max_dist_retest: float = 0.0020
     short_max_dist_rejection: float = 0.0025
     short_max_dist_sweep: float = 0.0015
+    overext_ema_len: int = 20
+    overext_atr_mult: float = 1.5
     swing_lookback_1h: int = 60
     swing_lookback_mtf: int = 32
     level_recent_secs: int = 14400

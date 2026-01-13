@@ -163,9 +163,12 @@ def _score_breakdown(result: dict) -> dict:
 
 def _append_detail_log(line: str) -> None:
     try:
-        log_dir = os.path.join(ROOT_DIR, "logs", "atlas")
+        log_dir = os.path.join(ROOT_DIR, "logs", "atlas", "atlastest")
         os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, "atlas_test_detail.log"), "a", encoding="utf-8") as f:
+        kst = timezone(timedelta(hours=9))
+        date_tag = datetime.now(tz=kst).strftime("%Y-%m-%d")
+        filename = f"atlas_test_detail-{date_tag}.log"
+        with open(os.path.join(log_dir, filename), "a", encoding="utf-8") as f:
             f.write(line.rstrip("\n") + "\n")
     except Exception:
         pass

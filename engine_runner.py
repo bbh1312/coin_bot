@@ -48,6 +48,15 @@ try:
     from engines.base import EngineContext
     from engines.swaggy.swaggy_engine import SwaggyEngine, SwaggyConfig
     from engines.swaggy.logs import format_cut_top, format_zone_stats
+    from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine as SwaggyAtlasLabEngine
+    from engines.swaggy_atlas_lab.config import SwaggyConfig as SwaggyAtlasLabConfig
+    from engines.swaggy_atlas_lab.config import AtlasConfig as SwaggyAtlasLabAtlasConfig
+    from engines.swaggy_atlas_lab.atlas_eval import (
+        evaluate_global_gate as lab_evaluate_global_gate,
+        evaluate_local as lab_evaluate_local,
+    )
+    from engines.swaggy_atlas_lab.policy import apply_policy as lab_apply_policy
+    from engines.swaggy_atlas_lab.policy import AtlasMode as SwaggyAtlasLabMode
     from engines.atlas.atlas_engine import AtlasEngine, AtlasSwaggyConfig
     from engines.rsi.engine import RsiEngine
     from engines.div15m_long.engine import Div15mLongEngine
@@ -65,6 +74,13 @@ except Exception:
     EngineContext = None
     format_cut_top = None
     format_zone_stats = None
+    SwaggyAtlasLabEngine = None
+    SwaggyAtlasLabConfig = None
+    SwaggyAtlasLabAtlasConfig = None
+    lab_evaluate_global_gate = None
+    lab_evaluate_local = None
+    lab_apply_policy = None
+    SwaggyAtlasLabMode = None
     AtlasEngine = None
     AtlasSwaggyConfig = None
     RsiEngine = None
@@ -97,6 +113,7 @@ from executor import (
     cancel_stop_orders,
     cancel_conditional_by_side,
     dca_short_if_needed,
+    dca_long_if_needed,
     set_dry_run,
     get_global_backoff_until,
     refresh_positions_cache,
@@ -104,6 +121,7 @@ from executor import (
 )
 
 swaggy_engine = None
+swaggy_atlas_lab_engine = None
 atlas_engine = None
 atlas_swaggy_cfg = None
 rsi_engine = None
@@ -538,7 +556,15 @@ def _append_rsi_detail_log(line: str) -> None:
         pass
 
 def _append_atlas_rs_fail_short_log(line: str) -> None:
-    _append_log_lines("atlas_rs_fail_short.log", [line])
+    date_tag = time.strftime("%Y-%m-%d")
+    path = f"atlas_rs_fail_short/atlas_rs_fail_short-{date_tag}.log"
+    _append_log_lines(path, [line])
+
+
+def _append_swaggy_atlas_lab_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    path = os.path.join("swaggy_atlas_lab", f"swaggy_atlas_lab-{date_tag}.log")
+    _append_log_lines(path, [line])
 
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
     cycle_ts = state.get("_current_cycle_ts")
@@ -704,6 +730,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "DIV15M_SHORT"
     if key == "pumpfade_short":
         return "PUMPFADE"
+    if key == "atlas_rs_fail_short":
+        return "ATLAS_RS_FAIL_SHORT"
     if key == "short_entry":
         return "RSI"
     if key == "long_entry":
@@ -2184,6 +2212,262 @@ def _run_swaggy_cycle(
     return result
 
 
+def _run_swaggy_atlas_lab_cycle(
+    lab_engine,
+    lab_universe,
+    cached_ex,
+    state,
+    lab_cfg,
+    atlas_cfg,
+    active_positions_total,
+    send_alert,
+):
+    result = {"long_hits": 0, "short_hits": 0}
+    if not lab_engine or not lab_cfg or not atlas_cfg:
+        return result
+    if not lab_universe:
+        print("[swaggy_atlas_lab] 스캔 대상 없음")
+        return result
+    now_ts = time.time()
+    btc_df = cycle_cache.get_df(atlas_cfg.ref_symbol, lab_cfg.tf_mtf, limit=200)
+    for symbol in lab_universe:
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if st.get("in_pos"):
+            continue
+        last_entry = float(st.get("last_entry", 0.0) or 0.0)
+        if (now_ts - last_entry) < COOLDOWN_SEC:
+            continue
+        df_5m = cycle_cache.get_df(symbol, lab_cfg.tf_ltf, limit=lab_cfg.ltf_limit)
+        if df_5m.empty or len(df_5m) < 31:
+            continue
+        df_15m = cycle_cache.get_df(symbol, lab_cfg.tf_mtf, limit=max(lab_cfg.swing_lookback_mtf * 2, 120))
+        df_1h = cycle_cache.get_df(symbol, lab_cfg.tf_htf, limit=max(lab_cfg.vp_lookback_1h, 120))
+        df_4h = cycle_cache.get_df(symbol, lab_cfg.tf_htf2, limit=max(lab_cfg.regime_lookback * 2, 60))
+        signal = lab_engine.evaluate_symbol(symbol, df_4h, df_1h, df_15m, df_5m, now_ts)
+        if not signal or not signal.entry_ok or signal.entry_px is None:
+            continue
+        side = (signal.side or "").upper()
+        if side not in ("LONG", "SHORT"):
+            continue
+        gate = lab_evaluate_global_gate(btc_df, atlas_cfg) if lab_evaluate_global_gate else {}
+        atlas = lab_evaluate_local(symbol, side, df_15m, btc_df, gate, atlas_cfg) if lab_evaluate_local else None
+        policy = lab_apply_policy(SwaggyAtlasLabMode.HARD, USDT_PER_TRADE, atlas) if lab_apply_policy else None
+        if not policy or not policy.allow:
+            continue
+        cur_total = count_open_positions(force=True)
+        if not isinstance(cur_total, int):
+            cur_total = active_positions_total
+        if cur_total >= MAX_OPEN_POSITIONS:
+            print(f"[swaggy_atlas_lab] 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        _append_entry_log(
+            os.path.join("swaggy_atlas_lab", "swaggy_atlas_lab_entries.log"),
+            "ts=%d engine=swaggy_atlas_lab side=%s symbol=%s entry_ready=1 "
+            "entry_px=%.6g final_usdt=%.2f policy_action=%s atlas_reasons=%s"
+            % (
+                int(now_ts),
+                side,
+                symbol,
+                float(signal.entry_px),
+                float(policy.final_usdt),
+                policy.policy_action or "N/A",
+                ",".join(atlas.reasons or []) if atlas else "N/A",
+            ),
+        )
+        if side == "LONG":
+            result["long_hits"] += 1
+            order_info = "(알림 전용)"
+            entry_price_disp = None
+            if LONG_LIVE_TRADING:
+                try:
+                    refresh_positions_cache(force=True)
+                    existing_amt = get_long_position_amount(symbol)
+                except Exception:
+                    existing_amt = 0.0
+                if existing_amt > 0:
+                    st["in_pos"] = True
+                    state[symbol] = st
+                    print(f"[swaggy_atlas_lab] 롱 포지션 이미 존재 → 스킵 ({symbol})")
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_atlas_lab")
+                if not lock_ok:
+                    print(f"[ENTRY-LOCK] sym={symbol} owner=swaggy_atlas_lab ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                try:
+                    guard_key = _entry_guard_key(state, symbol, "LONG")
+                    if not _entry_guard_acquire(state, symbol, key=guard_key):
+                        print(f"[swaggy_atlas_lab] 롱 중복 차단 ({symbol})")
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
+                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "LONG", "swaggy_atlas_lab")
+                    if not seen_ok:
+                        print(f"[ENTRY-SEEN] sym={symbol} side=LONG engine=swaggy_atlas_lab blocked_by={seen_by}")
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
+                    try:
+                        entry_usdt = _resolve_entry_usdt(policy.final_usdt)
+                        res = long_market(
+                            symbol,
+                            usdt_amount=entry_usdt,
+                            leverage=LEVERAGE,
+                            margin_mode=MARGIN_MODE,
+                        )
+                        entry_order_id = _order_id_from_res(res)
+                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
+                        qty = res.get("amount") or res.get("order", {}).get("amount")
+                        entry_price_disp = fill_price
+                        order_info = f"entry_price={fill_price} qty={qty} usdt={entry_usdt}"
+                        st["in_pos"] = True
+                        st["last_entry"] = time.time()
+                        state[symbol] = st
+                        _log_trade_entry(
+                            state,
+                            side="LONG",
+                            symbol=symbol,
+                            entry_ts=time.time(),
+                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                            qty=qty if isinstance(qty, (int, float)) else None,
+                            usdt=entry_usdt,
+                            entry_order_id=entry_order_id,
+                            meta={"reason": "swaggy_atlas_lab"},
+                        )
+                        active_positions_total += 1
+                    finally:
+                        _entry_guard_release(state, symbol, key=guard_key)
+                finally:
+                    _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+                entry_usdt = _resolve_entry_usdt(policy.final_usdt)
+                reason_full = ",".join(signal.reasons or [])
+                _send_entry_alert(
+                    send_alert,
+                    side="LONG",
+                    symbol=symbol,
+                    engine="SWAGGY_ATLAS_LAB",
+                    entry_price=entry_price_disp,
+                    usdt=entry_usdt,
+                    reason=reason_full,
+                    live=LONG_LIVE_TRADING,
+                    order_info=order_info,
+                    entry_order_id=entry_order_id,
+                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
+                    tp=None,
+                )
+            else:
+                entry_usdt = _resolve_entry_usdt(policy.final_usdt)
+                entry_price_disp = signal.entry_px
+                reason_full = ",".join(signal.reasons or [])
+                _send_entry_alert(
+                    send_alert,
+                    side="LONG",
+                    symbol=symbol,
+                    engine="SWAGGY_ATLAS_LAB",
+                    entry_price=entry_price_disp,
+                    usdt=entry_usdt,
+                    reason=reason_full,
+                    live=LONG_LIVE_TRADING,
+                    order_info=order_info,
+                    sl=_fmt_price_safe(signal.entry_px, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
+                    tp=None,
+                )
+        else:
+            result["short_hits"] += 1
+            order_info = "(알림 전용)"
+            entry_price_disp = None
+            try:
+                refresh_positions_cache(force=True)
+                existing_amt = get_short_position_amount(symbol)
+            except Exception:
+                existing_amt = 0.0
+            if existing_amt > 0:
+                st["in_pos"] = True
+                state[symbol] = st
+                print(f"[swaggy_atlas_lab] 숏 포지션 이미 존재 → 스킵 ({symbol})")
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if LIVE_TRADING:
+                lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_atlas_lab")
+                if not lock_ok:
+                    print(f"[ENTRY-LOCK] sym={symbol} owner=swaggy_atlas_lab ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                try:
+                    guard_key = _entry_guard_key(state, symbol, "SHORT")
+                    if not _entry_guard_acquire(state, symbol, key=guard_key):
+                        print(f"[swaggy_atlas_lab] 숏 중복 차단 ({symbol})")
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
+                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "swaggy_atlas_lab")
+                    if not seen_ok:
+                        print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=swaggy_atlas_lab blocked_by={seen_by}")
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
+                    try:
+                        entry_usdt = _resolve_entry_usdt(policy.final_usdt)
+                        res = short_market(symbol, usdt_amount=entry_usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                        entry_order_id = _order_id_from_res(res)
+                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
+                        qty = res.get("amount") or res.get("order", {}).get("amount")
+                        entry_price_disp = fill_price
+                        order_info = f"entry_price={fill_price} qty={qty} usdt={entry_usdt}"
+                        st["in_pos"] = True
+                        st["last_entry"] = time.time()
+                        state[symbol] = st
+                        _log_trade_entry(
+                            state,
+                            side="SHORT",
+                            symbol=symbol,
+                            entry_ts=time.time(),
+                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                            qty=qty if isinstance(qty, (int, float)) else None,
+                            usdt=entry_usdt,
+                            entry_order_id=entry_order_id,
+                            meta={"reason": "swaggy_atlas_lab"},
+                        )
+                        active_positions_total += 1
+                    finally:
+                        _entry_guard_release(state, symbol, key=guard_key)
+                finally:
+                    _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+                entry_usdt = _resolve_entry_usdt(policy.final_usdt)
+                reason_full = ",".join(signal.reasons or [])
+                _send_entry_alert(
+                    send_alert,
+                    side="SHORT",
+                    symbol=symbol,
+                    engine="SWAGGY_ATLAS_LAB",
+                    entry_price=entry_price_disp,
+                    usdt=entry_usdt,
+                    reason=reason_full,
+                    live=LIVE_TRADING,
+                    order_info=order_info,
+                    entry_order_id=entry_order_id,
+                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                    tp=None,
+                )
+            else:
+                entry_usdt = _resolve_entry_usdt(policy.final_usdt)
+                entry_price_disp = signal.entry_px
+                reason_full = ",".join(signal.reasons or [])
+                _send_entry_alert(
+                    send_alert,
+                    side="SHORT",
+                    symbol=symbol,
+                    engine="SWAGGY_ATLAS_LAB",
+                    entry_price=entry_price_disp,
+                    usdt=entry_usdt,
+                    reason=reason_full,
+                    live=LIVE_TRADING,
+                    order_info=order_info,
+                    sl=_fmt_price_safe(signal.entry_px, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                    tp=None,
+                )
+        time.sleep(PER_SYMBOL_SLEEP)
+    return result
+
+
 def _run_atlas_fabio_cycle(
     universe_structure,
     cached_ex,
@@ -2993,8 +3277,9 @@ def _run_atlas_fabio_cycle(
         "data_missing_rsi={data_missing_rsi} data_missing_atr={data_missing_atr} "
         "data_missing_vol={data_missing_vol} data_missing_dist={data_missing_dist}".format(ts=funnel_ts, **funnel)
     )
-    print(funnel_line)
-    _append_atlasfabio_log(funnel_line)
+    if not state.get("_atlasfabio_backtest_quiet"):
+        print(funnel_line)
+        _append_atlasfabio_log(funnel_line)
     result["log"] = buf
     return result
 def _run_dtfx_cycle(
@@ -3481,7 +3766,20 @@ def _run_atlas_rs_fail_short_cycle(
     if not arsf_universe:
         return result
     now_ts = time.time()
-    _ensure_log_file("atlas_rs_fail_short.log")
+    date_tag = time.strftime("%Y-%m-%d")
+    _ensure_log_file(f"atlas_rs_fail_short/atlas_rs_fail_short-{date_tag}.log")
+    gate = _compute_atlas_swaggy_gate(state)
+    if isinstance(gate, dict):
+        _append_atlas_rs_fail_short_log(
+            "[atlas-rs-fail-short] gate regime=%s ref=%s allow_long=%s allow_short=%s score_cfg=%.2f"
+            % (
+                gate.get("regime") or "n/a",
+                getattr(atlas_swaggy_cfg, "ref_symbol", "n/a"),
+                gate.get("allow_long"),
+                gate.get("allow_short"),
+                getattr(arsf_cfg, "min_score", 0.0) or 0.0,
+            )
+        )
     ctx = EngineContext(
         exchange=exchange,
         state=state,
@@ -3506,6 +3804,7 @@ def _run_atlas_rs_fail_short_cycle(
         entry_price = sig.entry_price
         meta = sig.meta if isinstance(sig.meta, dict) else {}
         size_mult = meta.get("size_mult", 1.0)
+        print(f"[arsf] entry_ready sym={symbol} price={_fmt_float(entry_price)} size_mult={_fmt_float(size_mult)}")
         try:
             date_tag = time.strftime("%Y%m%d")
             atlas = meta.get("atlas") if isinstance(meta.get("atlas"), dict) else {}
@@ -3701,7 +4000,68 @@ def _trade_realized_pnl(trade: dict) -> Optional[float]:
     except Exception:
         return None
 
+def _fetch_fapi_user_trades_range(ex, symbol: str, start_ms: int, end_ms: int, limit: int = 1000) -> list:
+    if not symbol:
+        return []
+    try:
+        market = ex.market(symbol)
+        symbol_id = market.get("id") if isinstance(market, dict) else None
+    except Exception:
+        symbol_id = None
+    if not symbol_id:
+        return []
+    since = start_ms
+    out = []
+    last_ts = None
+    while True:
+        params = {"symbol": symbol_id, "startTime": since, "endTime": end_ms, "limit": limit}
+        try:
+            if hasattr(ex, "fapiPrivateGetUserTrades"):
+                batch = ex.fapiPrivateGetUserTrades(params)
+            else:
+                batch = ex.fapiPrivate_get_user_trades(params)
+        except Exception as e:
+            print(f"[report-api] fapi userTrades failed sym={symbol} err={e}")
+            break
+        if not batch:
+            break
+        progressed = False
+        for raw in batch:
+            ts = raw.get("time") or raw.get("timestamp")
+            if isinstance(ts, str):
+                try:
+                    ts = int(float(ts))
+                except Exception:
+                    ts = None
+            if not isinstance(ts, (int, float)):
+                continue
+            ts = int(ts)
+            if ts < start_ms or ts >= end_ms:
+                continue
+            out.append(
+                {
+                    "timestamp": ts,
+                    "symbol": symbol,
+                    "side": raw.get("side"),
+                    "price": raw.get("price"),
+                    "amount": raw.get("qty"),
+                    "order": raw.get("orderId") or raw.get("orderID"),
+                    "info": raw,
+                }
+            )
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+                progressed = True
+        if not progressed:
+            break
+        since = (last_ts or since) + 1
+        if last_ts is not None and last_ts >= end_ms:
+            break
+    return out
+
 def _fetch_my_trades_range(ex, symbol: Optional[str], start_ms: int, end_ms: int, limit: int = 500) -> list:
+    if symbol and (hasattr(ex, "fapiPrivateGetUserTrades") or hasattr(ex, "fapiPrivate_get_user_trades")):
+        return _fetch_fapi_user_trades_range(ex, symbol, start_ms, end_ms, limit=1000)
     since = start_ms
     out = []
     last_ts = None
@@ -3760,7 +4120,7 @@ def _read_report_csv_records(report_date: str) -> Optional[list]:
     except Exception:
         return None
 
-def _load_entry_events_map(report_date: str) -> tuple[dict, dict]:
+def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dict]:
     path = os.path.join("logs", "entry_events.log")
     by_id = {}
     by_symbol_side = {}
@@ -3779,8 +4139,6 @@ def _load_entry_events_map(report_date: str) -> tuple[dict, dict]:
                 entry_ts = payload.get("entry_ts")
                 if not isinstance(entry_ts, (int, float)):
                     continue
-                if _date_str_kst(float(entry_ts)) != report_date:
-                    continue
                 entry_id = payload.get("entry_order_id")
                 symbol = payload.get("symbol") or ""
                 side = payload.get("side") or ""
@@ -3794,8 +4152,9 @@ def _load_entry_events_map(report_date: str) -> tuple[dict, dict]:
                 }
                 if entry_id:
                     by_id[str(entry_id)] = record
-                key = (symbol, side)
-                by_symbol_side.setdefault(key, []).append(record)
+                if report_date is None or _date_str_kst(float(entry_ts)) == report_date:
+                    key = (symbol, side)
+                    by_symbol_side.setdefault(key, []).append(record)
     except Exception:
         return by_id, by_symbol_side
     return by_id, by_symbol_side
@@ -3819,7 +4178,7 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
         return False
 
     log = _get_trade_log(state)
-    targets = []
+    exit_map = {}
     for tr in log:
         if tr.get("status") != "closed":
             continue
@@ -3828,9 +4187,19 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
             continue
         if _date_str_kst(exit_ts) != report_date:
             continue
-        if tr.get("symbol"):
-            targets.append(tr)
-    if not targets:
+        exit_id = tr.get("exit_order_id")
+        symbol = tr.get("symbol")
+        if exit_id and symbol:
+            exit_map[str(exit_id)] = tr
+
+    entry_map, entry_by_symbol = _load_entry_events_map(report_date)
+    order_map = {}
+    symbols = {tr.get("symbol") for tr in exit_map.values() if tr.get("symbol")}
+    for (sym, _side) in entry_by_symbol.keys():
+        if sym:
+            symbols.add(sym)
+    symbols = sorted(symbols)
+    if not symbols:
         try:
             os.makedirs("reports", exist_ok=True)
             report_path = os.path.join("reports", f"{report_date}.csv")
@@ -3842,29 +4211,13 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
         except Exception as e:
             print(f"[report-api] write empty failed report_date={report_date} err={e}")
             return False
-
-    entry_map, entry_by_symbol = _load_entry_events_map(report_date)
-    order_map = {}
-    trades = _fetch_my_trades_range(ex, None, start_ms, end_ms)
-    if trades:
+    for sym in symbols:
+        trades = _fetch_my_trades_range(ex, sym, start_ms, end_ms)
         for t in trades:
             oid = _trade_order_id(t)
             if not oid:
                 continue
             order_map.setdefault(oid, []).append(t)
-    else:
-        symbols = {tr.get("symbol") for tr in targets if tr.get("symbol")}
-        for (sym, _side) in entry_by_symbol.keys():
-            if sym:
-                symbols.add(sym)
-        symbols = sorted(symbols)
-        for sym in symbols:
-            trades = _fetch_my_trades_range(ex, sym, start_ms, end_ms)
-            for t in trades:
-                oid = _trade_order_id(t)
-                if not oid:
-                    continue
-                order_map.setdefault(oid, []).append(t)
 
     expected_cols = [
         "entry_ts",
@@ -3884,134 +4237,8 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
         "loss",
     ]
     records = []
-    used_exit_ids = set()
-    used_entry_ids = set()
-    for tr in targets:
-        updated_tr = False
-        entry_id = tr.get("entry_order_id")
-        exit_id = tr.get("exit_order_id")
-        if not exit_id or exit_id not in order_map:
-            continue
-        used_exit_ids.add(str(exit_id))
-        entry_ts_str = ""
-        exit_reason = tr.get("exit_reason") or ""
-        engine = tr.get("engine_label") or _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
-        entry_event = entry_map.get(str(entry_id)) if entry_id else None
-        if entry_event:
-            engine = entry_event.get("engine") or engine
-            if entry_event.get("entry_order_id"):
-                used_entry_ids.add(str(entry_event.get("entry_order_id")))
-        else:
-            key = (symbol, side)
-            candidates = entry_by_symbol.get(key) or []
-            if len(candidates) == 1:
-                engine = candidates[0].get("engine") or "unknown"
-                entry_id = candidates[0].get("entry_order_id") or entry_id
-            else:
-                engine = "unknown"
-        side = tr.get("side") or ""
-        symbol = tr.get("symbol") or ""
-        entry_price = tr.get("entry_price")
-        qty = tr.get("qty")
-
-        if entry_id and entry_id in order_map:
-            e_trades = order_map.get(entry_id) or []
-            total_qty = 0.0
-            total_notional = 0.0
-            entry_latest_ts = None
-            for t in e_trades:
-                price, amount = _trade_price_amount(t)
-                if price is None or amount is None:
-                    continue
-                q = abs(amount)
-                total_qty += q
-                total_notional += price * q
-                ts = t.get("timestamp")
-                if isinstance(ts, (int, float)):
-                    ts = int(ts)
-                    if entry_latest_ts is None or ts > entry_latest_ts:
-                        entry_latest_ts = ts
-            if total_qty > 0:
-                entry_price = total_notional / total_qty
-                qty = total_qty
-            if entry_latest_ts is not None:
-                entry_ts_str = datetime.fromtimestamp(entry_latest_ts / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
-
-        x_trades = order_map.get(exit_id) or []
-        total_qty = 0.0
-        total_notional = 0.0
-        pnl_sum = 0.0
-        pnl_found = False
-        latest_ts = None
-        for t in x_trades:
-            price, amount = _trade_price_amount(t)
-            if price is not None and amount is not None:
-                q = abs(amount)
-                total_qty += q
-                total_notional += price * q
-            rp = _trade_realized_pnl(t)
-            if rp is not None:
-                pnl_sum += rp
-                pnl_found = True
-            ts = t.get("timestamp")
-            if isinstance(ts, (int, float)):
-                ts = int(ts)
-                if latest_ts is None or ts > latest_ts:
-                    latest_ts = ts
-        if total_qty > 0 and (not isinstance(qty, (int, float)) or qty <= 0):
-            qty = total_qty
-        exit_price = (total_notional / total_qty) if total_qty > 0 else None
-        exit_ts_str = ""
-        if latest_ts is not None:
-            exit_ts_str = datetime.fromtimestamp(latest_ts / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
-        pnl_val = pnl_sum if pnl_found else None
-        if not pnl_found:
-            continue
-
-        roi_val = None
-        if isinstance(pnl_val, (int, float)) and isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and entry_price > 0:
-            notional = entry_price * qty
-            if notional > 0:
-                roi_val = (float(pnl_val) / notional) * 100.0
-        win = ""
-        loss = ""
-        if isinstance(pnl_val, (int, float)) or isinstance(roi_val, (int, float)):
-            base = pnl_val if isinstance(pnl_val, (int, float)) else roi_val
-            if base is not None:
-                if base > 0:
-                    win, loss = "1", "0"
-                elif base < 0:
-                    win, loss = "0", "1"
-                else:
-                    win, loss = "0", "0"
-
-        records.append(
-            {
-                "entry_ts": entry_ts_str,
-                "entry_order_id": entry_id or "",
-                "symbol": symbol,
-                "side": side,
-                "engine": engine,
-                "entry_price": entry_price if entry_price is not None else "",
-                "qty": qty if qty is not None else "",
-                "exit_ts": exit_ts_str,
-                "exit_order_id": exit_id or "",
-                "exit_price": exit_price if exit_price is not None else "",
-                "roi": roi_val if roi_val is not None else "",
-                "pnl": pnl_val if pnl_val is not None else "",
-                "exit_reason": exit_reason,
-                "win": win,
-                "loss": loss,
-            }
-        )
-        updated_tr = True
-        if updated_tr:
-            pass
-
     for oid, trades in order_map.items():
         oid_str = str(oid)
-        if oid_str in used_exit_ids:
-            continue
         pnl_sum = 0.0
         pnl_found = False
         total_qty = 0.0
@@ -4046,9 +4273,7 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
                 ts = int(ts)
                 if latest_ts is None or ts > latest_ts:
                     latest_ts = ts
-        if not pnl_found:
-            continue
-        if abs(pnl_sum) < 1e-12:
+        if not pnl_found or abs(pnl_sum) < 1e-12:
             continue
         exit_price = (total_notional / total_qty) if total_qty > 0 else None
         exit_ts_str = ""
@@ -4057,12 +4282,44 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
             exit_ts_val = latest_ts / 1000.0
             exit_ts_str = datetime.fromtimestamp(exit_ts_val).strftime("%Y-%m-%d %H:%M:%S")
         pnl_val = pnl_sum if pnl_found else None
-        entry_order_id = ""
         entry_ts_str = ""
+        entry_order_id = ""
         entry_price = ""
         entry_qty = total_qty if total_qty > 0 else ""
         engine = "unknown"
-        entry_order_id = ""
+        exit_reason = "api_unmatched"
+        tr = exit_map.get(oid_str)
+        if tr:
+            entry_order_id = str(tr.get("entry_order_id") or "")
+            exit_reason = tr.get("exit_reason") or exit_reason
+            engine = tr.get("engine_label") or _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
+        if entry_order_id:
+            entry_event = entry_map.get(entry_order_id)
+            if entry_event:
+                engine = entry_event.get("engine") or engine
+        if entry_order_id and entry_order_id in order_map:
+            e_trades = order_map.get(entry_order_id) or []
+            total_entry_qty = 0.0
+            total_entry_notional = 0.0
+            entry_latest_ts = None
+            for t in e_trades:
+                price, amount = _trade_price_amount(t)
+                if price is None or amount is None:
+                    continue
+                q = abs(amount)
+                total_entry_qty += q
+                total_entry_notional += price * q
+                ts = t.get("timestamp")
+                if isinstance(ts, (int, float)):
+                    ts = int(ts)
+                    if entry_latest_ts is None or ts > entry_latest_ts:
+                        entry_latest_ts = ts
+            if total_entry_qty > 0:
+                entry_price = total_entry_notional / total_entry_qty
+                entry_qty = total_entry_qty
+            if entry_latest_ts is not None:
+                entry_ts_str = datetime.fromtimestamp(entry_latest_ts / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+
         roi_val = None
         if isinstance(pnl_val, (int, float)) and isinstance(entry_price, (int, float)) and isinstance(entry_qty, (int, float)) and entry_price > 0:
             entry_notional = entry_price * entry_qty
@@ -4079,11 +4336,6 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
                     win, loss = "0", "1"
                 else:
                     win, loss = "0", "0"
-        key = (symbol, side)
-        candidates = entry_by_symbol.get(key) or []
-        if len(candidates) == 1:
-            engine = candidates[0].get("engine") or engine
-            entry_order_id = str(candidates[0].get("entry_order_id") or "")
         records.append(
             {
                 "entry_ts": entry_ts_str,
@@ -4098,7 +4350,7 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
                 "exit_price": exit_price if exit_price is not None else "",
                 "roi": roi_val if roi_val is not None else "",
                 "pnl": pnl_val if pnl_val is not None else "",
-                "exit_reason": "api_unmatched",
+                "exit_reason": exit_reason,
                 "win": win,
                 "loss": loss,
             }
@@ -4582,7 +4834,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             )
             _append_report_line(sym, "SHORT", None, None, engine_label)
             last_entry_val = float(st.get("last_entry", 0))
-            state[sym] = {"in_pos": False, "last_ok": False, "last_entry": last_entry_val, "dca_adds": 0}
+            state[sym] = {
+                "in_pos": False,
+                "last_ok": False,
+                "last_entry": last_entry_val,
+                "dca_adds": 0,
+                "dca_adds_long": 0,
+                "dca_adds_short": 0,
+            }
             if exit_reason == "auto_exit_sl" and engine_label == "SWAGGY":
                 st = state.get(sym, {})
                 if isinstance(st, dict):
@@ -4671,7 +4930,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     exit_order_id = _order_id_from_res(res)
                     cancel_stop_orders(sym)
                     last_entry_val = float(st.get("last_entry", 0))
-                    state[sym] = {"in_pos": False, "last_ok": False, "last_entry": last_entry_val, "dca_adds": 0}
+                    state[sym] = {
+                        "in_pos": False,
+                        "last_ok": False,
+                        "last_entry": last_entry_val,
+                        "dca_adds": 0,
+                        "dca_adds_long": 0,
+                        "dca_adds_short": 0,
+                    }
                     avg_price = (
                         res.get("order", {}).get("average")
                         or res.get("order", {}).get("price")
@@ -4733,7 +4999,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     exit_order_id = _order_id_from_res(res)
                     cancel_stop_orders(sym)
                     last_entry_val = float(st.get("last_entry", 0))
-                    state[sym] = {"in_pos": False, "last_ok": False, "last_entry": last_entry_val, "dca_adds": 0}
+                    state[sym] = {
+                        "in_pos": False,
+                        "last_ok": False,
+                        "last_entry": last_entry_val,
+                        "dca_adds": 0,
+                        "dca_adds_long": 0,
+                        "dca_adds_short": 0,
+                    }
                     avg_price = (
                         res.get("order", {}).get("average")
                         or res.get("order", {}).get("price")
@@ -4782,10 +5055,10 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         st["manage_eval_ts"] = now
         state[sym] = st
 
-        adds_done = int(st.get("dca_adds", 0))
+        adds_done = int(st.get("dca_adds_short", st.get("dca_adds", 0)))
         dca_res = dca_short_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
         if dca_res.get("status") not in ("skip", "warn"):
-            st["dca_adds"] = adds_done + 1
+            st["dca_adds_short"] = adds_done + 1
             state[sym] = st
             send_telegram(
                 f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
@@ -4834,6 +5107,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 st["in_pos"] = False
                 st["last_ok"] = False
                 st["dca_adds"] = 0
+                st["dca_adds_long"] = 0
+                st["dca_adds_short"] = 0
                 state[sym] = st
                 if engine_label != "UNKNOWN" and _trade_has_entry(open_tr) and not _recent_auto_exit(state, sym, now):
                     order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
@@ -4867,9 +5142,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         if not isinstance(entry_px, (int, float)) or not isinstance(mark_px, (int, float)) or entry_px <= 0:
             continue
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
-        if not AUTO_EXIT_ENABLED:
-            continue
-        if profit_unlev >= AUTO_EXIT_LONG_TP_PCT:
+        closed = False
+        if AUTO_EXIT_ENABLED and profit_unlev >= AUTO_EXIT_LONG_TP_PCT:
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
@@ -4921,7 +5195,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
             )
             time.sleep(0.15)
-        elif profit_unlev <= -AUTO_EXIT_LONG_SL_PCT:
+            closed = True
+        elif AUTO_EXIT_ENABLED and profit_unlev <= -AUTO_EXIT_LONG_SL_PCT:
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
@@ -4973,6 +5248,23 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
             )
             time.sleep(0.15)
+            closed = True
+        if not closed:
+            st = state.get(sym, {})
+            last_eval = float(st.get("manage_eval_long_ts", 0.0) or 0.0)
+            if (now - last_eval) >= MANAGE_EVAL_COOLDOWN_SEC:
+                st["manage_eval_long_ts"] = now
+                state[sym] = st
+                adds_done = int(st.get("dca_adds_long", st.get("dca_adds", 0)))
+                dca_res = dca_long_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
+                if dca_res.get("status") not in ("skip", "warn"):
+                    st["dca_adds_long"] = adds_done + 1
+                    state[sym] = st
+                    send_telegram(
+                        f"➕ <b>DCA</b> {sym} LONG adds {adds_done}->{adds_done+1} "
+                        f"mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
+                    )
+                    time.sleep(0.1)
 
     tickers = _get_manage_tickers(state, exchange, MANAGE_TICKER_TTL_SEC)
     _reconcile_long_trades(state, cached_long_ex, tickers)
@@ -5011,6 +5303,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_entry_usdt",
         "_atlas_fabio_enabled",
         "_swaggy_enabled",
+        "_swaggy_atlas_lab_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -5023,7 +5316,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         if key in disk:
             state[key] = disk.get(key)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE
     if isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
@@ -5050,6 +5343,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
     if isinstance(state.get("_swaggy_enabled"), bool):
         SWAGGY_ENABLED = bool(state.get("_swaggy_enabled"))
+    if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
+        SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     if isinstance(state.get("_pumpfade_enabled"), bool):
@@ -5077,6 +5372,7 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_entry_usdt",
         "_atlas_fabio_enabled",
         "_swaggy_enabled",
+        "_swaggy_atlas_lab_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -5266,6 +5562,8 @@ def _sync_short_positions_state(state: dict, symbols: list) -> None:
         if amt > 0:
             st.setdefault("in_pos", True)
             st.setdefault("dca_adds", 0)
+            st.setdefault("dca_adds_long", 0)
+            st.setdefault("dca_adds_short", 0)
             st.setdefault("last_entry", now)
             st.setdefault("manage_ping_ts", now - MANAGE_PING_COOLDOWN_SEC)
             state[sym] = st
@@ -5289,6 +5587,8 @@ def _sync_positions_state(state: dict, symbols: list) -> None:
         if short_amt > 0 or long_amt > 0:
             st.setdefault("in_pos", True)
             st.setdefault("dca_adds", 0)
+            st.setdefault("dca_adds_long", 0)
+            st.setdefault("dca_adds_short", 0)
             st.setdefault("last_entry", now)
             st.setdefault("manage_ping_ts", now - MANAGE_PING_COOLDOWN_SEC)
             state[sym] = st
@@ -5382,7 +5682,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, USDT_PER_TRADE
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, USDT_PER_TRADE
     if not BOT_TOKEN:
         return
     last_update_id = int(state.get("_tg_offset", 0) or 0)
@@ -5535,7 +5835,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                             f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                             f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
+                            f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
                             f"/swaggy(추가진입): {'ON' if SWAGGY_ENABLED else 'OFF'}\n"
+                            f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
                             f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                             f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -5573,6 +5875,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                         f"/swaggy(추가진입): {'ON' if SWAGGY_ENABLED else 'OFF'}\n"
+                        f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
                         f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                         f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -5779,6 +6082,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_atlas_lab", "swaggy_atlas_lab")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SWAGGY_ATLAS_LAB_ENABLED = True
+                        state["_swaggy_atlas_lab_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ swaggy_atlas_lab ON (hard 모드)"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SWAGGY_ATLAS_LAB_ENABLED = False
+                        state["_swaggy_atlas_lab_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ swaggy_atlas_lab OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_atlas_lab 상태: {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_atlas_lab on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_atlas_lab cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/dtfx", "dtfx")) and not responded:
                     parts = lower.split()
@@ -6047,6 +6373,7 @@ FABIO_ENABLED = False
 ATLAS_FABIO_ENABLED = True
 ATLAS_FABIO_PAPER = False
 SWAGGY_ENABLED = True
+SWAGGY_ATLAS_LAB_ENABLED = False
 DTFX_ENABLED = True
 PUMPFADE_ENABLED = False
 ATLAS_RS_FAIL_SHORT_ENABLED = False
@@ -6267,6 +6594,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_entry_usdt",
                 "_atlas_fabio_enabled",
                 "_swaggy_enabled",
+                "_swaggy_atlas_lab_enabled",
                 "_dtfx_enabled",
                 "_pumpfade_enabled",
                 "_div15m_long_enabled",
@@ -6291,8 +6619,9 @@ def run():
     state = load_state()
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
-    global swaggy_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
+    global swaggy_engine, swaggy_atlas_lab_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
+    swaggy_atlas_lab_engine = SwaggyAtlasLabEngine() if SwaggyAtlasLabEngine else None
     atlas_engine = AtlasEngine() if AtlasEngine else None
     atlas_swaggy_cfg = AtlasSwaggyConfig() if AtlasSwaggyConfig else None
     global rsi_engine
@@ -6314,7 +6643,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
     global USDT_PER_TRADE
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
@@ -6352,6 +6681,10 @@ def run():
         SWAGGY_ENABLED = bool(state.get("_swaggy_enabled"))
     else:
         state["_swaggy_enabled"] = SWAGGY_ENABLED
+    if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
+        SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
+    else:
+        state["_swaggy_atlas_lab_enabled"] = SWAGGY_ATLAS_LAB_ENABLED
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
@@ -6431,7 +6764,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy on|off|status, /swaggy_atlas_lab on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -6670,7 +7003,9 @@ def run():
 
         swaggy_universe = []
         swaggy_cfg = None
-        if SWAGGY_ENABLED and swaggy_engine and SwaggyConfig and EngineContext:
+        swaggy_atlas_lab_cfg = None
+        swaggy_atlas_lab_atlas_cfg = None
+        if (SWAGGY_ENABLED or SWAGGY_ATLAS_LAB_ENABLED) and swaggy_engine and SwaggyConfig and EngineContext:
             swaggy_cfg = SwaggyConfig()
             ctx = EngineContext(
                 exchange=exchange,
@@ -6681,6 +7016,9 @@ def run():
             )
             swaggy_universe = swaggy_engine.build_universe(ctx)
             state["_swaggy_universe"] = swaggy_universe
+        if SWAGGY_ATLAS_LAB_ENABLED and SwaggyAtlasLabConfig and SwaggyAtlasLabAtlasConfig:
+            swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig()
+            swaggy_atlas_lab_atlas_cfg = SwaggyAtlasLabAtlasConfig()
 
             structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
             if STRUCTURE_TOP_N:
@@ -6800,6 +7138,7 @@ def run():
             fabio_cfg_atlas_mid.trigger_vol_ratio_min = 1.05
         fabio_universe_len = len(fabio_universe)
         swaggy_universe_len = len(swaggy_universe) if swaggy_universe else 0
+        swaggy_atlas_lab_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_ENABLED else 0
         dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
         pumpfade_universe_len = len(pumpfade_universe) if pumpfade_universe else 0
         atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
@@ -6811,6 +7150,14 @@ def run():
         fabio_ran = bool(heavy_scan and fabio_cfg)
         atlasfabio_ran = bool(heavy_scan and ATLAS_FABIO_ENABLED and atlas_cfg and fabio_cfg_atlas)
         swaggy_ran = bool(heavy_scan and SWAGGY_ENABLED and swaggy_cfg and swaggy_engine)
+        swaggy_atlas_lab_ran = bool(
+            heavy_scan
+            and SWAGGY_ATLAS_LAB_ENABLED
+            and swaggy_atlas_lab_cfg
+            and swaggy_atlas_lab_atlas_cfg
+            and swaggy_atlas_lab_engine
+            and swaggy_universe
+        )
         dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
         pumpfade_ran = bool(PUMPFADE_ENABLED and pumpfade_engine and pumpfade_cfg and pumpfade_universe)
         atlas_rs_fail_short_ran = bool(
@@ -6877,6 +7224,9 @@ def run():
         if swaggy_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_cfg.vp_lookback_1h))
+        if swaggy_atlas_lab_cfg:
+            mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
+            mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_atlas_lab_cfg.vp_lookback_1h))
         if pumpfade_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), int(max(80, pumpfade_cfg.lookback_hh + 10)))
             mid_plan["1h"] = max(mid_plan.get("1h", 0), 40)
@@ -6892,6 +7242,8 @@ def run():
         if fabio_cfg:
             slow_plan["4h"] = max(slow_plan.get("4h", 0), int(fabio_cfg.limit))
         if swaggy_cfg:
+            slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
+        if swaggy_atlas_lab_cfg:
             slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
         if "4h" in slow_plan:
             slow_plan["4h"] = min(slow_plan.get("4h", 0), SLOW_LIMIT_CAP)
@@ -7092,6 +7444,8 @@ def run():
         atlasfabio_thread = None
         swaggy_result = {}
         swaggy_thread = None
+        swaggy_atlas_lab_result = {}
+        swaggy_atlas_lab_thread = None
         dtfx_result = {}
         dtfx_thread = None
         pumpfade_result = {}
@@ -7152,6 +7506,23 @@ def run():
                 daemon=True,
             )
             swaggy_thread.start()
+        if SWAGGY_ATLAS_LAB_ENABLED and swaggy_atlas_lab_cfg and swaggy_atlas_lab_atlas_cfg and swaggy_atlas_lab_engine:
+            swaggy_atlas_lab_thread = threading.Thread(
+                target=lambda: swaggy_atlas_lab_result.update(
+                    _run_swaggy_atlas_lab_cycle(
+                        swaggy_atlas_lab_engine,
+                        swaggy_universe,
+                        cached_ex,
+                        state,
+                        swaggy_atlas_lab_cfg,
+                        swaggy_atlas_lab_atlas_cfg,
+                        active_positions,
+                        send_telegram,
+                    )
+                ),
+                daemon=True,
+            )
+            swaggy_atlas_lab_thread.start()
         if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
             dtfx_thread = threading.Thread(
                 target=lambda: dtfx_result.update(
@@ -7218,6 +7589,8 @@ def run():
                 if existing_amt > 0:
                     st["in_pos"] = True
                     st.setdefault("dca_adds", 0)
+                    st.setdefault("dca_adds_long", 0)
+                    st.setdefault("dca_adds_short", 0)
                     state[symbol] = st
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
@@ -7461,6 +7834,8 @@ def run():
                 if existing_amt > 0:
                     st["in_pos"] = True
                     st.setdefault("dca_adds", 0)
+                    st.setdefault("dca_adds_long", 0)
+                    st.setdefault("dca_adds_short", 0)
                     state[symbol] = st
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
@@ -7790,6 +8165,8 @@ def run():
             atlasfabio_thread.join()
         if swaggy_thread:
             swaggy_thread.join()
+        if swaggy_atlas_lab_thread:
+            swaggy_atlas_lab_thread.join()
         if dtfx_thread:
             dtfx_thread.join()
         if pumpfade_thread:
@@ -7827,7 +8204,8 @@ def run():
             f"pumpfade={pumpfade_universe_len} arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
         )
         print(
-            "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) fabio=%s(%d) atlasfabio=%s(%d) swaggy=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
+            "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) fabio=%s(%d) atlasfabio=%s(%d) "
+            "swaggy=%s(%d) swaggy_atlas_lab=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
             % (
                 "ON" if rsi_ran else "OFF",
                 rsi_universe_len,
@@ -7841,6 +8219,8 @@ def run():
                 fabio_universe_len,
                 "ON" if swaggy_ran else "OFF",
                 swaggy_universe_len,
+                "ON" if swaggy_atlas_lab_ran else "OFF",
+                swaggy_atlas_lab_universe_len,
                 "ON" if dtfx_ran else "OFF",
                 dtfx_universe_len,
                 "ON" if pumpfade_ran else "OFF",

@@ -11,7 +11,7 @@ class AtlasRsFailShortConfig:
 
     # Atlas gate
     min_score: float = 50.0
-    allow_regimes: Set[str] = field(default_factory=lambda: {"neutral", "bear", "range", "bull_extreme"})
+    allow_regimes: Set[str] = field(default_factory=lambda: {"bear", "range", "chaos_range", "chaos_vol"})
     bull_extreme_score_max: float = 80.0
     dir_score_max: float = 60.0
 
@@ -42,6 +42,8 @@ class AtlasRsFailShortConfig:
     wick_ratio_min: float = 0.55
     trigger_min: int = 2
     trigger_exact: bool = True
+
+
 
     # Noise filter
     atr_min_ratio: float = 0.002

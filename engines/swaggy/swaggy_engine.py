@@ -94,6 +94,9 @@ class SwaggyConfig:
     short_bull_min_strength: float = 0.55
     short_bull_wick_ratio: float = 0.70
     short_bull_vol_mult: float = 1.3
+    long_overext_ema60_pct: float = 0.006
+    post_impulse_body_atr_mult: float = 1.5
+    post_impulse_block_bars: int = 2
     max_dist_reclaim: float = 0.0025
     max_dist_retest: float = 0.0020
     short_max_dist_reclaim: float = 0.0025
@@ -816,10 +819,108 @@ class SwaggyEngine(BaseEngine):
                 evidence=evidence,
             )
 
+        if trigger.side == "long":
+            ema_inputs = _bull_short_regime_inputs(candles_4h, candles_1h, last_price)
+            dist_ema60 = ema_inputs.get("dist_to_ema60_pct")
+            if isinstance(dist_ema60, (int, float)) and dist_ema60 > cfg.long_overext_ema60_pct:
+                evidence = dict(trigger.evidence or {})
+                evidence.update(ema_inputs)
+                evidence["dist_to_ema60_pct"] = dist_ema60
+                evidence["overext_ema60_pct"] = cfg.long_overext_ema60_pct
+                _inject_regime_evidence(evidence, regime_state, cfg)
+                return SwaggyDecision(
+                    sym=sym,
+                    side=trigger.side,
+                    entry_ready=0,
+                    entry_px=None,
+                    sl_px=None,
+                    tp1_px=None,
+                    tp2_px=None,
+                    reason_codes=["OVER_EXT_EMA60"],
+                    debug=self._debug_payload(
+                        last_price,
+                        regime_state.regime,
+                        trigger,
+                        vp,
+                        "OVER_EXT_EMA60",
+                        trigger_debug,
+                    ),
+                    filters={"dist": 0, "lvn_gap": 0, "expansion": 0, "cooldown": 0, "regime": 0, "weak_signal": 0, "sweep_confirm": 0},
+                    evidence=evidence,
+                )
+
+        if trigger.side == "long":
+            atr = _atr(candles_5m, cfg.touch_atr_len)
+            if atr:
+                last_body = abs(float(candles_5m.iloc[-1]["close"]) - float(candles_5m.iloc[-1]["open"]))
+                prev_body = abs(float(candles_5m.iloc[-2]["close"]) - float(candles_5m.iloc[-2]["open"])) if len(candles_5m) >= 2 else 0.0
+                impulse_idx = None
+                if last_body >= (float(atr) * cfg.post_impulse_body_atr_mult):
+                    impulse_idx = len(candles_5m) - 1
+                elif prev_body >= (float(atr) * cfg.post_impulse_body_atr_mult):
+                    impulse_idx = len(candles_5m) - 2
+                if impulse_idx is not None:
+                    bars_since = (len(candles_5m) - 1) - impulse_idx
+                    if bars_since < cfg.post_impulse_block_bars:
+                        evidence = dict(trigger.evidence or {})
+                        evidence["atr"] = float(atr)
+                        evidence["impulse_body"] = last_body if impulse_idx == len(candles_5m) - 1 else prev_body
+                        evidence["impulse_body_atr_mult"] = cfg.post_impulse_body_atr_mult
+                        evidence["bars_since_impulse"] = bars_since
+                        _inject_regime_evidence(evidence, regime_state, cfg)
+                        return SwaggyDecision(
+                            sym=sym,
+                            side=trigger.side,
+                            entry_ready=0,
+                            entry_px=None,
+                            sl_px=None,
+                            tp1_px=None,
+                            tp2_px=None,
+                            reason_codes=["POST_IMPULSE_CHASE"],
+                            debug=self._debug_payload(
+                                last_price,
+                                regime_state.regime,
+                                trigger,
+                                vp,
+                                "POST_IMPULSE_CHASE",
+                                trigger_debug,
+                            ),
+                            filters={"dist": 0, "lvn_gap": 0, "expansion": 0, "cooldown": 0, "regime": 0, "weak_signal": 0, "sweep_confirm": 0},
+                            evidence=evidence,
+                        )
+
         if trigger.kind == "RECLAIM":
             atr = _atr(candles_5m, cfg.touch_atr_len)
             zone_high = trigger.level.high if trigger.level.high is not None else trigger.level.price
             zone_low = trigger.level.low if trigger.level.low is not None else trigger.level.price
+            if trigger.side == "long":
+                ema_inputs = _bull_short_regime_inputs(candles_4h, candles_1h, last_price)
+                ema60 = ema_inputs.get("ema60")
+                if isinstance(ema60, (int, float)) and trigger.level.price > ema60:
+                    evidence = dict(trigger.evidence or {})
+                    evidence.update(ema_inputs)
+                    evidence["level_price"] = trigger.level.price
+                    _inject_regime_evidence(evidence, regime_state, cfg)
+                    return SwaggyDecision(
+                        sym=sym,
+                        side=trigger.side,
+                        entry_ready=0,
+                        entry_px=None,
+                        sl_px=None,
+                        tp1_px=None,
+                        tp2_px=None,
+                        reason_codes=["RECLAIM_AT_TOP"],
+                        debug=self._debug_payload(
+                            last_price,
+                            regime_state.regime,
+                            trigger,
+                            vp,
+                            "RECLAIM_AT_TOP",
+                            trigger_debug,
+                        ),
+                        filters={"dist": 0, "lvn_gap": 0, "expansion": 0, "cooldown": 0, "regime": 0, "weak_signal": 0, "sweep_confirm": 0},
+                        evidence=evidence,
+                    )
             if trigger.side == "long":
                 if (last_price - zone_high) > (atr * cfg.reclaim_ext_atr_mult):
                     evidence = dict(trigger.evidence or {})
@@ -1139,7 +1240,8 @@ class SwaggyEngine(BaseEngine):
                     evidence["bars_left"] = bars_left
                     evidence["cooldown_bars"] = cfg.symbol_cooldown_bars
                     _inject_regime_evidence(evidence, regime_state, cfg)
-                    print(f"[swaggy] ENTRY_SKIP reason=COOLDOWN sym={sym} bars_left={bars_left}")
+                    if not state.get("_swaggy_quiet"):
+                        print(f"[swaggy] ENTRY_SKIP reason=COOLDOWN sym={sym} bars_left={bars_left}")
                     return SwaggyDecision(
                         sym=sym,
                         side=trigger.side,
@@ -1169,7 +1271,8 @@ class SwaggyEngine(BaseEngine):
                 evidence["zone_entry_count"] = zone_count
                 evidence["zone_reentry_limit"] = cfg.zone_reentry_limit
                 _inject_regime_evidence(evidence, regime_state, cfg)
-                print(f"[swaggy] ENTRY_SKIP reason=ZONE_REENTRY sym={sym}")
+                if not state.get("_swaggy_quiet"):
+                    print(f"[swaggy] ENTRY_SKIP reason=ZONE_REENTRY sym={sym}")
                 return SwaggyDecision(
                     sym=sym,
                     side=trigger.side,
@@ -1200,7 +1303,8 @@ class SwaggyEngine(BaseEngine):
                     evidence["bars_left"] = bars_left
                     evidence["post_sl_cooldown_bars"] = cfg.post_sl_cooldown_bars
                     _inject_regime_evidence(evidence, regime_state, cfg)
-                    print(f"[swaggy] SL_COOLDOWN_ACTIVE sym={sym} bars_left={bars_left}")
+                    if not state.get("_swaggy_quiet"):
+                        print(f"[swaggy] SL_COOLDOWN_ACTIVE sym={sym} bars_left={bars_left}")
                     return SwaggyDecision(
                         sym=sym,
                         side=trigger.side,
