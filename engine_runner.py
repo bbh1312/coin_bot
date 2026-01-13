@@ -676,8 +676,10 @@ def _exit_cooldown_blocked(
     symbol: str,
     engine: str,
     side: str,
-    ttl_sec: float = EXIT_COOLDOWN_SEC,
+    ttl_sec: Optional[float] = None,
 ) -> bool:
+    if ttl_sec is None:
+        ttl_sec = EXIT_COOLDOWN_SEC
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     last_exit_ts = st.get("last_exit_ts")
     if not isinstance(last_exit_ts, (int, float)):
