@@ -463,6 +463,14 @@ def _get_entry_seen(state: Dict[str, dict]) -> Dict[str, dict]:
         state["_entry_seen"] = seen
     return seen
 
+
+def _get_entry_seen_log(state: Dict[str, dict]) -> Dict[str, dict]:
+    cache = state.get("_entry_seen_log")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_entry_seen_log"] = cache
+    return cache
+
 def _entry_seen_acquire(
     state: Dict[str, dict],
     symbol: str,
@@ -483,7 +491,12 @@ def _entry_seen_acquire(
                 ts = float(rec.get("ts", 0.0) or 0.0)
                 if (now - ts) < ttl_sec:
                     blocked_by = str(rec.get("engine") or "unknown")
-                    _append_entry_gate_log(engine, symbol, f"entry_seen_by={blocked_by} side={side}")
+                    log_key = f"{key}|{blocked_by}"
+                    log_cache = _get_entry_seen_log(state)
+                    last_log_ts = float(log_cache.get(log_key, 0.0) or 0.0)
+                    if (now - last_log_ts) >= ttl_sec:
+                        _append_entry_gate_log(engine, symbol, f"중복차단=entry_seen_by:{blocked_by} side={side}")
+                        log_cache[log_key] = now
                     return False, blocked_by
         seen[key_side] = {"ts": now, "engine": engine}
         seen[key_engine] = {"ts": now, "engine": engine}
@@ -613,6 +626,11 @@ def _atlasfabio_entry_gate(
         return False, "cooldown"
     if isinstance(max_positions, int) and isinstance(active_positions, int):
         if active_positions >= max_positions:
+            _append_entry_gate_log(
+                "atlasfabio",
+                symbol,
+                f"포지션제한={active_positions}/{max_positions} side={side}",
+            )
             return False, "max_pos"
     return True, "ok"
 
@@ -1527,6 +1545,11 @@ def _run_fabio_cycle(
                     cur_total = active_positions_total
                 if cur_total >= MAX_OPEN_POSITIONS:
                     print(f"[fabio] 롱 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
+                    _append_entry_gate_log(
+                        "fabio",
+                        symbol,
+                        f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=LONG",
+                    )
                 else:
                     if LONG_LIVE_TRADING:
                         lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="fabio")
@@ -1647,6 +1670,11 @@ def _run_fabio_cycle(
                     cur_total = active_positions_total
                 if cur_total >= MAX_OPEN_POSITIONS:
                     print(f"[fabio] 숏 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
+                    _append_entry_gate_log(
+                        "fabio",
+                        symbol,
+                        f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
+                    )
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
                 order_info = "(알림 전용)"
@@ -1960,6 +1988,11 @@ def _run_swaggy_cycle(
             cur_total = active_positions_total
         if cur_total >= MAX_OPEN_POSITIONS:
             print(f"[swaggy] 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
+            _append_entry_gate_log(
+                "swaggy",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+            )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         reason_codes = ",".join(decision.reason_codes or []) if isinstance(decision.reason_codes, list) else ""
@@ -2292,6 +2325,11 @@ def _run_swaggy_atlas_lab_cycle(
             cur_total = active_positions_total
         if cur_total >= MAX_OPEN_POSITIONS:
             print(f"[swaggy_atlas_lab] 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
+            _append_entry_gate_log(
+                "swaggy_atlas_lab",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+            )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         _append_entry_log(
@@ -3127,6 +3165,11 @@ def _run_atlas_fabio_cycle(
         if cur_total >= MAX_OPEN_POSITIONS:
             funnel["entry_gate_skip_max_pos"] += 1
             _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=MAX_POS")
+            _append_entry_gate_log(
+                "atlasfabio",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+            )
             _entry_lock_release(state, symbol, owner="atlasfabio")
             continue
 
@@ -3384,6 +3427,11 @@ def _run_dtfx_cycle(
                 cur_total = active_positions_total
             if cur_total >= MAX_OPEN_POSITIONS:
                 print(f"[dtfx] 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
+                _append_entry_gate_log(
+                    "dtfx",
+                    symbol,
+                    f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+                )
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             if side == "LONG" and not LONG_LIVE_TRADING:
@@ -3671,6 +3719,11 @@ def _run_pumpfade_cycle(
         if not isinstance(cur_total, int):
             cur_total = 0
         if cur_total >= MAX_OPEN_POSITIONS:
+            _append_entry_gate_log(
+                "pumpfade",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
+            )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
@@ -3881,6 +3934,11 @@ def _run_atlas_rs_fail_short_cycle(
                         continue
         cur_total = count_open_positions(force=True)
         if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+            _append_entry_gate_log(
+                "atlas_rs_fail_short",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
+            )
             _arsf_skip(symbol, "MAX_POS", entry_price)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -7620,6 +7678,11 @@ def run():
             if cur_total >= MAX_OPEN_POSITIONS:
                 if not pos_limit_logged:
                     print(f"[제한] 동시 포지션 {cur_total}/{MAX_OPEN_POSITIONS} → 신규 진입 스킵")
+                    _append_entry_gate_log(
+                        "system",
+                        "ALL",
+                        f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS}",
+                    )
                     pos_limit_logged = True
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -7863,9 +7926,14 @@ def run():
             cur_total = count_open_positions(force=True)
             if not isinstance(cur_total, int):
                 cur_total = active_positions
-            if cur_total >= MAX_OPEN_POSITIONS:
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
+        if cur_total >= MAX_OPEN_POSITIONS:
+            _append_entry_gate_log(
+                "div15m",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=LONG",
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
 
             if now - last_entry < COOLDOWN_SEC:
                 time.sleep(PER_SYMBOL_SLEEP)
@@ -8029,9 +8097,14 @@ def run():
             cur_total = count_open_positions(force=True)
             if not isinstance(cur_total, int):
                 cur_total = active_positions
-            if cur_total >= MAX_OPEN_POSITIONS:
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
+        if cur_total >= MAX_OPEN_POSITIONS:
+            _append_entry_gate_log(
+                "div15m_short",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
 
             if now - last_entry < COOLDOWN_SEC:
                 time.sleep(PER_SYMBOL_SLEEP)
