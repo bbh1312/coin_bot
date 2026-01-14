@@ -257,6 +257,7 @@ def _min_required_bars(atlas_cfg, fabio_cfg) -> Dict[str, int]:
     min_map: Dict[str, int] = {}
     min_map[atlas_cfg.htf_tf] = max(atlas_cfg.supertrend_period + 2, 20) + 1
     min_map[atlas_cfg.ltf_tf] = max(atlas_cfg.atr_period + atlas_cfg.atr_sma_period, 70) + 1
+    min_map["3m"] = max(min_map.get("3m", 0), 10)
     rsi_min = max(100, int(getattr(fabio_cfg, "rsi_len", 14)) + 2)
     atr_min = max(100, int(getattr(fabio_cfg, "atr_len", 14)) + 2)
     vol_min = max(50, int(getattr(fabio_cfg, "vol_sma_len", 20)) + 1)
@@ -332,7 +333,7 @@ def _run_backtest_for_symbol(
 
     min_required = _min_required_bars(atlas_cfg, fabio_cfg)
     tfs = list({atlas_cfg.htf_tf, atlas_cfg.ltf_tf, fabio_cfg.timeframe_htf, fabio_cfg.timeframe_ltf,
-                fabio_cfg.short_timeframe_primary, fabio_cfg.short_timeframe_secondary, getattr(atlas_cfg, "d1_tf", None)})
+                fabio_cfg.short_timeframe_primary, fabio_cfg.short_timeframe_secondary, getattr(atlas_cfg, "d1_tf", None), "3m"})
     tfs = [tf for tf in tfs if tf]
 
     idx_by_tf: Dict[str, int] = {tf: 0 for tf in tfs}

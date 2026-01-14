@@ -706,7 +706,8 @@ def _run_swaggy_atlas_lab_cycle(
         df_1h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf, limit=htf_limit)
         df_4h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf2, limit=htf2_limit)
         df_1d = cycle_cache.get_df(symbol, swaggy_cfg.tf_d1, limit=d1_limit)
-        if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty:
+        df_3m = cycle_cache.get_df(symbol, "3m", limit=30)
+        if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty or df_3m.empty:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
@@ -717,6 +718,7 @@ def _run_swaggy_atlas_lab_cycle(
             df_1h,
             df_15m,
             df_5m,
+            df_3m,
             df_1d if isinstance(df_1d, pd.DataFrame) else pd.DataFrame(),
             now_ts,
         )

@@ -375,6 +375,7 @@ class SwaggySignalEngine:
         candles_1h: pd.DataFrame,
         candles_15m: pd.DataFrame,
         candles_5m: pd.DataFrame,
+        candles_3m: pd.DataFrame,
         candles_1d: pd.DataFrame,
         now_ts: float,
     ) -> SwaggySignal:
@@ -509,7 +510,9 @@ class SwaggySignalEngine:
                 debug={"regime": regime_state.regime, "chase_dist": chase_dist},
             )
 
-        ema7_series = ema(candles_5m["close"], 7)
+        if candles_3m.empty or len(candles_3m) < 9:
+            return SwaggySignal(False, side, strength, ["EMA7_WARMUP"], best.kind, None, debug={"regime": regime_state.regime})
+        ema7_series = ema(candles_3m["close"], 7)
         if not ema7_series.empty:
             ema7_val = float(ema7_series.iloc[-1])
             if side == "LONG" and last_price > ema7_val:

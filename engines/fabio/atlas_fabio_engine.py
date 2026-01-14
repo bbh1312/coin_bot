@@ -116,15 +116,15 @@ def evaluate_gate_long(symbol: str, cfg: Config) -> Dict[str, Any]:
     data = _load_gate_data(symbol, cfg)
     if not data:
         return {"status": "warmup"}
-    ltf5 = cycle_cache.get_df(symbol, "5m", 20)
-    if ltf5.empty or len(ltf5) < 10:
+    ltf3 = cycle_cache.get_df(symbol, "3m", 20)
+    if ltf3.empty or len(ltf3) < 10:
         return {"status": "warmup"}
-    ltf5 = ltf5.iloc[:-1]
-    ema7_vals = ema(ltf5["close"].tolist(), 7)
+    ltf3 = ltf3.iloc[:-1]
+    ema7_vals = ema(ltf3["close"].tolist(), 7)
     if not ema7_vals:
         return {"status": "warmup"}
     ema7_val = ema7_vals[-1]
-    last_close = ltf5["close"].tolist()[-1]
+    last_close = ltf3["close"].tolist()[-1]
     if isinstance(ema7_val, (int, float)) and isinstance(last_close, (int, float)):
         if float(last_close) > float(ema7_val):
             return {
@@ -179,15 +179,15 @@ def evaluate_gate_short(symbol: str, cfg: Config) -> Dict[str, Any]:
     data = _load_gate_data(symbol, cfg)
     if not data:
         return {"status": "warmup"}
-    ltf5 = cycle_cache.get_df(symbol, "5m", 20)
-    if ltf5.empty or len(ltf5) < 10:
+    ltf3 = cycle_cache.get_df(symbol, "3m", 20)
+    if ltf3.empty or len(ltf3) < 10:
         return {"status": "warmup"}
-    ltf5 = ltf5.iloc[:-1]
-    ema7_vals = ema(ltf5["close"].tolist(), 7)
+    ltf3 = ltf3.iloc[:-1]
+    ema7_vals = ema(ltf3["close"].tolist(), 7)
     if not ema7_vals:
         return {"status": "warmup"}
     ema7_val = ema7_vals[-1]
-    last_close = ltf5["close"].tolist()[-1]
+    last_close = ltf3["close"].tolist()[-1]
     if isinstance(ema7_val, (int, float)) and isinstance(last_close, (int, float)):
         if float(last_close) < float(ema7_val):
             return {

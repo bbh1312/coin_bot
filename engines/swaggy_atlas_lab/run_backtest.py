@@ -175,7 +175,7 @@ def main() -> None:
     )
 
     data_by_sym: Dict[str, Dict[str, object]] = {}
-    tfs = [sw_cfg.tf_ltf, sw_cfg.tf_mtf, sw_cfg.tf_htf, sw_cfg.tf_htf2, sw_cfg.tf_d1]
+    tfs = [sw_cfg.tf_ltf, sw_cfg.tf_mtf, sw_cfg.tf_htf, sw_cfg.tf_htf2, sw_cfg.tf_d1, "3m"]
     for sym in symbols:
         tf_map: Dict[str, object] = {}
         for tf in tfs:
@@ -217,12 +217,13 @@ def main() -> None:
                     ts_ms = int(cur["ts"])
                     now_ts = ts_ms / 1000.0
                     d5 = df_ltf.iloc[: i + 1]
+                    d3 = slice_df(data_by_sym[sym]["3m"], ts_ms)
                     d15 = slice_df(df_mtf, ts_ms)
                     d1h = slice_df(df_htf, ts_ms)
                     d4h = slice_df(df_htf2, ts_ms)
                     prev_phase = sym_state.get("phase")
                     d1d = slice_df(df_d1, ts_ms)
-                    signal = engine.evaluate_symbol(sym, d4h, d1h, d15, d5, d1d, now_ts)
+                    signal = engine.evaluate_symbol(sym, d4h, d1h, d15, d5, d3, d1d, now_ts)
                     new_phase = sym_state.get("phase")
                     key = (mode.value, sym)
                     overext_stats = overext_by_key.setdefault(
