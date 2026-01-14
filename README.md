@@ -126,11 +126,11 @@ pip install ccxt pandas requests websocket-client
 - DTFX     
   - 백테스트 (sl 크게)
     ```
-    python3 engines/dtfx/backtest_runner.py \
-    --days 5 \
-    --sl-pct 0.30 \
+     python3 engines/dtfx/backtest_runner.py \
+    --days 7 \
+    --sl-pct 0.3 \
     --tp-pct 0.03 \
-    --max-symbols 10
+    --max-symbols 15
     ```
   - 예시
     ```

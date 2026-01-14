@@ -3158,51 +3158,66 @@ def _read_report_csv_records(report_date: str) -> Optional[list]:
         return None
 
 def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dict]:
-    if report_date:
-        path = os.path.join("logs", "entry", f"entry_events-{report_date}.log")
-    else:
-        path = os.path.join("logs", "entry_events.log")
     by_id = {}
     by_symbol_side = {}
-    if not os.path.exists(path):
+    paths: list[str] = []
+    entry_dir = os.path.join("logs", "entry")
+    if os.path.isdir(entry_dir):
+        try:
+            for name in sorted(os.listdir(entry_dir)):
+                if name.startswith("entry_events-") and name.endswith(".log"):
+                    paths.append(os.path.join(entry_dir, name))
+        except Exception:
+            pass
+    legacy_path = os.path.join("logs", "entry_events.log")
+    if os.path.exists(legacy_path):
+        paths.append(legacy_path)
+    if report_date:
+        dated_path = os.path.join("logs", "entry", f"entry_events-{report_date}.log")
+        if os.path.exists(dated_path) and dated_path not in paths:
+            paths.append(dated_path)
+    if not paths:
         return by_id, by_symbol_side
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except Exception:
-                    continue
-                entry_ts = payload.get("entry_ts")
-                entry_ts_val = None
-                if isinstance(entry_ts, (int, float)):
-                    entry_ts_val = float(entry_ts)
-                elif isinstance(entry_ts, str):
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
-                        entry_ts_val = datetime.strptime(entry_ts, "%Y-%m-%d %H:%M:%S").timestamp()
+                        payload = json.loads(line)
                     except Exception:
-                        entry_ts_val = None
-                if entry_ts_val is None:
-                    continue
-                entry_id = payload.get("entry_order_id")
-                symbol = payload.get("symbol") or ""
-                side = payload.get("side") or ""
-                engine = payload.get("engine") or "unknown"
-                record = {
-                    "entry_ts": entry_ts_val,
-                    "entry_order_id": entry_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "engine": engine,
-                }
-                if entry_id:
-                    by_id[str(entry_id)] = record
-                if report_date is None or _date_str_kst(entry_ts_val) == report_date:
-                    key = (symbol, side)
-                    by_symbol_side.setdefault(key, []).append(record)
+                        continue
+                    entry_ts = payload.get("entry_ts")
+                    entry_ts_val = None
+                    if isinstance(entry_ts, (int, float)):
+                        entry_ts_val = float(entry_ts)
+                    elif isinstance(entry_ts, str):
+                        try:
+                            entry_ts_val = datetime.strptime(entry_ts, "%Y-%m-%d %H:%M:%S").timestamp()
+                        except Exception:
+                            entry_ts_val = None
+                    if entry_ts_val is None:
+                        continue
+                    entry_id = payload.get("entry_order_id")
+                    symbol = payload.get("symbol") or ""
+                    side = payload.get("side") or ""
+                    engine = payload.get("engine") or "unknown"
+                    record = {
+                        "entry_ts": entry_ts_val,
+                        "entry_order_id": entry_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "engine": engine,
+                    }
+                    if entry_id:
+                        by_id[str(entry_id)] = record
+                    if report_date is None or _date_str_kst(entry_ts_val) == report_date:
+                        key = (symbol, side)
+                        by_symbol_side.setdefault(key, []).append(record)
     except Exception:
         return by_id, by_symbol_side
     return by_id, by_symbol_side
@@ -4628,13 +4643,16 @@ def _update_report_csv(tr: dict) -> None:
 
 def _append_entry_event(tr: dict) -> None:
     try:
+        entry_order_id = tr.get("entry_order_id")
+        if not entry_order_id:
+            return
         date_tag = time.strftime("%Y-%m-%d")
         dir_path = os.path.join("logs", "entry")
         os.makedirs(dir_path, exist_ok=True)
         path = os.path.join(dir_path, f"entry_events-{date_tag}.log")
         payload = {
             "entry_ts": datetime.fromtimestamp(float(tr.get("entry_ts") or 0.0)).strftime("%Y-%m-%d %H:%M:%S"),
-            "entry_order_id": tr.get("entry_order_id"),
+            "entry_order_id": entry_order_id,
             "symbol": tr.get("symbol"),
             "side": tr.get("side"),
             "entry_price": tr.get("entry_price"),
