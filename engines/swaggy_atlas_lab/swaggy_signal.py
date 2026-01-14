@@ -375,6 +375,7 @@ class SwaggySignalEngine:
         candles_1h: pd.DataFrame,
         candles_15m: pd.DataFrame,
         candles_5m: pd.DataFrame,
+        candles_1d: pd.DataFrame,
         now_ts: float,
     ) -> SwaggySignal:
         cfg = self.config
@@ -475,6 +476,24 @@ class SwaggySignalEngine:
         ok_dist, _ = dist_to_level_ok(last_price, best.level, cfg.max_dist)
         if not ok_dist:
             return SwaggySignal(False, side, strength, ["DIST_FAIL"], best.kind, None, debug={"regime": regime_state.regime})
+
+        d1_dist_atr = 0.0
+        if not candles_1d.empty and len(candles_1d) >= max(cfg.d1_ema_len, cfg.d1_atr_len) + 2:
+            ema7_series = ema(candles_1d["close"], cfg.d1_ema_len)
+            d1_ema = float(ema7_series.iloc[-1]) if not ema7_series.empty else 0.0
+            d1_atr = atr(candles_1d, cfg.d1_atr_len)
+            if d1_atr > 0:
+                d1_dist_atr = abs(last_price - d1_ema) / d1_atr
+        if d1_dist_atr > cfg.d1_overext_atr_mult:
+            return SwaggySignal(
+                False,
+                side,
+                strength,
+                ["D1_EMA7_DIST"],
+                best.kind,
+                None,
+                debug={"regime": regime_state.regime, "d1_dist_atr": d1_dist_atr},
+            )
 
         chase_ok, chase_dist = _overextension_ok(candles_5m, side, cfg)
         if not chase_ok:

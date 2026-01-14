@@ -21,11 +21,16 @@ class Config:
     ltf_tf: str = "15m"
     htf_limit: int = 200
     ltf_limit: int = 200
+    d1_tf: str = "1d"
+    d1_limit: int = 120
     supertrend_period: int = 10
     supertrend_mult: float = 3.0
     atr_period: int = 14
     atr_sma_period: int = 50
     atr_mult: float = 1.2
+    d1_ema_len: int = 7
+    d1_atr_len: int = 14
+    d1_overext_atr_mult: float = 1.4
     vol_sma_period: int = 20
     vol_mult: float = 1.3
     strong_score_threshold: int = 70
@@ -38,10 +43,13 @@ class Config:
 def _load_gate_data(symbol: str, cfg: Config) -> Optional[Dict[str, Any]]:
     htf = cycle_cache.get_df(symbol, cfg.htf_tf, cfg.htf_limit)
     ltf = cycle_cache.get_df(symbol, cfg.ltf_tf, cfg.ltf_limit)
+    d1 = cycle_cache.get_df(symbol, cfg.d1_tf, cfg.d1_limit)
     if htf.empty or ltf.empty:
         return None
     htf = htf.iloc[:-1]
     ltf = ltf.iloc[:-1]
+    if not d1.empty:
+        d1 = d1.iloc[:-1]
     if len(htf) < max(cfg.supertrend_period + 2, 20) or len(ltf) < max(cfg.atr_period + cfg.atr_sma_period, 70):
         return None
 
@@ -75,6 +83,18 @@ def _load_gate_data(symbol: str, cfg: Config) -> Optional[Dict[str, Any]]:
     vol_sma = vol_sma_vals[-1] if vol_sma_vals else None
     vol_score = 30 if (vol_now is not None and vol_sma and vol_now > (vol_sma * cfg.vol_mult)) else 0
     vol_mult = (vol_now / vol_sma) if (vol_now is not None and vol_sma) else None
+    d1_dist_atr = None
+    if not d1.empty and len(d1) >= max(cfg.d1_ema_len, cfg.d1_atr_len) + 2:
+        d1_highs = d1["high"].tolist()
+        d1_lows = d1["low"].tolist()
+        d1_closes = d1["close"].tolist()
+        ema_vals = ema(d1_closes, cfg.d1_ema_len)
+        atr_vals = atr(d1_highs, d1_lows, d1_closes, cfg.d1_atr_len)
+        ema_now = ema_vals[-1] if ema_vals else None
+        atr_now = atr_vals[-1] if atr_vals else None
+        last_close = d1_closes[-1] if d1_closes else None
+        if isinstance(ema_now, (int, float)) and isinstance(atr_now, (int, float)) and atr_now > 0 and last_close:
+            d1_dist_atr = abs(float(last_close) - float(ema_now)) / float(atr_now)
 
     return {
         "htf_closes": htf_closes,
@@ -88,6 +108,7 @@ def _load_gate_data(symbol: str, cfg: Config) -> Optional[Dict[str, Any]]:
         "vol_sma": vol_sma,
         "vol_score": vol_score,
         "vol_mult": vol_mult,
+        "d1_dist_atr": d1_dist_atr,
     }
 
 
@@ -95,6 +116,18 @@ def evaluate_gate_long(symbol: str, cfg: Config) -> Dict[str, Any]:
     data = _load_gate_data(symbol, cfg)
     if not data:
         return {"status": "warmup"}
+    d1_dist_atr = data.get("d1_dist_atr")
+    if isinstance(d1_dist_atr, (int, float)) and d1_dist_atr > cfg.d1_overext_atr_mult:
+        return {
+            "status": "ok",
+            "trade_allowed": False,
+            "allow_long": False,
+            "allow_short": False,
+            "size_mult": cfg.size_mult_base,
+            "st_dir": data["st_dir"],
+            "d1_dist_atr": d1_dist_atr,
+            "block_reason": "D1_EMA7_DIST",
+        }
     st_dir = data["st_dir"]
     allow_long = st_dir == "UP"
     trade_allowed = bool(st_dir)
@@ -126,6 +159,18 @@ def evaluate_gate_short(symbol: str, cfg: Config) -> Dict[str, Any]:
     data = _load_gate_data(symbol, cfg)
     if not data:
         return {"status": "warmup"}
+    d1_dist_atr = data.get("d1_dist_atr")
+    if isinstance(d1_dist_atr, (int, float)) and d1_dist_atr > cfg.d1_overext_atr_mult:
+        return {
+            "status": "ok",
+            "trade_allowed": False,
+            "allow_long": False,
+            "allow_short": False,
+            "size_mult": cfg.size_mult_base,
+            "st_dir": data["st_dir"],
+            "d1_dist_atr": d1_dist_atr,
+            "block_reason": "D1_EMA7_DIST",
+        }
     st_dir = data["st_dir"]
     allow_short = st_dir == "DOWN"
     trade_allowed = bool(st_dir)

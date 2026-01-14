@@ -263,6 +263,9 @@ def _min_required_bars(atlas_cfg, fabio_cfg) -> Dict[str, int]:
     ltf_min = max(61, rsi_min, atr_min, vol_min, int(getattr(fabio_cfg, "long_retest_window", 12)) + 2)
     min_map[fabio_cfg.timeframe_htf] = max(min_map.get(fabio_cfg.timeframe_htf, 0), htf_min)
     min_map[fabio_cfg.timeframe_ltf] = max(min_map.get(fabio_cfg.timeframe_ltf, 0), ltf_min)
+    if getattr(atlas_cfg, "d1_tf", None):
+        d1_min = max(int(getattr(atlas_cfg, "d1_ema_len", 7)) + 2, int(getattr(atlas_cfg, "d1_atr_len", 14)) + 2)
+        min_map[atlas_cfg.d1_tf] = max(min_map.get(atlas_cfg.d1_tf, 0), d1_min)
     if fabio_cfg.short_timeframe_primary:
         min_map[fabio_cfg.short_timeframe_primary] = max(
             min_map.get(fabio_cfg.short_timeframe_primary, 0), max(rsi_min, atr_min, vol_min, 20)
@@ -328,7 +331,7 @@ def _run_backtest_for_symbol(
 
     min_required = _min_required_bars(atlas_cfg, fabio_cfg)
     tfs = list({atlas_cfg.htf_tf, atlas_cfg.ltf_tf, fabio_cfg.timeframe_htf, fabio_cfg.timeframe_ltf,
-                fabio_cfg.short_timeframe_primary, fabio_cfg.short_timeframe_secondary})
+                fabio_cfg.short_timeframe_primary, fabio_cfg.short_timeframe_secondary, getattr(atlas_cfg, "d1_tf", None)})
     tfs = [tf for tf in tfs if tf]
 
     idx_by_tf: Dict[str, int] = {tf: 0 for tf in tfs}
@@ -784,7 +787,7 @@ def main() -> None:
 
     atlas_cfg, fabio_cfg, _ = _build_atlasfabio_configs()
     tfs = list({atlas_cfg.htf_tf, atlas_cfg.ltf_tf, fabio_cfg.timeframe_htf, fabio_cfg.timeframe_ltf,
-                fabio_cfg.short_timeframe_primary, fabio_cfg.short_timeframe_secondary})
+                fabio_cfg.short_timeframe_primary, fabio_cfg.short_timeframe_secondary, getattr(atlas_cfg, "d1_tf", None)})
     tfs = [tf for tf in tfs if tf]
 
     min_required = _min_required_bars(atlas_cfg, fabio_cfg)

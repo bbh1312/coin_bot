@@ -5,11 +5,11 @@ User settings applied:
 - Leverage: 10x
 - Entry USDT: 20
 - DCA max adds: 3
-- Each DCA size: 20 USDT (fixed)
-- DCA trigger by entry-price move (against short):
-  - 1st add when mark ≥ entry * 1.20 (약 +20%)
-  - 2nd add when mark ≥ entry * 1.20 (약 +20%)
-  - 3rd add when mark ≥ entry * 1.20 (약 +20%)
+- Each DCA size: 2% of available USDT
+- DCA trigger by entry-price move (adverse vs entry):
+  - 1st add when adverse move >= 30%
+  - 2nd add when adverse move >= 30%
+  - 3rd add when adverse move >= 30%
 
 Security:
 - Use environment variables (DO NOT hardcode keys):
@@ -29,11 +29,12 @@ from env_loader import load_env
 DEFAULT_LEVERAGE = 10
 BASE_ENTRY_USDT = 40.0
 DCA_MAX_ADDS = 3
-DCA_USDT = 40.0
+DCA_ENABLED = True
+DCA_PCT = 2.0
 
-DCA_FIRST_PCT = 25.0   # price up vs entry (against short)
-DCA_SECOND_PCT = 25.0
-DCA_THIRD_PCT = 25.0
+DCA_FIRST_PCT = 30.0   # price up vs entry (against short)
+DCA_SECOND_PCT = 30.0
+DCA_THIRD_PCT = 30.0
 
 load_env()
 API_KEY = os.environ.get("BINANCE_API_KEY", "")
@@ -137,6 +138,16 @@ def get_available_usdt(ttl_sec: float = _BAL_TTL_SEC) -> Optional[float]:
             _BAL_CACHE["ts"] = now
             _BAL_CACHE["available"] = float(available)
     return available
+
+
+def _calc_dca_usdt() -> Optional[float]:
+    available = get_available_usdt()
+    if not isinstance(available, (int, float)) or available <= 0:
+        return None
+    usdt = float(available) * (DCA_PCT / 100.0)
+    if usdt <= 0:
+        return None
+    return usdt
 
 exchange = ccxt.binance({
     "apiKey": API_KEY,
@@ -1064,6 +1075,8 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
     }
 
 def dca_short_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolated") -> dict:
+    if not DCA_ENABLED:
+        return {"status": "skip", "reason": "dca_disabled", "symbol": symbol}
     if adds_done >= DCA_MAX_ADDS:
         return {"status": "skip", "reason": "max_adds_reached", "symbol": symbol, "adds_done": adds_done}
     p = _find_position(symbol)
@@ -1090,17 +1103,27 @@ def dca_short_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolate
             "mark": mark,
         }
 
-    res = short_market(symbol, usdt_amount=DCA_USDT, leverage=DEFAULT_LEVERAGE, margin_mode=margin_mode)
+    dca_usdt = _calc_dca_usdt()
+    if not isinstance(dca_usdt, (int, float)):
+        return {
+            "status": "skip",
+            "reason": "balance_unavailable",
+            "symbol": symbol,
+            "adds_done": adds_done,
+        }
+    res = short_market(symbol, usdt_amount=dca_usdt, leverage=DEFAULT_LEVERAGE, margin_mode=margin_mode)
     res.update({
         "adds_done_before": adds_done,
         "adds_done_after": adds_done + 1,
-        "dca_usdt": DCA_USDT,
+        "dca_usdt": dca_usdt,
         "entry": entry,
         "mark": mark,
     })
     return res
 
 def dca_long_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolated") -> dict:
+    if not DCA_ENABLED:
+        return {"status": "skip", "reason": "dca_disabled", "symbol": symbol}
     if adds_done >= DCA_MAX_ADDS:
         return {"status": "skip", "reason": "max_adds_reached", "symbol": symbol, "adds_done": adds_done}
     p = _find_long_position(symbol)
@@ -1127,11 +1150,19 @@ def dca_long_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolated
             "mark": mark,
         }
 
-    res = long_market(symbol, usdt_amount=DCA_USDT, leverage=DEFAULT_LEVERAGE, margin_mode=margin_mode)
+    dca_usdt = _calc_dca_usdt()
+    if not isinstance(dca_usdt, (int, float)):
+        return {
+            "status": "skip",
+            "reason": "balance_unavailable",
+            "symbol": symbol,
+            "adds_done": adds_done,
+        }
+    res = long_market(symbol, usdt_amount=dca_usdt, leverage=DEFAULT_LEVERAGE, margin_mode=margin_mode)
     res.update({
         "adds_done_before": adds_done,
         "adds_done_after": adds_done + 1,
-        "dca_usdt": DCA_USDT,
+        "dca_usdt": dca_usdt,
         "entry": entry,
         "mark": mark,
     })

@@ -211,15 +211,17 @@ class AtlasRsFailShortEngine(BaseEngine):
             _set_state("IDLE")
             bucket[symbol] = rec
             return _blocked("ATLAS_MISSING_REQUIRED", atlas_data)
-        if atlas_data.get("regime") == "bull_extreme" and float(atlas_data["score"]) >= cfg.bull_extreme_score_max:
+        score_val = float(atlas_data["score"])
+        if atlas_data.get("regime") == "bull_extreme" and score_val >= cfg.bull_extreme_score_max:
             _set_state("IDLE")
             bucket[symbol] = rec
             return _blocked("REGIME_BULL_EXTREME", atlas_data)
-        if atlas_data.get("regime") not in cfg.allow_regimes:
+        regime = atlas_data.get("regime")
+        bull_soft_allow = regime == "bull" and score_val < 80
+        if (not bull_soft_allow) and regime not in cfg.allow_regimes:
             _set_state("IDLE")
             bucket[symbol] = rec
             return _blocked("REGIME_NOT_ALLOWED", atlas_data)
-        score_val = float(atlas_data["score"])
         if not (atlas_data.get("dir") == "BEAR" or score_val <= cfg.dir_score_max):
             _set_state("IDLE")
             bucket[symbol] = rec

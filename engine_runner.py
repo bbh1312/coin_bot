@@ -120,6 +120,11 @@ from executor import (
     cancel_conditional_by_side,
     dca_short_if_needed,
     dca_long_if_needed,
+    DCA_ENABLED,
+    DCA_PCT,
+    DCA_FIRST_PCT,
+    DCA_SECOND_PCT,
+    DCA_THIRD_PCT,
     set_dry_run,
     get_global_backoff_until,
     refresh_positions_cache,
@@ -1955,7 +1960,13 @@ def _run_swaggy_cycle(
         if st.get("in_pos"):
             continue
         last_entry = float(st.get("last_entry", 0.0) or 0.0)
-        if (now_ts - last_entry) < COOLDOWN_SEC:
+        cooldown_sec = COOLDOWN_SEC
+        if isinstance(lab_cfg, object) and hasattr(lab_cfg, "cooldown_min"):
+            try:
+                cooldown_sec = max(0, int(float(lab_cfg.cooldown_min)) * 60)
+            except Exception:
+                cooldown_sec = COOLDOWN_SEC
+        if (now_ts - last_entry) < cooldown_sec:
             continue
         decision = swaggy_engine.on_tick(ctx, symbol)
         if not decision or not getattr(decision, "entry_ready", 0):
@@ -2352,7 +2363,9 @@ def _run_swaggy_atlas_lab_cycle(
         df_15m = cycle_cache.get_df(symbol, lab_cfg.tf_mtf, limit=max(lab_cfg.swing_lookback_mtf * 2, 120))
         df_1h = cycle_cache.get_df(symbol, lab_cfg.tf_htf, limit=max(lab_cfg.vp_lookback_1h, 120))
         df_4h = cycle_cache.get_df(symbol, lab_cfg.tf_htf2, limit=max(lab_cfg.regime_lookback * 2, 60))
-        signal = lab_engine.evaluate_symbol(symbol, df_4h, df_1h, df_15m, df_5m, now_ts)
+        d1_limit = max(lab_cfg.d1_atr_len + 5, lab_cfg.d1_ema_len + 5, 30)
+        df_1d = cycle_cache.get_df(symbol, lab_cfg.tf_d1, limit=d1_limit)
+        signal = lab_engine.evaluate_symbol(symbol, df_4h, df_1h, df_15m, df_5m, df_1d, now_ts)
         if not signal or not signal.entry_ok or signal.entry_px is None:
             continue
         side = (signal.side or "").upper()
@@ -2665,6 +2678,7 @@ def _run_atlas_fabio_cycle(
         "atlas_gate_calls_long": 0,
         "atlas_gate_calls_short": 0,
         "atlas_block": 0,
+        "d1_block": 0,
         "side_block": 0,
         "no_side_allowed": 0,
         "no_pullback": 0,
@@ -2731,7 +2745,10 @@ def _run_atlas_fabio_cycle(
 
         if not trade_allowed:
             funnel["atlas_block"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ATLAS_BLOCK")
+            block_reason = gate.get("block_reason") or "ATLAS_BLOCK"
+            if block_reason == "D1_EMA7_DIST":
+                funnel["d1_block"] += 1
+            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason={block_reason}")
             continue
 
         allowed_sides = []
@@ -3389,7 +3406,7 @@ def _run_atlas_fabio_cycle(
         "ltf_block={blocked_ltf} cooldown={blocked_cooldown} in_pos={blocked_in_pos} "
         "gate_skip={entry_gate_skip} gate_in_pos={entry_gate_skip_in_pos} gate_cooldown={entry_gate_skip_cooldown} "
         "gate_maxpos={entry_gate_skip_max_pos} gate_live_off={entry_gate_skip_live_off} "
-        "exchange_skip={entry_gate_skip_exchange} atlas_block={atlas_block} side_block={side_block} "
+        "exchange_skip={entry_gate_skip_exchange} atlas_block={atlas_block} d1_block={d1_block} side_block={side_block} "
         "no_side_allowed={no_side_allowed} no_pullback={no_pullback} "
         "entry_live_off={entry_live_off} "
         "trigger_hard={trigger_hard} trigger_soft={trigger_soft} "
@@ -5446,10 +5463,17 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_long_live",
         "_max_open_positions",
         "_entry_usdt",
+        "_dca_enabled",
+        "_dca_pct",
+        "_dca_first_pct",
+        "_dca_second_pct",
+        "_dca_third_pct",
+        "_exit_cooldown_hours",
         "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
         "_div15m_long_enabled",
         "_div15m_short_enabled",
+        "_rsi_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -5462,8 +5486,9 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         if key in disk:
             state[key] = disk.get(key)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
-    global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
+    global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
     if isinstance(state.get("_auto_exit_long_tp_pct"), (int, float)):
@@ -5493,6 +5518,31 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
     if isinstance(state.get("_div15m_short_enabled"), bool):
         DIV15M_SHORT_ENABLED = bool(state.get("_div15m_short_enabled"))
+    if isinstance(state.get("_rsi_enabled"), bool):
+        RSI_ENABLED = bool(state.get("_rsi_enabled"))
+    if isinstance(state.get("_dca_enabled"), bool):
+        DCA_ENABLED = bool(state.get("_dca_enabled"))
+        if executor_mod:
+            executor_mod.DCA_ENABLED = DCA_ENABLED
+    if isinstance(state.get("_dca_pct"), (int, float)):
+        DCA_PCT = float(state.get("_dca_pct"))
+        if executor_mod:
+            executor_mod.DCA_PCT = DCA_PCT
+    if isinstance(state.get("_dca_first_pct"), (int, float)):
+        DCA_FIRST_PCT = float(state.get("_dca_first_pct"))
+        if executor_mod:
+            executor_mod.DCA_FIRST_PCT = DCA_FIRST_PCT
+    if isinstance(state.get("_dca_second_pct"), (int, float)):
+        DCA_SECOND_PCT = float(state.get("_dca_second_pct"))
+        if executor_mod:
+            executor_mod.DCA_SECOND_PCT = DCA_SECOND_PCT
+    if isinstance(state.get("_dca_third_pct"), (int, float)):
+        DCA_THIRD_PCT = float(state.get("_dca_third_pct"))
+        if executor_mod:
+            executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
+    if isinstance(state.get("_exit_cooldown_hours"), (int, float)):
+        EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
+        EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     if isinstance(state.get("_pumpfade_enabled"), bool):
@@ -5518,10 +5568,17 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_long_live",
         "_max_open_positions",
         "_entry_usdt",
+        "_dca_enabled",
+        "_dca_pct",
+        "_dca_first_pct",
+        "_dca_second_pct",
+        "_dca_third_pct",
+        "_exit_cooldown_hours",
         "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
         "_div15m_long_enabled",
         "_div15m_short_enabled",
+        "_rsi_enabled",
         "_dtfx_enabled",
         "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -5833,7 +5890,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, USDT_PER_TRADE
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
+    global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if not BOT_TOKEN:
         return
     last_update_id = int(state.get("_tg_offset", 0) or 0)
@@ -5978,21 +6037,28 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     try:
                         over_limit = "YES" if open_pos > MAX_OPEN_POSITIONS else "NO"
                         status_msg = (
-                            f"🤖 상태\n"
+                            "🤖 상태\n"
                             f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
+                            f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
+                            f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
+                            f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
+                            f"/exit_cd_h(재진입시간h): {EXIT_COOLDOWN_HOURS:.2f}h\n"
+                            "--------------\n"
+                            f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
+                            f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
+                            f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
-                            f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
-                            f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
-                            f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
-                            f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
-                            f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
+                            "--------------\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
+                            f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
+                            f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
+                            f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
+                            f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
+                            f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                             f"/div15m_long(추가진입): {'ON' if DIV15M_LONG_ENABLED else 'OFF'}\n"
                             f"/div15m_short(추가진입): {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n"
-                            f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
-                            f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
-                            f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
+                            "--------------\n"
                             "/report(리포트): /report today|yesterday|YYYY-MM-DD\n"
                             f"open positions: {open_pos} (over_limit={over_limit})"
                         )
@@ -6018,20 +6084,28 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         print(f"[telegram] status open_pos error: {e}")
                     over_limit = "YES" if open_pos > MAX_OPEN_POSITIONS else "NO"
                     status_msg = (
-                        f"🤖 상태\n"
+                        "🤖 상태\n"
                         f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
+                        f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
+                        f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
+                        f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
+                        f"/exit_cd_h(재진입시간h): {EXIT_COOLDOWN_HOURS:.2f}h\n"
+                        "--------------\n"
+                        f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
+                        f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
+                        f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
-                        f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
-                        f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
-                        f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
-                        f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
+                        "--------------\n"
                         f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
+                        f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
+                        f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
+                        f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
+                        f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
+                        f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                         f"/div15m_long(추가진입): {'ON' if DIV15M_LONG_ENABLED else 'OFF'}\n"
                         f"/div15m_short(추가진입): {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n"
-                        f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n"
-                        f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
-                        f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
+                        "--------------\n"
                         "/report(리포트): /report today|yesterday|YYYY-MM-DD\n"
                         f"open positions: {open_pos} (over_limit={over_limit})"
                     )
@@ -6164,6 +6238,144 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] entry_usdt cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/dca", "dca")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        DCA_ENABLED = True
+                        if executor_mod:
+                            executor_mod.DCA_ENABLED = True
+                        state["_dca_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ dca ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        DCA_ENABLED = False
+                        if executor_mod:
+                            executor_mod.DCA_ENABLED = False
+                        state["_dca_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ dca OFF"
+                    else:
+                        resp = f"ℹ️ dca 상태: {'ON' if DCA_ENABLED else 'OFF'}\n사용법: /dca on|off|status"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] dca cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/dca_pct", "dca_pct")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("status", "help"):
+                        resp = f"ℹ️ dca_pct: {DCA_PCT:.2f}%\n사용법: /dca_pct 2.5"
+                    else:
+                        try:
+                            val = float(arg)
+                            if val <= 0:
+                                raise ValueError("non-positive")
+                            DCA_PCT = float(val)
+                            if executor_mod:
+                                executor_mod.DCA_PCT = DCA_PCT
+                            state["_dca_pct"] = DCA_PCT
+                            state_dirty = True
+                            resp = f"✅ dca_pct set to {DCA_PCT:.2f}%"
+                        except Exception:
+                            resp = "⛔ 사용법: /dca_pct 2.5"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] dca_pct cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/dca1", "dca1")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("status", "help"):
+                        resp = f"ℹ️ dca1: {DCA_FIRST_PCT:.2f}%\n사용법: /dca1 30"
+                    else:
+                        try:
+                            val = float(arg)
+                            if val <= 0:
+                                raise ValueError("non-positive")
+                            DCA_FIRST_PCT = float(val)
+                            if executor_mod:
+                                executor_mod.DCA_FIRST_PCT = DCA_FIRST_PCT
+                            state["_dca_first_pct"] = DCA_FIRST_PCT
+                            state_dirty = True
+                            resp = f"✅ dca1 set to {DCA_FIRST_PCT:.2f}%"
+                        except Exception:
+                            resp = "⛔ 사용법: /dca1 30"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] dca1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/dca2", "dca2")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("status", "help"):
+                        resp = f"ℹ️ dca2: {DCA_SECOND_PCT:.2f}%\n사용법: /dca2 30"
+                    else:
+                        try:
+                            val = float(arg)
+                            if val <= 0:
+                                raise ValueError("non-positive")
+                            DCA_SECOND_PCT = float(val)
+                            if executor_mod:
+                                executor_mod.DCA_SECOND_PCT = DCA_SECOND_PCT
+                            state["_dca_second_pct"] = DCA_SECOND_PCT
+                            state_dirty = True
+                            resp = f"✅ dca2 set to {DCA_SECOND_PCT:.2f}%"
+                        except Exception:
+                            resp = "⛔ 사용법: /dca2 30"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] dca2 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/dca3", "dca3")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("status", "help"):
+                        resp = f"ℹ️ dca3: {DCA_THIRD_PCT:.2f}%\n사용법: /dca3 30"
+                    else:
+                        try:
+                            val = float(arg)
+                            if val <= 0:
+                                raise ValueError("non-positive")
+                            DCA_THIRD_PCT = float(val)
+                            if executor_mod:
+                                executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
+                            state["_dca_third_pct"] = DCA_THIRD_PCT
+                            state_dirty = True
+                            resp = f"✅ dca3 set to {DCA_THIRD_PCT:.2f}%"
+                        except Exception:
+                            resp = "⛔ 사용법: /dca3 30"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] dca3 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/exit_cd_h", "exit_cd_h")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("status", "help"):
+                        resp = f"ℹ️ exit_cd_h: {EXIT_COOLDOWN_HOURS:.2f}h\n사용법: /exit_cd_h 2"
+                    else:
+                        try:
+                            val = float(arg)
+                            if val <= 0:
+                                raise ValueError("non-positive")
+                            EXIT_COOLDOWN_HOURS = float(val)
+                            EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+                            state["_exit_cooldown_hours"] = EXIT_COOLDOWN_HOURS
+                            state_dirty = True
+                            resp = f"✅ exit_cd_h set to {EXIT_COOLDOWN_HOURS:.2f}h"
+                        except Exception:
+                            resp = "⛔ 사용법: /exit_cd_h 2"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] exit_cd_h cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/long_live", "long_live")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -6278,6 +6490,26 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] div15m_short cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/rsi", "rsi")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        RSI_ENABLED = True
+                        state["_rsi_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ rsi ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        RSI_ENABLED = False
+                        state["_rsi_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ rsi OFF"
+                    else:
+                        resp = f"ℹ️ rsi 상태: {'ON' if RSI_ENABLED else 'OFF'}\n사용법: /rsi on|off|status"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] rsi cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/dtfx", "dtfx")) and not responded:
                     parts = lower.split()
@@ -6522,7 +6754,8 @@ MANAGE_EXIT_COOLDOWN_SEC: int = 5  # auto-exit 전용 최소 평가 주기(초)
 MANAGE_PING_COOLDOWN_SEC: int = 7200  # manage 알림 주기(초) - 2시간
 MANUAL_CLOSE_GRACE_SEC: int = 60  # 진입 직후 포지션 캐시 오차로 인한 오탐 방지
 AUTO_EXIT_GRACE_SEC: int = 30     # 진입 직후 자동청산 금지 구간
-EXIT_COOLDOWN_SEC: int = 7200     # 청산 후 재진입 쿨다운(초)
+EXIT_COOLDOWN_HOURS: float = 2.0  # 청산 후 재진입 쿨다운(시간)
+EXIT_COOLDOWN_SEC: int = int(EXIT_COOLDOWN_HOURS * 3600)  # 청산 후 재진입 쿨다운(초)
 MANAGE_LOOP_ENABLED: bool = True  # 관리 루프 분리 실행 여부
 MANAGE_LOOP_SLEEP_SEC: float = 2.0  # 관리 루프 주기(초)
 MANAGE_TICKER_TTL_SEC: float = 5.0  # 관리 루프 티커 캐시 TTL(초)
@@ -6555,6 +6788,7 @@ ATLAS_RS_FAIL_SHORT_ENABLED = False
 DIV15M_LONG_ENABLED = True
 DIV15M_SHORT_ENABLED = True
 ONLY_DIV15M_SHORT = False
+RSI_ENABLED = True
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
@@ -6767,6 +7001,12 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_long_live",
                 "_max_open_positions",
                 "_entry_usdt",
+                "_dca_enabled",
+                "_dca_pct",
+                "_dca_first_pct",
+                "_dca_second_pct",
+                "_dca_third_pct",
+                "_exit_cooldown_hours",
                 "_atlas_fabio_enabled",
                 "_swaggy_enabled",
                 "_swaggy_atlas_lab_enabled",
@@ -6774,13 +7014,16 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_pumpfade_enabled",
                 "_div15m_long_enabled",
                 "_div15m_short_enabled",
+                "_rsi_enabled",
                 "_runtime_cfg_ts",
             ]
             for key in runtime_keys:
                 if key in disk:
                     state[key] = disk.get(key)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    tmp_path = f"{STATE_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, STATE_FILE)
 
 def run():
     # 전역 백오프 변수는 run 스코프에서 재할당 하므로 선 선언 필요
@@ -6818,8 +7061,9 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT
-    global USDT_PER_TRADE
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
     state["_auto_exit"] = AUTO_EXIT_ENABLED
@@ -6846,6 +7090,45 @@ def run():
         DIV15M_SHORT_ENABLED = bool(state.get("_div15m_short_enabled"))
     else:
         state["_div15m_short_enabled"] = DIV15M_SHORT_ENABLED
+    if isinstance(state.get("_dca_enabled"), bool):
+        DCA_ENABLED = bool(state.get("_dca_enabled"))
+        if executor_mod:
+            executor_mod.DCA_ENABLED = DCA_ENABLED
+    else:
+        state["_dca_enabled"] = DCA_ENABLED
+    if isinstance(state.get("_dca_pct"), (int, float)):
+        DCA_PCT = float(state.get("_dca_pct"))
+        if executor_mod:
+            executor_mod.DCA_PCT = DCA_PCT
+    else:
+        state["_dca_pct"] = DCA_PCT
+    if isinstance(state.get("_dca_first_pct"), (int, float)):
+        DCA_FIRST_PCT = float(state.get("_dca_first_pct"))
+        if executor_mod:
+            executor_mod.DCA_FIRST_PCT = DCA_FIRST_PCT
+    else:
+        state["_dca_first_pct"] = DCA_FIRST_PCT
+    if isinstance(state.get("_dca_second_pct"), (int, float)):
+        DCA_SECOND_PCT = float(state.get("_dca_second_pct"))
+        if executor_mod:
+            executor_mod.DCA_SECOND_PCT = DCA_SECOND_PCT
+    else:
+        state["_dca_second_pct"] = DCA_SECOND_PCT
+    if isinstance(state.get("_dca_third_pct"), (int, float)):
+        DCA_THIRD_PCT = float(state.get("_dca_third_pct"))
+        if executor_mod:
+            executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
+    else:
+        state["_dca_third_pct"] = DCA_THIRD_PCT
+    if isinstance(state.get("_exit_cooldown_hours"), (int, float)):
+        EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
+        EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+    else:
+        state["_exit_cooldown_hours"] = EXIT_COOLDOWN_HOURS
+    if isinstance(state.get("_rsi_enabled"), bool):
+        RSI_ENABLED = bool(state.get("_rsi_enabled"))
+    else:
+        state["_rsi_enabled"] = RSI_ENABLED
     FABIO_ENABLED = False
     state["_fabio_enabled"] = False
     if isinstance(state.get("_atlas_fabio_enabled"), bool):
@@ -6872,6 +7155,7 @@ def run():
         ONLY_DIV15M_SHORT = True
         DIV15M_LONG_ENABLED = False
         DIV15M_SHORT_ENABLED = True
+        RSI_ENABLED = False
         DTFX_ENABLED = False
         PUMPFADE_ENABLED = False
         ATLAS_RS_FAIL_SHORT_ENABLED = False
@@ -6879,6 +7163,7 @@ def run():
         ATLAS_FABIO_ENABLED = False
         state["_div15m_long_enabled"] = False
         state["_div15m_short_enabled"] = True
+        state["_rsi_enabled"] = False
         state["_dtfx_enabled"] = False
         state["_pumpfade_enabled"] = False
         state["_atlas_rs_fail_short_enabled"] = False
@@ -6933,7 +7218,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -7048,7 +7333,7 @@ def run():
             cycle_label = f"{base_label}-RT{realtime_count}"
             print(f"\n[사이클 {cycle_label}] (동일 캔들) realtime only (heavy_scan=N)")
         cycle_start = time.time()
-        run_rsi_short = not ONLY_DIV15M_SHORT
+        run_rsi_short = bool(RSI_ENABLED and (not ONLY_DIV15M_SHORT))
         run_div15m_long = bool((not ONLY_DIV15M_SHORT) and DIV15M_LONG_ENABLED and div15m_engine)
         run_div15m_short = bool(div15m_short_engine and (DIV15M_SHORT_ENABLED or ONLY_DIV15M_SHORT))
         # 기존 Manage/SYNC는 Universe 생성 후로 이동하여 universe 심볼도 포함
@@ -7186,7 +7471,18 @@ def run():
             swaggy_universe = swaggy_engine.build_universe(ctx)
             state["_swaggy_universe"] = swaggy_universe
         elif SWAGGY_ATLAS_LAB_ENABLED:
-            swaggy_universe = list(shared_universe)
+            dtfx_cfg = dtfx_cfg if dtfx_cfg else DTFXConfig()
+            min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
+            anchors = []
+            for s in dtfx_cfg.anchor_symbols or []:
+                anchors.append(s if "/" in s else f"{s}/USDT:USDT")
+            swaggy_universe = build_universe_from_tickers(
+                tickers,
+                symbols=symbols,
+                min_quote_volume_usdt=min_qv,
+                top_n=dtfx_cfg.universe_top_n,
+                anchors=tuple(anchors),
+            )
             state["_swaggy_universe"] = swaggy_universe
         if SWAGGY_ATLAS_LAB_ENABLED and SwaggyAtlasLabConfig and SwaggyAtlasLabAtlasConfig:
             swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig()
@@ -7423,6 +7719,8 @@ def run():
         # SLOW TF (4h/1d) - TTL
         if fabio_cfg:
             slow_plan["4h"] = max(slow_plan.get("4h", 0), int(fabio_cfg.limit))
+        if atlas_cfg:
+            slow_plan["1d"] = max(slow_plan.get("1d", 0), int(getattr(atlas_cfg, "d1_limit", 90)))
         if swaggy_cfg:
             slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
         if swaggy_atlas_lab_cfg:
@@ -7787,11 +8085,6 @@ def run():
             if cur_total >= MAX_OPEN_POSITIONS:
                 if not pos_limit_logged:
                     print(f"[제한] 동시 포지션 {cur_total}/{MAX_OPEN_POSITIONS} → 신규 진입 스킵")
-                    _append_entry_gate_log(
-                        "system",
-                        "ALL",
-                        f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS}",
-                    )
                     pos_limit_logged = True
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue

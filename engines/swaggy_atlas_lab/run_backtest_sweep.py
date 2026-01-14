@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--fee", type=float, default=0.0)
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
+    parser.add_argument("--cooldown-min", type=int, default=0)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -63,6 +64,8 @@ def main() -> None:
         "--anchor",
         args.anchor,
     ]
+    if args.cooldown_min and args.cooldown_min > 0:
+        base_cmd.extend(["--cooldown-min", str(args.cooldown_min)])
     if args.symbols:
         base_cmd.extend(["--symbols", args.symbols])
     if args.symbols_file:
