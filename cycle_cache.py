@@ -51,16 +51,18 @@ def set_fetcher(fetcher: Optional[Callable[[str, str, int], Optional[list]]]) ->
     FETCHER = fetcher
 
 
-def get_df(symbol: str, tf: str, limit: int) -> pd.DataFrame:
+def get_df(symbol: str, tf: str, limit: int, force: bool = False) -> pd.DataFrame:
     key = (symbol, tf, limit)
-    cached = DF_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if not force:
+        cached = DF_CACHE.get(key)
+        if cached is not None:
+            return cached
     raw = get_raw(symbol, tf)
-    if not raw and FETCHER:
-        raw = FETCHER(symbol, tf, limit)
-        if raw:
-            set_raw(symbol, tf, raw)
+    if force or not raw:
+        if FETCHER:
+            raw = FETCHER(symbol, tf, limit)
+            if raw:
+                set_raw(symbol, tf, raw)
     if not raw:
         return pd.DataFrame()
     sliced = raw[-limit:] if len(raw) >= limit else raw

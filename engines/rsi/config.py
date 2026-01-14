@@ -12,8 +12,8 @@ class RsiConfig:
     rsi3m_downturn_threshold: float = 80.0
     rsi3m_spike_threshold: float = 85.0
     tf_check_order: List[str] = field(default_factory=lambda: ["1h", "15m", "5m", "3m"])
-    min_quote_volume_usdt: float = 30_000_000.0
-    universe_top_n: Optional[int] = 40
+    min_quote_volume_usdt: float = 8_000_000.0
+    universe_top_n: Optional[int] = 50
     anchors: List[str] = field(default_factory=lambda: ["BTC/USDT:USDT", "ETH/USDT:USDT"])
     vol_surge_lookback: int = 20
     vol_surge_mult: float = 1.1

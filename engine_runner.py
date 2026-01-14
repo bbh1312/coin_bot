@@ -20,6 +20,7 @@ import threading
 import builtins
 import sys
 import traceback
+import importlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List, Any
 
@@ -506,6 +507,48 @@ def _entry_seen_acquire(
         seen[key_side] = {"ts": now, "engine": engine}
         seen[key_engine] = {"ts": now, "engine": engine}
     return True, "ok"
+
+
+def _entry_seen_mark(state: Dict[str, dict], symbol: str, side: str, engine: str) -> None:
+    now = time.time()
+    side = (side or "").upper()
+    engine = (engine or "unknown").lower()
+    key_side = f"{symbol}|{side}"
+    key_engine = f"{symbol}|{side}|{engine}"
+    with _ENTRY_SEEN_MUTEX:
+        seen = _get_entry_seen(state)
+        seen[key_side] = {"ts": now, "engine": engine}
+        seen[key_engine] = {"ts": now, "engine": engine}
+
+
+def _entry_seen_blocked(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    engine: str,
+    ttl_sec: float = 60.0,
+) -> bool:
+    now = time.time()
+    side = (side or "").upper()
+    engine = (engine or "unknown").lower()
+    key_side = f"{symbol}|{side}"
+    key_engine = f"{symbol}|{side}|{engine}"
+    with _ENTRY_SEEN_MUTEX:
+        seen = _get_entry_seen(state)
+        for key in (key_side, key_engine):
+            rec = seen.get(key)
+            if isinstance(rec, dict):
+                ts = float(rec.get("ts", 0.0) or 0.0)
+                if (now - ts) < ttl_sec:
+                    blocked_by = str(rec.get("engine") or "unknown")
+                    log_key = f"{key}|{blocked_by}"
+                    log_cache = _get_entry_seen_log(state)
+                    last_log_ts = float(log_cache.get(log_key, 0.0) or 0.0)
+                    if (now - last_log_ts) >= ttl_sec:
+                        _append_entry_gate_log(engine, symbol, f"중복차단=entry_seen_by:{blocked_by} side={side}", side=side)
+                        log_cache[log_key] = now
+                    return True
+    return False
 
 def _append_entry_log(path: str, line: str) -> None:
     try:
@@ -2071,14 +2114,11 @@ def _run_atlas_fabio_cycle(
             _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_LOCK")
             print(f"[ENTRY-LOCK] sym={symbol} owner=atlasfabio ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
             continue
-        seen_ok, seen_by = _entry_seen_acquire(state, symbol, side, "atlasfabio")
-        if not seen_ok:
+        if _entry_seen_blocked(state, symbol, side, "atlasfabio"):
             funnel["entry_lock_skip"] += 1
             _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_SEEN")
-            print(f"[ENTRY-SEEN] sym={symbol} side={side} engine=atlasfabio blocked_by={seen_by}")
             _entry_lock_release(state, symbol, owner="atlasfabio")
             continue
-
         entry_line = (
             "ATLASFABIO_ENTRY sym=%s side=%s pass=Y strength=%.2f atlas_mult=%.2f strength_mult=%.2f final_usdt=%.2f reasons=%s"
             % (symbol, side, strength, size_mult, strength_mult, final_usdt, reasons)
@@ -2148,6 +2188,7 @@ def _run_atlas_fabio_cycle(
                         qty = res.get("amount") or res.get("order", {}).get("amount")
                         if res.get("order") or res.get("status") in ("ok", "dry_run"):
                             funnel["entry_order_ok"] += 1
+                            _entry_seen_mark(state, symbol, "LONG", "atlasfabio")
                         st = state.get(symbol, {})
                         st["in_pos"] = True
                         st["last_entry"] = time.time()
@@ -2230,6 +2271,8 @@ def _run_atlas_fabio_cycle(
                     st["last_entry"] = time.time()
                     funnel["entry_order_ok"] += 1
                     state[symbol] = st
+                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
+                        _entry_seen_mark(state, symbol, "SHORT", "atlasfabio")
                     _log_trade_entry(
                         state,
                         side="SHORT",
@@ -2403,12 +2446,11 @@ def _run_dtfx_cycle(
                 _entry_lock_release(state, symbol, owner="dtfx")
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
+            if _entry_seen_blocked(state, symbol, side, "dtfx"):
+                _entry_lock_release(state, symbol, owner="dtfx")
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
             try:
-                seen_ok, seen_by = _entry_seen_acquire(state, symbol, side, "dtfx")
-                if not seen_ok:
-                    print(f"[ENTRY-SEEN] sym={symbol} side={side} engine=dtfx blocked_by={seen_by}")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
                 if side == "LONG":
                     res = long_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
                     entry_order_id = _order_id_from_res(res)
@@ -2417,6 +2459,8 @@ def _run_dtfx_cycle(
                     result["long_hits"] += 1
                     st["last_entry"] = time.time()
                     state[symbol] = st
+                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
+                        _entry_seen_mark(state, symbol, "LONG", "dtfx")
                     _log_trade_entry(
                         state,
                         side="LONG",
@@ -2475,6 +2519,8 @@ def _run_dtfx_cycle(
                     st["in_pos"] = True
                     st["last_entry"] = time.time()
                     state[symbol] = st
+                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
+                        _entry_seen_mark(state, symbol, "SHORT", "dtfx")
                     _log_trade_entry(
                         state,
                         side="SHORT",
@@ -2734,9 +2780,7 @@ def _run_pumpfade_cycle(
                     print(f"[pumpfade] 숏 중복 차단 ({symbol})")
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
-                seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "pumpfade")
-                if not seen_ok:
-                    print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=pumpfade blocked_by={seen_by}")
+                if _entry_seen_blocked(state, symbol, "SHORT", "pumpfade"):
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
                 try:
@@ -2750,6 +2794,7 @@ def _run_pumpfade_cycle(
                     status = res.get("status")
                     order_info = f"market usdt={entry_usdt} status={status}"
                     if status in ("ok",) and order_id:
+                        _entry_seen_mark(state, symbol, "SHORT", "pumpfade")
                         pf["pending_order_id"] = None
                         pf["pending_deadline_ts"] = None
                         pf["last_retest_hh"] = hh_n if isinstance(hh_n, (int, float)) else last_hh
@@ -2762,6 +2807,7 @@ def _run_pumpfade_cycle(
                         st["in_pos"] = True
                         st["last_entry"] = time.time()
                         state[symbol] = st
+                        _entry_seen_mark(state, symbol, "SHORT", "pumpfade")
                         _log_trade_entry(
                             state,
                             side="SHORT",
@@ -4453,6 +4499,31 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         CHAT_ID_RUNTIME = str(state.get("_chat_id"))
     if isinstance(state.get("_manage_ws_mode"), bool):
         MANAGE_WS_MODE = bool(state.get("_manage_ws_mode"))
+    _maybe_reload_rsi_config()
+
+_RSI_CONFIG_MTIME: Optional[float] = None
+
+def _maybe_reload_rsi_config() -> None:
+    global _RSI_CONFIG_MTIME, rsi_engine
+    try:
+        cfg_path = os.path.join(os.path.dirname(__file__), "engines", "rsi", "config.py")
+        mtime = os.path.getmtime(cfg_path)
+    except Exception:
+        return
+    if _RSI_CONFIG_MTIME is None:
+        _RSI_CONFIG_MTIME = mtime
+        return
+    if mtime <= _RSI_CONFIG_MTIME:
+        return
+    try:
+        import engines.rsi.config as rsi_config
+        importlib.reload(rsi_config)
+        if rsi_engine:
+            rsi_engine.config = rsi_config.RsiConfig()
+        print(f"[config] rsi_config reloaded mtime={mtime:.0f}")
+    except Exception as e:
+        print(f"[config] rsi_config reload failed: {e}")
+    _RSI_CONFIG_MTIME = mtime
 
 def _save_runtime_settings_only(state: dict) -> None:
     disk = load_state()
@@ -7056,12 +7127,10 @@ def run():
                         print(f"[entry] 숏 중복 차단 ({symbol})")
                         time.sleep(PER_SYMBOL_SLEEP)
                         continue
+                    if _entry_seen_blocked(state, symbol, "SHORT", "rsi"):
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
                     try:
-                        seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "rsi")
-                        if not seen_ok:
-                            print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=rsi blocked_by={seen_by}")
-                            time.sleep(PER_SYMBOL_SLEEP)
-                            continue
                         res = short_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
                         entry_order_id = _order_id_from_res(res)
                         # 알림용 간략 정보
@@ -7073,40 +7142,42 @@ def run():
                         entry_price_disp = fill_price
                         state[symbol]["in_pos"] = True
                         active_positions += 1
-                        _log_trade_entry(
-                            state,
-                            side="SHORT",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                            qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=_resolve_entry_usdt(),
-                            entry_order_id=entry_order_id,
-                            meta={"reason": "short_entry"},
-                        )
-                        date_tag = time.strftime("%Y%m%d")
-                        _append_entry_log(
-                            f"rsi/rsi_entries_{date_tag}.log",
-                            "engine=rsi side=SHORT symbol=%s price=%s qty=%s usdt=%s "
-                            "rsi1h=%s rsi15=%s rsi5=%s rsi3=%s "
-                            "down5=%s down3=%s vol=%s struct=%s spike=%s structr=%s"
-                            % (
-                                symbol,
-                                f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
-                                f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
-                                f"{_resolve_entry_usdt():.2f}",
-                                f"{rsis.get('1h', 0):.2f}" if isinstance(rsis.get("1h"), (int, float)) else "N/A",
-                                f"{rsis.get('15m', 0):.2f}" if isinstance(rsis.get("15m"), (int, float)) else "N/A",
-                                f"{rsis.get('5m', 0):.2f}" if isinstance(rsis.get("5m"), (int, float)) else "N/A",
-                                f"{rsis.get('3m', 0):.2f}" if isinstance(rsis.get("3m"), (int, float)) else "N/A",
-                                "Y" if rsi5m_downturn else "N",
-                                "Y" if rsi3m_downturn else "N",
-                                "Y" if vol_ok else "N",
-                                "Y" if struct_ok else "N",
-                                "Y" if spike_ready else "N",
-                                "Y" if struct_ready else "N",
-                            ),
-                        )
+                        if res.get("order") or res.get("status") in ("ok", "dry_run"):
+                            _entry_seen_mark(state, symbol, "SHORT", "rsi")
+                            _log_trade_entry(
+                                state,
+                                side="SHORT",
+                                symbol=symbol,
+                                entry_ts=time.time(),
+                                entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                                qty=qty if isinstance(qty, (int, float)) else None,
+                                usdt=_resolve_entry_usdt(),
+                                entry_order_id=entry_order_id,
+                                meta={"reason": "short_entry"},
+                            )
+                            date_tag = time.strftime("%Y%m%d")
+                            _append_entry_log(
+                                f"rsi/rsi_entries_{date_tag}.log",
+                                "engine=rsi side=SHORT symbol=%s price=%s qty=%s usdt=%s "
+                                "rsi1h=%s rsi15=%s rsi5=%s rsi3=%s "
+                                "down5=%s down3=%s vol=%s struct=%s spike=%s structr=%s"
+                                % (
+                                    symbol,
+                                    f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
+                                    f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
+                                    f"{_resolve_entry_usdt():.2f}",
+                                    f"{rsis.get('1h', 0):.2f}" if isinstance(rsis.get("1h"), (int, float)) else "N/A",
+                                    f"{rsis.get('15m', 0):.2f}" if isinstance(rsis.get("15m"), (int, float)) else "N/A",
+                                    f"{rsis.get('5m', 0):.2f}" if isinstance(rsis.get("5m"), (int, float)) else "N/A",
+                                    f"{rsis.get('3m', 0):.2f}" if isinstance(rsis.get("3m"), (int, float)) else "N/A",
+                                    "Y" if rsi5m_downturn else "N",
+                                    "Y" if rsi3m_downturn else "N",
+                                    "Y" if vol_ok else "N",
+                                    "Y" if struct_ok else "N",
+                                    "Y" if spike_ready else "N",
+                                    "Y" if struct_ready else "N",
+                                ),
+                            )
                     except Exception as e:
                         order_info = f"order_error: {e}"
                     finally:
@@ -7246,12 +7317,10 @@ def run():
                     print(f"[entry] 롱 중복 차단 ({symbol})")
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
+                if _entry_seen_blocked(state, symbol, "LONG", "div15m"):
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
                 try:
-                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "LONG", "div15m")
-                    if not seen_ok:
-                        print(f"[ENTRY-SEEN] sym={symbol} side=LONG engine=div15m blocked_by={seen_by}")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
                     res = long_market(
                         symbol,
                         usdt_amount=_resolve_entry_usdt(),
@@ -7268,6 +7337,8 @@ def run():
                     st["in_pos"] = True
                     st["last_entry"] = time.time()
                     state[symbol] = st
+                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
+                        _entry_seen_mark(state, symbol, "LONG", "div15m")
                     _log_trade_entry(
                         state,
                         side="LONG",
@@ -7436,12 +7507,10 @@ def run():
                     print(f"[entry] 숏 중복 차단 ({symbol})")
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
+                if _entry_seen_blocked(state, symbol, "SHORT", "div15m_short"):
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
                 try:
-                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "div15m_short")
-                    if not seen_ok:
-                        print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=div15m_short blocked_by={seen_by}")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
                     res = short_market(
                         symbol,
                         usdt_amount=_resolve_entry_usdt(),
@@ -7455,6 +7524,8 @@ def run():
                         f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
                     )
                     entry_price_disp = fill_price
+                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
+                        _entry_seen_mark(state, symbol, "SHORT", "div15m_short")
                     st["in_pos"] = True
                     _log_trade_entry(
                         state,

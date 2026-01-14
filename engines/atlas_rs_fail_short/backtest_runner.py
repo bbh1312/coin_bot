@@ -448,7 +448,10 @@ def main():
         )
     engine = AtlasRsFailShortEngine(cfg)
     tickers = exchange.fetch_tickers()
-    state = {"_tickers": tickers, "_symbols": list(tickers.keys())}
+    state = {
+        "_tickers": tickers,
+        "_symbols": list(tickers.keys()),
+    }
     ctx = EngineContext(exchange=exchange, state=state, now_ts=time.time(), logger=lambda *_: None, config=cfg)
     engine.on_start(ctx)
     symbols = engine.build_universe(ctx)
@@ -457,6 +460,10 @@ def main():
         return
     if isinstance(args.max_symbols, int) and args.max_symbols > 0:
         symbols = symbols[: args.max_symbols]
+    _log_summary(
+        f"[BACKTEST] universe_count={len(symbols)} symbols={','.join(symbols)}",
+        log_path,
+    )
 
     def _normalize_out(path: str) -> str:
         if not path:

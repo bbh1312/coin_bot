@@ -7,7 +7,7 @@ from typing import Set
 @dataclass
 class AtlasRsFailShortConfig:
     ltf_tf: str = "15m"
-    ltf_limit: int = 200
+    ltf_limit: int = 300
 
     # Atlas gate
     min_score: float = 50.0

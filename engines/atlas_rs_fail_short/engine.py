@@ -28,13 +28,40 @@ class AtlasRsFailShortEngine(BaseEngine):
         self.config = config or AtlasRsFailShortConfig()
 
     def build_universe(self, ctx: EngineContext) -> list[str]:
-        shared = ctx.state.get("_universe")
         tickers = ctx.state.get("_tickers")
-        if isinstance(shared, list) and shared:
-            return list(shared)
-        if isinstance(tickers, dict):
-            return list(tickers.keys())
-        return []
+        if not isinstance(tickers, dict):
+            return []
+        min_qv = 8_000_000.0
+        exclude_top_abs = 20
+        exclude_top_qv = 20
+        top_by_qv = 30
+        pct_map = {}
+        qv_map = {}
+        for sym, t in tickers.items():
+            if not t:
+                continue
+            qv = t.get("quoteVolume")
+            pct = t.get("percentage")
+            if qv is None or pct is None:
+                continue
+            try:
+                qv_val = float(qv)
+                pct_val = float(pct)
+            except Exception:
+                continue
+            if qv_val < min_qv:
+                continue
+            qv_map[sym] = qv_val
+            pct_map[sym] = pct_val
+        if not qv_map:
+            return []
+        sorted_abs = sorted(pct_map.items(), key=lambda x: abs(x[1]), reverse=True)
+        excluded = {sym for sym, _ in sorted_abs[:exclude_top_abs]}
+        candidates = [(sym, qv) for sym, qv in qv_map.items() if sym not in excluded]
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        if exclude_top_qv > 0:
+            candidates = candidates[exclude_top_qv:]
+        return [sym for sym, _ in candidates[:top_by_qv]]
 
     def on_tick(self, ctx: EngineContext, symbol: str) -> Optional[Signal]:
         sig = self.evaluate_symbol(ctx, symbol)
@@ -169,12 +196,34 @@ class AtlasRsFailShortEngine(BaseEngine):
 
         # 공통 재진입 쿨다운만 사용
 
+        min_bars_ready = max(cfg.ema_len + 5, 40)
+        cached_hit = False
+        try:
+            cached_hit = cycle_cache.get_raw(symbol, cfg.ltf_tf) is not None
+        except Exception:
+            cached_hit = False
         df_ltf = cycle_cache.get_df(symbol, cfg.ltf_tf, cfg.ltf_limit)
-        if df_ltf.empty or len(df_ltf) < max(cfg.ema_len + 5, 40):
-            return _blocked("DATA_MISSING")
+        if df_ltf is None or df_ltf.empty or len(df_ltf) < min_bars_ready:
+            _blocked(f"DATA_MISSING len={0 if df_ltf is None else len(df_ltf)} limit={cfg.ltf_limit} cached={1 if cached_hit else 0}")
+            df_retry = None
+            try:
+                df_retry = cycle_cache.get_df(symbol, cfg.ltf_tf, cfg.ltf_limit, force=True)
+            except Exception:
+                df_retry = None
+            if df_retry is None or df_retry.empty or len(df_retry) < min_bars_ready:
+                return _blocked("DATA_MISSING")
+            df_ltf = df_retry
         df_ltf = df_ltf.iloc[:-1]
-        if df_ltf.empty or len(df_ltf) < max(cfg.ema_len + 5, 40):
-            return _blocked("DATA_MISSING")
+        if df_ltf.empty or len(df_ltf) < min_bars_ready:
+            _blocked(f"DATA_MISSING len={len(df_ltf)} limit={cfg.ltf_limit} cached={1 if cached_hit else 0}")
+            df_retry = None
+            try:
+                df_retry = cycle_cache.get_df(symbol, cfg.ltf_tf, cfg.ltf_limit, force=True)
+            except Exception:
+                df_retry = None
+            if df_retry is None or df_retry.empty or len(df_retry) < min_bars_ready:
+                return _blocked("DATA_MISSING")
+            df_ltf = df_retry.iloc[:-1]
         last_ts = int(df_ltf["ts"].iloc[-1])
         if last_ts == rec.get("last_bar_ts"):
             return None
