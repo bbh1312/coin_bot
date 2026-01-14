@@ -500,7 +500,7 @@ def _entry_seen_acquire(
                     log_cache = _get_entry_seen_log(state)
                     last_log_ts = float(log_cache.get(log_key, 0.0) or 0.0)
                     if (now - last_log_ts) >= ttl_sec:
-                        _append_entry_gate_log(engine, symbol, f"중복차단=entry_seen_by:{blocked_by} side={side}")
+                        _append_entry_gate_log(engine, symbol, f"중복차단=entry_seen_by:{blocked_by} side={side}", side=side)
                         log_cache[log_key] = now
                     return False, blocked_by
         seen[key_side] = {"ts": now, "engine": engine}
@@ -517,12 +517,14 @@ def _append_entry_log(path: str, line: str) -> None:
     except Exception:
         pass
 
-def _append_entry_gate_log(engine: str, symbol: str, reason: str) -> None:
+def _append_entry_gate_log(engine: str, symbol: str, reason: str, side: Optional[str] = None) -> None:
     try:
         date_tag = time.strftime("%Y-%m-%d")
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         path = os.path.join("entry_gate", f"entry_gate-{date_tag}.log")
         line = f"{ts} engine={engine or 'unknown'} symbol={symbol} reason={reason or 'unknown'}"
+        if side and "side=" not in line:
+            line = f"{line} side={side}"
         _append_log_lines(path, [line])
     except Exception:
         pass
@@ -603,6 +605,248 @@ def _append_swaggy_atlas_lab_log(line: str) -> None:
     path = os.path.join("swaggy_atlas_lab", f"swaggy_atlas_lab-{date_tag}.log")
     _append_log_lines(path, [line])
 
+def _run_swaggy_atlas_lab_cycle(
+    swaggy_atlas_lab_engine,
+    swaggy_universe,
+    cached_ex,
+    state,
+    swaggy_cfg,
+    atlas_cfg,
+    active_positions_total,
+    send_alert,
+):
+    result = {"long_hits": 0, "short_hits": 0}
+    if (not SWAGGY_ATLAS_LAB_ENABLED) or (not swaggy_atlas_lab_engine) or (not swaggy_cfg) or (not atlas_cfg):
+        return result
+    if not swaggy_universe:
+        return result
+
+    now_ts = time.time()
+    btc_df = cycle_cache.get_df(atlas_cfg.ref_symbol, swaggy_cfg.tf_mtf, limit=200)
+    if btc_df is None:
+        btc_df = pd.DataFrame()
+
+    ltf_limit = max(int(swaggy_cfg.ltf_limit), 120)
+    mtf_limit = 200
+    htf_limit = max(int(swaggy_cfg.vp_lookback_1h), 120)
+    htf2_limit = 200
+    d1_limit = 120
+
+    for symbol in swaggy_universe:
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if st.get("in_pos"):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            long_amt = get_long_position_amount(symbol)
+        except Exception:
+            long_amt = 0.0
+        try:
+            short_amt = get_short_position_amount(symbol)
+        except Exception:
+            short_amt = 0.0
+        if (long_amt > 0) or (short_amt > 0):
+            st["in_pos"] = True
+            st["last_entry"] = time.time()
+            state[symbol] = st
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        last_entry = float(st.get("last_entry", 0.0) or 0.0)
+        if (now_ts - last_entry) < COOLDOWN_SEC:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        df_5m = cycle_cache.get_df(symbol, swaggy_cfg.tf_ltf, limit=ltf_limit)
+        df_15m = cycle_cache.get_df(symbol, swaggy_cfg.tf_mtf, limit=mtf_limit)
+        df_1h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf, limit=htf_limit)
+        df_4h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf2, limit=htf2_limit)
+        df_1d = cycle_cache.get_df(symbol, swaggy_cfg.tf_d1, limit=d1_limit)
+        if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        prev_phase = swaggy_atlas_lab_engine._state.get(symbol, {}).get("phase")
+        signal = swaggy_atlas_lab_engine.evaluate_symbol(
+            symbol,
+            df_4h,
+            df_1h,
+            df_15m,
+            df_5m,
+            df_1d if isinstance(df_1d, pd.DataFrame) else pd.DataFrame(),
+            now_ts,
+        )
+        new_phase = swaggy_atlas_lab_engine._state.get(symbol, {}).get("phase")
+        if prev_phase != new_phase and new_phase:
+            _append_swaggy_atlas_lab_log(
+                "SWAGGY_ATLAS_LAB_PHASE sym=%s prev=%s now=%s reasons=%s"
+                % (symbol, prev_phase, new_phase, ",".join(signal.reasons or []))
+            )
+
+        if not signal.entry_ok or not signal.side or signal.entry_px is None:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        side = signal.side.upper()
+        if _exit_cooldown_blocked(state, symbol, "swaggy_atlas_lab", side):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        gate = None
+        atlas = None
+        if lab_evaluate_global_gate and lab_evaluate_local and not btc_df.empty:
+            gate = lab_evaluate_global_gate(btc_df, atlas_cfg)
+            atlas = lab_evaluate_local(symbol, side, df_15m, btc_df, gate, atlas_cfg)
+        policy = lab_apply_policy(SwaggyAtlasLabMode.HARD, USDT_PER_TRADE, atlas) if lab_apply_policy else None
+        if policy is None:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        entry_line = (
+            "SWAGGY_ATLAS_LAB_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
+            "final_usdt=%.2f atlas_pass=%s atlas_mult=%s atlas_reasons=%s policy_action=%s"
+            % (
+                symbol,
+                side,
+                float(signal.strength or 0.0),
+                ",".join(signal.reasons or []),
+                float(policy.final_usdt or 0.0),
+                policy.atlas_pass if policy.atlas_pass is not None else "N/A",
+                policy.atlas_mult if policy.atlas_mult is not None else "N/A",
+                ",".join(policy.atlas_reasons or []),
+                policy.policy_action or "N/A",
+            )
+        )
+        _append_swaggy_atlas_lab_log(entry_line)
+        if not policy.allow:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        cur_total = count_open_positions(force=True)
+        if not isinstance(cur_total, int):
+            cur_total = active_positions_total
+        if cur_total >= MAX_OPEN_POSITIONS:
+            _append_entry_gate_log(
+                "swaggy_atlas_lab",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+                side=side,
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_atlas_lab", side=side)
+        if not lock_ok:
+            _append_swaggy_atlas_lab_log(
+                f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=ENTRY_LOCK owner={lock_owner} age_s={lock_age:.1f}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        guard_key = _entry_guard_key(state, symbol, side)
+        if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_atlas_lab", side=side):
+            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        entry_usdt = _resolve_entry_usdt(policy.final_usdt)
+        entry_order_id = None
+        fill_price = None
+        qty = None
+        try:
+            if side == "LONG":
+                if LONG_LIVE_TRADING:
+                    res = long_market(
+                        symbol,
+                        usdt_amount=entry_usdt,
+                        leverage=LEVERAGE,
+                        margin_mode=MARGIN_MODE,
+                    )
+                    entry_order_id = _order_id_from_res(res)
+                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
+                    qty = res.get("amount") or res.get("order", {}).get("amount")
+                    st["in_pos"] = True
+                    st["last_entry"] = time.time()
+                    state[symbol] = st
+                    _log_trade_entry(
+                        state,
+                        side="LONG",
+                        symbol=symbol,
+                        entry_ts=time.time(),
+                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                        qty=qty if isinstance(qty, (int, float)) else None,
+                        usdt=entry_usdt,
+                        entry_order_id=entry_order_id,
+                        meta={"reason": "swaggy_atlas_lab"},
+                    )
+                    result["long_hits"] += 1
+                else:
+                    result["long_hits"] += 1
+                if send_alert:
+                    _send_entry_alert(
+                        send_alert,
+                        side="LONG",
+                        symbol=symbol,
+                        engine="SWAGGY_ATLAS_LAB",
+                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                        usdt=entry_usdt,
+                        reason="SWAGGY_ATLAS_LAB",
+                        live=LONG_LIVE_TRADING,
+                        entry_order_id=entry_order_id,
+                        sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
+                        tp=None,
+                    )
+            else:
+                if LIVE_TRADING:
+                    res = short_market(
+                        symbol,
+                        usdt_amount=entry_usdt,
+                        leverage=LEVERAGE,
+                        margin_mode=MARGIN_MODE,
+                    )
+                    entry_order_id = _order_id_from_res(res)
+                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
+                    qty = res.get("amount") or res.get("order", {}).get("amount")
+                    st["in_pos"] = True
+                    st["last_entry"] = time.time()
+                    state[symbol] = st
+                    _log_trade_entry(
+                        state,
+                        side="SHORT",
+                        symbol=symbol,
+                        entry_ts=time.time(),
+                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                        qty=qty if isinstance(qty, (int, float)) else None,
+                        usdt=entry_usdt,
+                        entry_order_id=entry_order_id,
+                        meta={"reason": "swaggy_atlas_lab"},
+                    )
+                    result["short_hits"] += 1
+                else:
+                    result["short_hits"] += 1
+                if send_alert:
+                    _send_entry_alert(
+                        send_alert,
+                        side="SHORT",
+                        symbol=symbol,
+                        engine="SWAGGY_ATLAS_LAB",
+                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+                        usdt=entry_usdt,
+                        reason="SWAGGY_ATLAS_LAB",
+                        live=LIVE_TRADING,
+                        entry_order_id=entry_order_id,
+                        sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
+                        tp=None,
+                    )
+        except Exception as e:
+            _append_swaggy_atlas_lab_log(f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=EXCHANGE_ERROR {e}")
+        finally:
+            _entry_guard_release(state, symbol, key=guard_key)
+            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+
+        time.sleep(PER_SYMBOL_SLEEP)
+    return result
+
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
     cycle_ts = state.get("_current_cycle_ts")
     side = (side or "").upper()
@@ -643,6 +887,7 @@ def _atlasfabio_entry_gate(
                 "atlasfabio",
                 symbol,
                 f"포지션제한={active_positions}/{max_positions} side={side}",
+                side=side,
             )
             return False, "max_pos"
     return True, "ok"
@@ -670,7 +915,7 @@ def _entry_guard_acquire(
     gkey = key or symbol
     ts = float(guard.get(gkey, 0.0) or 0.0)
     if (now - ts) < ttl_sec:
-        _append_entry_gate_log(engine or "unknown", symbol, f"entry_guard_ttl side={side or 'N/A'}")
+        _append_entry_gate_log(engine or "unknown", symbol, f"entry_guard_ttl side={side or 'N/A'}", side=side)
         return False
     guard[gkey] = now
     return True
@@ -695,6 +940,7 @@ def _exit_cooldown_blocked(
             engine,
             symbol,
             f"청산쿨다운={int(ttl_sec)}s side={side}",
+            side=side,
         )
         return True
     return False
@@ -710,7 +956,13 @@ def _entry_guard_release(state: Dict[str, dict], symbol: str, key: Optional[str]
         guard.pop(k, None)
 
 
-def _entry_lock_acquire(state: Dict[str, dict], symbol: str, owner: str, ttl_sec: float = 10.0) -> tuple[bool, Optional[str], Optional[float]]:
+def _entry_lock_acquire(
+    state: Dict[str, dict],
+    symbol: str,
+    owner: str,
+    ttl_sec: float = 10.0,
+    side: Optional[str] = None,
+) -> tuple[bool, Optional[str], Optional[float]]:
     lock = _get_entry_lock(state)
     now = time.time()
     with _ENTRY_LOCK_MUTEX:
@@ -719,7 +971,7 @@ def _entry_lock_acquire(state: Dict[str, dict], symbol: str, owner: str, ttl_sec
             expires = float(cur.get("expires", 0.0) or 0.0)
             if now < expires and cur.get("owner"):
                 held_by = str(cur.get("owner"))
-                _append_entry_gate_log(owner, symbol, f"entry_lock_held_by={held_by}")
+                _append_entry_gate_log(owner, symbol, f"entry_lock_held_by={held_by}", side=side)
                 return False, held_by, expires - now
         lock[symbol] = {"owner": owner, "expires": now + ttl_sec, "ts": now}
     return True, None, None
@@ -800,8 +1052,6 @@ def _get_open_symbols(state: Dict[str, dict], side: str) -> List[str]:
 
 def _engine_label_from_reason(reason: Optional[str]) -> str:
     key = (reason or "").lower()
-    if key in ("fabio_long", "fabio_short"):
-        return "FABIO"
     if key in ("atlasfabio_long", "atlasfabio_short"):
         return "ATLASFABIO"
     if key in ("swaggy_long", "swaggy_short"):
@@ -1072,8 +1322,6 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
                     pnl_pct = (entry_price - exit_price) / entry_price * 100.0
             raw_reason = (tr.get("meta") or {}).get("reason") or tr.get("exit_reason") or "unknown"
             reason_map = {
-                "fabio_long": "fabio",
-                "fabio_short": "fabio",
                 "atlasfabio_long": "atlas-fabio",
                 "atlasfabio_short": "atlas-fabio",
                 "swaggy_long": "atlas-swaggy",
@@ -1233,1370 +1481,6 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
     lines.extend(symbol_lines("LONG"))
     lines.append("</pre>")
     return "\n".join(lines)
-
-def _run_fabio_cycle(
-    universe_structure,
-    cached_ex,
-    state,
-    fabio_cfg,
-    active_positions_total,
-    dir_hint,
-    send_alert,
-):
-    result = {"long_hits": 0, "short_hits": 0, "early_hits": 0}
-    funnel = {
-        "candidates_total": 0,
-        "evaluated": 0,
-        "skip_precheck": 0,
-        "skip_eval_none": 0,
-        "skip_warmup": 0,
-        "skip_dup_candle": 0,
-        "trigger_seen": 0,
-        "confirm_ok": 0,
-        "entry_ready": 0,
-        "confirm_fail": 0,
-        "blocked_regime": 0,
-        "blocked_chase": 0,
-        "blocked_retest": 0,
-        "blocked_rsi_downturn": 0,
-        "blocked_reject": 0,
-        "blocked_impulse": 0,
-        "blocked_volume": 0,
-        "block_no_ema7_pullback_long": 0,
-        "block_no_ema7_pullback_short": 0,
-        "block_overext_long": 0,
-        "block_overext_short": 0,
-        "blocked_ltf": 0,
-        "blocked_cooldown": 0,
-        "blocked_in_pos": 0,
-        "no_signal": 0,
-        "entry_signal": 0,
-        "entry_order_ok": 0,
-        "entry_blocked_guard": 0,
-        "entry_lock_skip": 0,
-        "entry_ready_skip": 0,
-        "entry_ready_skip_need_trigger": 0,
-        "entry_ready_skip_need_confirm": 0,
-        "entry_ready_skip_dir_mismatch": 0,
-        "entry_ready_skip_other": 0,
-    }
-    side_keys = [
-        "evaluated",
-        "regime_ok",
-        "regime_fail",
-        "struct_ok",
-        "struct_fail",
-        "trigger_ok",
-        "trigger_fail",
-        "rsi_downturn_fail",
-        "reject_fail",
-        "impulse_block",
-        "price_ok_fail",
-        "dist_ok_fail",
-        "fast_drop_block",
-        "vol_ok",
-        "vol_fail",
-        "entry_ready",
-        "entry",
-        "order_ok",
-        "in_pos_skip",
-        "lock_skip",
-        "exchange_skip",
-    ]
-    funnel_long = {k: 0 for k in side_keys}
-    funnel_short = {k: 0 for k in side_keys}
-    def _inc_side(key: str, side: Optional[str]) -> None:
-        if side == "LONG":
-            funnel_long[key] += 1
-        elif side == "SHORT":
-            funnel_short[key] += 1
-    eval_dbg = 0
-    fabio_entry_skip_debug = 0
-    fabio_trigger_debug = 0
-    fabio_short_hit_debug = 0
-    fabio_short_cut_debug = 0
-    fabio_buf = []
-    _set_thread_log_buffer(fabio_buf)
-    if not fabio_cfg or not FABIO_ENABLED:
-        _set_thread_log_buffer(None)
-        result["log"] = fabio_buf
-        return result
-    if not isinstance(active_positions_total, int):
-        active_positions_total = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
-    for symbol in universe_structure:
-        funnel["candidates_total"] += 1
-        allowed_dir = None
-        if isinstance(dir_hint, dict):
-            allowed_dir = dir_hint.get(symbol)
-        st = state.get(symbol, {"in_pos": False, "last_ok": False, "last_entry": 0})
-        side_pre = allowed_dir if allowed_dir in ("LONG", "SHORT") else None
-        if st.get("in_pos"):
-            funnel["skip_precheck"] += 1
-            funnel["blocked_in_pos"] += 1
-            _inc_side("in_pos_skip", side_pre)
-            continue
-        last_entry = float(st.get("last_entry", 0))
-        if (time.time() - last_entry) < COOLDOWN_SEC:
-            funnel["skip_precheck"] += 1
-            funnel["blocked_cooldown"] += 1
-            continue
-        early_res = fabio_entry_engine.evaluate_early_short(symbol, state, fabio_cfg)
-        if early_res.get("ok"):
-            bucket = state.get("_fabio_early", {})
-            early_ts = float((bucket.get(symbol) or {}).get("ts", 0.0))
-            if (time.time() - early_ts) >= FABIO_EARLY_ALERT_COOLDOWN_SEC:
-                bucket[symbol] = {"ts": time.time(), "reason": early_res.get("reason")}
-                state["_fabio_early"] = bucket
-                result["early_hits"] += 1
-                send_alert(
-                    "🔻 <b>Fabio Early-Short</b>\n"
-                    f"<b>{symbol}</b> 15m\n"
-                    "구조 전조 감지\n"
-                    "사유: 고점 리테스트 실패 + 거절/모멘텀 약화"
-                )
-        fabio_res = fabio_entry_engine.evaluate_symbol(symbol, cached_ex, state, fabio_cfg, bucket_key="_fabio")
-        if eval_dbg < 3:
-            bucket = fabio_entry_engine._get_bucket_with_key(state, "_fabio").get(symbol) or {}
-            last_ts = bucket.get("last_ts")
-            try:
-                df_dbg = cycle_cache.get_df(symbol, fabio_cfg.timeframe_ltf, 3)
-                sym_ts = None
-                if not df_dbg.empty:
-                    df_dbg = df_dbg.iloc[:-1]
-                    if len(df_dbg) > 0:
-                        sym_ts = int(df_dbg["ts"].iloc[-1])
-                is_dup = (last_ts == sym_ts) if (last_ts is not None and sym_ts is not None) else None
-                print(f"[EVAL-TS] sym={symbol} sym_ts={sym_ts} last_ts={last_ts} is_dup={is_dup}")
-            except Exception:
-                print(f"[EVAL-TS] sym={symbol} sym_ts=? last_ts={last_ts} is_dup=?")
-            eval_dbg += 1
-        if not isinstance(fabio_res, dict) or not fabio_res:
-            funnel["skip_eval_none"] += 1
-            continue
-        if fabio_res.get("status") == "warmup":
-            funnel["skip_warmup"] += 1
-            continue
-        if fabio_res.get("block_reason") == "dup_candle":
-            funnel["skip_dup_candle"] += 1
-            continue
-        gate_tier = fabio_res.get("tier") or "STRONG"
-        wait_mode = (fabio_entry_engine._get_bucket_with_key(state, "_fabio").get(symbol) or {}).get("mode")
-        side_tag = "LONG" if wait_mode == "WAIT_LONG" else ("SHORT" if wait_mode == "WAIT_SHORT" else None)
-        def _inc_side_local(key: str) -> None:
-            if side_tag == "LONG":
-                funnel_long[key] += 1
-            elif side_tag == "SHORT":
-                funnel_short[key] += 1
-        if allowed_dir == "LONG" and wait_mode == "WAIT_SHORT":
-            fabio_res["entry_ready"] = False
-            fabio_res["short"] = False
-        if allowed_dir == "SHORT" and wait_mode == "WAIT_LONG":
-            fabio_res["entry_ready"] = False
-            fabio_res["long"] = False
-        if fabio_res.get("block_reason") == "retest" and not getattr(fabio_cfg, "pullback_only", False):
-            rsi_val = fabio_res.get("rsi")
-            rsi_ok = isinstance(rsi_val, (int, float)) and rsi_val >= 53.0
-            trigger_ok = bool(fabio_res.get("trigger_ok"))
-            vol_ok = bool(fabio_res.get("vol_ok"))
-            bypass_ok = (
-                fabio_res.get("dist_ok")
-                and fabio_res.get("trigger_price_ok")
-                and (trigger_ok or vol_ok)
-                and rsi_ok
-            )
-            if bypass_ok:
-                if wait_mode == "WAIT_LONG":
-                    fabio_res["entry_ready"] = True
-                    fabio_res["long"] = True
-                    fabio_res["reason"] = "fabio_retest_bypass"
-                    fabio_res["block_reason"] = None
-                elif wait_mode == "WAIT_SHORT":
-                    fabio_res["entry_ready"] = True
-                    fabio_res["short"] = True
-                    fabio_res["reason"] = "fabio_retest_bypass"
-                    fabio_res["block_reason"] = None
-            elif fabio_res.get("trigger_ok") is False and fabio_trigger_debug < 3:
-                print(
-                    f"[TRIGGER-OK] sym={symbol} gate=FABIO tf_src={fabio_res.get('trigger_tf')} "
-                    f"price_ok={fabio_res.get('trigger_price_ok')} vol_ok={fabio_res.get('vol_ok')} "
-                    f"result={fabio_res.get('trigger_ok')} detail={fabio_res.get('block_reason')}"
-                )
-                fabio_trigger_debug += 1
-        if fabio_res.get("block_reason") == "no_location":
-            bb_pos = fabio_res.get("bb_pos")
-            ema20 = fabio_res.get("price_ema20")
-            atr_now = fabio_res.get("atr_now")
-            side_disp = side_tag or "NA"
-            print(
-                "SKIP reason=NO_LOCATION side=%s bb_pos=%s ema20=%s atr=%s"
-                % (
-                    side_disp,
-                    _fmt_float(bb_pos, 4),
-                    _fmt_float(ema20, 6),
-                    _fmt_float(atr_now, 6),
-                )
-            )
-        if fabio_res.get("block_reason") == "no_ema7_pullback":
-            side_disp = side_tag or "NA"
-            if side_disp == "LONG":
-                funnel["block_no_ema7_pullback_long"] += 1
-            elif side_disp == "SHORT":
-                funnel["block_no_ema7_pullback_short"] += 1
-            print(
-                "PULLBACK_CHECK side=%s prev_low=%s prev_high=%s ema7_prev=%s ema7_now=%s "
-                "ema20_prev=%s ema20_th=%s close_now=%s pass=N"
-                % (
-                    side_disp,
-                    _fmt_float(fabio_res.get("pullback_prev_low"), 6),
-                    _fmt_float(fabio_res.get("pullback_prev_high"), 6),
-                    _fmt_float(fabio_res.get("pullback_ema7_prev"), 6),
-                    _fmt_float(fabio_res.get("pullback_ema7_now"), 6),
-                    _fmt_float(fabio_res.get("pullback_ema20_prev"), 6),
-                    _fmt_float(fabio_res.get("pullback_ema20_th"), 6),
-                    _fmt_float(fabio_res.get("pullback_close_now"), 6),
-                )
-            )
-        if fabio_res.get("block_reason") == "overext":
-            side_disp = side_tag or "NA"
-            if side_disp == "LONG":
-                funnel["block_overext_long"] += 1
-            elif side_disp == "SHORT":
-                funnel["block_overext_short"] += 1
-            close_now = fabio_res.get("price_close")
-            ema7_now = fabio_res.get("price_ema7")
-            ext7 = None
-            if isinstance(close_now, (int, float)) and close_now > 0 and isinstance(ema7_now, (int, float)):
-                if side_disp == "SHORT":
-                    ext7 = (ema7_now - close_now) / close_now
-                else:
-                    ext7 = (close_now - ema7_now) / close_now
-            print(
-                "SKIP reason=OVEREXT side=%s close=%s ema7=%s ext7=%s"
-                % (
-                    side_disp,
-                    _fmt_float(close_now, 6),
-                    _fmt_float(ema7_now, 6),
-                    _fmt_float(ext7, 6),
-                )
-            )
-        funnel["evaluated"] += 1
-        _inc_side_local("evaluated")
-        if fabio_res.get("confirm_ok") is True:
-            funnel["confirm_ok"] += 1
-            _inc_side_local("struct_ok")
-        elif fabio_res.get("confirm_ok") is False:
-            _inc_side_local("struct_fail")
-        if allowed_dir == "LONG" and fabio_res.get("entry_ready") is True:
-            if gate_tier == "MID" and fabio_res.get("reason") == ATLASFABIO_MID_RETEST_REASON:
-                dist_raw = fabio_res.get("dist_ratio")
-                dist_pct = fabio_res.get("dist_pct")
-                dist_mode = fabio_res.get("dist_mode") or "ratio"
-                if isinstance(dist_raw, (int, float)) and dist_raw > ATLASFABIO_MID_DIST_MAX:
-                    funnel["atlas_mid_dist_too_far"] += 1
-                    atlasfabio_cut_stats["MID"]["dist_too_far"] += 1
-                    print(
-                        "[ATLAS-CUT] sym=%s tier=MID reason=dist_too_far dist_raw=%.4f max=%.4f dist_pct=%.2f "
-                        "dist_mode=%s entry_ready_final=0"
-                        % (
-                            symbol,
-                            dist_raw,
-                            ATLASFABIO_MID_DIST_MAX,
-                            dist_pct or 0.0,
-                            dist_mode,
-                        )
-                    )
-                    fabio_res["entry_ready"] = False
-                    continue
-            if not fabio_res.get("price_ok") or not fabio_res.get("dist_ok"):
-                funnel["atlas_cut_price_dist"] += 1
-                print(
-                    f"[atlas-cut-top] sym={symbol} reason=price_or_dist_fail "
-                    f"price_ok={fabio_res.get('price_ok')} dist_ok={fabio_res.get('dist_ok')} "
-                    f"dist_raw={fabio_res.get('dist_ratio')} dist_pct={fabio_res.get('dist_pct')}"
-                )
-                fabio_res["entry_ready"] = False
-                continue
-        if fabio_res.get("entry_ready") is True:
-            funnel["entry_ready"] += 1
-            _inc_side_local("entry_ready")
-        if fabio_res.get("trigger_ok") is True:
-            _inc_side_local("trigger_ok")
-        elif fabio_res.get("trigger_ok") is False:
-            _inc_side_local("trigger_fail")
-        if fabio_res.get("trigger_price_ok") is False:
-            _inc_side_local("price_ok_fail")
-        if fabio_res.get("dist_ok") is False:
-            _inc_side_local("dist_ok_fail")
-        if fabio_res.get("fast_drop") is True:
-            _inc_side_local("fast_drop_block")
-        if fabio_res.get("impulse_block") is True:
-            _inc_side_local("impulse_block")
-        if fabio_res.get("vol_ok") is True:
-            _inc_side_local("vol_ok")
-        elif fabio_res.get("vol_ok") is False:
-            _inc_side_local("vol_fail")
-        if fabio_res.get("block_reason") == "rsi_not_downturn":
-            _inc_side_local("rsi_downturn_fail")
-        elif fabio_res.get("block_reason") == "no_reject_candle":
-            _inc_side_local("reject_fail")
-        if fabio_res.get("block_reason") == "regime":
-            _inc_side_local("regime_fail")
-        else:
-            _inc_side_local("regime_ok")
-        entry_attempted = False
-        entry_error = False
-        if fabio_res.get("long"):
-            if allowed_dir == "SHORT":
-                fabio_res["long"] = False
-            else:
-                entry_attempted = True
-                result["long_hits"] += 1
-                funnel["entry_signal"] += 1
-                _inc_side_local("entry")
-                print(f"[fabio] 롱 트리거 {symbol}")
-                _append_entry_log(
-                    "fabio_entries.log",
-                    "ts=%d engine=fabio side=LONG symbol=%s wait_mode=%s dir_hint=%s entry_ready=%s "
-                    "confirm_ok=%s trigger_ok=%s price_ok=%s dist_ok=%s vol_ok=%s fast_drop=%s "
-                    "trigger_tf=%s block_reason=%s rsi=%s dist_pct=%s vol_ratio=%s reason=%s"
-                    % (
-                        int(time.time()),
-                        symbol,
-                        wait_mode,
-                        allowed_dir,
-                        fabio_res.get("entry_ready"),
-                        fabio_res.get("confirm_ok"),
-                        fabio_res.get("trigger_ok"),
-                        fabio_res.get("trigger_price_ok"),
-                        fabio_res.get("dist_ok"),
-                        fabio_res.get("vol_ok"),
-                        fabio_res.get("fast_drop"),
-                        fabio_res.get("trigger_tf"),
-                        fabio_res.get("block_reason"),
-                        fabio_res.get("rsi"),
-                        fabio_res.get("dist_pct"),
-                        fabio_res.get("vol_ratio"),
-                        fabio_res.get("reason"),
-                    ),
-                )
-                cur_total = count_open_positions(force=True)
-                if not isinstance(cur_total, int):
-                    cur_total = active_positions_total
-                if cur_total >= MAX_OPEN_POSITIONS:
-                    print(f"[fabio] 롱 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
-                    _append_entry_gate_log(
-                        "fabio",
-                        symbol,
-                        f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=LONG",
-                    )
-                else:
-                    if _exit_cooldown_blocked(state, symbol, "fabio", "LONG"):
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    if LONG_LIVE_TRADING:
-                        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="fabio")
-                        if not lock_ok:
-                            print(f"[ENTRY-LOCK] sym={symbol} owner=fabio ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-                            funnel["entry_lock_skip"] += 1
-                            _inc_side_local("lock_skip")
-                        else:
-                            try:
-                                guard_key = _entry_guard_key(state, symbol, "LONG")
-                                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="fabio", side="LONG"):
-                                    print(f"[fabio] 롱 중복 차단 ({symbol})")
-                                    funnel["entry_blocked_guard"] += 1
-                                else:
-                                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "LONG", "fabio")
-                                    if not seen_ok:
-                                        print(f"[ENTRY-SEEN] sym={symbol} side=LONG engine=fabio blocked_by={seen_by}")
-                                        time.sleep(PER_SYMBOL_SLEEP)
-                                        continue
-                                    try:
-                                        res = long_market(
-                                            symbol,
-                                            usdt_amount=_resolve_entry_usdt(),
-                                            leverage=LEVERAGE,
-                                            margin_mode=MARGIN_MODE,
-                                        )
-                                        entry_order_id = _order_id_from_res(res)
-                                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                                        qty = res.get("amount") or res.get("order", {}).get("amount")
-                                        if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                                            funnel["entry_order_ok"] += 1
-                                            _inc_side_local("order_ok")
-                                        st["in_pos"] = True
-                                        st["last_entry"] = time.time()
-                                        state[symbol] = st
-                                        _log_trade_entry(
-                                            state,
-                                            side="LONG",
-                                            symbol=symbol,
-                                            entry_ts=time.time(),
-                                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                                            qty=qty if isinstance(qty, (int, float)) else None,
-                                            usdt=_resolve_entry_usdt(),
-                                            entry_order_id=entry_order_id,
-                                            meta={"reason": "fabio_long"},
-                                        )
-                                        active_positions_total += 1
-                                    except Exception as e:
-                                        print(f"[fabio] long order error {symbol}: {e}")
-                                        entry_error = True
-                                    finally:
-                                        _entry_guard_release(state, symbol, key=guard_key)
-                            finally:
-                                _entry_lock_release(state, symbol, owner="fabio")
-                    else:
-                        _send_entry_alert(
-                            send_alert,
-                            side="LONG",
-                            symbol=symbol,
-                            engine="FABIO",
-                            entry_price=None,
-                            usdt=_resolve_entry_usdt(),
-                            reason="조건 충족",
-                            live=LONG_LIVE_TRADING,
-                            order_info="(알림 전용)",
-                            sl=None,
-                            tp=None,
-                        )
-                        print(f"[fabio] 롱 시그널 {symbol}")
-                continue
-        if fabio_res.get("short"):
-            if allowed_dir == "LONG":
-                fabio_res["short"] = False
-            else:
-                try:
-                    refresh_positions_cache(force=True)
-                    existing_amt = get_short_position_amount(symbol)
-                except Exception:
-                    existing_amt = 0.0
-                if existing_amt > 0:
-                    st["in_pos"] = True
-                    state[symbol] = st
-                    print(f"[fabio] 숏 포지션 이미 존재 → 스킵 ({symbol})")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                entry_attempted = True
-                result["short_hits"] += 1
-                funnel["entry_signal"] += 1
-                _inc_side_local("entry")
-                print(f"[fabio] 숏 트리거 {symbol}")
-                _append_entry_log(
-                    "fabio_entries.log",
-                    "ts=%d engine=fabio side=SHORT symbol=%s wait_mode=%s dir_hint=%s entry_ready=%s "
-                    "confirm_ok=%s trigger_ok=%s price_ok=%s dist_ok=%s vol_ok=%s fast_drop=%s "
-                    "trigger_tf=%s block_reason=%s rsi=%s dist_pct=%s vol_ratio=%s reason=%s"
-                    % (
-                        int(time.time()),
-                        symbol,
-                        wait_mode,
-                        allowed_dir,
-                        fabio_res.get("entry_ready"),
-                        fabio_res.get("confirm_ok"),
-                        fabio_res.get("trigger_ok"),
-                        fabio_res.get("trigger_price_ok"),
-                        fabio_res.get("dist_ok"),
-                        fabio_res.get("vol_ok"),
-                        fabio_res.get("fast_drop"),
-                        fabio_res.get("trigger_tf"),
-                        fabio_res.get("block_reason"),
-                        fabio_res.get("rsi"),
-                        fabio_res.get("dist_pct"),
-                        fabio_res.get("vol_ratio"),
-                        fabio_res.get("reason"),
-                    ),
-                )
-                cur_total = count_open_positions(force=True)
-                if not isinstance(cur_total, int):
-                    cur_total = active_positions_total
-                if cur_total >= MAX_OPEN_POSITIONS:
-                    print(f"[fabio] 숏 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
-                    _append_entry_gate_log(
-                        "fabio",
-                        symbol,
-                        f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
-                    )
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                if _exit_cooldown_blocked(state, symbol, "fabio", "SHORT"):
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                order_info = "(알림 전용)"
-                entry_price_disp = None
-                entry_order_id = None
-                early_bucket = state.get("_fabio_early", {})
-                had_early = symbol in early_bucket
-                if had_early:
-                    early_bucket.pop(symbol, None)
-                    state["_fabio_early"] = early_bucket
-                if LIVE_TRADING:
-                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "fabio")
-                    if not seen_ok:
-                        print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=fabio blocked_by={seen_by}")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="fabio")
-                    if not lock_ok:
-                        print(f"[ENTRY-LOCK] sym={symbol} owner=fabio ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-                        funnel["entry_lock_skip"] += 1
-                        _inc_side_local("lock_skip")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    try:
-                        guard_key = _entry_guard_key(state, symbol, "SHORT")
-                        if not _entry_guard_acquire(state, symbol, key=guard_key, engine="fabio", side="SHORT"):
-                            print(f"[fabio] 숏 중복 차단 ({symbol})")
-                            funnel["entry_blocked_guard"] += 1
-                            time.sleep(PER_SYMBOL_SLEEP)
-                            continue
-                        try:
-                            res = short_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                            entry_order_id = _order_id_from_res(res)
-                            fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                            qty = res.get("amount") or res.get("order", {}).get("amount")
-                            order_info = (
-                                f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
-                            )
-                            entry_price_disp = fill_price
-                            st["in_pos"] = True
-                            st["last_entry"] = time.time()
-                            state[symbol] = st
-                            funnel["entry_order_ok"] += 1
-                            _inc_side_local("order_ok")
-                            _log_trade_entry(
-                                state,
-                                side="SHORT",
-                                symbol=symbol,
-                                entry_ts=time.time(),
-                                entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                                qty=qty if isinstance(qty, (int, float)) else None,
-                                usdt=_resolve_entry_usdt(),
-                                entry_order_id=entry_order_id,
-                                meta={"reason": "fabio_short"},
-                            )
-                            active_positions_total += 1
-                        except Exception as e:
-                            order_info = f"order_error: {e}"
-                            entry_error = True
-                        finally:
-                            _entry_guard_release(state, symbol, key=guard_key)
-                    finally:
-                        _entry_lock_release(state, symbol, owner="fabio")
-                st["last_entry"] = time.time()
-                state[symbol] = st
-                reason = "조건 충족"
-                if had_early:
-                    reason = f"{reason} (early=Y)"
-                _send_entry_alert(
-                    send_alert,
-                    side="SHORT",
-                    symbol=symbol,
-                    engine="FABIO",
-                    entry_price=entry_price_disp,
-                    usdt=_resolve_entry_usdt(),
-                    reason=reason,
-                    live=LIVE_TRADING,
-                    order_info=order_info,
-                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                    tp=None,
-                )
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-        if entry_error:
-            _inc_side_local("exchange_skip")
-        if fabio_res.get("entry_ready") is True and not entry_attempted:
-            funnel["entry_ready_skip"] += 1
-            if fabio_entry_skip_debug < 3:
-                reason = "no_direction"
-                if fabio_res.get("long"):
-                    reason = "no_engine"
-                elif fabio_res.get("short"):
-                    reason = "no_engine"
-                print(f"[fabio] entry_ready skip {symbol} reason={reason}")
-                fabio_entry_skip_debug += 1
-        block_reason = fabio_res.get("block_reason")
-        wait_mode = (fabio_entry_engine._get_bucket_with_key(state, "_fabio").get(symbol) or {}).get("mode")
-        if wait_mode in ("WAIT_LONG", "WAIT_SHORT"):
-            funnel["trigger_seen"] += 1
-        if wait_mode in ("WAIT_LONG", "WAIT_SHORT") and block_reason in (
-            "retest",
-            "chase",
-            "volume",
-            "regime",
-            "rsi_not_downturn",
-            "no_reject_candle",
-        ):
-            funnel["confirm_fail"] += 1
-        if block_reason == "regime":
-            funnel["blocked_regime"] += 1
-        elif block_reason == "chase":
-            funnel["blocked_chase"] += 1
-        elif block_reason == "retest":
-            funnel["blocked_retest"] += 1
-        elif block_reason == "rsi_not_downturn":
-            funnel["blocked_rsi_downturn"] += 1
-        elif block_reason == "no_reject_candle":
-            funnel["blocked_reject"] += 1
-        elif block_reason == "impulse_up":
-            funnel["blocked_impulse"] += 1
-        elif block_reason in ("volume", "pullback_vol"):
-            funnel["blocked_volume"] += 1
-        else:
-            funnel["no_signal"] += 1
-        if side_tag == "SHORT":
-            if fabio_res.get("entry_ready") and fabio_short_hit_debug < 3:
-                print(
-                    f"[FABIO-SHORT-HIT] sym={symbol} regime={'Y' if block_reason != 'regime' else 'N'} "
-                    f"struct={'Y' if fabio_res.get('confirm_ok') else 'N'} "
-                    f"trigger={'Y' if fabio_res.get('trigger_ok') else 'N'} "
-                    f"price_ok={'Y' if fabio_res.get('trigger_price_ok') else 'N'} "
-                    f"dist_ok={'Y' if fabio_res.get('dist_ok') else 'N'} "
-                    f"fast_drop={'Y' if fabio_res.get('fast_drop') else 'N'} "
-                    f"vol_ok={'Y' if fabio_res.get('vol_ok') else 'N'} "
-                    f"entry_ready={'Y' if fabio_res.get('entry_ready') else 'N'} reason={fabio_res.get('reason')}"
-                )
-                fabio_short_hit_debug += 1
-            if block_reason and fabio_short_cut_debug < 5:
-                cut_reason = block_reason
-                if fabio_res.get("fast_drop"):
-                    cut_reason = "fast_drop"
-                elif fabio_res.get("trigger_price_ok") is False:
-                    cut_reason = "price_ok"
-                elif fabio_res.get("dist_ok") is False:
-                    cut_reason = "dist"
-                elif fabio_res.get("trigger_ok") is False:
-                    cut_reason = "trigger"
-                if block_reason == "rsi_not_downturn":
-                    cut_reason = "rsi_not_downturn"
-                elif block_reason == "no_reject_candle":
-                    cut_reason = "no_reject_candle"
-                elif block_reason == "impulse_up":
-                    cut_reason = "impulse_up"
-                elif fabio_res.get("confirm_ok") is False:
-                    cut_reason = "struct"
-                print(f"[FABIO-SHORT-CUT] sym={symbol} reason={cut_reason}")
-                fabio_short_cut_debug += 1
-    _set_thread_log_buffer(None)
-    funnel_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    funnel_line = (
-        "{ts} [fabio-funnel] total={candidates_total} evaluated={evaluated} precheck={skip_precheck} "
-        "eval_none={skip_eval_none} warmup={skip_warmup} dup={skip_dup_candle} "
-        "trigger_seen={trigger_seen} confirm_ok={confirm_ok} entry_ready={entry_ready} "
-        "confirm_fail={confirm_fail} "
-        "regime={blocked_regime} chase={blocked_chase} retest={blocked_retest} impulse={blocked_impulse} "
-        "volume={blocked_volume} no_signal={no_signal} cooldown={blocked_cooldown} in_pos={blocked_in_pos} "
-        "entry={entry_signal} order_ok={entry_order_ok} guard={entry_blocked_guard} lock={entry_lock_skip} "
-        "entry_ready_skip={entry_ready_skip} pullback_long={block_no_ema7_pullback_long} "
-        "pullback_short={block_no_ema7_pullback_short} overext_long={block_overext_long} "
-        "overext_short={block_overext_short}".format(ts=funnel_ts, **funnel)
-    )
-    print(funnel_line)
-    funnel_long_line = (
-        f"{time.strftime('%Y-%m-%d %H:%M:%S')} [fabio-funnel-long] evaluated={evaluated} regime_ok={regime_ok} regime_fail={regime_fail} "
-        "struct_ok={struct_ok} struct_fail={struct_fail} trigger_ok={trigger_ok} trigger_fail={trigger_fail} "
-        "rsi_downturn_fail={rsi_downturn_fail} reject_fail={reject_fail} "
-        "price_ok_fail={price_ok_fail} dist_ok_fail={dist_ok_fail} fast_drop_block={fast_drop_block} "
-        "vol_ok={vol_ok} vol_fail={vol_fail} entry_ready={entry_ready} entry={entry} order_ok={order_ok} "
-        "in_pos_skip={in_pos_skip} lock_skip={lock_skip} exchange_skip={exchange_skip}".format(**funnel_long)
-    )
-    print(funnel_long_line)
-    funnel_short_line = (
-        f"{time.strftime('%Y-%m-%d %H:%M:%S')} [fabio-funnel-short] evaluated={evaluated} regime_ok={regime_ok} regime_fail={regime_fail} "
-        "struct_ok={struct_ok} struct_fail={struct_fail} trigger_ok={trigger_ok} trigger_fail={trigger_fail} "
-        "rsi_downturn_fail={rsi_downturn_fail} reject_fail={reject_fail} "
-        "price_ok_fail={price_ok_fail} dist_ok_fail={dist_ok_fail} fast_drop_block={fast_drop_block} "
-        "vol_ok={vol_ok} vol_fail={vol_fail} entry_ready={entry_ready} entry={entry} order_ok={order_ok} "
-        "in_pos_skip={in_pos_skip} lock_skip={lock_skip} exchange_skip={exchange_skip}".format(**funnel_short)
-    )
-    print(funnel_short_line)
-    try:
-        os.makedirs("logs", exist_ok=True)
-        with open(os.path.join("logs", "fabio_funnel.log"), "a", encoding="utf-8") as f:
-            f.write(funnel_line + "\n")
-            f.write(funnel_long_line + "\n")
-            f.write(funnel_short_line + "\n")
-    except Exception:
-        pass
-    result["log"] = fabio_buf
-    return result
-
-
-def _run_swaggy_cycle(
-    swaggy_engine,
-    swaggy_universe,
-    cached_ex,
-    state,
-    swaggy_cfg,
-    active_positions_total,
-    send_alert,
-):
-    result = {"long_hits": 0, "short_hits": 0}
-    buf = []
-    _set_thread_log_buffer(buf)
-    if not swaggy_engine or not swaggy_cfg:
-        _set_thread_log_buffer(None)
-        result["log"] = buf
-        return result
-    if not swaggy_universe:
-        print("[swaggy] 스캔 대상 없음")
-        _set_thread_log_buffer(None)
-        result["log"] = buf
-        return result
-    now_ts = time.time()
-    state["_atlas_swaggy_gate"] = _compute_atlas_swaggy_gate(state)
-    swaggy_engine.begin_cycle()
-    ctx = EngineContext(
-        exchange=cached_ex,
-        state=state,
-        now_ts=now_ts,
-        logger=print,
-        config=swaggy_cfg,
-    )
-    scanned = 0
-    for symbol in swaggy_universe:
-        scanned += 1
-        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
-            continue
-        last_entry = float(st.get("last_entry", 0.0) or 0.0)
-        cooldown_sec = COOLDOWN_SEC
-        if isinstance(lab_cfg, object) and hasattr(lab_cfg, "cooldown_min"):
-            try:
-                cooldown_sec = max(0, int(float(lab_cfg.cooldown_min)) * 60)
-            except Exception:
-                cooldown_sec = COOLDOWN_SEC
-        if (now_ts - last_entry) < cooldown_sec:
-            continue
-        decision = swaggy_engine.on_tick(ctx, symbol)
-        if not decision or not getattr(decision, "entry_ready", 0):
-            continue
-        side = (decision.side or "").upper()
-        if side not in ("LONG", "SHORT"):
-            continue
-        dbg = decision.debug or {}
-        strength = dbg.get("strength")
-        dist_pct = dbg.get("dist_pct")
-        atlas_gate = state.get("_atlas_swaggy_gate") or {}
-        atlas_local = _compute_atlas_swaggy_local(symbol, decision, atlas_gate, swaggy_cfg)
-        block_reason = None
-        size_mult = None
-        if side == "LONG":
-            block_reason = atlas_local.get("atlas_long_block_reason")
-            size_mult = atlas_local.get("long_size_mult")
-        elif side == "SHORT":
-            block_reason = atlas_local.get("atlas_short_block_reason")
-            size_mult = atlas_local.get("short_size_mult")
-        _append_atlas_route_log(
-            "SWAGGY",
-            symbol,
-            {
-                "side": side,
-                "dir": atlas_local.get("symbol_direction"),
-                "state": atlas_local.get("state"),
-                "regime": atlas_gate.get("regime"),
-                "reason": atlas_gate.get("reason"),
-                "trade_allowed": atlas_gate.get("trade_allowed"),
-                "allow_long": atlas_local.get("allow_long"),
-                "allow_short": atlas_local.get("allow_short"),
-                "size_mult": size_mult,
-                "block_reason": block_reason,
-            },
-        )
-        if side == "LONG" and not atlas_local.get("allow_long", 0):
-            block_reason = atlas_local.get("atlas_long_block_reason") or "ATLAS_LONG_NO_EXCEPTION"
-            detail = (
-                f"reason={block_reason} sub={atlas_local.get('atlas_long_block_subreason')} "
-                f"exception={atlas_local.get('atlas_long_exception')} "
-                f"rs_z={atlas_local.get('rs_z')} corr={atlas_local.get('corr')} "
-                f"beta={atlas_local.get('beta')} vol_ratio={atlas_local.get('vol_ratio')} "
-                f"trigger={dbg.get('trigger')} strength={strength} dist_pct={dist_pct}"
-            )
-            if hasattr(swaggy_engine, "apply_external_gate"):
-                decision.reason_codes = [block_reason]
-                decision.evidence = {**(decision.evidence or {}), "atlas": atlas_gate, "atlas_local": atlas_local}
-                swaggy_engine.apply_external_gate(decision, block_reason, detail)
-            print(f"[swaggy] ATLAS 롱 차단 ({block_reason}) ({symbol})")
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        if side == "SHORT" and not atlas_local.get("allow_short", 0):
-            block_reason = atlas_local.get("atlas_short_block_reason") or "ATLAS_SHORT_BLOCK_QUALITY"
-            detail = (
-                f"reason={block_reason} quality={atlas_local.get('atlas_short_quality')} "
-                f"sub={atlas_local.get('atlas_short_block_subreason')} "
-                f"rs_z={atlas_local.get('rs_z')} corr={atlas_local.get('corr')} "
-                f"beta={atlas_local.get('beta')} vol_ratio={atlas_local.get('vol_ratio')}"
-            )
-            if hasattr(swaggy_engine, "apply_external_gate"):
-                decision.reason_codes = [block_reason]
-                decision.evidence = {**(decision.evidence or {}), "atlas": atlas_gate, "atlas_local": atlas_local}
-                swaggy_engine.apply_external_gate(decision, block_reason, detail)
-            print(f"[swaggy] ATLAS 숏 차단 ({block_reason}) ({symbol})")
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        cur_total = count_open_positions(force=True)
-        if not isinstance(cur_total, int):
-            cur_total = active_positions_total
-        if cur_total >= MAX_OPEN_POSITIONS:
-            print(f"[swaggy] 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
-            _append_entry_gate_log(
-                "swaggy",
-                symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
-            )
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        if _exit_cooldown_blocked(state, symbol, "swaggy", side):
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        reason_codes = ",".join(decision.reason_codes or []) if isinstance(decision.reason_codes, list) else ""
-        regime = dbg.get("regime")
-        _append_entry_log(
-            os.path.join("swaggy", "swaggy_entries.log"),
-            "ts=%d engine=swaggy side=%s symbol=%s entry_ready=%s reason=%s "
-            "trigger=%s strength=%s dist_pct=%s regime=%s "
-            "atlas_regime=%s atlas_allow_long=%s atlas_allow_short=%s atlas_reason=%s "
-            "atlas_rs=%s atlas_rs_z=%s atlas_corr=%s atlas_beta=%s atlas_vol_ratio=%s "
-            "atlas_long_exception=%s atlas_long_block_reason=%s atlas_short_quality=%s atlas_short_block_reason=%s "
-            "atlas_long_mult=%s atlas_short_mult=%s"
-            % (
-                int(now_ts),
-                side,
-                symbol,
-                decision.entry_ready,
-                reason_codes,
-                dbg.get("trigger"),
-                strength,
-                dist_pct,
-                regime,
-                atlas_local.get("state"),
-                atlas_local.get("allow_long"),
-                atlas_local.get("allow_short"),
-                atlas_gate.get("reason"),
-                atlas_local.get("rs"),
-                atlas_local.get("rs_z"),
-                atlas_local.get("corr"),
-                atlas_local.get("beta"),
-                atlas_local.get("vol_ratio"),
-                atlas_local.get("atlas_long_exception"),
-                atlas_local.get("atlas_long_block_reason"),
-                atlas_local.get("atlas_short_quality"),
-                atlas_local.get("atlas_short_block_reason"),
-                atlas_local.get("long_size_mult"),
-                atlas_local.get("short_size_mult"),
-            ),
-        )
-        if side == "LONG":
-            result["long_hits"] += 1
-            order_info = "(알림 전용)"
-            entry_price_disp = None
-            atlas_info = (
-                f"atlas={atlas_local.get('state')} conf={atlas_gate.get('confidence')} "
-                f"reason={atlas_gate.get('reason')} rs={_fmt_float(atlas_local.get('rs'))} "
-                f"corr={_fmt_float(atlas_local.get('corr'))}"
-            )
-            if LONG_LIVE_TRADING:
-                try:
-                    refresh_positions_cache(force=True)
-                    existing_amt = get_long_position_amount(symbol)
-                except Exception:
-                    existing_amt = 0.0
-                if existing_amt > 0:
-                    st["in_pos"] = True
-                    state[symbol] = st
-                    print(f"[swaggy] 롱 포지션 이미 존재 → 스킵 ({symbol})")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy")
-                if not lock_ok:
-                    print(f"[ENTRY-LOCK] sym={symbol} owner=swaggy ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    guard_key = _entry_guard_key(state, symbol, "LONG")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy", side="LONG"):
-                        print(f"[swaggy] 롱 중복 차단 ({symbol})")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "LONG", "swaggy")
-                    if not seen_ok:
-                        print(f"[ENTRY-SEEN] sym={symbol} side=LONG engine=swaggy blocked_by={seen_by}")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    try:
-                        size_mult = float(atlas_local.get("long_size_mult", 1.0) or 1.0)
-                        regime = (decision.debug or {}).get("regime")
-                        if regime == "range":
-                            size_mult *= 0.5
-                        entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
-                        res = long_market(
-                            symbol,
-                            usdt_amount=entry_usdt,
-                            leverage=LEVERAGE,
-                            margin_mode=MARGIN_MODE,
-                        )
-                        entry_order_id = _order_id_from_res(res)
-                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                        qty = res.get("amount") or res.get("order", {}).get("amount")
-                        entry_price_disp = fill_price
-                        order_info = (
-                            f"entry_price={fill_price} qty={qty} usdt={entry_usdt}"
-                        )
-                        st["in_pos"] = True
-                        st["last_entry"] = time.time()
-                        state[symbol] = st
-                        _log_trade_entry(
-                            state,
-                            side="LONG",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                            qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=entry_usdt,
-                            entry_order_id=entry_order_id,
-                            meta={"reason": "swaggy_long"},
-                        )
-                        active_positions_total += 1
-                    finally:
-                        _entry_guard_release(state, symbol, key=guard_key)
-                finally:
-                    _entry_lock_release(state, symbol, owner="swaggy")
-                size_mult = float(atlas_local.get("long_size_mult", 1.0) or 1.0)
-                if (decision.debug or {}).get("regime") == "range":
-                    size_mult *= 0.5
-                entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
-                tp_disp = None
-                if isinstance(decision.tp1_px, (int, float)):
-                    tp_disp = f"{float(decision.tp1_px):.6g}"
-                reason_full = reason_codes
-                if atlas_info:
-                    reason_full = f"{reason_full} | {atlas_info}" if reason_full else atlas_info
-                _send_entry_alert(
-                    send_alert,
-                    side="LONG",
-                    symbol=symbol,
-                    engine="SWAGGY",
-                    entry_price=entry_price_disp,
-                    usdt=entry_usdt,
-                    reason=reason_full,
-                    live=LONG_LIVE_TRADING,
-                    order_info=order_info,
-                    entry_order_id=entry_order_id,
-                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                    tp=tp_disp,
-                )
-            else:
-                size_mult = float(atlas_local.get("long_size_mult", 1.0) or 1.0)
-                if (decision.debug or {}).get("regime") == "range":
-                    size_mult *= 0.5
-                entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
-                entry_price_disp = decision.entry_px
-                order_info = "(알림 전용)"
-                tp_disp = None
-                if isinstance(decision.tp1_px, (int, float)):
-                    tp_disp = f"{float(decision.tp1_px):.6g}"
-                reason_full = reason_codes
-                if atlas_info:
-                    reason_full = f"{reason_full} | {atlas_info}" if reason_full else atlas_info
-                _send_entry_alert(
-                    send_alert,
-                    side="LONG",
-                    symbol=symbol,
-                    engine="SWAGGY",
-                    entry_price=entry_price_disp,
-                    usdt=entry_usdt,
-                    reason=reason_full,
-                    live=LONG_LIVE_TRADING,
-                    order_info=order_info,
-                    sl=_fmt_price_safe(decision.entry_px, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                    tp=tp_disp,
-                )
-        else:
-            result["short_hits"] += 1
-            order_info = "(알림 전용)"
-            entry_price_disp = None
-            try:
-                refresh_positions_cache(force=True)
-                existing_amt = get_short_position_amount(symbol)
-            except Exception:
-                existing_amt = 0.0
-            if existing_amt > 0:
-                st["in_pos"] = True
-                state[symbol] = st
-                print(f"[swaggy] 숏 포지션 이미 존재 → 스킵 ({symbol})")
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            if LIVE_TRADING:
-                lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy")
-                if not lock_ok:
-                    print(f"[ENTRY-LOCK] sym={symbol} owner=swaggy ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    guard_key = _entry_guard_key(state, symbol, "SHORT")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy", side="SHORT"):
-                        print(f"[swaggy] 숏 중복 차단 ({symbol})")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "swaggy")
-                    if not seen_ok:
-                        print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=swaggy blocked_by={seen_by}")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    try:
-                        size_mult = float(atlas_local.get("short_size_mult", 1.0) or 1.0)
-                        entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
-                        res = short_market(symbol, usdt_amount=entry_usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                        entry_order_id = _order_id_from_res(res)
-                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                        qty = res.get("amount") or res.get("order", {}).get("amount")
-                        try:
-                            pos_amt = get_short_position_amount(symbol)
-                        except Exception:
-                            pos_amt = None
-                        print(f"[short-entry] sym={symbol} pos_amt={pos_amt} fill={fill_price} qty={qty}")
-                        entry_price_disp = fill_price
-                        order_info = (
-                            f"entry_price={fill_price} qty={qty} usdt={entry_usdt}"
-                        )
-                        st["in_pos"] = True
-                        st["last_entry"] = time.time()
-                        state[symbol] = st
-                        _log_trade_entry(
-                            state,
-                            side="SHORT",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                            qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=_resolve_entry_usdt(),
-                            entry_order_id=entry_order_id,
-                            meta={"reason": "swaggy_short"},
-                        )
-                        active_positions_total += 1
-                    finally:
-                        _entry_guard_release(state, symbol, key=guard_key)
-                finally:
-                    _entry_lock_release(state, symbol, owner="swaggy")
-            entry_disp = f"{entry_price_disp:.6g}" if entry_price_disp is not None else "N/A"
-            size_mult = float(atlas_local.get("short_size_mult", 1.0) or 1.0)
-            entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult)
-            atlas_info = (
-                f"atlas={atlas_local.get('state')} conf={atlas_gate.get('confidence')} "
-                f"reason={atlas_gate.get('reason')} rs={_fmt_float(atlas_local.get('rs'))} "
-                f"corr={_fmt_float(atlas_local.get('corr'))}"
-            )
-            reason_full = reason_codes
-            if atlas_info:
-                reason_full = f"{reason_full} | {atlas_info}" if reason_full else atlas_info
-            _send_entry_alert(
-                send_alert,
-                side="SHORT",
-                symbol=symbol,
-                engine="SWAGGY",
-                entry_price=entry_price_disp,
-                usdt=entry_usdt,
-                reason=reason_full,
-                live=LIVE_TRADING,
-                order_info=order_info,
-                entry_order_id=entry_order_id if LIVE_TRADING else None,
-                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                tp=None,
-            )
-        time.sleep(PER_SYMBOL_SLEEP)
-    if format_cut_top and format_zone_stats:
-        print(
-            format_cut_top(
-                swaggy_engine.get_trigger_counts(),
-                swaggy_engine.get_filter_counts(),
-                swaggy_engine.get_gate_fail_counts(),
-                swaggy_engine.get_gate_stage_counts(),
-            )
-        )
-        print(format_zone_stats(swaggy_engine.get_stats(), swaggy_engine.get_ready_fail_counts()))
-        no_level_samples = swaggy_engine.get_no_level_samples() if hasattr(swaggy_engine, "get_no_level_samples") else []
-        if no_level_samples:
-            print("[swaggy-no-level] top10")
-            for row in no_level_samples[:10]:
-                print(
-                    "[swaggy-no-level] "
-                    f"sym={row.get('sym')} len1h={row.get('len_1h')} len15m={row.get('len_15m')} "
-                    f"tick_size={row.get('tick_size')} vp_none={row.get('vp_none')} "
-                    f"before={row.get('before_cluster')} after_cluster={row.get('after_cluster')} "
-                    f"after_dist={row.get('after_dist')} after_cap={row.get('after_cap')} "
-                    f"reason={row.get('reason')}"
-                )
-    _set_thread_log_buffer(None)
-    _append_log_lines(os.path.join("swaggy", "swaggy.log"), buf)
-    result["log"] = buf
-    return result
-
-
-def _run_swaggy_atlas_lab_cycle(
-    lab_engine,
-    lab_universe,
-    cached_ex,
-    state,
-    lab_cfg,
-    atlas_cfg,
-    active_positions_total,
-    send_alert,
-):
-    result = {"long_hits": 0, "short_hits": 0}
-    if not lab_engine or not lab_cfg or not atlas_cfg:
-        return result
-    if not lab_universe:
-        print("[swaggy_atlas_lab] 스캔 대상 없음")
-        return result
-    now_ts = time.time()
-    btc_df = cycle_cache.get_df(atlas_cfg.ref_symbol, lab_cfg.tf_mtf, limit=200)
-    for symbol in lab_universe:
-        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
-            continue
-        last_entry = float(st.get("last_entry", 0.0) or 0.0)
-        if (now_ts - last_entry) < COOLDOWN_SEC:
-            continue
-        df_5m = cycle_cache.get_df(symbol, lab_cfg.tf_ltf, limit=lab_cfg.ltf_limit)
-        if df_5m.empty or len(df_5m) < 31:
-            continue
-        df_15m = cycle_cache.get_df(symbol, lab_cfg.tf_mtf, limit=max(lab_cfg.swing_lookback_mtf * 2, 120))
-        df_1h = cycle_cache.get_df(symbol, lab_cfg.tf_htf, limit=max(lab_cfg.vp_lookback_1h, 120))
-        df_4h = cycle_cache.get_df(symbol, lab_cfg.tf_htf2, limit=max(lab_cfg.regime_lookback * 2, 60))
-        d1_limit = max(lab_cfg.d1_atr_len + 5, lab_cfg.d1_ema_len + 5, 30)
-        df_1d = cycle_cache.get_df(symbol, lab_cfg.tf_d1, limit=d1_limit)
-        signal = lab_engine.evaluate_symbol(symbol, df_4h, df_1h, df_15m, df_5m, df_1d, now_ts)
-        if not signal or not signal.entry_ok or signal.entry_px is None:
-            continue
-        side = (signal.side or "").upper()
-        if side not in ("LONG", "SHORT"):
-            continue
-        gate = lab_evaluate_global_gate(btc_df, atlas_cfg) if lab_evaluate_global_gate else {}
-        atlas = lab_evaluate_local(symbol, side, df_15m, btc_df, gate, atlas_cfg) if lab_evaluate_local else None
-        policy = lab_apply_policy(SwaggyAtlasLabMode.HARD, USDT_PER_TRADE, atlas) if lab_apply_policy else None
-        if not policy or not policy.allow:
-            continue
-        cur_total = count_open_positions(force=True)
-        if not isinstance(cur_total, int):
-            cur_total = active_positions_total
-        if cur_total >= MAX_OPEN_POSITIONS:
-            print(f"[swaggy_atlas_lab] 제한 {cur_total}/{MAX_OPEN_POSITIONS} → 스킵 ({symbol})")
-            _append_entry_gate_log(
-                "swaggy_atlas_lab",
-                symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
-            )
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        if _exit_cooldown_blocked(state, symbol, "swaggy_atlas_lab", side):
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        _append_entry_log(
-            os.path.join("swaggy_atlas_lab", "swaggy_atlas_lab_entries.log"),
-            "ts=%d engine=swaggy_atlas_lab side=%s symbol=%s entry_ready=1 "
-            "entry_px=%.6g final_usdt=%.2f policy_action=%s atlas_reasons=%s"
-            % (
-                int(now_ts),
-                side,
-                symbol,
-                float(signal.entry_px),
-                float(policy.final_usdt),
-                policy.policy_action or "N/A",
-                ",".join(atlas.reasons or []) if atlas else "N/A",
-            ),
-        )
-        if side == "LONG":
-            result["long_hits"] += 1
-            order_info = "(알림 전용)"
-            entry_price_disp = None
-            if LONG_LIVE_TRADING:
-                try:
-                    refresh_positions_cache(force=True)
-                    existing_amt = get_long_position_amount(symbol)
-                except Exception:
-                    existing_amt = 0.0
-                if existing_amt > 0:
-                    st["in_pos"] = True
-                    state[symbol] = st
-                    print(f"[swaggy_atlas_lab] 롱 포지션 이미 존재 → 스킵 ({symbol})")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_atlas_lab")
-                if not lock_ok:
-                    print(f"[ENTRY-LOCK] sym={symbol} owner=swaggy_atlas_lab ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    guard_key = _entry_guard_key(state, symbol, "LONG")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_atlas_lab", side="LONG"):
-                        print(f"[swaggy_atlas_lab] 롱 중복 차단 ({symbol})")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "LONG", "swaggy_atlas_lab")
-                    if not seen_ok:
-                        print(f"[ENTRY-SEEN] sym={symbol} side=LONG engine=swaggy_atlas_lab blocked_by={seen_by}")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    try:
-                        entry_usdt = _resolve_entry_usdt(policy.final_usdt)
-                        res = long_market(
-                            symbol,
-                            usdt_amount=entry_usdt,
-                            leverage=LEVERAGE,
-                            margin_mode=MARGIN_MODE,
-                        )
-                        entry_order_id = _order_id_from_res(res)
-                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                        qty = res.get("amount") or res.get("order", {}).get("amount")
-                        entry_price_disp = fill_price
-                        order_info = f"entry_price={fill_price} qty={qty} usdt={entry_usdt}"
-                        st["in_pos"] = True
-                        st["last_entry"] = time.time()
-                        state[symbol] = st
-                        _log_trade_entry(
-                            state,
-                            side="LONG",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                            qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=entry_usdt,
-                            entry_order_id=entry_order_id,
-                            meta={"reason": "swaggy_atlas_lab"},
-                        )
-                        active_positions_total += 1
-                    finally:
-                        _entry_guard_release(state, symbol, key=guard_key)
-                finally:
-                    _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
-                entry_usdt = _resolve_entry_usdt(policy.final_usdt)
-                reason_full = ",".join(signal.reasons or [])
-                _send_entry_alert(
-                    send_alert,
-                    side="LONG",
-                    symbol=symbol,
-                    engine="SWAGGY_ATLAS_LAB",
-                    entry_price=entry_price_disp,
-                    usdt=entry_usdt,
-                    reason=reason_full,
-                    live=LONG_LIVE_TRADING,
-                    order_info=order_info,
-                    entry_order_id=entry_order_id,
-                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                    tp=None,
-                )
-            else:
-                entry_usdt = _resolve_entry_usdt(policy.final_usdt)
-                entry_price_disp = signal.entry_px
-                reason_full = ",".join(signal.reasons or [])
-                _send_entry_alert(
-                    send_alert,
-                    side="LONG",
-                    symbol=symbol,
-                    engine="SWAGGY_ATLAS_LAB",
-                    entry_price=entry_price_disp,
-                    usdt=entry_usdt,
-                    reason=reason_full,
-                    live=LONG_LIVE_TRADING,
-                    order_info=order_info,
-                    sl=_fmt_price_safe(signal.entry_px, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                    tp=None,
-                )
-        else:
-            result["short_hits"] += 1
-            order_info = "(알림 전용)"
-            entry_price_disp = None
-            try:
-                refresh_positions_cache(force=True)
-                existing_amt = get_short_position_amount(symbol)
-            except Exception:
-                existing_amt = 0.0
-            if existing_amt > 0:
-                st["in_pos"] = True
-                state[symbol] = st
-                print(f"[swaggy_atlas_lab] 숏 포지션 이미 존재 → 스킵 ({symbol})")
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            if LIVE_TRADING:
-                lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_atlas_lab")
-                if not lock_ok:
-                    print(f"[ENTRY-LOCK] sym={symbol} owner=swaggy_atlas_lab ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    guard_key = _entry_guard_key(state, symbol, "SHORT")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_atlas_lab", side="SHORT"):
-                        print(f"[swaggy_atlas_lab] 숏 중복 차단 ({symbol})")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    seen_ok, seen_by = _entry_seen_acquire(state, symbol, "SHORT", "swaggy_atlas_lab")
-                    if not seen_ok:
-                        print(f"[ENTRY-SEEN] sym={symbol} side=SHORT engine=swaggy_atlas_lab blocked_by={seen_by}")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    try:
-                        entry_usdt = _resolve_entry_usdt(policy.final_usdt)
-                        res = short_market(symbol, usdt_amount=entry_usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                        entry_order_id = _order_id_from_res(res)
-                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                        qty = res.get("amount") or res.get("order", {}).get("amount")
-                        entry_price_disp = fill_price
-                        order_info = f"entry_price={fill_price} qty={qty} usdt={entry_usdt}"
-                        st["in_pos"] = True
-                        st["last_entry"] = time.time()
-                        state[symbol] = st
-                        _log_trade_entry(
-                            state,
-                            side="SHORT",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                            qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=entry_usdt,
-                            entry_order_id=entry_order_id,
-                            meta={"reason": "swaggy_atlas_lab"},
-                        )
-                        active_positions_total += 1
-                    finally:
-                        _entry_guard_release(state, symbol, key=guard_key)
-                finally:
-                    _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
-                entry_usdt = _resolve_entry_usdt(policy.final_usdt)
-                reason_full = ",".join(signal.reasons or [])
-                _send_entry_alert(
-                    send_alert,
-                    side="SHORT",
-                    symbol=symbol,
-                    engine="SWAGGY_ATLAS_LAB",
-                    entry_price=entry_price_disp,
-                    usdt=entry_usdt,
-                    reason=reason_full,
-                    live=LIVE_TRADING,
-                    order_info=order_info,
-                    entry_order_id=entry_order_id,
-                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                    tp=None,
-                )
-            else:
-                entry_usdt = _resolve_entry_usdt(policy.final_usdt)
-                entry_price_disp = signal.entry_px
-                reason_full = ",".join(signal.reasons or [])
-                _send_entry_alert(
-                    send_alert,
-                    side="SHORT",
-                    symbol=symbol,
-                    engine="SWAGGY_ATLAS_LAB",
-                    entry_price=entry_price_disp,
-                    usdt=entry_usdt,
-                    reason=reason_full,
-                    live=LIVE_TRADING,
-                    order_info=order_info,
-                    sl=_fmt_price_safe(signal.entry_px, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                    tp=None,
-                )
-        time.sleep(PER_SYMBOL_SLEEP)
-    return result
-
 
 def _run_atlas_fabio_cycle(
     universe_structure,
@@ -3181,7 +2065,7 @@ def _run_atlas_fabio_cycle(
             _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GATE_{gate_reason}")
             continue
 
-        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="atlasfabio")
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="atlasfabio", side=side)
         if not lock_ok:
             funnel["entry_lock_skip"] += 1
             _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_LOCK")
@@ -3232,6 +2116,7 @@ def _run_atlas_fabio_cycle(
                 "atlasfabio",
                 symbol,
                 f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+                side=side,
             )
             _entry_lock_release(state, symbol, owner="atlasfabio")
             continue
@@ -3494,6 +2379,7 @@ def _run_dtfx_cycle(
                     "dtfx",
                     symbol,
                     f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+                    side=side,
                 )
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -3506,7 +2392,7 @@ def _run_dtfx_cycle(
             if side == "SHORT" and not LIVE_TRADING:
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
-            lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="dtfx")
+            lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="dtfx", side=side)
             if not lock_ok:
                 print(f"[ENTRY-LOCK] sym={symbol} owner=dtfx ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
                 time.sleep(PER_SYMBOL_SLEEP)
@@ -3789,6 +2675,7 @@ def _run_pumpfade_cycle(
                 "pumpfade",
                 symbol,
                 f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
+                side="SHORT",
             )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -3836,7 +2723,7 @@ def _run_pumpfade_cycle(
         except Exception:
             pass
         if LIVE_TRADING:
-            lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="pumpfade")
+            lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="pumpfade", side="SHORT")
             if not lock_ok:
                 print(f"[ENTRY-LOCK] sym={symbol} owner=pumpfade ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
                 time.sleep(PER_SYMBOL_SLEEP)
@@ -3986,27 +2873,13 @@ def _run_atlas_rs_fail_short_cycle(
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         bucket = state.get("_atlas_rs_fail_short") if isinstance(state, dict) else None
-        if isinstance(bucket, dict):
-            rec = bucket.get(symbol)
-            if isinstance(rec, dict):
-                cooldown_until = float(rec.get("cooldown_until_ts") or 0.0)
-                if cooldown_until and now_ts < cooldown_until:
-                    _arsf_skip(symbol, "COOLDOWN_RECHECK", entry_price)
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                last_entry_ts = float(rec.get("last_entry_ts") or 0.0)
-                if last_entry_ts:
-                    cooldown_sec = float(getattr(arsf_cfg, "cooldown_minutes", 0) or 0) * 60.0
-                    if cooldown_sec and now_ts < last_entry_ts + cooldown_sec:
-                        _arsf_skip(symbol, "COOLDOWN_RECHECK", entry_price)
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
         cur_total = count_open_positions(force=True)
         if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
             _append_entry_gate_log(
                 "atlas_rs_fail_short",
                 symbol,
                 f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
+                side="SHORT",
             )
             _arsf_skip(symbol, "MAX_POS", entry_price)
             time.sleep(PER_SYMBOL_SLEEP)
@@ -4044,7 +2917,7 @@ def _run_atlas_rs_fail_short_cycle(
                 _arsf_skip(symbol, "CHASE_SKIP", entry_price)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
-        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="atlas_rs_fail_short")
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="atlas_rs_fail_short", side="SHORT")
         if not lock_ok:
             print(f"[ENTRY-LOCK] sym={symbol} owner=atlas_rs_fail_short ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
             _arsf_skip(symbol, "ENTRY_LOCK", entry_price)
@@ -4073,7 +2946,8 @@ def _run_atlas_rs_fail_short_cycle(
                 if isinstance(bucket, dict):
                     rec = bucket.get(symbol)
                     if isinstance(rec, dict):
-                        rec["last_entry_ts"] = time.time()
+                        now_entry_ts = time.time()
+                        rec["last_entry_ts"] = now_entry_ts
                         bucket[symbol] = rec
                 _log_trade_entry(
                     state,
@@ -4284,7 +3158,10 @@ def _read_report_csv_records(report_date: str) -> Optional[list]:
         return None
 
 def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dict]:
-    path = os.path.join("logs", "entry_events.log")
+    if report_date:
+        path = os.path.join("logs", "entry", f"entry_events-{report_date}.log")
+    else:
+        path = os.path.join("logs", "entry_events.log")
     by_id = {}
     by_symbol_side = {}
     if not os.path.exists(path):
@@ -4300,14 +3177,22 @@ def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dic
                 except Exception:
                     continue
                 entry_ts = payload.get("entry_ts")
-                if not isinstance(entry_ts, (int, float)):
+                entry_ts_val = None
+                if isinstance(entry_ts, (int, float)):
+                    entry_ts_val = float(entry_ts)
+                elif isinstance(entry_ts, str):
+                    try:
+                        entry_ts_val = datetime.strptime(entry_ts, "%Y-%m-%d %H:%M:%S").timestamp()
+                    except Exception:
+                        entry_ts_val = None
+                if entry_ts_val is None:
                     continue
                 entry_id = payload.get("entry_order_id")
                 symbol = payload.get("symbol") or ""
                 side = payload.get("side") or ""
                 engine = payload.get("engine") or "unknown"
                 record = {
-                    "entry_ts": float(entry_ts),
+                    "entry_ts": entry_ts_val,
                     "entry_order_id": entry_id,
                     "symbol": symbol,
                     "side": side,
@@ -4315,7 +3200,7 @@ def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dic
                 }
                 if entry_id:
                     by_id[str(entry_id)] = record
-                if report_date is None or _date_str_kst(float(entry_ts)) == report_date:
+                if report_date is None or _date_str_kst(entry_ts_val) == report_date:
                     key = (symbol, side)
                     by_symbol_side.setdefault(key, []).append(record)
     except Exception:
@@ -5743,9 +4628,12 @@ def _update_report_csv(tr: dict) -> None:
 
 def _append_entry_event(tr: dict) -> None:
     try:
-        os.makedirs("logs", exist_ok=True)
+        date_tag = time.strftime("%Y-%m-%d")
+        dir_path = os.path.join("logs", "entry")
+        os.makedirs(dir_path, exist_ok=True)
+        path = os.path.join(dir_path, f"entry_events-{date_tag}.log")
         payload = {
-            "entry_ts": tr.get("entry_ts"),
+            "entry_ts": datetime.fromtimestamp(float(tr.get("entry_ts") or 0.0)).strftime("%Y-%m-%d %H:%M:%S"),
             "entry_order_id": tr.get("entry_order_id"),
             "symbol": tr.get("symbol"),
             "side": tr.get("side"),
@@ -5754,7 +4642,7 @@ def _append_entry_event(tr: dict) -> None:
             "engine": tr.get("engine_label"),
             "usdt": tr.get("usdt"),
         }
-        with open(os.path.join("logs", "entry_events.log"), "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         pass
@@ -5890,7 +4778,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -6396,18 +5284,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] long_live cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
-                if (cmd in ("/fabio", "fabio")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    FABIO_ENABLED = False
-                    state["_fabio_enabled"] = False
-                    state_dirty = True
-                    resp = "⛔ fabio 엔진 비활성화됨 (AtlasFabio만 사용)"
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] fabio cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
                 if (cmd in ("/atlasfabio", "atlasfabio")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -6777,7 +5653,6 @@ TTL_1D_SEC = 86400
 
 # LONG signal control (used by Fabio/AtlasFabio)
 LONG_LIVE_TRADING = True
-FABIO_ENABLED = False
 ATLAS_FABIO_ENABLED = True
 ATLAS_FABIO_PAPER = False
 SWAGGY_ENABLED = False
@@ -7061,7 +5936,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, FABIO_ENABLED, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
@@ -7129,8 +6004,6 @@ def run():
         RSI_ENABLED = bool(state.get("_rsi_enabled"))
     else:
         state["_rsi_enabled"] = RSI_ENABLED
-    FABIO_ENABLED = False
-    state["_fabio_enabled"] = False
     if isinstance(state.get("_atlas_fabio_enabled"), bool):
         ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
     else:
@@ -7159,7 +6032,6 @@ def run():
         DTFX_ENABLED = False
         PUMPFADE_ENABLED = False
         ATLAS_RS_FAIL_SHORT_ENABLED = False
-        FABIO_ENABLED = False
         ATLAS_FABIO_ENABLED = False
         state["_div15m_long_enabled"] = False
         state["_div15m_short_enabled"] = True
@@ -7167,7 +6039,6 @@ def run():
         state["_dtfx_enabled"] = False
         state["_pumpfade_enabled"] = False
         state["_atlas_rs_fail_short_enabled"] = False
-        state["_fabio_enabled"] = False
         state["_atlas_fabio_enabled"] = False
         print("[모드] ONLY_DIV15M_SHORT 활성화: div15m_short만 스캔")
     if isinstance(state.get("_entry_usdt"), (int, float)):
@@ -7316,12 +6187,6 @@ def run():
             cycle_count += 1
             if cycle_ts and cycle_ts > last_cycle_ts:
                 state["_last_cycle_ts"] = cycle_ts
-            if cycle_ts and last_cycle_ts == 0:
-                fabio_bucket = state.get("_fabio")
-                if isinstance(fabio_bucket, dict):
-                    for sym, vals in fabio_bucket.items():
-                        if isinstance(vals, dict):
-                            vals["last_ts"] = 0
             cycle_label = cycle_kst if cycle_kst != "N/A" else str(cycle_count)
             print(f"\n[사이클 {cycle_label}] 시작 (heavy_scan=Y)")
         else:
@@ -7574,15 +6439,6 @@ def run():
                 short_cnt = sum(1 for v in fabio_dir_hint.values() if v == "SHORT")
             try:
                 os.makedirs("logs", exist_ok=True)
-                if FABIO_ENABLED:
-                    fabio_line = (
-                        f"[fabio-universe] total={len(fabio_universe)} "
-                        f"gainers={len(gainers)} losers={len(losers)} "
-                        f"long={long_cnt} short={short_cnt} "
-                        f"sample_gainers={gainers[:3]} sample_losers={losers[:3]}"
-                    )
-                    with open(os.path.join("logs", "fabio_universe.log"), "a", encoding="utf-8") as f:
-                        f.write(fabio_line + "\n")
                 atlas_line = (
                     f"[atlasfabio-universe] total={len(fabio_universe)} "
                     f"long={long_cnt} short={short_cnt} "
@@ -7596,7 +6452,6 @@ def run():
         cached_ex = CachedExchange(exchange)
         cached_long_ex = CachedExchange(exchange)
 
-        fabio_cfg = None
         atlas_cfg = atlas_fabio_engine.Config() if (heavy_scan and ATLAS_FABIO_ENABLED and atlas_fabio_engine) else None
         fabio_cfg_atlas = None
         fabio_cfg_atlas_mid = None
@@ -7625,7 +6480,6 @@ def run():
         rsi_ran = bool(run_rsi_short and universe_momentum)
         div15m_long_ran = bool(run_div15m_long and div15m_universe)
         div15m_short_ran = bool(run_div15m_short and div15m_short_universe)
-        fabio_ran = bool(heavy_scan and fabio_cfg)
         atlasfabio_ran = bool(heavy_scan and ATLAS_FABIO_ENABLED and atlas_cfg and fabio_cfg_atlas)
         swaggy_ran = bool(heavy_scan and SWAGGY_ENABLED and swaggy_cfg and swaggy_engine)
         swaggy_atlas_lab_ran = bool(
@@ -7697,8 +6551,8 @@ def run():
 
         # MID TF (15m) - 2~3 사이클마다
         mid_plan["15m"] = max(mid_plan.get("15m", 0), 60)
-        if fabio_cfg:
-            mid_plan["15m"] = max(mid_plan.get("15m", 0), int(fabio_cfg.limit))
+        if fabio_cfg_atlas:
+            mid_plan["15m"] = max(mid_plan.get("15m", 0), int(fabio_cfg_atlas.limit))
         if swaggy_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_cfg.vp_lookback_1h))
@@ -7717,8 +6571,8 @@ def run():
             mid_plan["1h"] = min(mid_plan.get("1h", 0), MID_LIMIT_CAP)
 
         # SLOW TF (4h/1d) - TTL
-        if fabio_cfg:
-            slow_plan["4h"] = max(slow_plan.get("4h", 0), int(fabio_cfg.limit))
+        if fabio_cfg_atlas:
+            slow_plan["4h"] = max(slow_plan.get("4h", 0), int(fabio_cfg_atlas.limit))
         if atlas_cfg:
             slow_plan["1d"] = max(slow_plan.get("1d", 0), int(getattr(atlas_cfg, "d1_limit", 90)))
         if swaggy_cfg:
@@ -7845,8 +6699,7 @@ def run():
             except Exception as e:
                 print("[WS] set_watch_symbols error:", e)
 
-        if fabio_cfg:
-            print(f"[fabio] 스캔 대상={len(fabio_universe)} mode={fabio_label}")
+
 
         if not MANAGE_LOOP_ENABLED:
             short_buf = []
@@ -7916,10 +6769,6 @@ def run():
                 pass
         active_positions = int(active_positions_total)
         pos_limit_logged = False
-        fabio_long_hits = 0
-        fabio_short_hits = 0
-        fabio_result = {}
-        fabio_thread = None
         atlasfabio_result = {}
         atlasfabio_thread = None
         swaggy_result = {}
@@ -7932,24 +6781,6 @@ def run():
         pumpfade_thread = None
         atlas_rs_fail_short_result = {}
         atlas_rs_fail_short_thread = None
-        if heavy_scan and fabio_cfg:
-            fabio_thread = threading.Thread(
-                target=lambda: fabio_result.update(
-                    _run_fabio_cycle(
-                        fabio_universe,
-                        cached_ex,
-                        state,
-                        fabio_cfg,
-                        active_positions,
-                        fabio_dir_hint,
-                        send_telegram,
-                    )
-                ),
-                daemon=True,
-            )
-            fabio_thread.start()
-        elif fabio_cfg:
-            pass
         if heavy_scan and ATLAS_FABIO_ENABLED and fabio_cfg_atlas and atlas_cfg:
             atlasfabio_thread = threading.Thread(
                 target=lambda: atlasfabio_result.update(
@@ -8047,8 +6878,6 @@ def run():
                 daemon=True,
             )
             atlas_rs_fail_short_thread.start()
-        if not run_rsi_short:
-            print("[모드] FABIO_ONLY 활성화: RSI 스캔 스킵")
         universe_total = len(universe_momentum)
         for idx, symbol in enumerate(universe_momentum, start=1):
             if not run_rsi_short:
@@ -8337,6 +7166,7 @@ def run():
                     "div15m",
                     symbol,
                     f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=LONG",
+                    side="LONG",
                 )
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -8511,6 +7341,7 @@ def run():
                     "div15m_short",
                     symbol,
                     f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
+                    side="SHORT",
                 )
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -8660,8 +7491,6 @@ def run():
 
             time.sleep(PER_SYMBOL_SLEEP)
 
-        if fabio_thread:
-            fabio_thread.join()
         if atlasfabio_thread:
             atlasfabio_thread.join()
         if swaggy_thread:
@@ -8701,11 +7530,11 @@ def run():
         print(
             f"[universe] rule=qVol>={int(min_qv):,} sort=abs(pct) topN={top_n} anchors={anchors_disp} "
             f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
-            f"fabio={fabio_universe_len} dtfx={dtfx_universe_len} "
+            f"dtfx={dtfx_universe_len} "
             f"pumpfade={pumpfade_universe_len} arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
         )
         print(
-            "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) fabio=%s(%d) atlasfabio=%s(%d) "
+            "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) atlasfabio=%s(%d) "
             "swaggy_atlas_lab=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
             % (
                 "ON" if rsi_ran else "OFF",
@@ -8714,8 +7543,6 @@ def run():
                 div15m_universe_len,
                 "ON" if div15m_short_ran else "OFF",
                 div15m_short_universe_len,
-                "ON" if fabio_ran else "OFF",
-                fabio_universe_len,
                 "ON" if atlasfabio_ran else "OFF",
                 fabio_universe_len,
                 "ON" if swaggy_atlas_lab_ran else "OFF",

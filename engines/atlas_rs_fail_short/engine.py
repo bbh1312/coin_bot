@@ -167,8 +167,7 @@ class AtlasRsFailShortEngine(BaseEngine):
             bucket[symbol] = rec
             return _blocked("IN_POSITION")
 
-        if now_ts < float(rec.get("cooldown_until_ts") or 0.0):
-            return _blocked("COOLDOWN")
+        # 공통 재진입 쿨다운만 사용
 
         df_ltf = cycle_cache.get_df(symbol, cfg.ltf_tf, cfg.ltf_limit)
         if df_ltf.empty or len(df_ltf) < max(cfg.ema_len + 5, 40):
@@ -328,9 +327,7 @@ class AtlasRsFailShortEngine(BaseEngine):
 
         _set_state("ENTRY_READY")
         entry_transition = state_transition
-        rec["cooldown_until_ts"] = now_ts + cfg.cooldown_minutes * 60
         rec["last_entry_fade_id"] = fade_id
-        rec["last_entry_ts"] = now_ts
         bucket[symbol] = rec
 
         risk_tags = []

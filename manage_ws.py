@@ -21,7 +21,10 @@ _ENTRY_EVENTS_TTL_SEC = 5.0
 def _get_entry_event_engine(entry_order_id: Optional[str]) -> Optional[str]:
     if not entry_order_id:
         return None
-    path = os.path.join("logs", "entry_events.log")
+    date_tag = time.strftime("%Y-%m-%d")
+    path = os.path.join("logs", "entry", f"entry_events-{date_tag}.log")
+    if not os.path.exists(path):
+        path = os.path.join("logs", "entry_events.log")
     try:
         mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
     except Exception:
@@ -95,12 +98,16 @@ def _get_tickers(cache: dict) -> dict:
 
 
 def _drain_entry_events(state) -> None:
-    path = os.path.join("logs", "entry_events.log")
+    date_tag = time.strftime("%Y-%m-%d")
+    path = os.path.join("logs", "entry", f"entry_events-{date_tag}.log")
+    legacy_path = os.path.join("logs", "entry_events.log")
     try:
-        if not os.path.exists(path):
+        if not os.path.exists(path) and not os.path.exists(legacy_path):
             return
-        offset = int(state.get("_entry_event_offset", 0) or 0)
-        with open(path, "r", encoding="utf-8") as f:
+        use_path = path if os.path.exists(path) else legacy_path
+        offset_key = "_entry_event_offset" if use_path == path else "_entry_event_offset_legacy"
+        offset = int(state.get(offset_key, 0) or 0)
+        with open(use_path, "r", encoding="utf-8") as f:
             f.seek(offset)
             lines = f.readlines()
             new_offset = f.tell()
@@ -115,11 +122,19 @@ def _drain_entry_events(state) -> None:
             except Exception:
                 continue
             entry_ts = payload.get("entry_ts")
-            if not isinstance(entry_ts, (int, float)):
+            entry_ts_val = None
+            if isinstance(entry_ts, (int, float)):
+                entry_ts_val = float(entry_ts)
+            elif isinstance(entry_ts, str):
+                try:
+                    entry_ts_val = time.mktime(time.strptime(entry_ts, "%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    entry_ts_val = None
+            if entry_ts_val is None:
                 continue
             payload_engine = payload.get("engine") or "UNKNOWN"
             tr = {
-                "entry_ts": float(entry_ts),
+                "entry_ts": entry_ts_val,
                 "entry_order_id": payload.get("entry_order_id"),
                 "symbol": payload.get("symbol"),
                 "side": payload.get("side"),
@@ -169,7 +184,7 @@ def _drain_entry_events(state) -> None:
                             "engine_label": payload_engine,
                         }
                     )
-        state["_entry_event_offset"] = new_offset
+        state[offset_key] = new_offset
     except Exception as e:
         print("[manage-ws] entry_events drain error:", e)
 
@@ -219,6 +234,23 @@ def _trade_engine_label(tr: Optional[dict]) -> str:
     return "UNKNOWN"
 
 
+def _recent_auto_exit_disk(symbol: str, now_ts: float) -> bool:
+    try:
+        disk = er.load_state()
+    except Exception:
+        return False
+    st = disk.get(symbol, {}) if isinstance(disk, dict) else {}
+    if not isinstance(st, dict):
+        return False
+    last_exit_ts = st.get("last_exit_ts")
+    last_exit_reason = st.get("last_exit_reason")
+    if not isinstance(last_exit_ts, (int, float)):
+        return False
+    if last_exit_reason not in ("auto_exit_tp", "auto_exit_sl"):
+        return False
+    return (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
+
+
 def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
     open_tr = er._get_open_trade(state, "LONG", symbol)
     if not open_tr:
@@ -231,6 +263,8 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
         and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
         and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
     ):
+        return
+    if _recent_auto_exit_disk(symbol, now_ts):
         return
     engine_label = _trade_engine_label(open_tr)
     st = state.get(symbol, {})
@@ -278,6 +312,8 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
         and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
         and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
     ):
+        return
+    if _recent_auto_exit_disk(symbol, now_ts):
         return
     engine_label = _trade_engine_label(open_tr)
     st = state.get(symbol, {})

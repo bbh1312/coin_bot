@@ -77,10 +77,11 @@ pip install ccxt pandas requests websocket-client
   - 백테스트
     ```
     python3 engines/fabio/backtest_runner.py \
-    --days 1 \
-    --sl-pct 0.03 \
-    --tp-pct 0.03 \
-    --max-symbols 7
+    --days 7 \
+    --sl-pct 0.05 \
+    --tp-pct 0.05 \
+    --max-symbols 15
+
     ```    
   - 예시
     ```
@@ -123,7 +124,7 @@ pip install ccxt pandas requests websocket-client
     [BACKTEST] TOTAL trades=9 wins=9 losses=0 winrate=100.00% tp=9 sl=0 avg_mfe=0.0551 avg_mae=0.0528 avg_hold=1396.7 long_wins=9 long_losses=0 short_wins=0 short_losses=0
     ```
 - DTFX     
-  - 백테스트
+  - 백테스트 (sl 크게)
     ```
     python3 engines/dtfx/backtest_runner.py \
     --days 5 \
@@ -146,31 +147,57 @@ pip install ccxt pandas requests websocket-client
     [BACKTEST] TOTAL trades=7 wins=6 losses=1 winrate=85.71% tp=6 sl=1 avg_mfe=0.0326 avg_mae=0.0652 avg_hold=1562.3
     ```
 - atlas_rs_fail_short(숏 전용)
-  - 백테스트
-    ```
-    python3 engines/atlas_rs_fail_short/backtest_runner.py \
-    --days 2 \
-    --sl-pct 0.03 \
-    --tp-pct 0.03 \
-    --max-symbols 10
-
-    ```
-  - 예시
+  - 백테스트 (sl 작게)
   ```
-  python3 -m engines.atlas_rs_fail_short.backtest_runner \
-    --symbols PTB/USDT:USDT,AKE/USDT:USDT,POL/USDT:USDT,TRUTH/USDT:USDT,ALCH/USDT:USDT,ARC/USDT:USDT,B/USDT:USDT \
-    --days 10 \
-    --sl-pct 0.30 \
-    --tp-pct 0.02 \
-    --out logs/atlas_rs_fail_short/arsf_signals.csv
-    [BACKTEST] PTB/USDT:USDT trades=9 wins=8 losses=1 winrate=88.89% tp=8 sl=1 avg_mfe=0.0268 avg_mae=0.0488 avg_hold=475.0
-    [BACKTEST] AKE/USDT:USDT trades=3 wins=2 losses=1 winrate=66.67% tp=2 sl=1 avg_mfe=0.0214 avg_mae=0.1188 avg_hold=2250.0
-    [BACKTEST] POL/USDT:USDT trades=3 wins=2 losses=1 winrate=66.67% tp=2 sl=1 avg_mfe=0.0186 avg_mae=0.1740 avg_hold=4230.0
-    [BACKTEST] TRUTH/USDT:USDT trades=11 wins=10 losses=1 winrate=90.91% tp=10 sl=1 avg_mfe=0.0286 avg_mae=0.0430 avg_hold=469.1
-    [BACKTEST] ALCH/USDT:USDT trades=2 wins=2 losses=0 winrate=100.00% tp=2 sl=0 avg_mfe=0.0282 avg_mae=0.0506 avg_hold=2310.0
-    [BACKTEST] ARC/USDT:USDT trades=8 wins=7 losses=1 winrate=87.50% tp=7 sl=1 avg_mfe=0.0263 avg_mae=0.0543 avg_hold=930.0
-    [BACKTEST] B/USDT:USDT trades=6 wins=6 losses=0 winrate=100.00% tp=6 sl=0 avg_mfe=0.0306 avg_mae=0.0513 avg_hold=835.0
-    [BACKTEST] total trades=42 wins=37 losses=5 winrate=88.10% tp=37 sl=5 avg_mfe=0.0268 avg_mae=0.0627 avg_hold=1093.9
+  python3 engines/atlas_rs_fail_short/backtest_runner.py \
+  --days 7 \
+  --sl-pct 0.05 \
+  --tp-pct 0.02 \
+  --max-symbols 15
+  [BACKTEST] match-live config ltf_tf=15m ref_symbol=BTC/USDT:USDT
+  [BACKTEST] FLOW/USDT:USDT trades=6 wins=5 losses=1 winrate=83.33% tp=5 sl=1 avg_mfe=0.0170 avg_mae=0.0243 avg_hold=392.5
+  [BACKTEST] BAT/USDT:USDT trades=5 wins=4 losses=1 winrate=80.00% tp=4 sl=1 avg_mfe=0.0185 avg_mae=0.0125 avg_hold=477.0
+  [BACKTEST] KAS/USDT:USDT trades=2 wins=1 losses=1 winrate=50.00% tp=1 sl=1 avg_mfe=0.0223 avg_mae=0.0298 avg_hold=2970.0
+  [BACKTEST] SOPH/USDT:USDT trades=5 wins=4 losses=1 winrate=80.00% tp=4 sl=1 avg_mfe=0.0198 avg_mae=0.0184 avg_hold=954.0
+  [BACKTEST] TROY/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+  [BACKTEST] UMA/USDT:USDT trades=5 wins=3 losses=2 winrate=60.00% tp=3 sl=2 avg_mfe=0.0180 avg_mae=0.0339 avg_hold=741.0
+  [BACKTEST] ARIA/USDT:USDT trades=4 wins=2 losses=2 winrate=50.00% tp=2 sl=2 avg_mfe=0.0185 avg_mae=0.0364 avg_hold=547.5
+  [BACKTEST] TURBO/USDT:USDT trades=5 wins=4 losses=1 winrate=80.00% tp=4 sl=1 avg_mfe=0.0227 avg_mae=0.0302 avg_hold=795.0
+  [BACKTEST] QUICK/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+  [BACKTEST] CRV/USDT:USDT trades=5 wins=5 losses=0 winrate=100.00% tp=5 sl=0 avg_mfe=0.0237 avg_mae=0.0245 avg_hold=1179.0
+  [BACKTEST] H/USDT:USDT trades=6 wins=4 losses=2 winrate=66.67% tp=4 sl=2 avg_mfe=0.0178 avg_mae=0.0207 avg_hold=425.0
+  [BACKTEST] 1000WHY/USDT:USDT trades=6 wins=4 losses=2 winrate=66.67% tp=4 sl=2 avg_mfe=0.0261 avg_mae=0.0371 avg_hold=535.0
+  [BACKTEST] ZK/USDT:USDT trades=6 wins=5 losses=1 winrate=83.33% tp=5 sl=1 avg_mfe=0.0205 avg_mae=0.0228 avg_hold=755.0
+  [BACKTEST] JUP/USDT:USDT trades=3 wins=2 losses=1 winrate=66.67% tp=2 sl=1 avg_mfe=0.0170 avg_mae=0.0444 avg_hold=1800.0
+  [BACKTEST] XEM/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+  [BACKTEST] total trades=58 wins=43 losses=15 winrate=74.14% tp=43 sl=15 avg_mfe=0.0202 avg_mae=0.0270 avg_hold=808.7
+
+  ```
+  - 백테스트 (sl 크게)
+  ```
+  python3 engines/atlas_rs_fail_short/backtest_runner.py \
+  --days 7 \
+  --sl-pct 0.3 \
+  --tp-pct 0.03 \
+  --max-symbols 15
+  [BACKTEST] match-live config ltf_tf=15m ref_symbol=BTC/USDT:USDT
+  [BACKTEST] FLUX/USDT:USDT trades=3 wins=3 losses=0 winrate=100.00% tp=3 sl=0 avg_mfe=0.0344 avg_mae=0.0153 avg_hold=1740.0
+  [BACKTEST] LTC/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0303 avg_mae=0.0076 avg_hold=5265.0
+  [BACKTEST] JASMY/USDT:USDT trades=3 wins=3 losses=0 winrate=100.00% tp=3 sl=0 avg_mfe=0.0351 avg_mae=0.0594 avg_hold=835.0
+  [BACKTEST] TURTLE/USDT:USDT trades=2 wins=2 losses=0 winrate=100.00% tp=2 sl=0 avg_mfe=0.0327 avg_mae=0.0413 avg_hold=2257.5
+  [BACKTEST] SENT/USDT:USDT trades=3 wins=3 losses=0 winrate=100.00% tp=3 sl=0 avg_mfe=0.0349 avg_mae=0.0184 avg_hold=1755.0
+  [BACKTEST] CGPT/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0329 avg_mae=0.0074 avg_hold=480.0
+  [BACKTEST] BCH/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0310 avg_mae=0.0545 avg_hold=7875.0
+  [BACKTEST] SNT/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+  [BACKTEST] KSM/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0364 avg_mae=0.0550 avg_hold=3540.0
+  [BACKTEST] PUFFER/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+  [BACKTEST] VINE/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0369 avg_mae=0.0902 avg_hold=4395.0
+  [BACKTEST] DYDX/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+  [BACKTEST] 1000SHIB/USDT:USDT trades=2 wins=2 losses=0 winrate=100.00% tp=2 sl=0 avg_mfe=0.0307 avg_mae=0.0113 avg_hold=2460.0
+  [BACKTEST] SUN/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
+  [BACKTEST] SAHARA/USDT:USDT trades=2 wins=2 losses=0 winrate=100.00% tp=2 sl=0 avg_mfe=0.0340 avg_mae=0.0672 avg_hold=1972.5
+  [BACKTEST] total trades=20 wins=20 losses=0 winrate=100.00% tp=20 sl=0 avg_mfe=0.0338 avg_mae=0.0367 avg_hold=2396.2
+
   ```
 
 ## Live 전환
