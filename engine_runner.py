@@ -21,6 +21,7 @@ import builtins
 import sys
 import traceback
 import importlib
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List, Any
 
@@ -1435,7 +1436,7 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
         win_rate = (t["wins"] / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
         losses = t["losses"]
         if compact:
-            return f"총진입={t['count']} 총수익={pnl_usdt_part} 승률={win_rate:.1f}% 승={t['wins']} 패={losses}"
+            return f"총청산={t['count']} 총수익={pnl_usdt_part} 승률={win_rate:.1f}% 승={t['wins']} 패={losses}"
         pnl_fmt = f"{pnl_usdt_part:<{pnl_width}}"
         count_fmt = f"{t['count']:<{count_width}}"
         win_fmt = f"{win_rate:.1f}%"
@@ -1446,7 +1447,7 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
 
     def _summary_header(label: str) -> str:
         return (
-            f"| {label:<10} | {'총진입':<{count_width}} | {'총수익':<{pnl_width}} | "
+            f"| {label:<10} | {'총청산':<{count_width}} | {'총수익':<{pnl_width}} | "
             f"{'승률':<{win_width}} | {'승':<{wl_width}} | {'패':<{wl_width}} |"
         )
 
@@ -1503,7 +1504,7 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
     total_win_rate = (total_wins / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
     lines = [
         f"📊 일일 리포트 (KST, {report_date})",
-        f"- 총진입={total_entries} 승={total_wins} 패={total_losses} 승률={total_win_rate:.1f}%",
+        f"- 총청산={total_entries} 승={total_wins} 패={total_losses} 승률={total_win_rate:.1f}%",
         "🔴 SHORT",
     ]
     lines.extend(total_line("SHORT"))
@@ -3250,7 +3251,7 @@ def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dic
                         continue
                     entry_id = payload.get("entry_order_id")
                     symbol = payload.get("symbol") or ""
-                    side = payload.get("side") or ""
+                    side = (payload.get("side") or "").upper()
                     engine = payload.get("engine") or "unknown"
                     record = {
                         "entry_ts": entry_ts_val,
@@ -3405,6 +3406,26 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
             entry_event = entry_map.get(entry_order_id)
             if entry_event:
                 engine = entry_event.get("engine") or engine
+        if (engine == "unknown" or not entry_order_id) and symbol and side:
+            candidates = entry_by_symbol.get((symbol, side)) or []
+            chosen = None
+            if candidates:
+                if exit_ts_val:
+                    eligible = [c for c in candidates if c.get("entry_ts") and c["entry_ts"] <= exit_ts_val]
+                    if eligible:
+                        chosen = max(eligible, key=lambda c: c.get("entry_ts") or 0)
+                if chosen is None:
+                    chosen = max(candidates, key=lambda c: c.get("entry_ts") or 0)
+            if chosen:
+                if not entry_order_id:
+                    entry_order_id = str(chosen.get("entry_order_id") or "")
+                if engine == "unknown":
+                    engine = chosen.get("engine") or engine
+                if not entry_ts_str:
+                    try:
+                        entry_ts_str = datetime.fromtimestamp(float(chosen.get("entry_ts"))).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        pass
         if entry_order_id and entry_order_id in order_map:
             e_trades = order_map.get(entry_order_id) or []
             total_entry_qty = 0.0
@@ -4502,6 +4523,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
     _maybe_reload_rsi_config()
 
 _RSI_CONFIG_MTIME: Optional[float] = None
+_RSI_CONFIG_LOGGED: bool = False
 
 def _maybe_reload_rsi_config() -> None:
     global _RSI_CONFIG_MTIME, rsi_engine
@@ -4512,6 +4534,14 @@ def _maybe_reload_rsi_config() -> None:
         return
     if _RSI_CONFIG_MTIME is None:
         _RSI_CONFIG_MTIME = mtime
+        try:
+            import engines.rsi.config as rsi_config
+            importlib.reload(rsi_config)
+            if rsi_engine:
+                rsi_engine.config = rsi_config.RsiConfig()
+            print(f"[config] rsi_config loaded mtime={mtime:.0f}")
+        except Exception as e:
+            print(f"[config] rsi_config load failed: {e}")
         return
     if mtime <= _RSI_CONFIG_MTIME:
         return
@@ -4524,6 +4554,59 @@ def _maybe_reload_rsi_config() -> None:
     except Exception as e:
         print(f"[config] rsi_config reload failed: {e}")
     _RSI_CONFIG_MTIME = mtime
+
+def _load_rsi_config_defaults() -> Optional[object]:
+    try:
+        import engines.rsi.config as rsi_config
+        importlib.reload(rsi_config)
+        return rsi_config.RsiConfig()
+    except Exception as e:
+        print(f"[config] rsi_config load failed: {e}")
+        return None
+
+def _read_rsi_config_values() -> Dict[str, Any]:
+    cfg_path = os.path.join(os.path.dirname(__file__), "engines", "rsi", "config.py")
+    try:
+        text = open(cfg_path, "r", encoding="utf-8").read()
+    except Exception:
+        return {}
+    values: Dict[str, Any] = {}
+    for line in text.splitlines():
+        raw = line.strip()
+        if raw.startswith("min_quote_volume_usdt"):
+            parts = raw.split("=", 1)
+            if len(parts) == 2:
+                val = parts[1].split("#", 1)[0].strip().replace("_", "")
+                try:
+                    values["min_quote_volume_usdt"] = float(val)
+                except Exception:
+                    pass
+        elif raw.startswith("universe_top_n"):
+            parts = raw.split("=", 1)
+            if len(parts) == 2:
+                val = parts[1].split("#", 1)[0].strip().replace("_", "")
+                if val != "None":
+                    try:
+                        values["universe_top_n"] = int(val)
+                    except Exception:
+                        pass
+    if "min_quote_volume_usdt" not in values:
+        m = re.search(r"min_quote_volume_usdt\\s*=\\s*([0-9_\\.]+)", text)
+        if m:
+            try:
+                values["min_quote_volume_usdt"] = float(m.group(1).replace("_", ""))
+            except Exception:
+                pass
+    if "universe_top_n" not in values:
+        m = re.search(r"universe_top_n\\s*=\\s*([0-9_]+|None)", text)
+        if m:
+            raw = m.group(1)
+            if raw != "None":
+                try:
+                    values["universe_top_n"] = int(raw.replace("_", ""))
+                except Exception:
+                    pass
+    return values
 
 def _save_runtime_settings_only(state: dict) -> None:
     disk = load_state()
@@ -6008,6 +6091,10 @@ def run():
     atlas_swaggy_cfg = AtlasSwaggyConfig() if AtlasSwaggyConfig else None
     global rsi_engine
     rsi_engine = RsiEngine() if RsiEngine else None
+    _maybe_reload_rsi_config()
+    cfg_defaults = _load_rsi_config_defaults()
+    if rsi_engine and cfg_defaults:
+        rsi_engine.config = cfg_defaults
     div15m_engine = Div15mLongEngine() if Div15mLongEngine else None
     div15m_short_engine = Div15mShortEngine() if Div15mShortEngine else None
     dtfx_engine = DTFXEngine() if DTFXEngine else None
@@ -6333,9 +6420,23 @@ def run():
         qv_map = {}
         anchors = ("BTC/USDT:USDT", "ETH/USDT:USDT")
 
-        rsi_cfg = rsi_engine.config if rsi_engine else None
-        min_qv = rsi_cfg.min_quote_volume_usdt if rsi_cfg else 30_000_000.0
-        top_n = rsi_cfg.universe_top_n if rsi_cfg else 40
+        _maybe_reload_rsi_config()
+        cfg_defaults = _load_rsi_config_defaults()
+        if rsi_engine and cfg_defaults:
+            rsi_engine.config = cfg_defaults
+        rsi_cfg = rsi_engine.config if rsi_engine else cfg_defaults
+        global _RSI_CONFIG_LOGGED
+        cfg_vals = _read_rsi_config_values()
+        if not _RSI_CONFIG_LOGGED:
+            cfg_path = os.path.join(os.path.dirname(__file__), "engines", "rsi", "config.py")
+            print(f"[config] rsi_config path={cfg_path} parsed={cfg_vals} engine={__file__}")
+            _RSI_CONFIG_LOGGED = True
+        shared_min_qv = cfg_vals.get("min_quote_volume_usdt")
+        if not isinstance(shared_min_qv, (int, float)):
+            shared_min_qv = rsi_cfg.min_quote_volume_usdt if rsi_cfg else 30_000_000.0
+        shared_top_n = cfg_vals.get("universe_top_n")
+        if not isinstance(shared_top_n, int):
+            shared_top_n = rsi_cfg.universe_top_n if rsi_cfg else 40
         for s in symbols:
             t = tickers.get(s)
             if not t:
@@ -6351,23 +6452,23 @@ def run():
                 continue
             pct_all_map[s] = pct
             qv_all_map[s] = qv
-            if qv >= min_qv:
+            if qv >= shared_min_qv:
                 qv_map[s] = qv
         shared_universe = []
         if build_universe_from_tickers:
             shared_universe = build_universe_from_tickers(
                 tickers,
                 symbols=symbols,
-                min_quote_volume_usdt=min_qv,
-                top_n=top_n,
+                min_quote_volume_usdt=shared_min_qv,
+                top_n=shared_top_n,
                 anchors=anchors,
             )
         else:
             shared_universe = [s for s, _ in sorted(pct_all_map.items(), key=lambda x: abs(x[1]), reverse=True)]
-            shared_universe = [s for s in shared_universe if qv_all_map.get(s, 0) >= min_qv]
+            shared_universe = [s for s in shared_universe if qv_all_map.get(s, 0) >= shared_min_qv]
             shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
-            if top_n:
-                shared_universe = shared_universe[:top_n]
+            if shared_top_n:
+                shared_universe = shared_universe[:shared_top_n]
         state["_universe"] = list(shared_universe)
         if rsi_engine:
             ctx = EngineContext(
@@ -6426,14 +6527,14 @@ def run():
             state["_swaggy_universe"] = swaggy_universe
         elif SWAGGY_ATLAS_LAB_ENABLED:
             dtfx_cfg = dtfx_cfg if dtfx_cfg else DTFXConfig()
-            min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
+            dtfx_min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
             anchors = []
             for s in dtfx_cfg.anchor_symbols or []:
                 anchors.append(s if "/" in s else f"{s}/USDT:USDT")
             swaggy_universe = build_universe_from_tickers(
                 tickers,
                 symbols=symbols,
-                min_quote_volume_usdt=min_qv,
+                min_quote_volume_usdt=dtfx_min_qv,
                 top_n=dtfx_cfg.universe_top_n,
                 anchors=tuple(anchors),
             )
@@ -7617,7 +7718,7 @@ def run():
         print_section("사이클 요약")
         anchors_disp = ",".join(anchors)
         print(
-            f"[universe] rule=qVol>={int(min_qv):,} sort=abs(pct) topN={top_n} anchors={anchors_disp} "
+            f"[universe] rule=qVol>={int(shared_min_qv):,} sort=abs(pct) topN={shared_top_n} anchors={anchors_disp} "
             f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
             f"dtfx={dtfx_universe_len} "
             f"pumpfade={pumpfade_universe_len} arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"

@@ -33,8 +33,8 @@ class AtlasRsFailShortEngine(BaseEngine):
             return []
         min_qv = 8_000_000.0
         exclude_top_abs = 20
-        exclude_top_qv = 20
-        top_by_qv = 30
+        exclude_top_qv = 30
+        top_by_qv = 40
         pct_map = {}
         qv_map = {}
         for sym, t in tickers.items():

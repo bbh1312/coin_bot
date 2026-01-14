@@ -489,15 +489,19 @@ def main() -> None:
             )
             for t in trades_by_key.get((mode, sym), []):
                 hold_min = float(t.get("duration_bars") or 0) * ltf_minutes
+                pnl_pct = float(t.get("pnl_pct") or 0.0)
+                outcome = "WIN" if pnl_pct > 0 else "LOSS"
                 print(
-                    "[ENTRY] sym=%s mode=%s entry_ts=%s exit_ts=%s reason=%s pnl_pct=%.4f hold_min=%.1f"
+                    "[ENTRY] sym=%s side=%s outcome=%s mode=%s entry_ts=%s exit_ts=%s reason=%s pnl_pct=%.4f hold_min=%.1f"
                     % (
                         t.get("sym"),
+                        t.get("side"),
+                        outcome,
                         t.get("mode"),
                         t.get("entry_ts"),
                         t.get("exit_ts"),
                         t.get("exit_reason"),
-                        float(t.get("pnl_pct") or 0.0),
+                        pnl_pct,
                         hold_min,
                     )
                 )

@@ -173,8 +173,8 @@ def _drain_entry_events(state) -> None:
                         {
                             "side": side,
                             "symbol": sym,
-                            "entry_ts": float(entry_ts),
-                            "entry_ts_ms": int(float(entry_ts) * 1000),
+                            "entry_ts": float(entry_ts_val),
+                            "entry_ts_ms": int(float(entry_ts_val) * 1000),
                             "entry_price": payload.get("entry_price"),
                             "qty": payload.get("qty"),
                             "usdt": None,

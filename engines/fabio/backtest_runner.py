@@ -357,10 +357,15 @@ def _run_backtest_for_symbol(
     cooldown_until = -10**9
     ltf_ms = _tf_to_ms(fabio_cfg.timeframe_ltf)
     ltf_minutes = (ltf_ms / 60000.0) if ltf_ms > 0 else 0.0
+    entries: List[Dict[str, Any]] = []
     trade_stats: Dict[str, float] = {
         "trades": 0,
         "wins": 0,
         "losses": 0,
+        "long_wins": 0,
+        "long_losses": 0,
+        "short_wins": 0,
+        "short_losses": 0,
         "timeouts": 0,
         "tp": 0,
         "sl": 0,
@@ -446,11 +451,30 @@ def _run_backtest_for_symbol(
                     trade_stats["sl"] += 1
                 if pnl_pct >= 0:
                     trade_stats["wins"] += 1
+                    if trade.side == "LONG":
+                        trade_stats["long_wins"] += 1
+                    else:
+                        trade_stats["short_wins"] += 1
                 else:
                     trade_stats["losses"] += 1
+                    if trade.side == "LONG":
+                        trade_stats["long_losses"] += 1
+                    else:
+                        trade_stats["short_losses"] += 1
                 trade_stats["mfe_sum"] += mfe
                 trade_stats["mae_sum"] += mae
                 trade_stats["hold_sum"] += hold_min
+                entries.append(
+                    {
+                        "symbol": symbol,
+                        "side": trade.side,
+                        "entry_ts": trade.entry_ts,
+                        "exit_ts": trade.exit_ts,
+                        "exit_reason": trade.exit_reason,
+                        "pnl_pct": pnl_pct,
+                        "hold_min": hold_min,
+                    }
+                )
                 _append_trade(
                     out_trades,
                     [
@@ -664,11 +688,30 @@ def _run_backtest_for_symbol(
         trade_stats["trades"] += 1
         if pnl_pct >= 0:
             trade_stats["wins"] += 1
+            if trade.side == "LONG":
+                trade_stats["long_wins"] += 1
+            else:
+                trade_stats["short_wins"] += 1
         else:
             trade_stats["losses"] += 1
+            if trade.side == "LONG":
+                trade_stats["long_losses"] += 1
+            else:
+                trade_stats["short_losses"] += 1
         trade_stats["mfe_sum"] += mfe
         trade_stats["mae_sum"] += mae
         trade_stats["hold_sum"] += hold_min
+        entries.append(
+            {
+                "symbol": symbol,
+                "side": trade.side,
+                "entry_ts": trade.entry_ts,
+                "exit_ts": trade.exit_ts,
+                "exit_reason": trade.exit_reason,
+                "pnl_pct": pnl_pct,
+                "hold_min": hold_min,
+            }
+        )
         _append_trade(
             out_trades,
             [
@@ -697,6 +740,8 @@ def _run_backtest_for_symbol(
         "[atlasfabio-trades] "
         f"sym={symbol} trades={trade_stats['trades']} wins={trade_stats['wins']} "
         f"losses={trade_stats['losses']} timeouts={trade_stats['timeouts']} "
+        f"long_wins={trade_stats['long_wins']} long_losses={trade_stats['long_losses']} "
+        f"short_wins={trade_stats['short_wins']} short_losses={trade_stats['short_losses']} "
         f"win_rate={win_rate:.4f} skip_in_pos={trade_stats['skipped_in_pos']} "
         f"skip_cooldown={trade_stats['skipped_cooldown']} skip_no_next={trade_stats['skipped_no_next']}"
     )
@@ -705,6 +750,10 @@ def _run_backtest_for_symbol(
         "trades": trade_stats["trades"],
         "wins": trade_stats["wins"],
         "losses": trade_stats["losses"],
+        "long_wins": trade_stats["long_wins"],
+        "long_losses": trade_stats["long_losses"],
+        "short_wins": trade_stats["short_wins"],
+        "short_losses": trade_stats["short_losses"],
         "timeouts": trade_stats["timeouts"],
         "tp": trade_stats["tp"],
         "sl": trade_stats["sl"],
@@ -712,6 +761,7 @@ def _run_backtest_for_symbol(
         "avg_mfe": avg_mfe,
         "avg_mae": avg_mae,
         "avg_hold": avg_hold,
+        "entries": entries,
     }
 
 
@@ -912,12 +962,20 @@ def main() -> None:
         total_mfe = 0.0
         total_mae = 0.0
         total_hold = 0.0
+        total_long_wins = 0
+        total_long_losses = 0
+        total_short_wins = 0
+        total_short_losses = 0
         for row in summary_rows:
             trades = int(row.get("trades") or 0)
             wins = int(row.get("wins") or 0)
             losses = int(row.get("losses") or 0)
             tp = int(row.get("tp") or 0)
             sl = int(row.get("sl") or 0)
+            long_wins = int(row.get("long_wins") or 0)
+            long_losses = int(row.get("long_losses") or 0)
+            short_wins = int(row.get("short_wins") or 0)
+            short_losses = int(row.get("short_losses") or 0)
             win_rate = (wins / trades * 100.0) if trades else 0.0
             avg_mfe = float(row.get("avg_mfe") or 0.0)
             avg_mae = float(row.get("avg_mae") or 0.0)
@@ -930,9 +988,14 @@ def main() -> None:
             total_mfe += avg_mfe * trades
             total_mae += avg_mae * trades
             total_hold += avg_hold * trades
+            total_long_wins += long_wins
+            total_long_losses += long_losses
+            total_short_wins += short_wins
+            total_short_losses += short_losses
             print(
                 "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f "
+                "long_wins=%d long_losses=%d short_wins=%d short_losses=%d"
                 % (
                     row.get("symbol"),
                     trades,
@@ -944,15 +1007,36 @@ def main() -> None:
                     avg_mfe,
                     avg_mae,
                     avg_hold,
+                    long_wins,
+                    long_losses,
+                    short_wins,
+                    short_losses,
                 )
             )
+            for entry in row.get("entries") or []:
+                pnl_pct = float(entry.get("pnl_pct") or 0.0)
+                outcome = "WIN" if pnl_pct > 0 else "LOSS"
+                print(
+                    "[ENTRY] sym=%s side=%s outcome=%s entry_ts=%s exit_ts=%s reason=%s pnl_pct=%.4f hold_min=%.1f"
+                    % (
+                        entry.get("symbol"),
+                        entry.get("side"),
+                        outcome,
+                        entry.get("entry_ts"),
+                        entry.get("exit_ts"),
+                        entry.get("exit_reason"),
+                        pnl_pct,
+                        float(entry.get("hold_min") or 0.0),
+                    )
+                )
         total_win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
         total_avg_mfe = (total_mfe / total_trades) if total_trades else 0.0
         total_avg_mae = (total_mae / total_trades) if total_trades else 0.0
         total_avg_hold = (total_hold / total_trades) if total_trades else 0.0
         print(
             "[BACKTEST] TOTAL trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-            "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+            "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f "
+            "long_wins=%d long_losses=%d short_wins=%d short_losses=%d"
             % (
                 total_trades,
                 total_wins,
@@ -963,6 +1047,10 @@ def main() -> None:
                 total_avg_mfe,
                 total_avg_mae,
                 total_avg_hold,
+                total_long_wins,
+                total_long_losses,
+                total_short_wins,
+                total_short_losses,
             )
         )
 

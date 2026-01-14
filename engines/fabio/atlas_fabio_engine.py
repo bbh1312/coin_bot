@@ -30,7 +30,7 @@ class Config:
     atr_mult: float = 1.2
     d1_ema_len: int = 7
     d1_atr_len: int = 14
-    d1_overext_atr_mult: float = 1.4
+    d1_overext_atr_mult: float = 1.3
     vol_sma_period: int = 20
     vol_mult: float = 1.3
     strong_score_threshold: int = 70
