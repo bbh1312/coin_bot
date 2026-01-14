@@ -509,6 +509,30 @@ class SwaggySignalEngine:
                 debug={"regime": regime_state.regime, "chase_dist": chase_dist},
             )
 
+        ema7_series = ema(candles_5m["close"], 7)
+        if not ema7_series.empty:
+            ema7_val = float(ema7_series.iloc[-1])
+            if side == "LONG" and last_price > ema7_val:
+                return SwaggySignal(
+                    False,
+                    side,
+                    strength,
+                    ["EMA7_DIR"],
+                    best.kind,
+                    None,
+                    debug={"regime": regime_state.regime, "ema7": ema7_val},
+                )
+            if side == "SHORT" and last_price < ema7_val:
+                return SwaggySignal(
+                    False,
+                    side,
+                    strength,
+                    ["EMA7_DIR"],
+                    best.kind,
+                    None,
+                    debug={"regime": regime_state.regime, "ema7": ema7_val},
+                )
+
         state["last_signal_ts"] = now_ts
         state["phase"] = "COOLDOWN"
         state["cooldown_until"] = now_ts + cfg.cooldown_min * 60

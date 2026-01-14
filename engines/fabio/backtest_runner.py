@@ -16,7 +16,9 @@ if ROOT_DIR not in sys.path:
 import cycle_cache
 import engine_runner
 from engines.fabio import fabio_entry_engine, atlas_fabio_engine
+from engines.dtfx.engine import DTFXConfig
 from engines.rsi.engine import RsiEngine
+from engines.universe import build_universe_from_tickers
 
 
 def _parse_datetime(value: str) -> int:
@@ -807,36 +809,20 @@ def main() -> None:
     )
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    auto_long_syms: List[str] = []
-    auto_short_syms: List[str] = []
     if not symbols:
         tickers = exchange.fetch_tickers()
-        pct_all_map: Dict[str, float] = {}
-        for sym, t in tickers.items():
-            if not t:
-                continue
-            pct = t.get("percentage")
-            qv = t.get("quoteVolume")
-            if pct is None or qv is None:
-                continue
-            try:
-                pct_all_map[sym] = float(pct)
-            except Exception:
-                continue
-        gainers = sorted(pct_all_map.keys(), key=lambda x: pct_all_map.get(x, 0.0), reverse=True)[:engine_runner.FABIO_GAIN_TOP_N]
-        losers = sorted(pct_all_map.keys(), key=lambda x: pct_all_map.get(x, 0.0))[:engine_runner.FABIO_LOSS_TOP_N]
-        symbols = list(dict.fromkeys(gainers + losers))
-        if len(symbols) < (engine_runner.FABIO_GAIN_TOP_N + engine_runner.FABIO_LOSS_TOP_N):
-            seen = set(symbols)
-            for s in sorted(pct_all_map.keys(), key=lambda x: abs(pct_all_map.get(x, 0.0)), reverse=True):
-                if s in seen:
-                    continue
-                symbols.append(s)
-                seen.add(s)
-                if len(symbols) >= (engine_runner.FABIO_GAIN_TOP_N + engine_runner.FABIO_LOSS_TOP_N):
-                    break
-        auto_long_syms = list(gainers)
-        auto_short_syms = list(losers)
+        dtfx_cfg = DTFXConfig()
+        anchors = []
+        for s in dtfx_cfg.anchor_symbols or []:
+            anchors.append(s if "/" in s else f"{s}/USDT:USDT")
+        min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
+        symbols = build_universe_from_tickers(
+            tickers,
+            symbols=list(tickers.keys()),
+            min_quote_volume_usdt=min_qv,
+            top_n=dtfx_cfg.universe_top_n,
+            anchors=tuple(anchors),
+        )
     if isinstance(args.max_symbols, int) and args.max_symbols > 0:
         symbols = symbols[: args.max_symbols]
     if not symbols:
@@ -913,8 +899,8 @@ def main() -> None:
         data_by_tf,
         fabio_cfg.timeframe_ltf,
         args.direction,
-        long_syms=[s.strip() for s in args.long.split(",") if s.strip()] or auto_long_syms,
-        short_syms=[s.strip() for s in args.short.split(",") if s.strip()] or auto_short_syms,
+        long_syms=[s.strip() for s in args.long.split(",") if s.strip()],
+        short_syms=[s.strip() for s in args.short.split(",") if s.strip()],
         verbose=args.verbose,
     )
 

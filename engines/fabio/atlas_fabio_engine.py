@@ -116,6 +116,26 @@ def evaluate_gate_long(symbol: str, cfg: Config) -> Dict[str, Any]:
     data = _load_gate_data(symbol, cfg)
     if not data:
         return {"status": "warmup"}
+    ltf5 = cycle_cache.get_df(symbol, "5m", 20)
+    if ltf5.empty or len(ltf5) < 10:
+        return {"status": "warmup"}
+    ltf5 = ltf5.iloc[:-1]
+    ema7_vals = ema(ltf5["close"].tolist(), 7)
+    if not ema7_vals:
+        return {"status": "warmup"}
+    ema7_val = ema7_vals[-1]
+    last_close = ltf5["close"].tolist()[-1]
+    if isinstance(ema7_val, (int, float)) and isinstance(last_close, (int, float)):
+        if float(last_close) > float(ema7_val):
+            return {
+                "status": "ok",
+                "trade_allowed": False,
+                "allow_long": False,
+                "allow_short": False,
+                "size_mult": cfg.size_mult_base,
+                "st_dir": data["st_dir"],
+                "block_reason": "EMA7_DIR",
+            }
     d1_dist_atr = data.get("d1_dist_atr")
     if isinstance(d1_dist_atr, (int, float)) and d1_dist_atr > cfg.d1_overext_atr_mult:
         return {
@@ -159,6 +179,26 @@ def evaluate_gate_short(symbol: str, cfg: Config) -> Dict[str, Any]:
     data = _load_gate_data(symbol, cfg)
     if not data:
         return {"status": "warmup"}
+    ltf5 = cycle_cache.get_df(symbol, "5m", 20)
+    if ltf5.empty or len(ltf5) < 10:
+        return {"status": "warmup"}
+    ltf5 = ltf5.iloc[:-1]
+    ema7_vals = ema(ltf5["close"].tolist(), 7)
+    if not ema7_vals:
+        return {"status": "warmup"}
+    ema7_val = ema7_vals[-1]
+    last_close = ltf5["close"].tolist()[-1]
+    if isinstance(ema7_val, (int, float)) and isinstance(last_close, (int, float)):
+        if float(last_close) < float(ema7_val):
+            return {
+                "status": "ok",
+                "trade_allowed": False,
+                "allow_long": False,
+                "allow_short": False,
+                "size_mult": cfg.size_mult_base,
+                "st_dir": data["st_dir"],
+                "block_reason": "EMA7_DIR",
+            }
     d1_dist_atr = data.get("d1_dist_atr")
     if isinstance(d1_dist_atr, (int, float)) and d1_dist_atr > cfg.d1_overext_atr_mult:
         return {

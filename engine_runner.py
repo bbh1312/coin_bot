@@ -5646,6 +5646,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
             state_dirty = True
         if state_dirty:
             try:
+                state["_runtime_cfg_ts"] = time.time()
                 if MANAGE_WS_MODE:
                     _save_runtime_settings_only(state)
                 else:
@@ -6490,22 +6491,19 @@ def run():
         fabio_universe = []
         fabio_label = "realtime_only"
         fabio_dir_hint = {}
-        if heavy_scan:
-            fabio_label = "gainers15+losers15"
-            gainers = sorted(pct_all_map.keys(), key=lambda x: pct_all_map.get(x, 0.0), reverse=True)[:FABIO_GAIN_TOP_N]
-            losers = sorted(pct_all_map.keys(), key=lambda x: pct_all_map.get(x, 0.0))[:FABIO_LOSS_TOP_N]
-            fabio_universe = list(dict.fromkeys(gainers + losers))
-            if len(fabio_universe) < (FABIO_GAIN_TOP_N + FABIO_LOSS_TOP_N):
-                seen = set(fabio_universe)
-                for s in sorted(pct_all_map.keys(), key=lambda x: abs(pct_all_map.get(x, 0.0)), reverse=True):
-                    if s in seen:
-                        continue
-                    fabio_universe.append(s)
-                    seen.add(s)
-                    if len(fabio_universe) >= (FABIO_GAIN_TOP_N + FABIO_LOSS_TOP_N):
-                        break
-            fabio_dir_hint = {s: "LONG" for s in gainers}
-            fabio_dir_hint.update({s: "SHORT" for s in losers})
+        if heavy_scan and dtfx_cfg and build_universe_from_tickers:
+            fabio_label = "dtfx_universe"
+            anchors = []
+            for s in dtfx_cfg.anchor_symbols or []:
+                anchors.append(s if "/" in s else f"{s}/USDT:USDT")
+            dtfx_min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
+            fabio_universe = build_universe_from_tickers(
+                tickers,
+                symbols=symbols,
+                min_quote_volume_usdt=dtfx_min_qv,
+                top_n=dtfx_cfg.universe_top_n,
+                anchors=tuple(anchors),
+            )
             state["_fabio_universe"] = fabio_universe
             state["_fabio_label"] = fabio_label
             state["_fabio_dir_hint"] = fabio_dir_hint
@@ -6622,17 +6620,10 @@ def run():
                 )
             )
         if heavy_scan:
-            long_cnt = 0
-            short_cnt = 0
-            if isinstance(fabio_dir_hint, dict):
-                long_cnt = sum(1 for v in fabio_dir_hint.values() if v == "LONG")
-                short_cnt = sum(1 for v in fabio_dir_hint.values() if v == "SHORT")
             try:
                 os.makedirs("logs", exist_ok=True)
                 atlas_line = (
-                    f"[atlasfabio-universe] total={len(fabio_universe)} "
-                    f"long={long_cnt} short={short_cnt} "
-                    f"sample_gainers={gainers[:3]} sample_losers={losers[:3]}"
+                    f"[atlasfabio-universe] total={len(fabio_universe)} label={fabio_label}"
                 )
                 with open(os.path.join("logs", "fabio", "atlasfabio_universe.log"), "a", encoding="utf-8") as f:
                     f.write(atlas_line + "\n")
