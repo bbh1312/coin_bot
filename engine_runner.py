@@ -22,6 +22,7 @@ import sys
 import traceback
 import importlib
 import re
+import copy
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List, Any
 
@@ -6070,9 +6071,18 @@ def save_state(state: Dict[str, dict]) -> None:
             for key in runtime_keys:
                 if key in disk:
                     state[key] = disk.get(key)
+    state_snapshot = None
+    for _ in range(3):
+        try:
+            state_snapshot = copy.deepcopy(state)
+            break
+        except RuntimeError:
+            time.sleep(0.01)
+    if state_snapshot is None:
+        state_snapshot = dict(state)
     tmp_path = f"{STATE_FILE}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+        json.dump(state_snapshot, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, STATE_FILE)
 
 def run():

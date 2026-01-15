@@ -1,18 +1,21 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
+import sys
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 from env_loader import load_env
 
-from .atlas_config import Config
-from .atlas_engine import evaluate_atlas, set_cache, compute_global_gate, get_ref_symbol
+from atlas_test.atlas_config import Config
+from atlas_test.atlas_engine import evaluate_atlas, set_cache, compute_global_gate, get_ref_symbol
 from engines.atlas.atlas_engine import AtlasSwaggyConfig
-from .data_feed import init_exchange, wait_with_backoff, fetch_ohlcv
-from .notifier_telegram import send_message
-from .state_store import load_state, save_state
+from atlas_test.data_feed import init_exchange, wait_with_backoff, fetch_ohlcv
+from atlas_test.notifier_telegram import send_message
+from atlas_test.state_store import load_state, save_state
 from engines.universe import build_universe_from_tickers
-
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _fmt_kst(ts_ms: int) -> str:

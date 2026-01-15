@@ -151,6 +151,10 @@
             width: 100%;
             max-width: 11rem;
         }
+        #risk-controls .divider {
+            border-top: 1px dashed var(--line);
+            margin: 0.6rem 0;
+        }
         input, select {
             background: var(--panel-2);
             border: 1px solid var(--line);
@@ -240,6 +244,22 @@
         const liveControls = document.getElementById("live-controls");
         const engineControls = document.getElementById("engine-controls");
         const riskControls = document.getElementById("risk-controls");
+        const commandByKey = new Map(COMMANDS.map((item) => [item.key, item]));
+        const riskOrder = [
+            "_entry_usdt",
+            "_max_open_positions",
+            "_exit_cooldown_hours",
+            "divider",
+            "_auto_exit_long_tp_pct",
+            "_auto_exit_long_sl_pct",
+            "_auto_exit_short_tp_pct",
+            "_auto_exit_short_sl_pct",
+            "divider",
+            "_dca_pct",
+            "_dca_first_pct",
+            "_dca_second_pct",
+            "_dca_third_pct",
+        ];
 
         async function sendCommand(payload) {
             const res = await fetch("/command", {
@@ -294,6 +314,12 @@
             return row;
         }
 
+        function buildDividerRow() {
+            const divider = document.createElement("div");
+            divider.className = "divider";
+            return divider;
+        }
+
         async function refreshStatus() {
             const res = await fetch("/status");
             if (!res.ok) {
@@ -317,9 +343,19 @@
                     } else {
                         engineControls.appendChild(row);
                     }
-                } else {
-                    riskControls.appendChild(buildNumberRow(item, current));
                 }
+            });
+            riskOrder.forEach((key) => {
+                if (key === "divider") {
+                    riskControls.appendChild(buildDividerRow());
+                    return;
+                }
+                const item = commandByKey.get(key);
+                if (!item) {
+                    return;
+                }
+                const current = data[item.key];
+                riskControls.appendChild(buildNumberRow(item, current));
             });
         }
 
