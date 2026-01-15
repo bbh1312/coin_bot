@@ -210,7 +210,7 @@ def build_report(db_path: str, since_sec: int, out_path: str, daily_out_path: st
             ps.trade_count += 1
             ps.realized_pnl += pnl
             ps.realized_pnl_net += pnl
-            day = time.strftime("%Y-%m-%d", time.gmtime(float(ts) + 9 * 3600))
+            day = time.strftime("%Y-%m-%d", time.gmtime(float(ts)))
             dkey = (day, symbol, side)
             dps = daily.setdefault(dkey, PositionState())
             dps.trade_count += 1

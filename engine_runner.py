@@ -264,6 +264,13 @@ def _date_str_kst(ts: float) -> str:
     except Exception:
         return "unknown"
 
+def _report_day_str(ts: float) -> str:
+    try:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return "unknown"
+
 def _get_trade_log(state: Dict[str, dict]) -> list:
     log = state.get("_trade_log")
     if not isinstance(log, list):
@@ -1420,8 +1427,8 @@ def _load_income_trade_rows(start_date: str, end_date: str) -> List[dict]:
         return []
     if end_dt < start_dt:
         start_dt, end_dt = end_dt, start_dt
-    start_ts = calendar.timegm((start_dt - timedelta(hours=9)).timetuple())
-    end_ts = calendar.timegm((end_dt + timedelta(days=1) - timedelta(hours=9)).timetuple())
+    start_ts = calendar.timegm(start_dt.timetuple())
+    end_ts = calendar.timegm((end_dt + timedelta(days=1)).timetuple())
     db_path = getattr(dbrec, "DB_PATH", "") or "logs/trades.db"
     out: List[dict] = []
     try:
@@ -1514,7 +1521,7 @@ def _load_db_daily_rows(report_date: str) -> Optional[List[dict]]:
                 """
                 SELECT DISTINCT symbol
                 FROM income
-                WHERE date(datetime(ts, 'unixepoch', '+9 hours')) = ?
+                WHERE date(datetime(ts, 'unixepoch')) = ?
                 """,
                 (report_date,),
             ).fetchall()
@@ -1597,7 +1604,7 @@ def _load_db_daily_rows_range(start_date: str, end_date: str) -> Optional[List[d
                 """
                 SELECT DISTINCT symbol
                 FROM income
-                WHERE date(datetime(ts, 'unixepoch', '+9 hours')) BETWEEN ? AND ?
+                WHERE date(datetime(ts, 'unixepoch')) BETWEEN ? AND ?
                 """,
                 (start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")),
             ).fetchall()
@@ -1798,7 +1805,7 @@ def _format_report_output(
     total_pnl_str = f"{total_pnl_int:+d} USDT" if total_pnl_int is not None else "N/A"
     lines = [
         f"📊 일일 리포트 (KST, {report_label})",
-        f"- 총 진입={entry_count} 총 청산={total_exits} 총 수익={total_pnl_str} 승률={total_win_rate:.1f}% 승={total_wins} 패={total_losses}",
+        f"- <b>총 진입={entry_count} 총 청산={total_exits} 총 수익={total_pnl_str} 승률={total_win_rate:.1f}% 승={total_wins} 패={total_losses}</b>",
         "",
         "🔴 SHORT",
     ]
@@ -2104,7 +2111,7 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
             exit_ts = tr.get("exit_ts")
             if not exit_ts:
                 continue
-            if _date_str_kst(exit_ts) != report_date:
+            if _report_day_str(exit_ts) != report_date:
                 continue
             side = str(tr.get("side") or "").upper()
             if side not in totals:
@@ -4085,7 +4092,7 @@ def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dic
                     }
                     if entry_id:
                         by_id[str(entry_id)] = record
-                    if report_date is None or _date_str_kst(entry_ts_val) == report_date:
+                    if report_date is None or _report_day_str(entry_ts_val) == report_date:
                         key = (symbol, side)
                         by_symbol_side.setdefault(key, []).append(record)
     except Exception:
@@ -4118,7 +4125,7 @@ def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
         exit_ts = tr.get("exit_ts")
         if not isinstance(exit_ts, (int, float)):
             continue
-        if _date_str_kst(exit_ts) != report_date:
+        if _report_day_str(exit_ts) != report_date:
             continue
         exit_id = tr.get("exit_order_id")
         symbol = tr.get("symbol")
@@ -8718,11 +8725,11 @@ def run():
         avg_cycle = (TOTAL_ELAPSED / TOTAL_CYCLES) if TOTAL_CYCLES > 0 else 0.0
         avg_rest = (TOTAL_REST_CALLS / TOTAL_CYCLES) if TOTAL_CYCLES > 0 else 0.0
         avg_429 = (TOTAL_429_COUNT / TOTAL_CYCLES) if TOTAL_CYCLES > 0 else 0.0
-        # daily report at 09:00 KST for previous day
+        # daily report at 09:30 KST for previous day
         now_kst = _kst_now()
         today_kst = now_kst.strftime("%Y-%m-%d")
         last_report_date = state.get("_daily_report_date")
-        if now_kst.hour >= 9 and last_report_date != today_kst:
+        if (now_kst.hour > 9 or (now_kst.hour == 9 and now_kst.minute >= 30)) and last_report_date != today_kst:
             report_guard = os.path.join("reports", f"daily_report_{today_kst}.done")
             try:
                 os.makedirs("reports", exist_ok=True)
