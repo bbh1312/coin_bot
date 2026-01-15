@@ -229,6 +229,7 @@ def main() -> None:
         bears = []
         exits = []
         symbols_state = state.setdefault("symbols", {})
+        now_ts = int(summary_ts)
 
         for idx, sym in enumerate(universe, start=1):
             sym_cfg = Config()
@@ -243,6 +244,13 @@ def main() -> None:
             counts[state_now] = counts.get(state_now, 0) + 1
             atlas_local = result.get("atlas_local") or {}
             breakdown = _score_breakdown(result)
+            sym_state = symbols_state.get(sym, {"last_state": "NO_TRADE", "last_alert_state": "NO_TRADE"})
+            last_detail_score = sym_state.get("last_detail_score")
+            last_detail_ts = sym_state.get("last_detail_ts")
+            allow_detail = True
+            if last_detail_score == (result.get("score") or 0) and isinstance(last_detail_ts, (int, float)):
+                if now_ts - int(last_detail_ts) < 3600:
+                    allow_detail = False
             detail_line = (
                 "[{ts}] [atlas-test] idx={idx} sym={sym} state={state} score={score} "
                 "regime={regime} dir={direction} part=R{sr}/RS{srsi}/I{sind}/V{svol} "
@@ -271,8 +279,11 @@ def main() -> None:
                 betas=_fmt_val(breakdown.get("beta_slow")),
                 vol=_fmt_val(breakdown.get("vol_ratio"), "{:.2f}"),
             )
-            print(detail_line)
-            _append_detail_log(detail_line)
+            if allow_detail:
+                print(detail_line)
+                _append_detail_log(detail_line)
+                sym_state["last_detail_score"] = result.get("score") or 0
+                sym_state["last_detail_ts"] = now_ts
             entry = {
                 "symbol": sym.replace("/USDT:USDT", ""),
                 "score": result.get("score") or 0,
@@ -286,7 +297,6 @@ def main() -> None:
             elif state_now == "STRONG_BEAR":
                 bears.append(entry)
 
-            sym_state = symbols_state.get(sym, {"last_state": "NO_TRADE", "last_alert_state": "NO_TRADE"})
             last_state = sym_state.get("last_state", "NO_TRADE")
             last_alert = sym_state.get("last_alert_state", "NO_TRADE")
             if state_now != last_state:

@@ -25,6 +25,10 @@ from typing import Optional, Dict
 
 import ccxt
 from env_loader import load_env
+try:
+    import db_recorder as dbrec
+except Exception:
+    dbrec = None
 
 DEFAULT_LEVERAGE = 10
 BASE_ENTRY_USDT = 40.0
@@ -155,6 +159,38 @@ exchange = ccxt.binance({
     "enableRateLimit": True,
     "options": {"defaultType": "swap"},
 })
+
+def _db_record_order(action: str, symbol: str, side: str, res: Optional[dict], status_override: Optional[str] = None) -> None:
+    if not dbrec or not isinstance(res, dict):
+        return
+    order = res.get("order") if isinstance(res.get("order"), dict) else {}
+    order_id = res.get("order_id") or order.get("id") or (order.get("info") or {}).get("orderId")
+    status = order.get("status") or status_override or res.get("status") or "ok"
+    price = order.get("price") or order.get("average") or res.get("price") or res.get("last")
+    qty = order.get("amount") or res.get("amount")
+    ts = order.get("timestamp") or order.get("lastTradeTimestamp")
+    if isinstance(ts, (int, float)):
+        ts = float(ts) / 1000.0 if ts > 1e12 else float(ts)
+    else:
+        ts = time.time()
+    try:
+        dbrec.record_order(
+            order_id=order_id,
+            symbol=symbol,
+            side=side,
+            order_type=action,
+            status=status,
+            price=price,
+            qty=qty,
+            ts=ts,
+            engine=None,
+            client_order_id=order.get("clientOrderId") or (order.get("info") or {}).get("clientOrderId"),
+            raw=order if order else res,
+        )
+        if order:
+            dbrec.record_fills_from_order(order, symbol=symbol, side=side)
+    except Exception:
+        return
 
 # --- Position mode (Hedge vs One-way) detection cache ---
 _POSMODE_CACHE_TS = 0.0
@@ -676,7 +712,7 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
             "min_notional": min_notional,
         }
     if DRY_RUN:
-        return {
+        res = {
             "status": "dry_run",
             "action": "short_market",
             "symbol": symbol,
@@ -686,12 +722,14 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
             "lev": leverage,
             "order_id": None,
         }
+        _db_record_order("short_market", symbol, "SHORT", res, status_override="dry_run")
+        return res
     params = {}
     if is_hedge_mode():
         params["positionSide"] = "SHORT"
     order = exchange.create_market_sell_order(symbol, amount, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
-    return {
+    res = {
         "status": "ok",
         "action": "short_market",
         "order": order,
@@ -701,6 +739,8 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
         "usdt": usdt_amount,
         "lev": leverage,
     }
+    _db_record_order("short_market", symbol, "SHORT", res)
+    return res
 
 def short_limit(
     symbol: str,
@@ -760,7 +800,7 @@ def short_limit(
             "min_notional": min_notional,
         }
     if DRY_RUN:
-        return {
+        res = {
             "status": "dry_run",
             "action": "short_limit",
             "symbol": symbol,
@@ -770,12 +810,14 @@ def short_limit(
             "lev": leverage,
             "order_id": None,
         }
+        _db_record_order("short_limit", symbol, "SHORT", res, status_override="dry_run")
+        return res
     params = {}
     if is_hedge_mode():
         params["positionSide"] = "SHORT"
     order = exchange.create_limit_sell_order(symbol, amount, price, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
-    return {
+    res = {
         "status": "ok",
         "action": "short_limit",
         "order": order,
@@ -785,6 +827,8 @@ def short_limit(
         "usdt": usdt_amount,
         "lev": leverage,
     }
+    _db_record_order("short_limit", symbol, "SHORT", res)
+    return res
 
 def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated") -> dict:
     ensure_ready()
@@ -837,7 +881,7 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
             "min_notional": min_notional,
         }
     if DRY_RUN:
-        return {
+        res = {
             "status": "dry_run",
             "action": "long_market",
             "symbol": symbol,
@@ -847,12 +891,14 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
             "lev": leverage,
             "order_id": None,
         }
+        _db_record_order("long_market", symbol, "LONG", res, status_override="dry_run")
+        return res
     params = {}
     if is_hedge_mode():
         params["positionSide"] = "LONG"
     order = exchange.create_market_buy_order(symbol, amount, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
-    return {
+    res = {
         "status": "ok",
         "action": "long_market",
         "order": order,
@@ -862,6 +908,8 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
         "usdt": usdt_amount,
         "lev": leverage,
     }
+    _db_record_order("long_market", symbol, "LONG", res)
+    return res
 
 def close_short_market(symbol: str) -> dict:
     ensure_ready()
@@ -870,7 +918,9 @@ def close_short_market(symbol: str) -> dict:
         return {"status": "skip", "reason": "no_short_position", "symbol": symbol}
     amount = float(exchange.amount_to_precision(symbol, amount))
     if DRY_RUN:
-        return {"status": "dry_run", "action": "close_short_market", "symbol": symbol, "amount": amount, "order_id": None}
+        res = {"status": "dry_run", "action": "close_short_market", "symbol": symbol, "amount": amount, "order_id": None}
+        _db_record_order("close_short_market", symbol, "SHORT", res, status_override="dry_run")
+        return res
     hedge = False
     try:
         hedge = is_hedge_mode()
@@ -880,7 +930,9 @@ def close_short_market(symbol: str) -> dict:
     params = {"positionSide": "SHORT"} if hedge else {"reduceOnly": True}
     order = exchange.create_market_buy_order(symbol, amount, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
-    return {"status": "ok", "action": "close_short_market", "order": order, "order_id": order_id, "amount": amount}
+    res = {"status": "ok", "action": "close_short_market", "order": order, "order_id": order_id, "amount": amount}
+    _db_record_order("close_short_market", symbol, "SHORT", res)
+    return res
 
 def close_long_market(symbol: str) -> dict:
     ensure_ready()
@@ -889,7 +941,9 @@ def close_long_market(symbol: str) -> dict:
         return {"status": "skip", "reason": "no_long_position", "symbol": symbol}
     amount = float(exchange.amount_to_precision(symbol, amount))
     if DRY_RUN:
-        return {"status": "dry_run", "action": "close_long_market", "symbol": symbol, "amount": amount, "order_id": None}
+        res = {"status": "dry_run", "action": "close_long_market", "symbol": symbol, "amount": amount, "order_id": None}
+        _db_record_order("close_long_market", symbol, "LONG", res, status_override="dry_run")
+        return res
     hedge = False
     try:
         hedge = is_hedge_mode()
@@ -898,7 +952,9 @@ def close_long_market(symbol: str) -> dict:
     params = {"positionSide": "LONG"} if hedge else {"reduceOnly": True}
     order = exchange.create_market_sell_order(symbol, amount, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
-    return {"status": "ok", "action": "close_long_market", "order": order, "order_id": order_id, "amount": amount}
+    res = {"status": "ok", "action": "close_long_market", "order": order, "order_id": order_id, "amount": amount}
+    _db_record_order("close_long_market", symbol, "LONG", res)
+    return res
 
 def cancel_open_orders(symbol: str) -> dict:
     ensure_ready()
@@ -911,6 +967,11 @@ def cancel_open_orders(symbol: str) -> dict:
             try:
                 exchange.cancel_order(o["id"], symbol)
                 canceled += 1
+                if dbrec:
+                    try:
+                        dbrec.record_cancel(order_id=o.get("id"), symbol=symbol, side=None, ts=time.time(), reason="cancel_open_orders", raw=o)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         return {"status": "ok", "action": "cancel_open_orders", "symbol": symbol, "canceled": canceled}
@@ -973,10 +1034,20 @@ def cancel_stop_orders(symbol: str) -> dict:
                 try:
                     exchange.cancel_order(o["id"], symbol, params)
                     canceled += 1
+                    if dbrec:
+                        try:
+                            dbrec.record_cancel(order_id=o.get("id"), symbol=symbol, side=pos_side, ts=time.time(), reason="cancel_stop_orders", raw=o)
+                        except Exception:
+                            pass
                 except Exception:
                     try:
                         exchange.cancel_order(o["id"], symbol)
                         canceled += 1
+                        if dbrec:
+                            try:
+                                dbrec.record_cancel(order_id=o.get("id"), symbol=symbol, side=pos_side, ts=time.time(), reason="cancel_stop_orders", raw=o)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
             except Exception:
@@ -1058,10 +1129,20 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
         try:
             exchange.cancel_order(o["id"], symbol, params)
             canceled += 1
+            if dbrec:
+                try:
+                    dbrec.record_cancel(order_id=o.get("id"), symbol=symbol, side=pos_side, ts=time.time(), reason="cancel_conditional_by_side", raw=o)
+                except Exception:
+                    pass
         except Exception:
             try:
                 exchange.cancel_order(o["id"], symbol)
                 canceled += 1
+                if dbrec:
+                    try:
+                        dbrec.record_cancel(order_id=o.get("id"), symbol=symbol, side=pos_side, ts=time.time(), reason="cancel_conditional_by_side", raw=o)
+                    except Exception:
+                        pass
             except Exception:
                 pass
     return {

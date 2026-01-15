@@ -10,6 +10,9 @@ import os
 import json
 from typing import Optional
 
+from env_loader import load_env
+load_env()
+
 import ws_manager
 import executor as executor_mod
 import engine_runner as er
@@ -292,9 +295,9 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
     order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
     order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
-        f"🔴 <b>롱 청산</b>\n"
+        f"{er.EXIT_ICON} <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
-        f"엔진: {engine_label}\n"
+        f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: MANUAL\n"
         f"{order_line}".rstrip()
     )
@@ -343,7 +346,7 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
     er.send_telegram(
         f"🔴 <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
-        f"엔진: {engine_label}\n"
+        f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: MANUAL\n"
         f"{order_line}".rstrip()
     )
@@ -398,9 +401,9 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
     )
     order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
-        f"🟢 <b>롱 청산</b>\n"
+        f"{er.EXIT_ICON} <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
-        f"엔진: {engine_label}\n"
+        f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: TP\n"
         f"{order_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
@@ -459,9 +462,9 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts) -> bool:
     )
     order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
-        f"✅ <b>숏 청산</b>\n"
+        f"{er.EXIT_ICON} <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
-        f"엔진: {engine_label}\n"
+        f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: TP\n"
         f"{order_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
@@ -518,9 +521,9 @@ def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
     )
     order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
-        f"🔴 <b>롱 청산</b>\n"
+        f"{er.EXIT_ICON} <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
-        f"엔진: {engine_label}\n"
+        f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: SL\n"
         f"{order_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
@@ -579,7 +582,7 @@ def _handle_short_sl(state, symbol, detail, mark_px, now_ts) -> bool:
     er.send_telegram(
         f"🔴 <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
-        f"엔진: {engine_label}\n"
+        f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: SL\n"
         f"{order_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
