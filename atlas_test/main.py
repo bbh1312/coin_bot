@@ -65,10 +65,17 @@ def _build_summary_message(cfg: Config, summary_ts: int, results: dict, universe
     exits = results.get("exits", [])
     counts = results.get("counts", {"STRONG_BULL": 0, "STRONG_BEAR": 0, "NO_TRADE": 0})
     total = sum(int(v or 0) for v in counts.values())
+    ref_states = results.get("ref_states") or {}
+    btc_state = ref_states.get("BTC") or "N/A"
+    eth_state = ref_states.get("ETH") or "N/A"
     lines = [
         f"[ATLAS-TEST] 15m 요약 (KST {time_str})",
         f"Universe: {universe_label}",
         f"Universe size: {total}",
+        "----",
+        f"BTC : {btc_state}",
+        f"ETH : {eth_state}",
+        "----",
         f"STRONG_BULL: {counts.get('STRONG_BULL', 0)} | STRONG_BEAR: {counts.get('STRONG_BEAR', 0)} | NO_TRADE: {counts.get('NO_TRADE', 0)}",
         "",
         "TOP BULL",
@@ -223,6 +230,15 @@ def main() -> None:
         if summary_ts <= last_summary:
             wait_with_backoff(cfg.poll_sec)
             continue
+        dt_kst = datetime.fromtimestamp(summary_ts / 1000, tz=timezone.utc) + timedelta(hours=9)
+        if dt_kst.minute != 0:
+            wait_with_backoff(cfg.poll_sec)
+            continue
+        hour_key = dt_kst.strftime("%Y-%m-%d %H")
+        last_hour = state.get("global", {}).get("last_summary_hour")
+        if last_hour == hour_key:
+            wait_with_backoff(cfg.poll_sec)
+            continue
 
         counts = {"STRONG_BULL": 0, "STRONG_BEAR": 0, "NO_TRADE": 0}
         bulls = []
@@ -323,7 +339,20 @@ def main() -> None:
             "bulls": bulls[: cfg.summary_top_n],
             "bears": bears[: cfg.summary_top_n],
             "exits": exits[: cfg.summary_top_n],
+            "ref_states": {},
         }
+        try:
+            for ref_sym in ("BTC/USDT:USDT", "ETH/USDT:USDT"):
+                ref_cfg = Config()
+                ref_cfg.symbol = ref_sym
+                ref_cfg.ltf_tf = cfg.ltf_tf
+                ref_cfg.ltf_limit = cfg.ltf_limit
+                ref_res = evaluate_atlas(exchange, ref_cfg, atlas_gate)
+                state_now = ref_res.get("state") or "NO_TRADE"
+                key = "BTC" if ref_sym.startswith("BTC") else "ETH"
+                summary["ref_states"][key] = state_now.replace("STRONG_", "").lower()
+        except Exception:
+            summary["ref_states"] = summary.get("ref_states") or {}
         msg = _build_summary_message(cfg, summary_ts, summary, universe_label)
         print(msg)
         ok = False
@@ -335,6 +364,7 @@ def main() -> None:
             time.sleep(0.5)
         print(f"[atlas-test] summary sent={ok} symbols={len(universe)}")
         state["global"]["last_summary_ts"] = summary_ts
+        state["global"]["last_summary_hour"] = hour_key
         state["symbols"] = symbols_state
         save_state(cfg.state_file, state)
         wait_with_backoff(cfg.poll_sec)

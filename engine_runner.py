@@ -177,6 +177,7 @@ def print_section(title: str) -> None:
 _PRINT_ORIG = builtins.print
 _THREAD_LOG = threading.local()
 _ENTRY_LOCK_MUTEX = threading.Lock()
+_LAST_CYCLE_TS_MEM = 0
 _ENTRY_SEEN_MUTEX = threading.Lock()
 
 def _log_error(msg: str) -> None:
@@ -1512,6 +1513,16 @@ def _load_db_daily_rows(report_date: str) -> Optional[List[dict]]:
     if not dbrec or not dbrec.ENABLED or not dbpnl:
         return None
     try:
+        try:
+            report_start_ts = calendar.timegm(datetime.strptime(report_date, "%Y-%m-%d").timetuple())
+        except Exception:
+            report_start_ts = None
+        if dbrecon and executor_mod and hasattr(executor_mod, "exchange"):
+            lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
+            since_ts = time.time() - float(lookback)
+            if isinstance(report_start_ts, (int, float)):
+                since_ts = min(since_ts, float(report_start_ts))
+            dbrecon.sync_income(executor_mod.exchange, since_ts=since_ts)
         income_symbols = set()
         try:
             db_path = getattr(dbrec, "DB_PATH", "") or "logs/trades.db"
@@ -1554,13 +1565,15 @@ def _load_db_daily_rows(report_date: str) -> Optional[List[dict]]:
             if symbols:
                 lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
                 since_ts = time.time() - float(lookback)
+                if isinstance(report_start_ts, (int, float)):
+                    since_ts = min(since_ts, float(report_start_ts))
                 dbrecon.sync_exchange_state(executor_mod.exchange, since_ts=since_ts, symbols=norm_syms)
-            lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
-            dbrecon.sync_income(executor_mod.exchange, since_ts=time.time() - float(lookback))
         db_path = getattr(dbrec, "DB_PATH", "") or "logs/trades.db"
         out_path = os.path.join("reports", "db_pnl_last3d.csv")
         daily_path = os.path.join("reports", "db_pnl_daily_last3d.csv")
         lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
+        if isinstance(report_start_ts, (int, float)):
+            lookback = max(lookback, time.time() - float(report_start_ts))
         dbpnl.build_report(db_path, int(lookback), out_path, daily_path)
         if not os.path.exists(daily_path):
             return None
@@ -1595,6 +1608,13 @@ def _load_db_daily_rows_range(start_date: str, end_date: str) -> Optional[List[d
     if end_dt < start_dt:
         start_dt, end_dt = end_dt, start_dt
     try:
+        range_start_ts = calendar.timegm(start_dt.timetuple())
+        if dbrecon and executor_mod and hasattr(executor_mod, "exchange"):
+            lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
+            since_ts = time.time() - float(lookback)
+            if isinstance(range_start_ts, (int, float)):
+                since_ts = min(since_ts, float(range_start_ts))
+            dbrecon.sync_income(executor_mod.exchange, since_ts=since_ts)
         income_symbols = set()
         try:
             db_path = getattr(dbrec, "DB_PATH", "") or "logs/trades.db"
@@ -1642,13 +1662,15 @@ def _load_db_daily_rows_range(start_date: str, end_date: str) -> Optional[List[d
                 norm_syms = sorted({_norm(sym) for sym in symbols if sym})
                 lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
                 since_ts = time.time() - float(lookback)
+                if isinstance(range_start_ts, (int, float)):
+                    since_ts = min(since_ts, float(range_start_ts))
                 dbrecon.sync_exchange_state(executor_mod.exchange, since_ts=since_ts, symbols=norm_syms)
-            lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
-            dbrecon.sync_income(executor_mod.exchange, since_ts=time.time() - float(lookback))
         db_path = getattr(dbrec, "DB_PATH", "") or "logs/trades.db"
         out_path = os.path.join("reports", "db_pnl_last3d.csv")
         daily_path = os.path.join("reports", "db_pnl_daily_last3d.csv")
         lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
+        if isinstance(range_start_ts, (int, float)):
+            lookback = max(lookback, time.time() - float(range_start_ts))
         dbpnl.build_report(db_path, int(lookback), out_path, daily_path)
         if not os.path.exists(daily_path):
             return None
@@ -1803,13 +1825,16 @@ def _format_report_output(
     total_outcomes = total_wins + total_losses
     total_win_rate = (total_wins / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
     total_pnl_str = f"{total_pnl_int:+d} USDT" if total_pnl_int is not None else "N/A"
+    short_line = _format_total(totals["SHORT"])
+    long_line = _format_total(totals["LONG"])
     lines = [
         f"📊 일일 리포트 (KST, {report_label})",
         f"- <b>총 진입={entry_count} 총 청산={total_exits} 총 수익={total_pnl_str} 승률={total_win_rate:.1f}% 승={total_wins} 패={total_losses}</b>",
+        f"- SHORT {short_line}",
+        f"- LONG {long_line}",
         "",
         "🔴 SHORT",
     ]
-    lines.extend(total_line("SHORT"))
     if not compact:
         lines.append("")
     lines.extend(engine_lines("SHORT"))
@@ -1818,7 +1843,6 @@ def _format_report_output(
     lines.extend(symbol_lines("SHORT"))
     lines.append("</pre>")
     lines.append("🟢 LONG")
-    lines.extend(total_line("LONG"))
     if not compact:
         lines.append("")
     lines.extend(engine_lines("LONG"))
@@ -1845,11 +1869,16 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
         _, entry_by_symbol = _load_entry_events_map(report_date)
     except Exception:
         entry_by_symbol = {}
+    entry_by_symbol_all = {}
+    try:
+        _, entry_by_symbol_all = _load_entry_events_map(None)
+    except Exception:
+        entry_by_symbol_all = {}
 
     entry_engine_map: Dict[Tuple[str, str], Tuple[float, str]] = {}
     entry_event_index: Dict[Tuple[str, str], List[Tuple[float, str]]] = {}
     entry_event_index: Dict[Tuple[str, str], List[Tuple[float, str]]] = {}
-    for (sym, side), records_by_sym in entry_by_symbol.items():
+    for (sym, side), records_by_sym in entry_by_symbol_all.items():
         side_key = (side or "").upper()
         sym_key = _report_symbol_key(sym)
         if not sym_key or side_key not in ("LONG", "SHORT"):
@@ -2198,6 +2227,12 @@ def _build_range_report(state: Dict[str, dict], start_date: str, end_date: str, 
     entry_by_symbol: dict = {}
     entry_count = 0
     entry_engine_map: Dict[Tuple[str, str], Tuple[float, str]] = {}
+    entry_event_index: Dict[Tuple[str, str], List[Tuple[float, str]]] = {}
+    entry_by_symbol_all = {}
+    try:
+        _, entry_by_symbol_all = _load_entry_events_map(None)
+    except Exception:
+        entry_by_symbol_all = {}
     totals = {
         "LONG": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
         "SHORT": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
@@ -2210,31 +2245,45 @@ def _build_range_report(state: Dict[str, dict], start_date: str, end_date: str, 
             day = cur.strftime("%Y-%m-%d")
             _, entry_by_symbol = _load_entry_events_map(day)
             entry_count += sum(len(v) for v in entry_by_symbol.values())
-            for (sym, side), records_by_sym in entry_by_symbol.items():
-                side_key = (side or "").upper()
-                if side_key not in ("LONG", "SHORT"):
-                    continue
-                sym_key = _report_symbol_key(sym)
-                if not sym_key:
-                    continue
-            ev_list = entry_event_index.setdefault((sym_key, side_key), [])
-            for rec in records_by_sym:
-                ts = rec.get("entry_ts")
-                eng = rec.get("engine") or "unknown"
-                if isinstance(ts, (int, float)):
-                    ev_list.append((float(ts), eng))
-                cur_rec = entry_engine_map.get((sym_key, side_key))
-                if cur_rec is None or (isinstance(ts, (int, float)) and ts > cur_rec[0]):
-                    entry_engine_map[(sym_key, side_key)] = (float(ts) if isinstance(ts, (int, float)) else 0.0, eng)
             cur += timedelta(days=1)
     except Exception:
         entry_count = 0
-        entry_engine_map = {}
+
+    for (sym, side), records_by_sym in entry_by_symbol_all.items():
+        side_key = (side or "").upper()
+        if side_key not in ("LONG", "SHORT"):
+            continue
+        sym_key = _report_symbol_key(sym)
+        if not sym_key:
+            continue
+        ev_list = entry_event_index.setdefault((sym_key, side_key), [])
+        for rec in records_by_sym:
+            ts = rec.get("entry_ts")
+            eng = rec.get("engine") or "unknown"
+            if isinstance(ts, (int, float)):
+                ev_list.append((float(ts), eng))
+            cur_rec = entry_engine_map.get((sym_key, side_key))
+            if cur_rec is None or (isinstance(ts, (int, float)) and ts > cur_rec[0]):
+                entry_engine_map[(sym_key, side_key)] = (float(ts) if isinstance(ts, (int, float)) else 0.0, eng)
 
     def _engine_for(symbol: str, side_key: str) -> str:
         key = (_report_symbol_key(symbol), side_key)
         rec = entry_engine_map.get(key)
         return rec[1] if rec else "DB"
+
+    def _engine_for_trade(symbol: str, side_key: str, exec_ts: Optional[float]) -> str:
+        key = (_report_symbol_key(symbol), side_key)
+        events = entry_event_index.get(key)
+        if not events:
+            return _engine_for(symbol, side_key)
+        if exec_ts is None:
+            return _engine_for(symbol, side_key)
+        events_sorted = sorted(events, key=lambda item: item[0])
+        ts_list = [item[0] for item in events_sorted]
+        idx = bisect.bisect_right(ts_list, float(exec_ts)) - 1
+        if idx >= 0:
+            return events_sorted[idx][1]
+        return _engine_for(symbol, side_key)
 
     def _engine_for_trade(symbol: str, side_key: str, exec_ts: Optional[float]) -> str:
         key = (_report_symbol_key(symbol), side_key)
@@ -5652,14 +5701,15 @@ def _update_report_csv(tr: dict) -> None:
 def _append_entry_event(tr: dict) -> None:
     try:
         entry_order_id = tr.get("entry_order_id")
-        if not entry_order_id:
-            return
-        date_tag = time.strftime("%Y-%m-%d")
+        entry_ts = tr.get("entry_ts")
+        if not isinstance(entry_ts, (int, float)):
+            entry_ts = time.time()
+        date_tag = datetime.fromtimestamp(float(entry_ts), tz=timezone.utc).strftime("%Y-%m-%d")
         dir_path = os.path.join("logs", "entry")
         os.makedirs(dir_path, exist_ok=True)
         path = os.path.join(dir_path, f"entry_events-{date_tag}.log")
         payload = {
-            "entry_ts": datetime.fromtimestamp(float(tr.get("entry_ts") or 0.0)).strftime("%Y-%m-%d %H:%M:%S"),
+            "entry_ts": datetime.fromtimestamp(float(entry_ts)).strftime("%Y-%m-%d %H:%M:%S"),
             "entry_order_id": entry_order_id,
             "symbol": tr.get("symbol"),
             "side": tr.get("side"),
@@ -5672,16 +5722,13 @@ def _append_entry_event(tr: dict) -> None:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         if dbrec:
             try:
-                ts_val = tr.get("entry_ts")
-                if not isinstance(ts_val, (int, float)):
-                    ts_val = time.time()
                 dbrec.record_engine_signal(
                     symbol=payload.get("symbol") or "",
                     side=payload.get("side") or "",
                     engine=payload.get("engine") or "",
                     reason=(payload.get("engine") or "").lower(),
                     meta=payload,
-                    ts=float(ts_val),
+                    ts=float(entry_ts),
                 )
             except Exception:
                 pass
@@ -7258,6 +7305,7 @@ def run():
     cycle_count = 0
     realtime_count = 0
     last_cfg_reload_ts = 0.0
+    global _LAST_CYCLE_TS_MEM
     while True:
         now = time.time()  # manage 모드 등 선행 로직에서 사용
         # 전역 백오프(OHLCV/티커) + executor 백오프 통합 체크
@@ -7298,11 +7346,11 @@ def run():
         except Exception:
             cycle_ts = None
         last_cycle_raw = state.get("_last_cycle_ts", 0)
-        try:
-            last_cycle_ts = int(float(last_cycle_raw))
-        except Exception:
-            last_cycle_ts = 0
-            state["_last_cycle_ts"] = 0
+        last_cycle_ts = _coerce_state_int(last_cycle_raw)
+        if not last_cycle_ts and isinstance(_LAST_CYCLE_TS_MEM, int) and _LAST_CYCLE_TS_MEM:
+            last_cycle_ts = _LAST_CYCLE_TS_MEM
+        if not isinstance(last_cycle_raw, (int, float, str)):
+            state["_last_cycle_ts"] = last_cycle_ts
         state["_current_cycle_ts"] = cycle_ts
         def _fmt_ms_kst(ms: Optional[int]) -> str:
             if not ms:
@@ -7342,6 +7390,7 @@ def run():
             cycle_count += 1
             if cycle_ts and cycle_ts > last_cycle_ts:
                 state["_last_cycle_ts"] = cycle_ts
+                _LAST_CYCLE_TS_MEM = cycle_ts
             cycle_label = cycle_kst if cycle_kst != "N/A" else str(cycle_count)
             print(f"\n[사이클 {cycle_label}] 시작 (heavy_scan=Y)")
         else:
