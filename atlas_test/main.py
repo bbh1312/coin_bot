@@ -63,7 +63,7 @@ def _build_summary_message(cfg: Config, summary_ts: int, results: dict, universe
     bulls = results.get("bulls", [])
     bears = results.get("bears", [])
     exits = results.get("exits", [])
-    counts = results.get("counts", {"STRONG_BULL": 0, "STRONG_BEAR": 0, "NO_TRADE": 0})
+    counts = results.get("counts", {"DIR_BULL": 0, "DIR_BEAR": 0, "DIR_NONE": 0})
     total = sum(int(v or 0) for v in counts.values())
     ref_states = results.get("ref_states") or {}
     btc_state = ref_states.get("BTC") or "N/A"
@@ -76,9 +76,9 @@ def _build_summary_message(cfg: Config, summary_ts: int, results: dict, universe
         f"BTC : {btc_state}",
         f"ETH : {eth_state}",
         "----",
-        f"STRONG_BULL: {counts.get('STRONG_BULL', 0)} | STRONG_BEAR: {counts.get('STRONG_BEAR', 0)} | NO_TRADE: {counts.get('NO_TRADE', 0)}",
+        f"DIR_BULL: {counts.get('DIR_BULL', 0)} | DIR_BEAR: {counts.get('DIR_BEAR', 0)} | DIR_NONE: {counts.get('DIR_NONE', 0)}",
         "",
-        "TOP BULL",
+        "TOP BULL (dir)",
     ]
     if bulls:
         for idx, item in enumerate(bulls, start=1):
@@ -88,7 +88,7 @@ def _build_summary_message(cfg: Config, summary_ts: int, results: dict, universe
     else:
         lines.append("none")
     lines.append("")
-    lines.append("TOP BEAR")
+    lines.append("TOP BEAR (dir)")
     if bears:
         for idx, item in enumerate(bears, start=1):
             lines.append(
@@ -97,7 +97,7 @@ def _build_summary_message(cfg: Config, summary_ts: int, results: dict, universe
     else:
         lines.append("none")
     lines.append("")
-    lines.append("EXIT (STRONG→NO)")
+    lines.append("EXIT (DIR→NONE)")
     if exits:
         for idx, item in enumerate(exits, start=1):
             lines.append(f"{idx}) {item['symbol']} from={item['from_state']}")
@@ -231,16 +231,12 @@ def main() -> None:
             wait_with_backoff(cfg.poll_sec)
             continue
         dt_kst = datetime.fromtimestamp(summary_ts / 1000, tz=timezone.utc) + timedelta(hours=9)
-        if dt_kst.minute != 0:
+        if dt_kst.minute % 15 != 0:
             wait_with_backoff(cfg.poll_sec)
             continue
         hour_key = dt_kst.strftime("%Y-%m-%d %H")
-        last_hour = state.get("global", {}).get("last_summary_hour")
-        if last_hour == hour_key:
-            wait_with_backoff(cfg.poll_sec)
-            continue
 
-        counts = {"STRONG_BULL": 0, "STRONG_BEAR": 0, "NO_TRADE": 0}
+        counts = {"DIR_BULL": 0, "DIR_BEAR": 0, "DIR_NONE": 0}
         bulls = []
         bears = []
         exits = []
@@ -254,12 +250,18 @@ def main() -> None:
             sym_cfg.ltf_limit = cfg.ltf_limit
             result = evaluate_atlas(exchange, sym_cfg, atlas_gate)
             if result.get("status") != "ok":
-                counts["NO_TRADE"] += 1
+                counts["DIR_NONE"] += 1
                 continue
             state_now = result.get("state") or "NO_TRADE"
-            counts[state_now] = counts.get(state_now, 0) + 1
             atlas_local = result.get("atlas_local") or {}
             breakdown = _score_breakdown(result)
+            direction = (atlas_local.get("symbol_direction") or "").upper()
+            if direction == "BULL":
+                counts["DIR_BULL"] += 1
+            elif direction == "BEAR":
+                counts["DIR_BEAR"] += 1
+            else:
+                counts["DIR_NONE"] += 1
             sym_state = symbols_state.get(sym, {"last_state": "NO_TRADE", "last_alert_state": "NO_TRADE"})
             last_detail_score = sym_state.get("last_detail_score")
             last_detail_ts = sym_state.get("last_detail_ts")
@@ -308,19 +310,26 @@ def main() -> None:
                 "beta": atlas_local.get("beta"),
                 "vol_ratio": atlas_local.get("vol_ratio"),
             }
-            if state_now == "STRONG_BULL":
+            if direction == "BULL":
                 bulls.append(entry)
-            elif state_now == "STRONG_BEAR":
+            elif direction == "BEAR":
                 bears.append(entry)
 
             last_state = sym_state.get("last_state", "NO_TRADE")
             last_alert = sym_state.get("last_alert_state", "NO_TRADE")
-            if state_now != last_state:
-                sym_state["last_state"] = state_now
-            if last_state in ("STRONG_BULL", "STRONG_BEAR") and state_now == "NO_TRADE":
+            dir_state = "NO_TRADE"
+            if direction == "BULL":
+                dir_state = "DIR_BULL"
+            elif direction == "BEAR":
+                dir_state = "DIR_BEAR"
+            else:
+                dir_state = "DIR_NONE"
+            if dir_state != last_state:
+                sym_state["last_state"] = dir_state
+            if last_state in ("DIR_BULL", "DIR_BEAR") and dir_state == "DIR_NONE":
                 exits.append({"symbol": sym.replace("/USDT:USDT", ""), "from_state": last_state})
-            if last_state == "NO_TRADE" and state_now in ("STRONG_BULL", "STRONG_BEAR"):
-                if result.get("score", 0) >= cfg.instant_score_min and state_now != last_alert:
+            if last_state == "DIR_NONE" and dir_state in ("DIR_BULL", "DIR_BEAR"):
+                if result.get("score", 0) >= cfg.instant_score_min and dir_state != last_alert:
                     msg = _build_instant_message(
                         sym.replace("/USDT:USDT", ""),
                         result,
@@ -328,8 +337,8 @@ def main() -> None:
                         cfg.instant_score_min,
                     )
                     ok = send_message(token, chat_id, msg)
-                    print(f"[atlas-test] instant {sym} {state_now} sent={ok}")
-                    sym_state["last_alert_state"] = state_now
+                    print(f"[atlas-test] instant {sym} {dir_state} sent={ok}")
+                    sym_state["last_alert_state"] = dir_state
             symbols_state[sym] = sym_state
 
         bulls.sort(key=lambda x: x["score"], reverse=True)
