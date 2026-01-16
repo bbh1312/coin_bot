@@ -169,6 +169,7 @@ CHAT_ID_RUNTIME = CHAT_ID
 START_TIME = time.time()
 TELEGRAM_STARTUP_GRACE_SEC = 15.0
 EXIT_ICON = os.getenv("EXIT_ICON", "✅")
+MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "14"))
 
 def print_section(title: str) -> None:
     print(f"[{title}]")
@@ -6989,6 +6990,27 @@ def _parse_funding_interval_hours(info: dict) -> Optional[float]:
                 pass
     return None
 
+def _parse_onboard_date_ms(info: dict) -> Optional[int]:
+    if not isinstance(info, dict):
+        return None
+    for key in ("onboardDate", "listingDate", "listDate", "onboardTime"):
+        if key in info:
+            try:
+                val = int(info.get(key))
+            except Exception:
+                val = None
+            if isinstance(val, int) and val > 0:
+                return val
+    return None
+
+def _is_symbol_old_enough(market: dict, min_days: float) -> bool:
+    info = market.get("info") if isinstance(market, dict) else None
+    onboard_ms = _parse_onboard_date_ms(info or {})
+    if not onboard_ms:
+        return True
+    age_days = (time.time() * 1000.0 - float(onboard_ms)) / (1000.0 * 60 * 60 * 24)
+    return age_days >= min_days
+
 def fetch_funding_rate(symbol: str) -> (Optional[float], Optional[float]):
     now = time.time()
     cached = FUNDING_TTL_CACHE.get(symbol)
@@ -7024,9 +7046,15 @@ def get_symbols() -> List[str]:
     else:
         raise RuntimeError("load_markets 실패(재시도 초과)")
     symbols = []
+    skipped_new = 0
     for m in markets.values():
         if m.get("swap") and m.get("linear") and m.get("settle") == "USDT" and m.get("active", True):
+            if not _is_symbol_old_enough(m, MIN_LISTING_AGE_DAYS):
+                skipped_new += 1
+                continue
             symbols.append(m["symbol"])
+    if skipped_new:
+        print(f"[초기화] 신규 상장 필터: {skipped_new}개 제외 (상장 {MIN_LISTING_AGE_DAYS:.0f}일 미만)")
     return sorted(list(set(symbols)))
 
 def load_state() -> Dict[str, dict]:
