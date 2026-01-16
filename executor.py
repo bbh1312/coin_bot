@@ -21,6 +21,7 @@ import os
 import random
 import time
 import threading
+from contextlib import contextmanager
 from typing import Optional, Dict
 
 import ccxt
@@ -50,28 +51,241 @@ POSITION_MODE = os.environ.get("POSITION_MODE", "hedge").lower().strip()
 
 # --- Position TTL cache (to reduce REST calls) ---
 POS_TTL_SEC = 30.0  # fetch_positions 호출 간 최소 간격을 늘려 레이트리밋 완화
-_POS_CACHE = {}
-_POS_LONG_CACHE = {}
-_POS_ALL_CACHE = {"ts": 0.0, "positions_by_symbol": {}}
 
 # --- Balance TTL cache (USDT available) ---
 _BAL_TTL_SEC = 5.0
-_BAL_CACHE = {"ts": 0.0, "available": None}
-_BAL_LOCK = threading.Lock()
 
 # 전역 레이트리밋 백오프 (engine_runner와 공유 목적)
 GLOBAL_BACKOFF_UNTIL = 0.0
 _BACKOFF_SECS = 0.0
 
+
+class ExecutorContext:
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        dry_run: bool,
+        position_mode: str,
+        default_leverage: int,
+        base_entry_usdt: float,
+        dca_enabled: bool,
+        dca_pct: float,
+        dca_first_pct: float,
+        dca_second_pct: float,
+        dca_third_pct: float,
+    ) -> None:
+        self.exchange = ccxt.binance(
+            {
+                "apiKey": api_key,
+                "secret": api_secret,
+                "enableRateLimit": True,
+                "options": {"defaultType": "swap"},
+            }
+        )
+        self.dry_run = bool(dry_run)
+        self.position_mode = (position_mode or "hedge").lower().strip()
+        self.default_leverage = int(default_leverage)
+        self.base_entry_usdt = float(base_entry_usdt)
+        self.dca_enabled = bool(dca_enabled)
+        self.dca_pct = float(dca_pct)
+        self.dca_first_pct = float(dca_first_pct)
+        self.dca_second_pct = float(dca_second_pct)
+        self.dca_third_pct = float(dca_third_pct)
+
+        self.pos_cache = {}
+        self.pos_long_cache = {}
+        self.pos_all_cache = {"ts": 0.0, "positions_by_symbol": {}}
+        self.pos_ttl_sec = POS_TTL_SEC
+
+        self.bal_ttl_sec = _BAL_TTL_SEC
+        self.bal_cache = {"ts": 0.0, "available": None}
+        self.bal_lock = threading.Lock()
+
+        self.posmode_cache_ts = 0.0
+        self.posmode_cache_val = False
+        self.posmode_ttl = 60.0
+
+        self.global_backoff_until = 0.0
+        self.backoff_secs = 0.0
+
+    def apply_globals(self) -> None:
+        self.dry_run = bool(DRY_RUN)
+        self.position_mode = (POSITION_MODE or "hedge").lower().strip()
+        self.default_leverage = int(DEFAULT_LEVERAGE)
+        self.base_entry_usdt = float(BASE_ENTRY_USDT)
+        self.dca_enabled = bool(DCA_ENABLED)
+        self.dca_pct = float(DCA_PCT)
+        self.dca_first_pct = float(DCA_FIRST_PCT)
+        self.dca_second_pct = float(DCA_SECOND_PCT)
+        self.dca_third_pct = float(DCA_THIRD_PCT)
+
+
+_THREAD_CTX = threading.local()
+_DEFAULT_CTX = ExecutorContext(
+    api_key=API_KEY,
+    api_secret=API_SECRET,
+    dry_run=DRY_RUN,
+    position_mode=POSITION_MODE,
+    default_leverage=DEFAULT_LEVERAGE,
+    base_entry_usdt=BASE_ENTRY_USDT,
+    dca_enabled=DCA_ENABLED,
+    dca_pct=DCA_PCT,
+    dca_first_pct=DCA_FIRST_PCT,
+    dca_second_pct=DCA_SECOND_PCT,
+    dca_third_pct=DCA_THIRD_PCT,
+)
+
+
+def _get_ctx() -> ExecutorContext:
+    ctx = getattr(_THREAD_CTX, "current", None)
+    if ctx is None:
+        ctx = _DEFAULT_CTX
+    if ctx is _DEFAULT_CTX:
+        ctx.apply_globals()
+    return ctx
+
+
+@contextmanager
+def use_context(ctx: ExecutorContext):
+    prev = getattr(_THREAD_CTX, "current", None)
+    _THREAD_CTX.current = ctx
+    try:
+        yield
+    finally:
+        _THREAD_CTX.current = prev
+
+
+class AccountExecutor:
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        dry_run: bool,
+        position_mode: str,
+        default_leverage: int,
+        base_entry_usdt: float,
+        dca_enabled: bool,
+        dca_pct: float,
+        dca_first_pct: float,
+        dca_second_pct: float,
+        dca_third_pct: float,
+    ) -> None:
+        self.ctx = ExecutorContext(
+            api_key=api_key,
+            api_secret=api_secret,
+            dry_run=dry_run,
+            position_mode=position_mode,
+            default_leverage=default_leverage,
+            base_entry_usdt=base_entry_usdt,
+            dca_enabled=dca_enabled,
+            dca_pct=dca_pct,
+            dca_first_pct=dca_first_pct,
+            dca_second_pct=dca_second_pct,
+            dca_third_pct=dca_third_pct,
+        )
+
+    @contextmanager
+    def activate(self):
+        with use_context(self.ctx):
+            yield
+
+    def set_dry_run(self, flag: bool) -> bool:
+        with self.activate():
+            return set_dry_run(flag)
+
+    def refresh_positions_cache(self, force: bool = False) -> bool:
+        with self.activate():
+            return refresh_positions_cache(force=force)
+
+    def count_open_positions(self, force: bool = False) -> Optional[int]:
+        with self.activate():
+            return count_open_positions(force=force)
+
+    def list_open_position_symbols(self, force: bool = False) -> Dict[str, set]:
+        with self.activate():
+            return list_open_position_symbols(force=force)
+
+    def get_available_usdt(self, ttl_sec: float = _BAL_TTL_SEC) -> Optional[float]:
+        with self.activate():
+            return get_available_usdt(ttl_sec=ttl_sec)
+
+    def get_short_position_amount(self, symbol: str) -> float:
+        with self.activate():
+            return get_short_position_amount(symbol)
+
+    def get_long_position_amount(self, symbol: str) -> float:
+        with self.activate():
+            return get_long_position_amount(symbol)
+
+    def get_short_roi_pct(self, symbol: str):
+        with self.activate():
+            return get_short_roi_pct(symbol)
+
+    def get_short_position_detail(self, symbol: str) -> dict:
+        with self.activate():
+            return get_short_position_detail(symbol)
+
+    def get_long_position_detail(self, symbol: str) -> dict:
+        with self.activate():
+            return get_long_position_detail(symbol)
+
+    def short_market(self, symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated") -> dict:
+        with self.activate():
+            return short_market(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
+
+    def short_limit(self, *args, **kwargs) -> dict:
+        with self.activate():
+            return short_limit(*args, **kwargs)
+
+    def long_market(self, symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated") -> dict:
+        with self.activate():
+            return long_market(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
+
+    def close_short_market(self, symbol: str) -> dict:
+        with self.activate():
+            return close_short_market(symbol)
+
+    def close_long_market(self, symbol: str) -> dict:
+        with self.activate():
+            return close_long_market(symbol)
+
+    def cancel_open_orders(self, symbol: str) -> dict:
+        with self.activate():
+            return cancel_open_orders(symbol)
+
+    def cancel_stop_orders(self, symbol: str) -> dict:
+        with self.activate():
+            return cancel_stop_orders(symbol)
+
+    def cancel_conditional_by_side(self, symbol: str, side: str) -> dict:
+        with self.activate():
+            return cancel_conditional_by_side(symbol, side)
+
+    def dca_short_if_needed(self, symbol: str, adds_done: int, margin_mode: str = "isolated") -> dict:
+        with self.activate():
+            return dca_short_if_needed(symbol, adds_done=adds_done, margin_mode=margin_mode)
+
+    def dca_long_if_needed(self, symbol: str, adds_done: int, margin_mode: str = "isolated") -> dict:
+        with self.activate():
+            return dca_long_if_needed(symbol, adds_done=adds_done, margin_mode=margin_mode)
+
 def trigger_rate_limit_backoff(msg: str = ""):
     """429/-1003 감지 시 외부에서 호출해 전역 백오프를 공유."""
     global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS
-    _BACKOFF_SECS = 5.0 if _BACKOFF_SECS <= 0 else min(_BACKOFF_SECS * 1.5, 30.0)
-    GLOBAL_BACKOFF_UNTIL = time.time() + _BACKOFF_SECS
-    print(f"[rate-limit/executor] 백오프 {_BACKOFF_SECS:.1f}s (사유: {str(msg)[:80]})")
+    ctx = _get_ctx()
+    ctx.backoff_secs = 5.0 if ctx.backoff_secs <= 0 else min(ctx.backoff_secs * 1.5, 30.0)
+    ctx.global_backoff_until = time.time() + ctx.backoff_secs
+    if ctx is _DEFAULT_CTX:
+        _BACKOFF_SECS = ctx.backoff_secs
+        GLOBAL_BACKOFF_UNTIL = ctx.global_backoff_until
+    print(f"[rate-limit/executor] 백오프 {ctx.backoff_secs:.1f}s (사유: {str(msg)[:80]})")
 
 def get_global_backoff_until() -> float:
-    return float(GLOBAL_BACKOFF_UNTIL or 0.0)
+    ctx = _get_ctx()
+    if ctx is _DEFAULT_CTX:
+        return float(GLOBAL_BACKOFF_UNTIL or 0.0)
+    return float(ctx.global_backoff_until or 0.0)
 
 def _extract_usdt_available(balance: dict) -> Optional[float]:
     if not isinstance(balance, dict):
@@ -120,45 +334,42 @@ def _extract_usdt_available(balance: dict) -> Optional[float]:
     return None
 
 def get_available_usdt(ttl_sec: float = _BAL_TTL_SEC) -> Optional[float]:
+    ctx = _get_ctx()
     now = time.time()
-    with _BAL_LOCK:
-        ts = float(_BAL_CACHE.get("ts", 0.0) or 0.0)
-        cached = _BAL_CACHE.get("available")
+    with ctx.bal_lock:
+        ts = float(ctx.bal_cache.get("ts", 0.0) or 0.0)
+        cached = ctx.bal_cache.get("available")
         if cached is not None and (now - ts) <= ttl_sec:
             return float(cached)
     try:
-        balance = exchange.fetch_balance({"type": "swap"})
+        balance = ctx.exchange.fetch_balance({"type": "swap"})
     except Exception:
         try:
-            balance = exchange.fetch_balance({"type": "future"})
+            balance = ctx.exchange.fetch_balance({"type": "future"})
         except Exception:
             try:
-                balance = exchange.fetch_balance()
+                balance = ctx.exchange.fetch_balance()
             except Exception:
                 return None
     available = _extract_usdt_available(balance)
     if isinstance(available, (int, float)) and available > 0:
-        with _BAL_LOCK:
-            _BAL_CACHE["ts"] = now
-            _BAL_CACHE["available"] = float(available)
+        with ctx.bal_lock:
+            ctx.bal_cache["ts"] = now
+            ctx.bal_cache["available"] = float(available)
     return available
 
 
 def _calc_dca_usdt() -> Optional[float]:
+    ctx = _get_ctx()
     available = get_available_usdt()
     if not isinstance(available, (int, float)) or available <= 0:
         return None
-    usdt = float(available) * (DCA_PCT / 100.0)
+    usdt = float(available) * (ctx.dca_pct / 100.0)
     if usdt <= 0:
         return None
     return usdt
 
-exchange = ccxt.binance({
-    "apiKey": API_KEY,
-    "secret": API_SECRET,
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
-})
+exchange = _DEFAULT_CTX.exchange
 
 def _db_record_order(action: str, symbol: str, side: str, res: Optional[dict], status_override: Optional[str] = None) -> None:
     if not dbrec or not isinstance(res, dict):
@@ -192,66 +403,64 @@ def _db_record_order(action: str, symbol: str, side: str, res: Optional[dict], s
     except Exception:
         return
 
-# --- Position mode (Hedge vs One-way) detection cache ---
-_POSMODE_CACHE_TS = 0.0
-_POSMODE_CACHE_VAL = False  # False=oneway, True=hedge
-_POSMODE_TTL = 60.0
-
 def is_hedge_mode() -> bool:
     """Return True if account is in Hedge mode.
     Priority: env override -> auto-detect (live only) -> default False.
     """
-    global _POSMODE_CACHE_TS, _POSMODE_CACHE_VAL
+    ctx = _get_ctx()
     # Explicit override by env
-    if POSITION_MODE == "hedge":
+    if ctx.position_mode == "hedge":
         return True
-    if POSITION_MODE == "oneway":
+    if ctx.position_mode == "oneway":
         return False
     # DRY_RUN 여부와 관계없이 설정/감지 결과를 사용
     now = time.time()
-    if (now - _POSMODE_CACHE_TS) <= _POSMODE_TTL:
-        return _POSMODE_CACHE_VAL
+    if (now - ctx.posmode_cache_ts) <= ctx.posmode_ttl:
+        return ctx.posmode_cache_val
     try:
         # ccxt raw method name variants
-        if hasattr(exchange, "fapiPrivateGetPositionSideDual"):
-            resp = exchange.fapiPrivateGetPositionSideDual()
+        if hasattr(ctx.exchange, "fapiPrivateGetPositionSideDual"):
+            resp = ctx.exchange.fapiPrivateGetPositionSideDual()
         else:
-            resp = exchange.fapiPrivate_get_positionsidedual()
+            resp = ctx.exchange.fapiPrivate_get_positionsidedual()
         val = resp.get("dualSidePosition")
         if isinstance(val, str):
             val = val.lower() in ("true", "1", "yes")
         hedge = bool(val)
     except Exception:
         hedge = False
-    _POSMODE_CACHE_TS = now
-    _POSMODE_CACHE_VAL = hedge
+    ctx.posmode_cache_ts = now
+    ctx.posmode_cache_val = hedge
     return hedge
 
 def ensure_ready():
     # DRY_RUN이면 키 없이도 마켓 로드는 시도
-    if DRY_RUN:
+    ctx = _get_ctx()
+    if ctx.dry_run:
         try:
-            exchange.load_markets()
+            ctx.exchange.load_markets()
             return
         except Exception:
             pass
-    if not API_KEY or not API_SECRET:
+    if not ctx.exchange.apiKey or not ctx.exchange.secret:
         raise RuntimeError("환경변수 BINANCE_API_KEY / BINANCE_API_SECRET 설정 필요")
-    exchange.load_markets()
+    ctx.exchange.load_markets()
 
 def set_dry_run(flag: bool) -> bool:
     """런타임에 DRY_RUN 토글. True=dry-run, False=live"""
     global DRY_RUN
     DRY_RUN = bool(flag)
+    _DEFAULT_CTX.dry_run = DRY_RUN
     return DRY_RUN
 
 def set_leverage_and_margin(symbol: str, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated"):
+    ctx = _get_ctx()
     try:
-        exchange.set_margin_mode(margin_mode, symbol)
+        ctx.exchange.set_margin_mode(margin_mode, symbol)
     except Exception as e:
         print("[margin_mode] warn:", e)
     try:
-        exchange.set_leverage(leverage, symbol)
+        ctx.exchange.set_leverage(leverage, symbol)
     except Exception as e:
         print("[leverage] warn:", e)
 
@@ -261,66 +470,69 @@ def _get_position_cached(symbol: str):
     """
     now = time.time()
     # 1) 전체 포지션 캐시 우선 사용
+    ctx = _get_ctx()
     try:
-        ts_all = float(_POS_ALL_CACHE.get("ts", 0.0) or 0.0)
-        if (now - ts_all) <= POS_TTL_SEC:
-            pos_map = _POS_ALL_CACHE.get("positions_by_symbol") or {}
+        ts_all = float(ctx.pos_all_cache.get("ts", 0.0) or 0.0)
+        if (now - ts_all) <= ctx.pos_ttl_sec:
+            pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
             pos = _select_short_position(pos_map.get(symbol) or []) if symbol in pos_map else None
-            _POS_CACHE[symbol] = (now, pos)
+            ctx.pos_cache[symbol] = (now, pos)
             return pos
     except Exception:
         pass
     try:
-        ts, pos = _POS_CACHE.get(symbol, (0.0, None))
+        ts, pos = ctx.pos_cache.get(symbol, (0.0, None))
     except Exception:
         ts, pos = 0.0, None
-    if (now - ts) <= POS_TTL_SEC:
+    if (now - ts) <= ctx.pos_ttl_sec:
         return pos
     ensure_ready()
     try:
-        positions = exchange.fetch_positions([symbol])
+        positions = ctx.exchange.fetch_positions([symbol])
     except Exception as e:
         msg = str(e)
         print("[fetch_positions] warn:", e)
         if ("429" in msg) or ("-1003" in msg):
             trigger_rate_limit_backoff(msg)
         # keep previous cache if exists
-        _POS_CACHE[symbol] = (now, pos)
+        ctx.pos_cache[symbol] = (now, pos)
         return pos
     found = _select_short_position(positions)
-    _POS_CACHE[symbol] = (now, found)
+    ctx.pos_cache[symbol] = (now, found)
     return found
 
 def _get_long_position_cached(symbol: str):
     """Return long position object for symbol using TTL cache."""
     now = time.time()
     try:
-        ts_all = float(_POS_ALL_CACHE.get("ts", 0.0) or 0.0)
-        if (now - ts_all) <= POS_TTL_SEC:
-            pos_map = _POS_ALL_CACHE.get("positions_by_symbol") or {}
+        ctx = _get_ctx()
+        ts_all = float(ctx.pos_all_cache.get("ts", 0.0) or 0.0)
+        if (now - ts_all) <= ctx.pos_ttl_sec:
+            pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
             pos = _select_long_position(pos_map.get(symbol) or []) if symbol in pos_map else None
-            _POS_LONG_CACHE[symbol] = (now, pos)
+            ctx.pos_long_cache[symbol] = (now, pos)
             return pos
     except Exception:
         pass
     try:
-        ts, pos = _POS_LONG_CACHE.get(symbol, (0.0, None))
+        ctx = _get_ctx()
+        ts, pos = ctx.pos_long_cache.get(symbol, (0.0, None))
     except Exception:
         ts, pos = 0.0, None
-    if (now - ts) <= POS_TTL_SEC:
+    if (now - ts) <= ctx.pos_ttl_sec:
         return pos
     ensure_ready()
     try:
-        positions = exchange.fetch_positions([symbol])
+        positions = ctx.exchange.fetch_positions([symbol])
     except Exception as e:
         msg = str(e)
         print("[fetch_positions] warn:", e)
         if ("429" in msg) or ("-1003" in msg):
             trigger_rate_limit_backoff(msg)
-        _POS_LONG_CACHE[symbol] = (now, pos)
+        ctx.pos_long_cache[symbol] = (now, pos)
         return pos
     found = _select_long_position(positions)
-    _POS_LONG_CACHE[symbol] = (now, found)
+    ctx.pos_long_cache[symbol] = (now, found)
     return found
 
 def _select_short_position(positions) -> Optional[dict]:
@@ -385,16 +597,17 @@ def _select_long_position(positions) -> Optional[dict]:
 
 def refresh_positions_cache(force: bool = False) -> bool:
     """전체 포지션을 한 번에 가져와 심볼별 캐시에 저장."""
+    ctx = _get_ctx()
     now = time.time()
     try:
-        ts_all = float(_POS_ALL_CACHE.get("ts", 0.0) or 0.0)
-        if (not force) and (now - ts_all) <= POS_TTL_SEC:
+        ts_all = float(ctx.pos_all_cache.get("ts", 0.0) or 0.0)
+        if (not force) and (now - ts_all) <= ctx.pos_ttl_sec:
             return True
     except Exception:
         pass
     ensure_ready()
     try:
-        positions = exchange.fetch_positions()
+        positions = ctx.exchange.fetch_positions()
     except Exception as e:
         msg = str(e)
         print("[fetch_positions] warn:", e)
@@ -407,8 +620,8 @@ def refresh_positions_cache(force: bool = False) -> bool:
         if not sym:
             continue
         pos_map.setdefault(sym, []).append(p)
-    _POS_ALL_CACHE["ts"] = now
-    _POS_ALL_CACHE["positions_by_symbol"] = pos_map
+    ctx.pos_all_cache["ts"] = now
+    ctx.pos_all_cache["positions_by_symbol"] = pos_map
     return True
 
 
@@ -416,7 +629,8 @@ def count_open_positions(force: bool = False) -> Optional[int]:
     """현재 열린 포지션 수(롱/숏 합산)를 반환한다."""
     if not refresh_positions_cache(force=force):
         return None
-    pos_map = _POS_ALL_CACHE.get("positions_by_symbol") or {}
+    ctx = _get_ctx()
+    pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
     cnt = 0
     hedge = False
     try:
@@ -441,7 +655,8 @@ def list_open_position_symbols(force: bool = False) -> Dict[str, set]:
     """현재 열린 포지션 심볼을 롱/숏으로 반환한다."""
     if not refresh_positions_cache(force=force):
         return {"long": set(), "short": set()}
-    pos_map = _POS_ALL_CACHE.get("positions_by_symbol") or {}
+    ctx = _get_ctx()
+    pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
     longs = set()
     shorts = set()
     for sym, positions in pos_map.items():
@@ -637,34 +852,37 @@ def get_long_position_detail(symbol: str) -> dict:
 
 def should_dca_by_price(entry: float, mark: float, adds_done: int) -> bool:
     """Adverse move vs entry for short. Triggers when mark price rises by configured %."""
+    ctx = _get_ctx()
     if entry <= 0:
         return False
     adverse_pct = (mark - entry) / entry * 100.0
     if adds_done <= 0:
-        return adverse_pct >= DCA_FIRST_PCT
+        return adverse_pct >= ctx.dca_first_pct
     if adds_done == 1:
-        return adverse_pct >= DCA_SECOND_PCT
-    return adverse_pct >= DCA_THIRD_PCT
+        return adverse_pct >= ctx.dca_second_pct
+    return adverse_pct >= ctx.dca_third_pct
 
 def should_dca_by_price_long(entry: float, mark: float, adds_done: int) -> bool:
     """Adverse move vs entry for long. Triggers when mark price falls by configured %."""
+    ctx = _get_ctx()
     if entry <= 0:
         return False
     adverse_pct = (entry - mark) / entry * 100.0
     if adds_done <= 0:
-        return adverse_pct >= DCA_FIRST_PCT
+        return adverse_pct >= ctx.dca_first_pct
     if adds_done == 1:
-        return adverse_pct >= DCA_SECOND_PCT
-    return adverse_pct >= DCA_THIRD_PCT
+        return adverse_pct >= ctx.dca_second_pct
+    return adverse_pct >= ctx.dca_third_pct
 
 def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated") -> dict:
+    ctx = _get_ctx()
     ensure_ready()
     set_leverage_and_margin(symbol, leverage=leverage, margin_mode=margin_mode)
-    market = exchange.market(symbol)
-    last = float(exchange.fetch_ticker(symbol)["last"])
+    market = ctx.exchange.market(symbol)
+    last = float(ctx.exchange.fetch_ticker(symbol)["last"])
     # usdt_amount를 증거금으로 해석하고 레버리지를 곱해 명목가로 변환
     notional = float(usdt_amount) * float(leverage)
-    amount = float(exchange.amount_to_precision(symbol, notional / last))
+    amount = float(ctx.exchange.amount_to_precision(symbol, notional / last))
 
     # 최소 수량/명목 조건 확인
     limits = market.get("limits") or {}
@@ -711,7 +929,7 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
             "notional": notional_after,
             "min_notional": min_notional,
         }
-    if DRY_RUN:
+    if ctx.dry_run:
         res = {
             "status": "dry_run",
             "action": "short_market",
@@ -727,7 +945,7 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
     params = {}
     if is_hedge_mode():
         params["positionSide"] = "SHORT"
-    order = exchange.create_market_sell_order(symbol, amount, params=params)
+    order = ctx.exchange.create_market_sell_order(symbol, amount, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
     res = {
         "status": "ok",
@@ -749,13 +967,14 @@ def short_limit(
     leverage: int = DEFAULT_LEVERAGE,
     margin_mode: str = "isolated",
 ) -> dict:
+    ctx = _get_ctx()
     ensure_ready()
     if price <= 0:
         return {"status": "skip", "reason": "price_unavailable", "symbol": symbol}
     set_leverage_and_margin(symbol, leverage=leverage, margin_mode=margin_mode)
-    market = exchange.market(symbol)
+    market = ctx.exchange.market(symbol)
     notional = float(usdt_amount) * float(leverage)
-    amount = float(exchange.amount_to_precision(symbol, notional / float(price)))
+    amount = float(ctx.exchange.amount_to_precision(symbol, notional / float(price)))
 
     limits = market.get("limits") or {}
     min_qty = None
@@ -799,7 +1018,7 @@ def short_limit(
             "notional": notional_after,
             "min_notional": min_notional,
         }
-    if DRY_RUN:
+    if ctx.dry_run:
         res = {
             "status": "dry_run",
             "action": "short_limit",
@@ -815,7 +1034,7 @@ def short_limit(
     params = {}
     if is_hedge_mode():
         params["positionSide"] = "SHORT"
-    order = exchange.create_limit_sell_order(symbol, amount, price, params=params)
+    order = ctx.exchange.create_limit_sell_order(symbol, amount, price, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
     res = {
         "status": "ok",
@@ -831,12 +1050,13 @@ def short_limit(
     return res
 
 def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated") -> dict:
+    ctx = _get_ctx()
     ensure_ready()
     set_leverage_and_margin(symbol, leverage=leverage, margin_mode=margin_mode)
-    market = exchange.market(symbol)
-    last = float(exchange.fetch_ticker(symbol)["last"])
+    market = ctx.exchange.market(symbol)
+    last = float(ctx.exchange.fetch_ticker(symbol)["last"])
     notional = float(usdt_amount) * float(leverage)
-    amount = float(exchange.amount_to_precision(symbol, notional / last))
+    amount = float(ctx.exchange.amount_to_precision(symbol, notional / last))
 
     limits = market.get("limits") or {}
     min_qty = None
@@ -880,7 +1100,7 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
             "notional": notional_after,
             "min_notional": min_notional,
         }
-    if DRY_RUN:
+    if ctx.dry_run:
         res = {
             "status": "dry_run",
             "action": "long_market",
@@ -896,7 +1116,7 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
     params = {}
     if is_hedge_mode():
         params["positionSide"] = "LONG"
-    order = exchange.create_market_buy_order(symbol, amount, params=params)
+    order = ctx.exchange.create_market_buy_order(symbol, amount, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
     res = {
         "status": "ok",
@@ -912,12 +1132,13 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
     return res
 
 def close_short_market(symbol: str) -> dict:
+    ctx = _get_ctx()
     ensure_ready()
     amount = get_short_position_amount(symbol)
     if amount <= 0:
         return {"status": "skip", "reason": "no_short_position", "symbol": symbol}
-    amount = float(exchange.amount_to_precision(symbol, amount))
-    if DRY_RUN:
+    amount = float(ctx.exchange.amount_to_precision(symbol, amount))
+    if ctx.dry_run:
         res = {"status": "dry_run", "action": "close_short_market", "symbol": symbol, "amount": amount, "order_id": None}
         _db_record_order("close_short_market", symbol, "SHORT", res, status_override="dry_run")
         return res
@@ -928,19 +1149,20 @@ def close_short_market(symbol: str) -> dict:
         hedge = False
     # hedge 모드에서는 reduceOnly를 보내지 않고 positionSide만 지정
     params = {"positionSide": "SHORT"} if hedge else {"reduceOnly": True}
-    order = exchange.create_market_buy_order(symbol, amount, params=params)
+    order = ctx.exchange.create_market_buy_order(symbol, amount, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
     res = {"status": "ok", "action": "close_short_market", "order": order, "order_id": order_id, "amount": amount}
     _db_record_order("close_short_market", symbol, "SHORT", res)
     return res
 
 def close_long_market(symbol: str) -> dict:
+    ctx = _get_ctx()
     ensure_ready()
     amount = get_long_position_amount(symbol)
     if amount <= 0:
         return {"status": "skip", "reason": "no_long_position", "symbol": symbol}
-    amount = float(exchange.amount_to_precision(symbol, amount))
-    if DRY_RUN:
+    amount = float(ctx.exchange.amount_to_precision(symbol, amount))
+    if ctx.dry_run:
         res = {"status": "dry_run", "action": "close_long_market", "symbol": symbol, "amount": amount, "order_id": None}
         _db_record_order("close_long_market", symbol, "LONG", res, status_override="dry_run")
         return res
@@ -950,22 +1172,23 @@ def close_long_market(symbol: str) -> dict:
     except Exception:
         hedge = False
     params = {"positionSide": "LONG"} if hedge else {"reduceOnly": True}
-    order = exchange.create_market_sell_order(symbol, amount, params=params)
+    order = ctx.exchange.create_market_sell_order(symbol, amount, params=params)
     order_id = order.get("id") or (order.get("info") or {}).get("orderId")
     res = {"status": "ok", "action": "close_long_market", "order": order, "order_id": order_id, "amount": amount}
     _db_record_order("close_long_market", symbol, "LONG", res)
     return res
 
 def cancel_open_orders(symbol: str) -> dict:
+    ctx = _get_ctx()
     ensure_ready()
-    if DRY_RUN:
+    if ctx.dry_run:
         return {"status": "dry_run", "action": "cancel_open_orders", "symbol": symbol}
     try:
-        orders = exchange.fetch_open_orders(symbol)
+        orders = ctx.exchange.fetch_open_orders(symbol)
         canceled = 0
         for o in orders:
             try:
-                exchange.cancel_order(o["id"], symbol)
+                ctx.exchange.cancel_order(o["id"], symbol)
                 canceled += 1
                 if dbrec:
                     try:
@@ -982,20 +1205,21 @@ def cancel_stop_orders(symbol: str) -> dict:
     """
     Cancel stop-loss related orders only (skip take-profit).
     """
+    ctx = _get_ctx()
     ensure_ready()
-    if DRY_RUN:
+    if ctx.dry_run:
         return {"status": "dry_run", "action": "cancel_stop_orders", "symbol": symbol}
     try:
         orders = []
         try:
-            orders = exchange.fetch_open_orders(symbol)
+            orders = ctx.exchange.fetch_open_orders(symbol)
         except Exception:
             orders = []
         # Some exchanges separate conditional/stop orders; try extra fetches.
         extra_orders = []
         for params in ({"type": "stop"}, {"stop": True}, {"trigger": True}):
             try:
-                extra_orders.extend(exchange.fetch_open_orders(symbol, params))
+                extra_orders.extend(ctx.exchange.fetch_open_orders(symbol, params))
             except Exception:
                 continue
         if extra_orders:
@@ -1032,7 +1256,7 @@ def cancel_stop_orders(symbol: str) -> dict:
                 if pos_side:
                     params["positionSide"] = pos_side
                 try:
-                    exchange.cancel_order(o["id"], symbol, params)
+                    ctx.exchange.cancel_order(o["id"], symbol, params)
                     canceled += 1
                     if dbrec:
                         try:
@@ -1041,7 +1265,7 @@ def cancel_stop_orders(symbol: str) -> dict:
                             pass
                 except Exception:
                     try:
-                        exchange.cancel_order(o["id"], symbol)
+                        ctx.exchange.cancel_order(o["id"], symbol)
                         canceled += 1
                         if dbrec:
                             try:
@@ -1055,7 +1279,7 @@ def cancel_stop_orders(symbol: str) -> dict:
         if stop_count > 0 and canceled == 0:
             for params in ({"type": "STOP_MARKET"}, {"type": "stop"}, {"stop": True}, {"reduceOnly": True}):
                 try:
-                    exchange.cancel_all_orders(symbol, params)
+                    ctx.exchange.cancel_all_orders(symbol, params)
                 except Exception:
                     continue
         return {
@@ -1073,15 +1297,16 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
     """
     Cancel conditional reduce-only/closePosition orders for a specific positionSide.
     """
+    ctx = _get_ctx()
     ensure_ready()
-    if DRY_RUN:
+    if ctx.dry_run:
         return {"status": "dry_run", "action": "cancel_conditional_by_side", "symbol": symbol, "side": side}
     orders = []
     seen_ids = set()
     fetch_errors = []
     for params in ({}, {"type": "stop"}, {"stop": True}, {"trigger": True}, {"reduceOnly": True}):
         try:
-            batch = exchange.fetch_open_orders(symbol, params) if params else exchange.fetch_open_orders(symbol)
+            batch = ctx.exchange.fetch_open_orders(symbol, params) if params else ctx.exchange.fetch_open_orders(symbol)
         except Exception as e:
             fetch_errors.append(str(e))
             continue
@@ -1127,7 +1352,7 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
         if pos_side:
             params["positionSide"] = pos_side
         try:
-            exchange.cancel_order(o["id"], symbol, params)
+            ctx.exchange.cancel_order(o["id"], symbol, params)
             canceled += 1
             if dbrec:
                 try:
@@ -1136,7 +1361,7 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
                     pass
         except Exception:
             try:
-                exchange.cancel_order(o["id"], symbol)
+                ctx.exchange.cancel_order(o["id"], symbol)
                 canceled += 1
                 if dbrec:
                     try:
@@ -1156,7 +1381,8 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
     }
 
 def dca_short_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolated") -> dict:
-    if not DCA_ENABLED:
+    ctx = _get_ctx()
+    if not ctx.dca_enabled:
         return {"status": "skip", "reason": "dca_disabled", "symbol": symbol}
     if adds_done >= DCA_MAX_ADDS:
         return {"status": "skip", "reason": "max_adds_reached", "symbol": symbol, "adds_done": adds_done}
@@ -1192,7 +1418,7 @@ def dca_short_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolate
             "symbol": symbol,
             "adds_done": adds_done,
         }
-    res = short_market(symbol, usdt_amount=dca_usdt, leverage=DEFAULT_LEVERAGE, margin_mode=margin_mode)
+    res = short_market(symbol, usdt_amount=dca_usdt, leverage=ctx.default_leverage, margin_mode=margin_mode)
     res.update({
         "adds_done_before": adds_done,
         "adds_done_after": adds_done + 1,
@@ -1203,7 +1429,8 @@ def dca_short_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolate
     return res
 
 def dca_long_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolated") -> dict:
-    if not DCA_ENABLED:
+    ctx = _get_ctx()
+    if not ctx.dca_enabled:
         return {"status": "skip", "reason": "dca_disabled", "symbol": symbol}
     if adds_done >= DCA_MAX_ADDS:
         return {"status": "skip", "reason": "max_adds_reached", "symbol": symbol, "adds_done": adds_done}
@@ -1239,7 +1466,7 @@ def dca_long_if_needed(symbol: str, adds_done: int, margin_mode: str = "isolated
             "symbol": symbol,
             "adds_done": adds_done,
         }
-    res = long_market(symbol, usdt_amount=dca_usdt, leverage=DEFAULT_LEVERAGE, margin_mode=margin_mode)
+    res = long_market(symbol, usdt_amount=dca_usdt, leverage=ctx.default_leverage, margin_mode=margin_mode)
     res.update({
         "adds_done_before": adds_done,
         "adds_done_after": adds_done + 1,
