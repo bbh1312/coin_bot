@@ -35,6 +35,7 @@ import pandas as pd
 import numpy as np
 import requests
 import cycle_cache
+import manage_queue
 
 try:
     import ws_manager
@@ -170,6 +171,7 @@ START_TIME = time.time()
 TELEGRAM_STARTUP_GRACE_SEC = 15.0
 EXIT_ICON = os.getenv("EXIT_ICON", "✅")
 MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "14"))
+MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "600"))
 
 def print_section(title: str) -> None:
     print(f"[{title}]")
@@ -829,96 +831,25 @@ def _run_swaggy_atlas_lab_cycle(
             continue
 
         entry_usdt = _resolve_entry_usdt(policy.final_usdt)
-        entry_order_id = None
-        fill_price = None
-        qty = None
         try:
-            if side == "LONG":
-                if LONG_LIVE_TRADING:
-                    res = long_market(
-                        symbol,
-                        usdt_amount=entry_usdt,
-                        leverage=LEVERAGE,
-                        margin_mode=MARGIN_MODE,
-                    )
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    st["in_pos"] = True
-                    _set_last_entry_state(st, "LONG", time.time())
-                    state[symbol] = st
-                    _log_trade_entry(
-                        state,
-                        side="LONG",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=entry_usdt,
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "swaggy_atlas_lab"},
-                    )
+            live = LONG_LIVE_TRADING if side == "LONG" else LIVE_TRADING
+            req_id = _enqueue_entry_request(
+                state,
+                symbol=symbol,
+                side=side,
+                engine="SWAGGY_ATLAS_LAB",
+                reason="swaggy_atlas_lab",
+                usdt=entry_usdt,
+                live=live,
+                alert_reason="SWAGGY_ATLAS_LAB",
+            )
+            if req_id:
+                if side == "LONG":
                     result["long_hits"] += 1
                 else:
-                    result["long_hits"] += 1
-                if send_alert:
-                    _send_entry_alert(
-                        send_alert,
-                        side="LONG",
-                        symbol=symbol,
-                        engine="SWAGGY_ATLAS_LAB",
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        usdt=entry_usdt,
-                        reason="SWAGGY_ATLAS_LAB",
-                        live=LONG_LIVE_TRADING,
-                        entry_order_id=entry_order_id,
-                        sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                        tp=None,
-                    )
-            else:
-                if LIVE_TRADING:
-                    res = short_market(
-                        symbol,
-                        usdt_amount=entry_usdt,
-                        leverage=LEVERAGE,
-                        margin_mode=MARGIN_MODE,
-                    )
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    st["in_pos"] = True
-                    _set_last_entry_state(st, "SHORT", time.time())
-                    state[symbol] = st
-                    _log_trade_entry(
-                        state,
-                        side="SHORT",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=entry_usdt,
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "swaggy_atlas_lab"},
-                    )
                     result["short_hits"] += 1
-                else:
-                    result["short_hits"] += 1
-                if send_alert:
-                    _send_entry_alert(
-                        send_alert,
-                        side="SHORT",
-                        symbol=symbol,
-                        engine="SWAGGY_ATLAS_LAB",
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        usdt=entry_usdt,
-                        reason="SWAGGY_ATLAS_LAB",
-                        live=LIVE_TRADING,
-                        entry_order_id=entry_order_id,
-                        sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                        tp=None,
-                    )
         except Exception as e:
-            _append_swaggy_atlas_lab_log(f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=EXCHANGE_ERROR {e}")
+            _append_swaggy_atlas_lab_log(f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
         finally:
             _entry_guard_release(state, symbol, key=guard_key)
             _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
@@ -1111,6 +1042,76 @@ def _entry_guard_release(state: Dict[str, dict], symbol: str, key: Optional[str]
     for k in keys:
         guard.pop(k, None)
 
+def _manage_pending_key(symbol: str, side: str) -> str:
+    return f"{symbol}|{side.upper()}"
+
+def _get_manage_pending(state: Dict[str, dict]) -> Dict[str, dict]:
+    pending = state.get("_manage_pending")
+    if not isinstance(pending, dict):
+        pending = {}
+        state["_manage_pending"] = pending
+    return pending
+
+def _mark_manage_pending(state: Dict[str, dict], symbol: str, side: str, req_id: str) -> None:
+    pending = _get_manage_pending(state)
+    pending[_manage_pending_key(symbol, side)] = {"id": req_id, "ts": time.time()}
+
+def _clear_manage_pending(state: Dict[str, dict], symbol: str, side: str) -> None:
+    pending = _get_manage_pending(state)
+    pending.pop(_manage_pending_key(symbol, side), None)
+
+def _is_manage_pending(state: Dict[str, dict], symbol: str, side: str) -> bool:
+    pending = _get_manage_pending(state)
+    key = _manage_pending_key(symbol, side)
+    item = pending.get(key)
+    if not isinstance(item, dict):
+        return False
+    ts = item.get("ts")
+    if isinstance(ts, (int, float)) and (time.time() - float(ts)) <= MANAGE_QUEUE_PENDING_TTL_SEC:
+        return True
+    pending.pop(key, None)
+    return False
+
+def _enqueue_entry_request(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    engine: str,
+    reason: str,
+    usdt: float,
+    live: bool,
+    alert_reason: Optional[str] = None,
+    entry_price_hint: Optional[float] = None,
+    size_mult: Optional[float] = None,
+    notify: bool = True,
+) -> Optional[str]:
+    if _is_manage_pending(state, symbol, side):
+        _append_entry_gate_log(engine.lower(), symbol, f"pending_request side={side}", side=side)
+        return None
+    payload = {
+        "type": "entry",
+        "symbol": symbol,
+        "side": side.upper(),
+        "engine": engine,
+        "reason": reason,
+        "alert_reason": alert_reason,
+        "usdt": float(usdt),
+        "leverage": LEVERAGE,
+        "margin_mode": MARGIN_MODE,
+        "live": bool(live),
+        "entry_price_hint": entry_price_hint,
+        "size_mult": size_mult,
+    }
+    req_id = manage_queue.enqueue_request(payload)
+    _mark_manage_pending(state, symbol, side, req_id)
+    if notify:
+        price_text = _fmt_float(entry_price_hint, 6) if isinstance(entry_price_hint, (int, float)) else "N/A"
+        send_telegram(
+            f"📝 <b>QUEUE</b>\n"
+            f"<b>{symbol}</b>\n"
+            f"{side} entry={price_text}"
+        )
+    return req_id
 
 def _entry_lock_acquire(
     state: Dict[str, dict],
@@ -3050,159 +3051,60 @@ def _run_atlas_fabio_cycle(
             continue
 
         if side == "LONG":
-            if LONG_LIVE_TRADING:
-                guard_key = _entry_guard_key(state, symbol, "LONG")
-                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
-                    funnel["entry_blocked_guard"] += 1
-                    _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
-                    _entry_lock_release(state, symbol, owner="atlasfabio")
-                else:
-                    try:
-                        res = long_market(
-                            symbol,
-                            usdt_amount=final_usdt,
-                            leverage=LEVERAGE,
-                            margin_mode=MARGIN_MODE,
-                        )
-                        entry_order_id = _order_id_from_res(res)
-                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                        qty = res.get("amount") or res.get("order", {}).get("amount")
-                        if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                            funnel["entry_order_ok"] += 1
-                            _entry_seen_mark(state, symbol, "LONG", "atlasfabio")
-                        st = state.get(symbol, {})
-                        st["in_pos"] = True
-                        _set_last_entry_state(st, "LONG", time.time())
-                        state[symbol] = st
-                        _log_trade_entry(
-                            state,
-                            side="LONG",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                            qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=final_usdt,
-                            entry_order_id=entry_order_id,
-                            meta={"reason": "atlasfabio_long"},
-                        )
-                        active_positions_total += 1
-                        if send_alert:
-                            _send_entry_alert(
-                                send_alert,
-                                side="LONG",
-                                symbol=symbol,
-                                engine="ATLASFABIO",
-                                entry_price=fill_price,
-                                usdt=final_usdt,
-                                reason="ATLAS + FABIO",
-                                live=LONG_LIVE_TRADING,
-                                entry_order_id=entry_order_id,
-                                sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                                tp=None,
-                            )
-                    except Exception as e:
-                        funnel["entry_gate_skip_exchange"] += 1
-                        _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=EXCHANGE_ERROR {e}")
-                    finally:
-                        _entry_guard_release(state, symbol, key=guard_key)
-                        _entry_lock_release(state, symbol, owner="atlasfabio")
-            else:
-                _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=SIGNAL")
-                _send_entry_alert(
-                    send_alert,
-                    side="LONG",
-                    symbol=symbol,
-                    engine="ATLASFABIO",
-                    entry_price=None,
-                    usdt=final_usdt,
-                    reason="ATLAS + FABIO",
-                    live=LONG_LIVE_TRADING,
-                    order_info="(알림 전용)",
-                    sl=None,
-                    tp=None,
-                )
+            guard_key = _entry_guard_key(state, symbol, "LONG")
+            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
+                funnel["entry_blocked_guard"] += 1
+                _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
                 _entry_lock_release(state, symbol, owner="atlasfabio")
-        else:
-            order_info = "(알림 전용)"
-            entry_price_disp = None
-            entry_order_id = None
-            if LIVE_TRADING:
-                guard_key = _entry_guard_key(state, symbol, "SHORT")
-                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
-                    funnel["entry_blocked_guard"] += 1
-                    _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
-                    _entry_lock_release(state, symbol, owner="atlasfabio")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
+            else:
                 try:
-                    if get_short_position_amount(symbol) > 0:
-                        _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=IN_POS")
-                        _entry_lock_release(state, symbol, owner="atlasfabio")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    res = short_market(symbol, usdt_amount=final_usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={final_usdt:.2f}"
-                    )
-                    entry_price_disp = fill_price
-                    st["in_pos"] = True
-                    _set_last_entry_state(st, "SHORT", time.time())
-                    funnel["entry_order_ok"] += 1
-                    state[symbol] = st
-                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                        _entry_seen_mark(state, symbol, "SHORT", "atlasfabio")
-                    _log_trade_entry(
+                    req_id = _enqueue_entry_request(
                         state,
-                        side="SHORT",
                         symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
+                        side="LONG",
+                        engine="ATLASFABIO",
+                        reason="atlasfabio_long",
                         usdt=final_usdt,
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "atlasfabio_short"},
+                        live=LONG_LIVE_TRADING,
+                        alert_reason="ATLAS + FABIO",
                     )
-                    active_positions_total += 1
-                    if send_alert:
-                        _send_entry_alert(
-                            send_alert,
-                            side="SHORT",
-                            symbol=symbol,
-                            engine="ATLASFABIO",
-                            entry_price=fill_price,
-                            usdt=final_usdt,
-                            reason=reasons,
-                            live=LIVE_TRADING,
-                            order_info=order_info,
-                            entry_order_id=entry_order_id,
-                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                            tp=None,
-                        )
+                    if req_id:
+                        funnel["entry_order_ok"] += 1
+                        active_positions_total += 1
                 except Exception as e:
-                    order_info = f"order_error: {e}"
                     funnel["entry_gate_skip_exchange"] += 1
-                    _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=EXCHANGE_ERROR {e}")
+                    _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
                 finally:
                     _entry_guard_release(state, symbol, key=guard_key)
                     _entry_lock_release(state, symbol, owner="atlasfabio")
-            else:
-                _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=SIGNAL")
+        else:
+            guard_key = _entry_guard_key(state, symbol, "SHORT")
+            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
+                funnel["entry_blocked_guard"] += 1
+                _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
                 _entry_lock_release(state, symbol, owner="atlasfabio")
-            _send_entry_alert(
-                send_alert,
-                side="SHORT",
-                symbol=symbol,
-                engine="ATLASFABIO",
-                entry_price=entry_price_disp,
-                usdt=final_usdt,
-                live=LIVE_TRADING,
-                order_info=order_info,
-                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                tp=None,
-            )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            try:
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side="SHORT",
+                    engine="ATLASFABIO",
+                    reason="atlasfabio_short",
+                    usdt=final_usdt,
+                    live=LIVE_TRADING,
+                    alert_reason=reasons,
+                )
+                if req_id:
+                    funnel["entry_order_ok"] += 1
+                    active_positions_total += 1
+            except Exception as e:
+                funnel["entry_gate_skip_exchange"] += 1
+                _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
+            finally:
+                _entry_guard_release(state, symbol, key=guard_key)
+                _entry_lock_release(state, symbol, owner="atlasfabio")
             time.sleep(PER_SYMBOL_SLEEP)
 
     _set_thread_log_buffer(None)
@@ -3328,131 +3230,41 @@ def _run_dtfx_cycle(
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             if _entry_seen_blocked(state, symbol, side, "dtfx"):
+                _entry_guard_release(state, symbol, key=guard_key)
                 _entry_lock_release(state, symbol, owner="dtfx")
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             try:
                 if side == "LONG":
-                    res = long_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    result["long_hits"] += 1
-                    _set_last_entry_state(st, "LONG", time.time())
-                    state[symbol] = st
-                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                        _entry_seen_mark(state, symbol, "LONG", "dtfx")
-                    _log_trade_entry(
+                    req_id = _enqueue_entry_request(
                         state,
+                        symbol=symbol,
                         side="LONG",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
+                        engine="DTFX",
+                        reason="dtfx_long",
                         usdt=_resolve_entry_usdt(),
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "dtfx_long", "event": sig.pattern},
+                        live=LONG_LIVE_TRADING,
+                        alert_reason=f"event={sig.pattern}",
                     )
-                    active_positions_total += 1
-                    if write_dtfx_log:
-                        touch_ts = None
-                        try:
-                            touch_ts = (sig.meta or {}).get("dtfx", {}).get("touch", {}).get("ts")
-                        except Exception:
-                            touch_ts = None
-                        payload = {
-                            "ts": int(touch_ts or time.time() * 1000),
-                            "engine": (sig.meta or {}).get("dtfx_engine", "dtfx"),
-                            "symbol": symbol,
-                            "tf_ltf": (sig.meta or {}).get("dtfx_tf_ltf", dtfx_cfg.tf_ltf),
-                            "tf_mtf": (sig.meta or {}).get("dtfx_tf_mtf", dtfx_cfg.tf_mtf),
-                            "tf_htf": (sig.meta or {}).get("dtfx_tf_htf", dtfx_cfg.tf_htf),
-                            "event": (sig.meta or {}).get("dtfx_event", sig.pattern),
-                            "state": (sig.meta or {}).get("dtfx_state", "ENTRY"),
-                            "context": {
-                                "side": "LONG",
-                                "entry_price": fill_price,
-                                "qty": qty,
-                                "usdt": _resolve_entry_usdt(),
-                                "dtfx": (sig.meta or {}).get("dtfx", {}),
-                            },
-                        }
-                        write_dtfx_log(payload, prefix="entries", mode="entry")
-                    if send_alert:
-                        _send_entry_alert(
-                            send_alert,
-                            side="LONG",
-                            symbol=symbol,
-                            engine="DTFX",
-                            entry_price=fill_price,
-                            usdt=_resolve_entry_usdt(),
-                            reason=f"event={sig.pattern}",
-                            live=LONG_LIVE_TRADING,
-                            entry_order_id=entry_order_id,
-                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                        )
+                    if req_id:
+                        result["long_hits"] += 1
+                        active_positions_total += 1
                 else:
-                    res = short_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    result["short_hits"] += 1
-                    st["in_pos"] = True
-                    _set_last_entry_state(st, "SHORT", time.time())
-                    state[symbol] = st
-                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                        _entry_seen_mark(state, symbol, "SHORT", "dtfx")
-                    _log_trade_entry(
+                    req_id = _enqueue_entry_request(
                         state,
-                        side="SHORT",
                         symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
+                        side="SHORT",
+                        engine="DTFX",
+                        reason="dtfx_short",
                         usdt=_resolve_entry_usdt(),
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "dtfx_short", "event": sig.pattern},
+                        live=LIVE_TRADING,
+                        alert_reason=f"event={sig.pattern}",
                     )
-                    active_positions_total += 1
-                    if write_dtfx_log:
-                        touch_ts = None
-                        try:
-                            touch_ts = (sig.meta or {}).get("dtfx", {}).get("touch", {}).get("ts")
-                        except Exception:
-                            touch_ts = None
-                        payload = {
-                            "ts": int(touch_ts or time.time() * 1000),
-                            "engine": (sig.meta or {}).get("dtfx_engine", "dtfx"),
-                            "symbol": symbol,
-                            "tf_ltf": (sig.meta or {}).get("dtfx_tf_ltf", dtfx_cfg.tf_ltf),
-                            "tf_mtf": (sig.meta or {}).get("dtfx_tf_mtf", dtfx_cfg.tf_mtf),
-                            "tf_htf": (sig.meta or {}).get("dtfx_tf_htf", dtfx_cfg.tf_htf),
-                            "event": (sig.meta or {}).get("dtfx_event", sig.pattern),
-                            "state": (sig.meta or {}).get("dtfx_state", "ENTRY"),
-                            "context": {
-                                "side": "SHORT",
-                                "entry_price": fill_price,
-                                "qty": qty,
-                                "usdt": _resolve_entry_usdt(),
-                                "dtfx": (sig.meta or {}).get("dtfx", {}),
-                            },
-                        }
-                        write_dtfx_log(payload, prefix="entries", mode="entry")
-                    if send_alert:
-                        _send_entry_alert(
-                            send_alert,
-                            side="SHORT",
-                            symbol=symbol,
-                            engine="DTFX",
-                            entry_price=fill_price,
-                            usdt=_resolve_entry_usdt(),
-                            reason=f"event={sig.pattern}",
-                            live=LIVE_TRADING,
-                            entry_order_id=entry_order_id,
-                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                        )
+                    if req_id:
+                        result["short_hits"] += 1
+                        active_positions_total += 1
             except Exception as e:
-                print(f"[dtfx] order error {symbol} side={side}: {e}")
+                print(f"[dtfx] queue error {symbol} side={side}: {e}")
             finally:
                 _entry_guard_release(state, symbol, key=guard_key)
                 _entry_lock_release(state, symbol, owner="dtfx")
@@ -3518,17 +3330,6 @@ def _run_pumpfade_cycle(
                 st["in_pos"] = True
                 _set_last_entry_state(st, "SHORT", time.time())
                 state[symbol] = st
-                detail = get_short_position_detail(symbol)
-                _log_trade_entry(
-                    state,
-                    side="SHORT",
-                    symbol=symbol,
-                    entry_ts=time.time(),
-                    entry_price=detail.get("entry") if isinstance(detail.get("entry"), (int, float)) else None,
-                    qty=detail.get("qty") if isinstance(detail.get("qty"), (int, float)) else None,
-                    usdt=_resolve_entry_usdt(),
-                    meta={"reason": "pumpfade_short", "pending_order_id": pending_id},
-                )
                 pf["pending_order_id"] = None
                 pf["pending_deadline_ts"] = None
                 bucket[symbol] = pf
@@ -3649,74 +3450,40 @@ def _run_pumpfade_cycle(
             )
         except Exception:
             pass
-        if LIVE_TRADING:
-            lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="pumpfade", side="SHORT")
-            if not lock_ok:
-                print(f"[ENTRY-LOCK] sym={symbol} owner=pumpfade ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="pumpfade", side="SHORT")
+        if not lock_ok:
+            print(f"[ENTRY-LOCK] sym={symbol} owner=pumpfade ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            guard_key = _entry_guard_key(state, symbol, "SHORT")
+            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="pumpfade", side="SHORT"):
+                print(f"[pumpfade] 숏 중복 차단 ({symbol})")
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if _entry_seen_blocked(state, symbol, "SHORT", "pumpfade"):
+                _entry_guard_release(state, symbol, key=guard_key)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             try:
-                guard_key = _entry_guard_key(state, symbol, "SHORT")
-                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="pumpfade", side="SHORT"):
-                    print(f"[pumpfade] 숏 중복 차단 ({symbol})")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                if _entry_seen_blocked(state, symbol, "SHORT", "pumpfade"):
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    res = short_market(
-                        symbol,
-                        usdt_amount=entry_usdt,
-                        leverage=LEVERAGE,
-                        margin_mode=MARGIN_MODE,
-                    )
-                    order_id = _order_id_from_res(res)
-                    status = res.get("status")
-                    order_info = f"market usdt={entry_usdt} status={status}"
-                    if status in ("ok",) and order_id:
-                        _entry_seen_mark(state, symbol, "SHORT", "pumpfade")
-                        pf["pending_order_id"] = None
-                        pf["pending_deadline_ts"] = None
-                        pf["last_retest_hh"] = hh_n if isinstance(hh_n, (int, float)) else last_hh
-                        prior_hh = meta.get("prior_hh")
-                        if isinstance(prior_hh, (int, float)):
-                            pf["pending_prior_hh"] = prior_hh
-                            pf["last_prior_hh"] = prior_hh
-                        bucket[symbol] = pf
-                    elif status == "dry_run":
-                        st["in_pos"] = True
-                        _set_last_entry_state(st, "SHORT", time.time())
-                        state[symbol] = st
-                        _entry_seen_mark(state, symbol, "SHORT", "pumpfade")
-                        _log_trade_entry(
-                            state,
-                            side="SHORT",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=entry_price,
-                            qty=None,
-                            usdt=entry_usdt,
-                            meta={"reason": "pumpfade_short", "dry_run": True},
-                        )
-                finally:
-                    _entry_guard_release(state, symbol, key=guard_key)
+                reason = ",".join(meta.get("reasons") or []) or "ENTRY_READY"
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side="SHORT",
+                    engine="PUMPFADE",
+                    reason="pumpfade_short",
+                    usdt=entry_usdt,
+                    live=LIVE_TRADING,
+                    alert_reason=reason,
+                    entry_price_hint=entry_price,
+                )
+                if req_id:
+                    result["hits"] += 1
             finally:
-                _entry_lock_release(state, symbol, owner="pumpfade")
-        reason = ",".join(meta.get("reasons") or [])
-        _send_entry_alert(
-            send_alert,
-            side="SHORT",
-            symbol=symbol,
-            engine="PUMPFADE",
-            entry_price=entry_price,
-            usdt=entry_usdt,
-            reason=reason or "ENTRY_READY",
-            live=LIVE_TRADING,
-            order_info=order_info,
-            sl=_fmt_price_safe(meta.get("failure_high"), AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-            tp=None,
-        )
+                _entry_guard_release(state, symbol, key=guard_key)
+        finally:
+            _entry_lock_release(state, symbol, owner="pumpfade")
         result["hits"] += 1
         time.sleep(PER_SYMBOL_SLEEP)
     return result
@@ -3858,49 +3625,25 @@ def _run_atlas_rs_fail_short_cycle(
                 continue
             try:
                 entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * float(size_mult or 1.0))
-                res = short_market(
-                    symbol,
-                    usdt_amount=entry_usdt,
-                    leverage=LEVERAGE,
-                    margin_mode=MARGIN_MODE,
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side="SHORT",
+                    engine="ATLAS_RS_FAIL_SHORT",
+                    reason="atlas_rs_fail_short",
+                    usdt=entry_usdt,
+                    live=LIVE_TRADING,
+                    alert_reason="PULLBACK_FAIL",
+                    entry_price_hint=entry_price,
+                    size_mult=size_mult,
                 )
-                entry_order_id = _order_id_from_res(res)
-                fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                qty = res.get("amount") or res.get("order", {}).get("amount")
-                st["in_pos"] = True
-                _set_last_entry_state(st, "SHORT", time.time())
-                state[symbol] = st
-                if isinstance(bucket, dict):
+                if req_id and isinstance(bucket, dict):
                     rec = bucket.get(symbol)
                     if isinstance(rec, dict):
-                        now_entry_ts = time.time()
-                        rec["last_entry_ts"] = now_entry_ts
+                        rec["last_entry_ts"] = time.time()
                         bucket[symbol] = rec
-                _log_trade_entry(
-                    state,
-                    side="SHORT",
-                    symbol=symbol,
-                    entry_ts=time.time(),
-                    entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                    qty=qty if isinstance(qty, (int, float)) else None,
-                    usdt=entry_usdt,
-                    entry_order_id=entry_order_id,
-                    meta={"reason": "atlas_rs_fail_short"},
-                )
-                _send_entry_alert(
-                    send_alert,
-                    side="SHORT",
-                    symbol=symbol,
-                    engine="ATLAS_RS_FAIL_SHORT",
-                    entry_price=fill_price if fill_price is not None else entry_price,
-                    usdt=entry_usdt,
-                    reason="PULLBACK_FAIL",
-                    live=LIVE_TRADING,
-                    entry_order_id=entry_order_id,
-                    sl=_fmt_price_safe(fill_price or entry_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                )
             except Exception as e:
-                print(f"[atlas-rs-fail-short] order error {symbol}: {e}")
+                print(f"[atlas-rs-fail-short] queue error {symbol}: {e}")
             finally:
                 _entry_guard_release(state, symbol, key=guard_key)
         finally:
@@ -4783,6 +4526,180 @@ def _get_manage_tickers(state: dict, exchange, ttl_sec: float) -> dict:
         print("[manage] tickers fetch failed:", e)
         return cached if isinstance(cached, dict) else {}
 
+def _process_manage_queue(state: dict, send_telegram) -> None:
+    offset = state.get("_manage_queue_offset", 0)
+    try:
+        offset = int(offset or 0)
+    except Exception:
+        offset = 0
+    offset, reqs = manage_queue.read_requests_from_offset(offset)
+    state["_manage_queue_offset"] = offset
+    if not reqs:
+        return
+    status = state.setdefault("_manage_queue_status", {})
+    now = time.time()
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        if req.get("type") != "entry":
+            continue
+        req_id = str(req.get("id") or "").strip()
+        if not req_id:
+            continue
+        st = status.get(req_id)
+        if isinstance(st, dict) and st.get("status") in ("done", "executing"):
+            continue
+        status[req_id] = {"status": "executing", "ts": now}
+        ok = _execute_manage_entry_request(state, req, send_telegram)
+        status[req_id] = {"status": "done" if ok else "failed", "ts": time.time()}
+
+def _detect_manual_positions(state: dict, send_telegram) -> None:
+    try:
+        pos_syms = list_open_position_symbols(force=True)
+    except Exception:
+        return
+    for side_key, side_label in (("short", "SHORT"), ("long", "LONG")):
+        syms = pos_syms.get(side_key) or set()
+        for sym in syms:
+            if _get_open_trade(state, side_label, sym):
+                continue
+            detail = get_short_position_detail(sym) if side_label == "SHORT" else get_long_position_detail(sym)
+            if not isinstance(detail, dict):
+                continue
+            qty = detail.get("qty") or detail.get("amount")
+            entry = detail.get("entry")
+            mark = detail.get("mark")
+            try:
+                qty = float(qty)
+            except Exception:
+                qty = None
+            if side_label == "SHORT" and isinstance(qty, (int, float)):
+                qty = abs(qty)
+            st = state.get(sym) if isinstance(state.get(sym), dict) else {}
+            if not isinstance(st, dict):
+                st = {}
+            prev_qty = st.get(f"manual_qty_{side_key}")
+            if not st.get("in_pos"):
+                _log_trade_entry(
+                    state,
+                    side=side_label,
+                    symbol=sym,
+                    entry_ts=time.time(),
+                    entry_price=entry if isinstance(entry, (int, float)) else None,
+                    qty=qty if isinstance(qty, (int, float)) else None,
+                    usdt=None,
+                    entry_order_id=None,
+                    meta={"reason": "manual_entry"},
+                )
+                _send_entry_alert(
+                    send_telegram,
+                    side=side_label,
+                    symbol=sym,
+                    engine="MANUAL",
+                    entry_price=entry if isinstance(entry, (int, float)) else None,
+                    usdt=None,
+                    reason="manual_entry",
+                    live=True,
+                    order_info="(manual)",
+                    entry_order_id=None,
+                    sl=_fmt_price_safe(entry, AUTO_EXIT_SHORT_SL_PCT if side_label == "SHORT" else AUTO_EXIT_LONG_SL_PCT, side=side_label),
+                    tp=None,
+                )
+                st["in_pos"] = True
+                st[f"manual_qty_{side_key}"] = qty
+                st[f"manual_dca_adds_{side_key}"] = 0
+                _set_last_entry_state(st, side_label, time.time())
+                state[sym] = st
+                continue
+            if isinstance(qty, (int, float)) and isinstance(prev_qty, (int, float)) and qty > prev_qty * 1.0001:
+                adds_key = f"manual_dca_adds_{side_key}"
+                adds_done = int(st.get(adds_key, 0) or 0)
+                st[adds_key] = adds_done + 1
+                st[f"manual_qty_{side_key}"] = qty
+                state[sym] = st
+                send_telegram(
+                    f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} "
+                    f"mark={mark} entry={entry} qty={qty}"
+                )
+
+def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool:
+    symbol = req.get("symbol")
+    side = str(req.get("side") or "").upper()
+    if not symbol or side not in ("LONG", "SHORT"):
+        return False
+    try:
+        if side == "SHORT" and get_short_position_amount(symbol) > 0:
+            _clear_manage_pending(state, symbol, side)
+            return True
+        if side == "LONG" and get_long_position_amount(symbol) > 0:
+            _clear_manage_pending(state, symbol, side)
+            return True
+    except Exception:
+        pass
+    live = bool(req.get("live"))
+    try:
+        set_dry_run(False if live else True)
+    except Exception:
+        pass
+    usdt = float(req.get("usdt") or 0.0)
+    res = {}
+    try:
+        if side == "SHORT":
+            res = short_market(symbol, usdt_amount=usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+        else:
+            res = long_market(symbol, usdt_amount=usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+    except Exception as e:
+        print(f"[manage-queue] execute failed sym={symbol} side={side} err={e}")
+        _clear_manage_pending(state, symbol, side)
+        return False
+    entry_order_id = _order_id_from_res(res)
+    fill_price = res.get("last") or (res.get("order") or {}).get("average") or (res.get("order") or {}).get("price")
+    qty = res.get("amount") or (res.get("order") or {}).get("amount")
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    if not isinstance(st, dict):
+        st = {}
+    st["in_pos"] = True
+    st.setdefault("dca_adds", 0)
+    st.setdefault("dca_adds_long", 0)
+    st.setdefault("dca_adds_short", 0)
+    _set_last_entry_state(st, side, time.time())
+    state[symbol] = st
+    _log_trade_entry(
+        state,
+        side=side,
+        symbol=symbol,
+        entry_ts=time.time(),
+        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+        qty=qty if isinstance(qty, (int, float)) else None,
+        usdt=usdt,
+        entry_order_id=entry_order_id,
+        meta={"reason": req.get("reason")},
+    )
+    try:
+        _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
+    except Exception:
+        pass
+    _send_entry_alert(
+        send_telegram,
+        side=side,
+        symbol=symbol,
+        engine=req.get("engine") or "UNKNOWN",
+        entry_price=fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
+        usdt=usdt,
+        reason=req.get("alert_reason") or req.get("reason") or "",
+        live=live,
+        order_info=None,
+        entry_order_id=entry_order_id,
+        sl=_fmt_price_safe(
+            fill_price if isinstance(fill_price, (int, float)) else None,
+            AUTO_EXIT_SHORT_SL_PCT if side == "SHORT" else AUTO_EXIT_LONG_SL_PCT,
+            side=side,
+        ),
+        tp=None,
+    )
+    _clear_manage_pending(state, symbol, side)
+    return True
+
 
 def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> None:
     now = time.time()
@@ -4822,6 +4739,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
     if time.time() < exec_backoff_mid:
         print("[rate-limit] executor backoff active during manage-mode; skip manage this cycle")
         return
+
+    _process_manage_queue(state, send_telegram)
+    _detect_manual_positions(state, send_telegram)
 
     exit_force_refreshed = False
     for sym, st in list(state.items()):
@@ -5779,19 +5699,6 @@ def _sync_positions_state(state: dict, symbols: list) -> None:
             st.setdefault("dca_adds_short", 0)
             st.setdefault("last_entry", now)
             st.setdefault("manage_ping_ts", now - MANAGE_PING_COOLDOWN_SEC)
-            if not was_in_pos:
-                try:
-                    side = "LONG" if long_amt > 0 else "SHORT" if short_amt > 0 else "UNKNOWN"
-                    dbrec and dbrec.record_engine_signal(
-                        symbol=sym,
-                        side=side,
-                        engine="MANUAL",
-                        reason="manual_entry",
-                        meta={"source": "pos_sync"},
-                        ts=now,
-                    )
-                except Exception:
-                    pass
             state[sym] = st
         else:
             if isinstance(st, dict):
@@ -8266,71 +8173,7 @@ def run():
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
 
-                order_info = "(알림 전용)"
                 entry_price_disp = None
-                if LIVE_TRADING:
-                    guard_key = _entry_guard_key(state, symbol, "SHORT")
-                    if not _entry_guard_acquire(state, symbol, key=guard_key, engine="rsi", side="SHORT"):
-                        print(f"[entry] 숏 중복 차단 ({symbol})")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    if _entry_seen_blocked(state, symbol, "SHORT", "rsi"):
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    try:
-                        res = short_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                        entry_order_id = _order_id_from_res(res)
-                        # 알림용 간략 정보
-                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                        qty = res.get("amount") or res.get("order", {}).get("amount")
-                        order_info = (
-                            f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
-                        )
-                        entry_price_disp = fill_price
-                        state[symbol]["in_pos"] = True
-                        active_positions += 1
-                        if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                            _entry_seen_mark(state, symbol, "SHORT", "rsi")
-                            _log_trade_entry(
-                                state,
-                                side="SHORT",
-                                symbol=symbol,
-                                entry_ts=time.time(),
-                                entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                                qty=qty if isinstance(qty, (int, float)) else None,
-                                usdt=_resolve_entry_usdt(),
-                                entry_order_id=entry_order_id,
-                                meta={"reason": "short_entry"},
-                            )
-                            date_tag = time.strftime("%Y%m%d")
-                            _append_entry_log(
-                                f"rsi/rsi_entries_{date_tag}.log",
-                                "engine=rsi side=SHORT symbol=%s price=%s qty=%s usdt=%s "
-                                "rsi1h=%s rsi15=%s rsi5=%s rsi3=%s "
-                                "down5=%s down3=%s vol=%s struct=%s spike=%s structr=%s"
-                                % (
-                                    symbol,
-                                    f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
-                                    f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
-                                    f"{_resolve_entry_usdt():.2f}",
-                                    f"{rsis.get('1h', 0):.2f}" if isinstance(rsis.get("1h"), (int, float)) else "N/A",
-                                    f"{rsis.get('15m', 0):.2f}" if isinstance(rsis.get("15m"), (int, float)) else "N/A",
-                                    f"{rsis.get('5m', 0):.2f}" if isinstance(rsis.get("5m"), (int, float)) else "N/A",
-                                    f"{rsis.get('3m', 0):.2f}" if isinstance(rsis.get("3m"), (int, float)) else "N/A",
-                                    "Y" if rsi5m_downturn else "N",
-                                    "Y" if rsi3m_downturn else "N",
-                                    "Y" if vol_ok else "N",
-                                    "Y" if struct_ok else "N",
-                                    "Y" if spike_ready else "N",
-                                    "Y" if struct_ready else "N",
-                                ),
-                            )
-                    except Exception as e:
-                        order_info = f"order_error: {e}"
-                    finally:
-                        _entry_guard_release(state, symbol, key=guard_key)
-
-                _set_last_entry_state(state[symbol], "SHORT", time.time())
 
                 reason_parts = ["RSI222"]
                 if spike_ready and struct_ready:
@@ -8352,20 +8195,34 @@ def run():
                 )
                 reason_full = reason if reason else "조건 충족"
                 reason_full = f"{reason_full} | {rsi_line}"
-                _send_entry_alert(
-                    send_telegram,
-                    side="SHORT",
-                    symbol=symbol,
-                    engine="RSI",
-                    entry_price=entry_price_disp,
-                    usdt=_resolve_entry_usdt(),
-                    reason=reason_full,
-                    live=LIVE_TRADING,
-                    order_info=order_info,
-                    entry_order_id=entry_order_id,
-                    sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                    tp=None,
-                )
+                guard_key = _entry_guard_key(state, symbol, "SHORT")
+                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="rsi", side="SHORT"):
+                    print(f"[entry] 숏 중복 차단 ({symbol})")
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                if _entry_seen_blocked(state, symbol, "SHORT", "rsi"):
+                    _entry_guard_release(state, symbol, key=guard_key)
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                try:
+                    req_id = _enqueue_entry_request(
+                        state,
+                        symbol=symbol,
+                        side="SHORT",
+                        engine="RSI",
+                        reason="short_entry",
+                        usdt=_resolve_entry_usdt(),
+                        live=LIVE_TRADING,
+                        alert_reason=reason_full,
+                        entry_price_hint=entry_price_disp,
+                    )
+                    if req_id:
+                        active_positions += 1
+                        _set_last_entry_state(state[symbol], "SHORT", time.time())
+                except Exception as e:
+                    print(f"[rsi] queue error {symbol}: {e}")
+                finally:
+                    _entry_guard_release(state, symbol, key=guard_key)
 
         if not run_div15m_long:
             print("[모드] DIV15M_LONG 비활성: 롱 다이버전스 스캔 스킵")
@@ -8455,84 +8312,34 @@ def run():
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
 
-            order_info = "(알림 전용)"
-            entry_price_disp = None
-            entry_order_id = None
-            if LONG_LIVE_TRADING:
-                guard_key = _entry_guard_key(state, symbol, "LONG")
-                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="div15m", side="LONG"):
-                    print(f"[entry] 롱 중복 차단 ({symbol})")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                if _entry_seen_blocked(state, symbol, "LONG", "div15m"):
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    res = long_market(
-                        symbol,
-                        usdt_amount=_resolve_entry_usdt(),
-                        leverage=LEVERAGE,
-                        margin_mode=MARGIN_MODE,
-                    )
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
-                    )
-                    entry_price_disp = fill_price
-                    st["in_pos"] = True
+            guard_key = _entry_guard_key(state, symbol, "LONG")
+            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="div15m", side="LONG"):
+                print(f"[entry] 롱 중복 차단 ({symbol})")
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if _entry_seen_blocked(state, symbol, "LONG", "div15m"):
+                _entry_guard_release(state, symbol, key=guard_key)
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            try:
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side="LONG",
+                    engine="DIV15M_LONG",
+                    reason="div15m_long",
+                    usdt=_resolve_entry_usdt(),
+                    live=LONG_LIVE_TRADING,
+                    alert_reason=f"trigger={event.reasons or 'ENTRY_READY'}",
+                )
+                if req_id:
+                    active_positions += 1
                     _set_last_entry_state(st, "LONG", time.time())
                     state[symbol] = st
-                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                        _entry_seen_mark(state, symbol, "LONG", "div15m")
-                    _log_trade_entry(
-                        state,
-                        side="LONG",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=_resolve_entry_usdt(),
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "div15m_long"},
-                    )
-                    date_tag = time.strftime("%Y%m%d")
-                    _append_entry_log(
-                        f"div15m_long/div15m_entries_{date_tag}.log",
-                        "engine=div15m_long side=LONG symbol=%s price=%s qty=%s usdt=%s p1=%s p2=%s score=%.4f"
-                        % (
-                            symbol,
-                            f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
-                            f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
-                            f"{_resolve_entry_usdt():.2f}",
-                            event.p1_idx,
-                            event.p2_idx,
-                            float(event.score or 0.0),
-                        ),
-                    )
-                    active_positions += 1
-                except Exception as e:
-                    order_info = f"order_error: {e}"
-                finally:
-                    _entry_guard_release(state, symbol, key=guard_key)
-
-            _set_last_entry_state(state[symbol], "LONG", time.time())
-
-            _send_entry_alert(
-                send_telegram,
-                side="LONG",
-                symbol=symbol,
-                engine="DIV15M_LONG",
-                entry_price=entry_price_disp,
-                usdt=_resolve_entry_usdt(),
-                reason=f"trigger={event.reasons or 'ENTRY_READY'}",
-                live=LONG_LIVE_TRADING,
-                order_info=order_info,
-                entry_order_id=entry_order_id,
-                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                tp=None,
-            )
+            except Exception as e:
+                print(f"[div15m-long] queue error {symbol}: {e}")
+            finally:
+                _entry_guard_release(state, symbol, key=guard_key)
 
         if not run_div15m_short:
             print("[모드] DIV15M_SHORT 비활성: 숏 다이버전스 스캔 스킵")
@@ -8646,80 +8453,35 @@ def run():
                 ),
             )
             _div15m_short_csv(event)
-            order_info = "(알림 전용)"
-            entry_price_disp = None
-            if LIVE_TRADING:
-                guard_key = _entry_guard_key(state, symbol, "SHORT")
-                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="div15m_short", side="SHORT"):
-                    print(f"[entry] 숏 중복 차단 ({symbol})")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                if _entry_seen_blocked(state, symbol, "SHORT", "div15m_short"):
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    res = short_market(
-                        symbol,
-                        usdt_amount=_resolve_entry_usdt(),
-                        leverage=LEVERAGE,
-                        margin_mode=MARGIN_MODE,
-                    )
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={_resolve_entry_usdt()}"
-                    )
-                    entry_price_disp = fill_price
-                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                        _entry_seen_mark(state, symbol, "SHORT", "div15m_short")
-                    st["in_pos"] = True
-                    _log_trade_entry(
-                        state,
-                        side="SHORT",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=_resolve_entry_usdt(),
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "div15m_short"},
-                    )
-                    _append_entry_log(
-                        f"div15m_short/div15m_entries_{date_tag}.log",
-                        "engine=div15m_short side=SHORT symbol=%s price=%s qty=%s usdt=%s p1=%s p2=%s score=%.4f"
-                        % (
-                            symbol,
-                            f"{fill_price:.6g}" if isinstance(fill_price, (int, float)) else "N/A",
-                            f"{qty:.6g}" if isinstance(qty, (int, float)) else "N/A",
-                            f"{_resolve_entry_usdt():.2f}",
-                            event.p1_idx,
-                            event.p2_idx,
-                            float(event.score or 0.0),
-                        ),
-                    )
+            guard_key = _entry_guard_key(state, symbol, "SHORT")
+            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="div15m_short", side="SHORT"):
+                print(f"[entry] 숏 중복 차단 ({symbol})")
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if _entry_seen_blocked(state, symbol, "SHORT", "div15m_short"):
+                _entry_guard_release(state, symbol, key=guard_key)
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            try:
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side="SHORT",
+                    engine="DIV15M_SHORT",
+                    reason="div15m_short",
+                    usdt=_resolve_entry_usdt(),
+                    live=LIVE_TRADING,
+                    alert_reason=f"trigger={event.reasons or 'ENTRY_READY'}",
+                    entry_price_hint=event.entry_px,
+                )
+                if req_id:
                     active_positions += 1
-                except Exception as e:
-                    order_info = f"order_error: {e}"
-                finally:
-                    _entry_guard_release(state, symbol, key=guard_key)
-
-            _set_last_entry_state(st, "SHORT", time.time())
-            div15m_short_bucket[symbol] = st
-            _send_entry_alert(
-                send_telegram,
-                side="SHORT",
-                symbol=symbol,
-                engine="DIV15M_SHORT",
-                entry_price=entry_price_disp,
-                usdt=_resolve_entry_usdt(),
-                reason=f"trigger={event.reasons or 'ENTRY_READY'}",
-                live=LIVE_TRADING,
-                order_info=order_info,
-                entry_order_id=entry_order_id,
-                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                tp=None,
-            )
+                    _set_last_entry_state(st, "SHORT", time.time())
+                    div15m_short_bucket[symbol] = st
+            except Exception as e:
+                print(f"[div15m-short] queue error {symbol}: {e}")
+            finally:
+                _entry_guard_release(state, symbol, key=guard_key)
             time.sleep(PER_SYMBOL_SLEEP)
         if int(time.time()) % 30 == 0:
             _reload_runtime_settings_from_disk(state)
