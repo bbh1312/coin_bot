@@ -607,6 +607,7 @@ def main():
     last_cfg_save_ts = 0.0
     last_watch_ts = 0.0
     last_reconcile_ts = 0.0
+    last_state_save_ts = 0.0
     watch_syms = []
     first_watch = True
     last_amt = {}
@@ -623,6 +624,9 @@ def main():
             last_cfg_save_ts = time.time()
         if (time.time() - last_watch_ts) >= 5.0:
             new_watch_syms = _update_watch_symbols()
+            active_count = len(new_watch_syms)
+            state["_active_positions_total"] = int(active_count)
+            state["_pos_limit_reached"] = bool(active_count >= er.MAX_OPEN_POSITIONS)
             if new_watch_syms != watch_syms:
                 if first_watch:
                     print(f"[manage-ws] watch_symbols={_format_symbol_list(new_watch_syms)}")
@@ -635,6 +639,12 @@ def main():
                         print(f"[manage-ws] watch_remove={_format_symbol_list(removed)}")
                 watch_syms = new_watch_syms
             last_watch_ts = time.time()
+        if (time.time() - last_state_save_ts) >= 5.0:
+            try:
+                er.save_state(state)
+            except Exception:
+                pass
+            last_state_save_ts = time.time()
         now_ts = time.time()
         if (now_ts - last_sync_ts) >= 5.0:
             try:

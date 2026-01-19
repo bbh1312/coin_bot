@@ -44,6 +44,19 @@ def _init_db(conn: sqlite3.Connection) -> None:
             reason TEXT,
             meta_json TEXT
         );
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            ts REAL,
+            symbol TEXT,
+            side TEXT,
+            event_type TEXT,
+            source TEXT,
+            qty REAL,
+            avg_entry REAL,
+            price REAL,
+            meta_json TEXT
+        );
         CREATE TABLE IF NOT EXISTS orders (
             order_id TEXT PRIMARY KEY,
             created_at TEXT,
@@ -112,6 +125,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_positions_ts_symbol ON positions (ts, symbol);
         CREATE INDEX IF NOT EXISTS idx_cancels_ts_symbol ON cancels (ts, symbol);
         CREATE INDEX IF NOT EXISTS idx_income_ts_symbol ON income (ts, symbol);
+        CREATE INDEX IF NOT EXISTS idx_events_ts_symbol ON events (ts, symbol);
         """
     )
     for table in ("engine_signals", "orders", "fills", "positions", "cancels"):
@@ -119,6 +133,10 @@ def _init_db(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN created_at TEXT")
         except Exception:
             pass
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN created_at TEXT")
+    except Exception:
+        pass
     try:
         conn.execute("ALTER TABLE income ADD COLUMN created_at TEXT")
     except Exception:
@@ -168,6 +186,41 @@ def record_engine_signal(
         )
         conn.commit()
 
+def record_event(
+    symbol: str,
+    side: str,
+    event_type: str,
+    source: str,
+    qty: Any,
+    avg_entry: Any,
+    price: Any = None,
+    meta: Optional[dict] = None,
+    ts: Optional[float] = None,
+) -> None:
+    conn = _get_conn()
+    if conn is None:
+        return
+    ts_val = float(ts if ts is not None else time.time())
+    with _LOCK:
+        conn.execute(
+            """
+            INSERT INTO events (created_at, ts, symbol, side, event_type, source, qty, avg_entry, price, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _kst_str(ts_val),
+                ts_val,
+                symbol,
+                side,
+                event_type,
+                source,
+                _to_float(qty),
+                _to_float(avg_entry),
+                _to_float(price),
+                _json(meta),
+            ),
+        )
+        conn.commit()
 
 def record_order(
     order_id: Optional[str],

@@ -172,6 +172,7 @@ TELEGRAM_STARTUP_GRACE_SEC = 15.0
 EXIT_ICON = os.getenv("EXIT_ICON", "✅")
 MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "14"))
 MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "600"))
+MANUAL_ALERT_TTL_SEC = float(os.getenv("MANUAL_ALERT_TTL_SEC", "3600"))
 
 def print_section(title: str) -> None:
     print(f"[{title}]")
@@ -1042,6 +1043,64 @@ def _entry_guard_release(state: Dict[str, dict], symbol: str, key: Optional[str]
     for k in keys:
         guard.pop(k, None)
 
+def _manual_alert_key(symbol: str, side: str) -> str:
+    return f"{symbol}|{side.upper()}"
+
+def _get_manual_alerted(state: Dict[str, dict]) -> Dict[str, float]:
+    cache = state.get("_manual_alerted")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_manual_alerted"] = cache
+    return cache
+
+def _manual_alert_info(state: Dict[str, dict], symbol: str, side: str) -> Optional[dict]:
+    cache = _get_manual_alerted(state)
+    info = cache.get(_manual_alert_key(symbol, side))
+    return info if isinstance(info, dict) else None
+
+def _mark_manual_alerted(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    entry_price: Optional[float] = None,
+    qty: Optional[float] = None,
+) -> None:
+    cache = _get_manual_alerted(state)
+    cache[_manual_alert_key(symbol, side)] = {
+        "ts": time.time(),
+        "entry": entry_price,
+        "qty": qty,
+    }
+
+def _clear_manual_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
+    cache = _get_manual_alerted(state)
+    cache.pop(_manual_alert_key(symbol, side), None)
+
+def _dca_alert_key(symbol: str, side: str, adds_done: int) -> str:
+    return f"{symbol}|{side.upper()}|{adds_done}"
+
+def _get_dca_alerted(state: Dict[str, dict]) -> Dict[str, float]:
+    cache = state.get("_dca_alerted")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_dca_alerted"] = cache
+    return cache
+
+def _dca_alerted(state: Dict[str, dict], symbol: str, side: str, adds_done: int) -> bool:
+    cache = _get_dca_alerted(state)
+    return _dca_alert_key(symbol, side, adds_done) in cache
+
+def _mark_dca_alerted(state: Dict[str, dict], symbol: str, side: str, adds_done: int) -> None:
+    cache = _get_dca_alerted(state)
+    cache[_dca_alert_key(symbol, side, adds_done)] = time.time()
+
+def _clear_dca_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
+    cache = _get_dca_alerted(state)
+    prefix = f"{symbol}|{side.upper()}|"
+    for key in list(cache.keys()):
+        if str(key).startswith(prefix):
+            cache.pop(key, None)
+
 def _manage_pending_key(symbol: str, side: str) -> str:
     return f"{symbol}|{side.upper()}"
 
@@ -1276,7 +1335,12 @@ def _close_trade(
     st["last_entry"] = float(exit_ts)
     _set_last_exit_state(st, side, exit_ts, reason)
     st["in_pos"] = False
+    suffix = "long" if side == "LONG" else "short"
+    st.pop(f"manual_entry_alerted_{suffix}", None)
+    st.pop(f"manual_qty_{suffix}", None)
+    st.pop(f"manual_dca_adds_{suffix}", None)
     state[symbol] = st
+    _clear_dca_alerted(state, symbol, side)
     if dbrec:
         try:
             dbrec.record_position_snapshot(
@@ -1854,9 +1918,40 @@ def _format_report_output(
     lines.append("</pre>")
     return "\n".join(lines)
 
+def _count_unique_entries(entry_by_symbol: dict) -> int:
+    seen = set()
+    total = 0
+    for (sym, side), entries in (entry_by_symbol or {}).items():
+        if not entries:
+            continue
+        for rec in entries:
+            order_id = rec.get("entry_order_id")
+            if order_id:
+                key = ("order", str(order_id))
+            else:
+                price = rec.get("entry_price")
+                ts = rec.get("entry_ts")
+                bucket = int(float(ts) // 1800) if isinstance(ts, (int, float)) else 0
+                if isinstance(price, (int, float)):
+                    key = ("price", sym, side, round(float(price), 8), bucket)
+                else:
+                    key = ("ts", sym, side, bucket)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += 1
+    return total
+
 def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool = False) -> str:
     db_rows = _load_db_daily_rows(report_date)
     records = None if db_rows else _read_report_csv_records(report_date)
+    try:
+        report_start_ts = calendar.timegm(datetime.strptime(report_date, "%Y-%m-%d").timetuple())
+    except Exception:
+        report_start_ts = None
+    report_end_ts = report_start_ts + 86400.0 if isinstance(report_start_ts, (int, float)) else None
+    lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
+    since_ts = (float(report_start_ts) - lookback) if isinstance(report_start_ts, (int, float)) else None
     totals = {
         "LONG": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
         "SHORT": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
@@ -1868,12 +1963,12 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
     use_trade_rows = False
     entry_by_symbol = {}
     try:
-        _, entry_by_symbol = _load_entry_events_map(report_date)
+        _, entry_by_symbol = _load_entry_events_map(report_date, since_ts=report_start_ts, end_ts=report_end_ts)
     except Exception:
         entry_by_symbol = {}
     entry_by_symbol_all = {}
     try:
-        _, entry_by_symbol_all = _load_entry_events_map(None)
+        _, entry_by_symbol_all = _load_entry_events_map(None, since_ts=since_ts, end_ts=report_end_ts)
     except Exception:
         entry_by_symbol_all = {}
 
@@ -2218,7 +2313,7 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
             exec_ts = tr.get("exit_ts") if isinstance(tr.get("exit_ts"), (int, float)) else None
             _update_symbol_row(side, symbol, reason, pnl, win_flag, exec_ts)
 
-    entry_count = sum(len(v) for v in entry_by_symbol.values()) if entry_by_symbol else 0
+    entry_count = _count_unique_entries(entry_by_symbol) if entry_by_symbol else 0
     rows_out = symbol_trade_rows if use_trade_rows else symbol_rows
     return _format_report_output(totals, engine_totals, rows_out, report_date, compact, entry_count)
 
@@ -2226,13 +2321,24 @@ def _build_range_report(state: Dict[str, dict], start_date: str, end_date: str, 
     db_rows = _load_db_daily_rows_range(start_date, end_date)
     if not db_rows:
         return _build_daily_report(state, start_date, compact=compact)
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except Exception:
+        return _build_daily_report(state, start_date, compact=compact)
+    if end_dt < start_dt:
+        start_dt, end_dt = end_dt, start_dt
+    range_start_ts = calendar.timegm(start_dt.timetuple())
+    range_end_ts = calendar.timegm((end_dt + timedelta(days=1)).timetuple())
+    lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
+    since_ts = float(range_start_ts) - lookback
     entry_by_symbol: dict = {}
     entry_count = 0
     entry_engine_map: Dict[Tuple[str, str], Tuple[float, str]] = {}
     entry_event_index: Dict[Tuple[str, str], List[Tuple[float, str]]] = {}
     entry_by_symbol_all = {}
     try:
-        _, entry_by_symbol_all = _load_entry_events_map(None)
+        _, entry_by_symbol_all = _load_entry_events_map(None, since_ts=since_ts, end_ts=range_end_ts)
     except Exception:
         entry_by_symbol_all = {}
     totals = {
@@ -2245,8 +2351,8 @@ def _build_range_report(state: Dict[str, dict], start_date: str, end_date: str, 
         cur = start_dt
         while cur <= end_dt:
             day = cur.strftime("%Y-%m-%d")
-            _, entry_by_symbol = _load_entry_events_map(day)
-            entry_count += sum(len(v) for v in entry_by_symbol.values())
+            _, entry_by_symbol = _load_entry_events_map(day, since_ts=range_start_ts, end_ts=range_end_ts)
+            entry_count += _count_unique_entries(entry_by_symbol)
             cur += timedelta(days=1)
     except Exception:
         entry_count = 0
@@ -3827,7 +3933,101 @@ def _read_report_csv_records(report_date: str) -> Optional[list]:
     except Exception:
         return None
 
-def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dict]:
+def _load_db_entry_events_map(
+    report_date: Optional[str] = None,
+    since_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+) -> tuple[dict, dict]:
+    by_id: dict = {}
+    by_symbol_side: dict = {}
+    if not dbrec or not dbrec.ENABLED:
+        return by_id, by_symbol_side
+    try:
+        db_path = getattr(dbrec, "DB_PATH", "") or "logs/trades.db"
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        clauses = ["event_type = 'ENTRY'"]
+        params: list = []
+        if report_date:
+            clauses.append("date(datetime(ts, 'unixepoch')) = ?")
+            params.append(report_date)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(float(since_ts))
+        if end_ts is not None:
+            clauses.append("ts <= ?")
+            params.append(float(end_ts))
+        where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = cur.execute(
+            f"""
+            SELECT ts, symbol, side, source, avg_entry, meta_json
+            FROM events
+            {where_sql}
+            """,
+            tuple(params),
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            try:
+                ts_val = float(row[0]) if row[0] is not None else None
+            except Exception:
+                ts_val = None
+            if ts_val is None:
+                continue
+            symbol = row[1] or ""
+            side = (row[2] or "").upper()
+            if not symbol or side not in ("LONG", "SHORT"):
+                continue
+            engine = row[3] or "unknown"
+            entry_price = None
+            try:
+                entry_price = float(row[4]) if row[4] is not None else None
+            except Exception:
+                entry_price = None
+            meta = None
+            raw_meta = row[5]
+            if raw_meta:
+                try:
+                    meta = json.loads(raw_meta)
+                except Exception:
+                    meta = None
+            if isinstance(meta, dict):
+                meta_engine = meta.get("engine") or meta.get("source_engine")
+                if meta_engine:
+                    engine = meta_engine
+                meta_entry_price = meta.get("entry_price") or meta.get("avg_entry")
+                if entry_price is None and isinstance(meta_entry_price, (int, float)):
+                    entry_price = float(meta_entry_price)
+                entry_order_id = meta.get("entry_order_id")
+            else:
+                entry_order_id = None
+            record = {
+                "entry_ts": ts_val,
+                "entry_order_id": entry_order_id,
+                "symbol": symbol,
+                "side": side,
+                "engine": engine,
+                "entry_price": entry_price,
+            }
+            key = (symbol, side)
+            by_symbol_side.setdefault(key, []).append(record)
+        return by_id, by_symbol_side
+    except Exception:
+        return by_id, by_symbol_side
+
+def _load_entry_events_map(
+    report_date: Optional[str] = None,
+    since_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+) -> tuple[dict, dict]:
+    if dbrec and dbrec.ENABLED:
+        by_id, by_symbol_side = _load_db_entry_events_map(
+            report_date=report_date,
+            since_ts=since_ts,
+            end_ts=end_ts,
+        )
+        if by_id or by_symbol_side:
+            return by_id, by_symbol_side
     by_id = {}
     by_symbol_side = {}
     paths: list[str] = []
@@ -3882,6 +4082,7 @@ def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dic
                         "symbol": symbol,
                         "side": side,
                         "engine": engine,
+                        "entry_price": payload.get("entry_price"),
                     }
                     if entry_id:
                         by_id[str(entry_id)] = record
@@ -4553,6 +4754,127 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
         ok = _execute_manage_entry_request(state, req, send_telegram)
         status[req_id] = {"status": "done" if ok else "failed", "ts": time.time()}
 
+def _record_position_event(
+    symbol: str,
+    side: str,
+    event_type: str,
+    source: str,
+    qty: Optional[float],
+    avg_entry: Optional[float],
+    price: Optional[float],
+    meta: Optional[dict],
+) -> None:
+    if not dbrec or not dbrec.ENABLED:
+        return
+    try:
+        dbrec.record_event(
+            symbol=symbol,
+            side=side,
+            event_type=event_type,
+            source=source,
+            qty=qty,
+            avg_entry=avg_entry,
+            price=price,
+            meta=meta,
+            ts=time.time(),
+        )
+    except Exception:
+        pass
+
+def _detect_position_events(state: dict, send_telegram) -> None:
+    try:
+        pos_syms = list_open_position_symbols(force=True)
+    except Exception:
+        return
+    snap = state.setdefault("_pos_snapshot", {})
+    now = time.time()
+    def _handle(symbol: str, side: str, detail: Optional[dict]) -> None:
+        open_tr = _get_open_trade(state, side, symbol)
+        managed = isinstance(open_tr, dict)
+        managed_engine = (open_tr.get("meta") or {}).get("engine") if managed else None
+        changed = False
+        key = f"{symbol}|{side}"
+        prev = snap.get(key) if isinstance(snap, dict) else None
+        prev_qty = prev.get("qty") if isinstance(prev, dict) else None
+        prev_entry = prev.get("entry") if isinstance(prev, dict) else None
+        qty = None
+        avg_entry = None
+        mark = None
+        if isinstance(detail, dict):
+            qty = detail.get("qty") or detail.get("amount")
+            avg_entry = detail.get("entry")
+            mark = detail.get("mark")
+        try:
+            qty = float(qty) if qty is not None else None
+        except Exception:
+            qty = None
+        if side == "SHORT" and isinstance(qty, (int, float)):
+            qty = abs(qty)
+        try:
+            avg_entry = float(avg_entry) if avg_entry is not None else None
+        except Exception:
+            avg_entry = None
+        if isinstance(qty, (int, float)) and qty <= 0:
+            qty = None
+        if prev_qty is None and qty is not None:
+            if not managed:
+                _record_position_event(symbol, side, "ENTRY", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
+                changed = True
+                _send_entry_alert(
+                    send_telegram,
+                    side=side,
+                    symbol=symbol,
+                    engine="MANUAL",
+                    entry_price=avg_entry,
+                    usdt=None,
+                    reason="manual_entry",
+                    live=True,
+                    order_info="(pos-snap)",
+                    entry_order_id=None,
+                    sl=_fmt_price_safe(
+                        avg_entry,
+                        AUTO_EXIT_SHORT_SL_PCT if side == "SHORT" else AUTO_EXIT_LONG_SL_PCT,
+                        side=side,
+                    ),
+                    tp=None,
+                )
+        elif prev_qty is not None and qty is not None:
+            if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > prev_qty * 1.0001:
+                if not managed:
+                    _record_position_event(symbol, side, "DCA", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
+                    changed = True
+                    send_telegram(
+                        f"➕ <b>DCA</b> {symbol} {side} adds mark={mark} entry={avg_entry} qty={qty}"
+                    )
+        elif prev_qty is not None and qty is None:
+            source = managed_engine or ("AUTO" if managed else "MANUAL")
+            _record_position_event(symbol, side, "EXIT", source, prev_qty, prev_entry, mark, {"source": "pos_snapshot"})
+            changed = True
+        if isinstance(snap, dict):
+            if qty is not None:
+                snap[key] = {"qty": qty, "entry": avg_entry, "ts": now}
+            else:
+                snap.pop(key, None)
+        if changed:
+            try:
+                save_state(state)
+            except Exception:
+                pass
+    for sym in pos_syms.get("short") or []:
+        detail = None
+        try:
+            detail = get_short_position_detail(sym)
+        except Exception:
+            detail = None
+        _handle(sym, "SHORT", detail)
+    for sym in pos_syms.get("long") or []:
+        detail = None
+        try:
+            detail = get_long_position_detail(sym)
+        except Exception:
+            detail = None
+        _handle(sym, "LONG", detail)
+
 def _detect_manual_positions(state: dict, send_telegram) -> None:
     try:
         pos_syms = list_open_position_symbols(force=True)
@@ -4580,6 +4902,30 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                 st = {}
             prev_qty = st.get(f"manual_qty_{side_key}")
             if not st.get("in_pos"):
+                info = _manual_alert_info(state, sym, side_label)
+                if info:
+                    prev_entry = info.get("entry")
+                    prev_qty = info.get("qty")
+                    prev_ts = info.get("ts")
+                    same_entry = False
+                    if isinstance(prev_entry, (int, float)) and isinstance(entry, (int, float)) and entry > 0:
+                        same_entry = abs(float(prev_entry) - float(entry)) / float(entry) <= 0.001
+                    elif prev_entry is None or entry is None:
+                        same_entry = True
+                    same_qty = False
+                    if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > 0:
+                        same_qty = abs(float(prev_qty) - float(qty)) / float(qty) <= 0.01
+                    elif prev_qty is None or qty is None:
+                        same_qty = True
+                    ttl_ok = False
+                    if isinstance(prev_ts, (int, float)):
+                        ttl_ok = (time.time() - float(prev_ts)) <= MANUAL_ALERT_TTL_SEC
+                    if same_entry and same_qty and ttl_ok:
+                        st["in_pos"] = True
+                        st[f"manual_qty_{side_key}"] = qty
+                        st.setdefault(f"manual_dca_adds_{side_key}", 0)
+                        state[sym] = st
+                        continue
                 _log_trade_entry(
                     state,
                     side=side_label,
@@ -4605,6 +4951,11 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                     sl=_fmt_price_safe(entry, AUTO_EXIT_SHORT_SL_PCT if side_label == "SHORT" else AUTO_EXIT_LONG_SL_PCT, side=side_label),
                     tp=None,
                 )
+                _mark_manual_alerted(state, sym, side_label, entry_price=entry, qty=qty)
+                try:
+                    save_state(state)
+                except Exception:
+                    pass
                 st["in_pos"] = True
                 st[f"manual_qty_{side_key}"] = qty
                 st[f"manual_dca_adds_{side_key}"] = 0
@@ -4621,6 +4972,10 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                     f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} "
                     f"mark={mark} entry={entry} qty={qty}"
                 )
+                try:
+                    save_state(state)
+                except Exception:
+                    pass
 
 def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool:
     symbol = req.get("symbol")
@@ -4673,7 +5028,17 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         qty=qty if isinstance(qty, (int, float)) else None,
         usdt=usdt,
         entry_order_id=entry_order_id,
-        meta={"reason": req.get("reason")},
+        meta={"reason": req.get("reason"), "engine": req.get("engine")},
+    )
+    _record_position_event(
+        symbol,
+        side,
+        "ENTRY",
+        str(req.get("engine") or "AUTO"),
+        qty if isinstance(qty, (int, float)) else None,
+        fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
+        fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
+        {"source": "manage_queue", "reason": req.get("reason")},
     )
     try:
         _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
@@ -4741,7 +5106,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         return
 
     _process_manage_queue(state, send_telegram)
-    _detect_manual_positions(state, send_telegram)
+    _detect_position_events(state, send_telegram)
 
     exit_force_refreshed = False
     for sym, st in list(state.items()):
@@ -5013,12 +5378,18 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         adds_done = int(st.get("dca_adds_short", st.get("dca_adds", 0)))
         dca_res = dca_short_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
         if dca_res.get("status") not in ("skip", "warn"):
-            st["dca_adds_short"] = adds_done + 1
-            state[sym] = st
-            send_telegram(
-                f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
-            )
-            time.sleep(0.1)
+            if not _dca_alerted(state, sym, "SHORT", adds_done + 1):
+                st["dca_adds_short"] = adds_done + 1
+                state[sym] = st
+                send_telegram(
+                    f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
+                )
+                _mark_dca_alerted(state, sym, "SHORT", adds_done + 1)
+                try:
+                    save_state(state)
+                except Exception:
+                    pass
+                time.sleep(0.1)
 
     long_syms = set(_get_open_symbols(state, "LONG"))
     try:
@@ -5211,13 +5582,19 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 adds_done = int(st.get("dca_adds_long", st.get("dca_adds", 0)))
                 dca_res = dca_long_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
                 if dca_res.get("status") not in ("skip", "warn"):
-                    st["dca_adds_long"] = adds_done + 1
-                    state[sym] = st
-                    send_telegram(
-                        f"➕ <b>DCA</b> {sym} LONG adds {adds_done}->{adds_done+1} "
-                        f"mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
-                    )
-                    time.sleep(0.1)
+                    if not _dca_alerted(state, sym, "LONG", adds_done + 1):
+                        st["dca_adds_long"] = adds_done + 1
+                        state[sym] = st
+                        send_telegram(
+                            f"➕ <b>DCA</b> {sym} LONG adds {adds_done}->{adds_done+1} "
+                            f"mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
+                        )
+                        _mark_dca_alerted(state, sym, "LONG", adds_done + 1)
+                        try:
+                            save_state(state)
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
 
     tickers = _get_manage_tickers(state, exchange, MANAGE_TICKER_TTL_SEC)
     _reconcile_long_trades(state, cached_long_ex, tickers)
@@ -7262,6 +7639,34 @@ def run():
             set_dry_run(not LIVE_TRADING)
         except Exception:
             pass
+        if state.get("_pos_limit_reached") is True:
+            last_warn = float(state.get("_pos_limit_skip_ts", 0.0) or 0.0)
+            if (now - last_warn) >= 60:
+                print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
+                state["_pos_limit_skip_ts"] = now
+            time.sleep(5)
+            continue
+        active_positions_state = sum(
+            1 for st in state.values() if isinstance(st, dict) and st.get("in_pos")
+        )
+        active_positions_cached = state.get("_active_positions_total")
+        if not isinstance(active_positions_cached, int):
+            try:
+                active_positions_cached = int(active_positions_cached)
+            except Exception:
+                active_positions_cached = None
+        active_positions_total_est = (
+            max(active_positions_state, active_positions_cached)
+            if isinstance(active_positions_cached, int)
+            else active_positions_state
+        )
+        if isinstance(active_positions_total_est, int) and active_positions_total_est >= MAX_OPEN_POSITIONS:
+            last_warn = float(state.get("_pos_limit_skip_ts", 0.0) or 0.0)
+            if (now - last_warn) >= 60:
+                print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
+                state["_pos_limit_skip_ts"] = now
+            time.sleep(5)
+            continue
 
         # cycle ts debug (BTC 15m, prev candle only)
         cycle_ts = None
@@ -7829,6 +8234,7 @@ def run():
             active_positions_total = sum(
                 1 for st in state.values() if isinstance(st, dict) and st.get("in_pos")
             )
+        state["_active_positions_total"] = int(active_positions_total)
 
         # --- SYNC from exchange: manage mode baseline (universe 포함) ---
         sync_syms = list(set(list(state.keys()) + list(universe_union)))
