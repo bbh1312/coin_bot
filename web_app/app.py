@@ -41,6 +41,7 @@ from engine_runner import (
     AUTO_EXIT_LONG_SL_PCT,
     AUTO_EXIT_SHORT_TP_PCT,
     AUTO_EXIT_SHORT_SL_PCT,
+    ENGINE_EXIT_OVERRIDES,
 )
 
 COMMAND_DEFS = [
@@ -66,6 +67,7 @@ COMMAND_DEFS = [
     {"cmd": "/l_exit_sl", "key": "_auto_exit_long_sl_pct", "label": "롱 SL (%)", "type": "number", "step": 0.1},
     {"cmd": "/s_exit_tp", "key": "_auto_exit_short_tp_pct", "label": "숏 TP (%)", "type": "number", "step": 0.1},
     {"cmd": "/s_exit_sl", "key": "_auto_exit_short_sl_pct", "label": "숏 SL (%)", "type": "number", "step": 0.1},
+    {"cmd": "/engine_exit", "key": "_engine_exit_overrides", "label": "엔진 TP/SL JSON", "type": "json"},
     {"cmd": "/max_pos", "key": "_max_open_positions", "label": "최대 포지션 수", "type": "int", "step": 1},
 ]
 COMMANDS_BY_CMD = {d["cmd"]: d for d in COMMAND_DEFS}
@@ -96,6 +98,7 @@ DEFAULTS = {
     "_auto_exit_long_sl_pct": AUTO_EXIT_LONG_SL_PCT,
     "_auto_exit_short_tp_pct": AUTO_EXIT_SHORT_TP_PCT,
     "_auto_exit_short_sl_pct": AUTO_EXIT_SHORT_SL_PCT,
+    "_engine_exit_overrides": ENGINE_EXIT_OVERRIDES,
 }
 
 
@@ -131,6 +134,11 @@ def _format_value(item: dict, value: object) -> str:
         return "ON" if bool(value) else "OFF"
     if item.get("type") == "int":
         return str(int(value))
+    if item.get("type") == "json":
+        try:
+            return json.dumps(value, ensure_ascii=True)
+        except Exception:
+            return str(value)
     try:
         return f"{float(value):.2f}"
     except Exception:
@@ -220,6 +228,19 @@ def command():
             if item["type"] == "int":
                 num = int(num)
             state[key] = num
+        elif item["type"] == "json":
+            if value is None or (isinstance(value, str) and not value.strip()):
+                return jsonify({"status": "missing value", "key": key}), 400
+            if isinstance(value, dict):
+                state[key] = value
+            else:
+                try:
+                    parsed = json.loads(value)
+                except Exception:
+                    return jsonify({"status": "invalid json", "key": key}), 400
+                if not isinstance(parsed, dict):
+                    return jsonify({"status": "json must be object", "key": key}), 400
+                state[key] = parsed
         state["_runtime_cfg_ts"] = time.time()
         save_state(state)
         _notify_change(item, state.get(key))

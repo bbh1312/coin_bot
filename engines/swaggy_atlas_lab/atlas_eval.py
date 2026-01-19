@@ -209,6 +209,7 @@ def evaluate_local(
         reasons.append("VOL")
 
     pass_hard = score >= cfg.exception_min_score
+    pass_soft = score >= 1
     if not pass_hard:
         reasons.append("QUALITY_FAIL")
 
@@ -219,4 +220,6 @@ def evaluate_local(
         elif score == cfg.exception_min_score:
             atlas_mult = 1.0
     strength = float(score) / max(1.0, float(cfg.exception_min_score))
+    metrics["pass_soft"] = pass_soft
+    metrics["pass_hard"] = pass_hard
     return AtlasDecision(pass_hard, atlas_mult, strength, reasons, metrics)

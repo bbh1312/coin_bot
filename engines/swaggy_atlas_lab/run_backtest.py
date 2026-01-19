@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
-from typing import Dict, List
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional
 
 import ccxt
 
@@ -52,6 +54,83 @@ def _append_backtest_entry_log(line: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"{ts} {line}\n")
+
+
+def _iso_kst_ms(ts_ms: int) -> str:
+    tz = timezone(timedelta(hours=9))
+    try:
+        dt = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=tz)
+        return dt.isoformat(timespec="seconds")
+    except Exception:
+        return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def _append_swaggy_trade_json(payload: Dict[str, object]) -> None:
+    try:
+        path = os.path.join("logs", "swaggy_trades.jsonl")
+        ensure_dir(os.path.dirname(path))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def _entry_quality_bucket(
+    atlas_pass_hard: Optional[bool],
+    confirm_pass: Optional[int],
+    overext_dist_at_entry: Optional[float],
+    trigger_combo: str,
+    trigger_parts: Dict[str, float],
+    strength_total: float,
+    strength_min_req: float,
+) -> tuple[str, List[str]]:
+    reasons: List[str] = []
+    if atlas_pass_hard:
+        reasons.append("ATLAS_HARD_OK")
+    if confirm_pass:
+        reasons.append("CONFIRM_OK")
+    if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry <= 1.0:
+        reasons.append("LOW_OVEREXT")
+    strong_combo = False
+    combo_set = {c.strip().upper() for c in (trigger_combo or "").split("+") if c.strip()}
+    if combo_set == {"SWEEP", "RECLAIM"}:
+        strong_combo = True
+    rej_strength = trigger_parts.get("REJECTION")
+    if rej_strength is not None and rej_strength >= 0.56:
+        strong_combo = True
+    if strong_combo:
+        reasons.append("TRIGGER_COMBO_STRONG")
+    if strength_total >= (strength_min_req + 0.08):
+        reasons.append("STRENGTH_ABOVE_MIN")
+
+    if (
+        atlas_pass_hard
+        and confirm_pass
+        and isinstance(overext_dist_at_entry, (int, float))
+        and overext_dist_at_entry <= 1.0
+        and strong_combo
+        and strength_total >= (strength_min_req + 0.08)
+    ):
+        return "A", reasons
+    if (
+        atlas_pass_hard
+        and confirm_pass
+        and isinstance(overext_dist_at_entry, (int, float))
+        and overext_dist_at_entry <= 1.35
+    ):
+        return "B", reasons
+    fail_reasons = []
+    if not atlas_pass_hard:
+        fail_reasons.append("ATLAS_HARD_FAIL")
+    if not confirm_pass:
+        fail_reasons.append("CONFIRM_FAIL")
+    if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry > 1.35:
+        fail_reasons.append("HIGH_OVEREXT")
+    if not strong_combo:
+        fail_reasons.append("WEAK_TRIGGER")
+    if strength_total < (strength_min_req + 0.08):
+        fail_reasons.append("LOW_STRENGTH")
+    return "C", reasons + fail_reasons
 
 
 def _make_exchange() -> ccxt.Exchange:
@@ -224,6 +303,28 @@ def main() -> None:
                     prev_phase = sym_state.get("phase")
                     d1d = slice_df(df_d1, ts_ms)
                     signal = engine.evaluate_symbol(sym, d4h, d1h, d15, d5, d3, d1d, now_ts)
+                    debug = signal.debug if isinstance(signal.debug, dict) else {}
+                    event_list = debug.get("events") if isinstance(debug.get("events"), list) else []
+                    if event_list:
+                        for event in event_list:
+                            if not isinstance(event, dict):
+                                continue
+                            payload = {
+                                "ts": _iso_kst_ms(ts_ms),
+                                "event": event.get("event") or "SWAGGY_EVENT",
+                                "engine": "SWAGGY_ATLAS_LAB",
+                                "mode": mode.value,
+                                "symbol": sym,
+                                "side": event.get("side") or signal.side,
+                                "ltf": sw_cfg.tf_ltf,
+                                "mtf": sw_cfg.tf_mtf,
+                                "htf": sw_cfg.tf_htf,
+                                "htf2": sw_cfg.tf_htf2,
+                                "cycle_id": ts_ms,
+                                "range_id": event.get("range_id") or debug.get("touch_key"),
+                            }
+                            payload.update(event)
+                            _append_swaggy_trade_json(payload)
                     new_phase = sym_state.get("phase")
                     key = (mode.value, sym)
                     overext_stats = overext_by_key.setdefault(
@@ -299,6 +400,29 @@ def main() -> None:
                                     "atlas_shadow_reasons": trade.atlas_shadow_reasons,
                                 }
                             )
+                            if trade.context and trade.exit_ts is not None:
+                                payload = dict(trade.context)
+                                entry_price = float(payload.get("entry_price") or 0.0)
+                                atr14 = payload.get("atr14_ltf")
+                                mfe_atr = None
+                                mae_atr = None
+                                if isinstance(atr14, (int, float)) and atr14 > 0 and entry_price > 0:
+                                    mfe_atr = (trade.mfe * entry_price) / atr14
+                                    mae_atr = (abs(trade.mae) * entry_price) / atr14
+                                pnl_r = (pnl_pct / bt_cfg.sl_pct) if bt_cfg.sl_pct > 0 else None
+                                payload.update(
+                                    {
+                                        "exit_ts": _iso_kst_ms(trade.exit_ts),
+                                        "exit_price": trade.exit_price,
+                                        "exit_reason": trade.exit_reason,
+                                        "pnl_r": pnl_r,
+                                        "pnl_pct": pnl_pct,
+                                        "mfe_atr": mfe_atr,
+                                        "mae_atr": mae_atr,
+                                        "hold_bars_ltf": trade.bars,
+                                    }
+                                )
+                                _append_swaggy_trade_json(payload)
                             log_fp.write(
                                 f"EXIT ts={trade.exit_ts} sym={sym} pnl_usdt={pnl_usdt:.4f} "
                                 f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars}\n"
@@ -338,6 +462,7 @@ def main() -> None:
                         continue
 
                     atlas = None
+                    gate = None
                     if mode != AtlasMode.OFF:
                         btc_slice = slice_df(btc_df, ts_ms)
                         gate = evaluate_global_gate(btc_slice, at_cfg)
@@ -376,8 +501,113 @@ def main() -> None:
                     if not policy.allow:
                         continue
                     dist_at_entry = _overext_dist(d5, side, sw_cfg)
+                    dist_at_entry_abs = abs(dist_at_entry) if isinstance(dist_at_entry, (int, float)) else dist_at_entry
                     overext_blocked = bool(sym_state.get("overext_blocked"))
                     sym_state["overext_blocked"] = False
+                    beta_val = atlas.metrics.get("beta") if atlas and atlas.metrics else None
+                    if (
+                        sw_cfg.skip_beta_mid
+                        and isinstance(beta_val, (int, float))
+                        and 1.0 <= float(beta_val) < 1.5
+                    ):
+                        line = f"SKIP ts={ts_ms} sym={sym} reason=SKIP_BETA_MID beta={beta_val:.4g}"
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        continue
+                    if (
+                        sw_cfg.skip_overext_mid
+                        and isinstance(dist_at_entry_abs, (int, float))
+                        and 1.1 <= float(dist_at_entry_abs) < 1.4
+                    ):
+                        line = f"SKIP ts={ts_ms} sym={sym} reason=SKIP_OVEREXT_MID overext={dist_at_entry_abs:.4g}"
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        continue
+                    body_ratio = None
+                    confirm_metrics = debug.get("confirm_metrics") if isinstance(debug, dict) else None
+                    if isinstance(confirm_metrics, dict):
+                        body_ratio = confirm_metrics.get("body_ratio")
+                    if (
+                        sw_cfg.skip_confirm_body
+                        and isinstance(body_ratio, (int, float))
+                        and float(body_ratio) < 0.60
+                    ):
+                        line = f"SKIP ts={ts_ms} sym={sym} reason=SKIP_CONFIRM_BODY body_ratio={body_ratio:.4g}"
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        continue
+                    entry_quality, entry_quality_reasons = _entry_quality_bucket(
+                        bool(atlas.pass_hard) if atlas and atlas.pass_hard is not None else False,
+                        int(debug.get("confirm_pass") or 0),
+                        dist_at_entry_abs,
+                        str(debug.get("trigger_combo") or ""),
+                        debug.get("trigger_parts") if isinstance(debug.get("trigger_parts"), dict) else {},
+                        float(debug.get("strength_total") or 0.0),
+                        float(debug.get("strength_min_req") or 0.0),
+                    )
+                    trade_context = {
+                        "ts": _iso_kst_ms(ts_ms),
+                        "event": "SWAGGY_TRADE",
+                        "engine": "SWAGGY_ATLAS_LAB",
+                        "mode": mode.value,
+                        "symbol": sym,
+                        "side": side,
+                        "ltf": sw_cfg.tf_ltf,
+                        "mtf": sw_cfg.tf_mtf,
+                        "htf": sw_cfg.tf_htf,
+                        "htf2": sw_cfg.tf_htf2,
+                        "cycle_id": ts_ms,
+                        "range_id": debug.get("touch_key"),
+                        "entry_ts": _iso_kst_ms(ts_ms),
+                        "entry_price": entry_px,
+                        "atr14_ltf": debug.get("atr14_ltf"),
+                        "atr14_htf": debug.get("atr14_htf"),
+                        "ema20_ltf": debug.get("ema20_ltf"),
+                        "ema20_htf": debug.get("ema20_htf"),
+                        "level_type": debug.get("level_type"),
+                        "level_price": debug.get("level_price"),
+                        "level_score": debug.get("level_score"),
+                        "touch_count": debug.get("touch_count"),
+                        "level_age_bars": debug.get("level_age_bars"),
+                        "touch_pct": debug.get("touch_pct"),
+                        "touch_atr_mult": debug.get("touch_atr_mult"),
+                        "touch_pass": int(debug.get("touch_pass") or 0),
+                        "touch_fail_reason": debug.get("touch_fail_reason"),
+                        "trigger_combo": debug.get("trigger_combo"),
+                        "trigger_strength_best": debug.get("trigger_strength_best"),
+                        "trigger_strength_min": debug.get("trigger_strength_min"),
+                        "trigger_strength_avg": debug.get("trigger_strength_avg"),
+                        "trigger_strength_used": debug.get("trigger_strength_used"),
+                        "trigger_parts": debug.get("trigger_parts"),
+                        "strength_total": debug.get("strength_total"),
+                        "strength_min_req": debug.get("strength_min_req"),
+                        "trigger_threshold_used": debug.get("trigger_threshold_used"),
+                        "use_trigger_min": debug.get("use_trigger_min"),
+                        "confirm_pass": int(debug.get("confirm_pass") or 0),
+                        "confirm_fail_reason": debug.get("confirm_fail"),
+                        "confirm_metrics": debug.get("confirm_metrics"),
+                        "confirm_body_ratio": (debug.get("confirm_metrics") or {}).get("body_ratio")
+                        if isinstance(debug.get("confirm_metrics"), dict)
+                        else None,
+                        "overext_ema_len": debug.get("overext_ema_len"),
+                        "overext_atr_mult": debug.get("overext_atr_mult"),
+                        "overext_dist_at_touch": debug.get("overext_dist_at_touch"),
+                        "overext_dist_at_entry": dist_at_entry_abs,
+                        "overext_blocked": 1 if overext_blocked else 0,
+                        "overext_state": "CHASE" if overext_blocked else "OK",
+                        "atlas_pass_soft": atlas.metrics.get("pass_soft") if atlas and atlas.metrics else None,
+                        "atlas_pass_hard": atlas.metrics.get("pass_hard") if atlas and atlas.metrics else None,
+                        "atlas_state": gate.get("reason") if gate else None,
+                        "atlas_regime": atlas.metrics.get("regime") if atlas and atlas.metrics else None,
+                        "atlas_rs": atlas.metrics.get("rs") if atlas and atlas.metrics else None,
+                        "atlas_rs_z": atlas.metrics.get("rs_z") if atlas and atlas.metrics else None,
+                        "atlas_corr": atlas.metrics.get("corr") if atlas and atlas.metrics else None,
+                        "atlas_beta": atlas.metrics.get("beta") if atlas and atlas.metrics else None,
+                        "atlas_vol_ratio": atlas.metrics.get("vol_ratio") if atlas and atlas.metrics else None,
+                        "atlas_block_reason": policy.policy_action if policy and not policy.allow else None,
+                        "entry_quality_bucket": entry_quality,
+                        "entry_quality_reasons": entry_quality_reasons,
+                    }
                     _append_backtest_entry_log(
                         "engine=swaggy_atlas_lab mode=%s symbol=%s side=%s entry=%.6g "
                         "final_usdt=%.2f sw_strength=%.3f sw_reasons=%s atlas_pass=%s atlas_mult=%s "
@@ -414,8 +644,9 @@ def main() -> None:
                         atlas_shadow_pass=shadow_pass if mode == AtlasMode.SHADOW else None,
                         atlas_shadow_reasons=shadow_reasons if mode == AtlasMode.SHADOW else None,
                         policy_action=policy.policy_action,
-                        overext_dist_at_entry=dist_at_entry,
+                        overext_dist_at_entry=dist_at_entry_abs,
                         overext_blocked=overext_blocked,
+                        context=trade_context,
                     )
 
     write_trades_csv(trades_path, trades)

@@ -254,6 +254,7 @@
             "_auto_exit_long_sl_pct",
             "_auto_exit_short_tp_pct",
             "_auto_exit_short_sl_pct",
+            "_engine_exit_overrides",
             "divider",
             "_dca_pct",
             "_dca_first_pct",
@@ -320,6 +321,34 @@
             return divider;
         }
 
+        function buildJsonRow(item, current) {
+            const row = document.createElement("div");
+            row.className = "toggle";
+            const label = document.createElement("div");
+            label.textContent = item.label;
+            const wrap = document.createElement("div");
+            wrap.className = "form-row";
+            const input = document.createElement("textarea");
+            input.rows = 4;
+            input.placeholder = '{"ENGINE":{"LONG":{"tp":2,"sl":4},"SHORT":{"tp":3,"sl":5}}}';
+            if (current && typeof current === "object") {
+                input.value = JSON.stringify(current, null, 2);
+            } else if (current) {
+                input.value = current;
+            }
+            const btn = document.createElement("button");
+            btn.textContent = "Apply";
+            btn.addEventListener("click", async () => {
+                await sendCommand({ key: item.key, value: input.value });
+                await refreshStatus();
+            });
+            wrap.appendChild(input);
+            wrap.appendChild(btn);
+            row.appendChild(label);
+            row.appendChild(wrap);
+            return row;
+        }
+
         async function refreshStatus() {
             const res = await fetch("/status");
             if (!res.ok) {
@@ -355,7 +384,11 @@
                     return;
                 }
                 const current = data[item.key];
-                riskControls.appendChild(buildNumberRow(item, current));
+                if (item.type === "json") {
+                    riskControls.appendChild(buildJsonRow(item, current));
+                } else {
+                    riskControls.appendChild(buildNumberRow(item, current));
+                }
             });
         }
 

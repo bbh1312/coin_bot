@@ -2,6 +2,7 @@
 DTFX backtest runner: fetches historical OHLCV and runs engines on past candles.
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -30,7 +31,7 @@ def parse_args():
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--sl-pct", type=float, default=0.0)
     parser.add_argument("--tp-pct", type=float, default=0.0)
-    parser.add_argument("--tf_ltf", type=str, default="1m")
+    parser.add_argument("--tf_ltf", type=str, default="5m")
     parser.add_argument("--tf_mtf", type=str, default="15m")
     parser.add_argument("--tf_htf", type=str, default="1h")
     parser.add_argument("--max-symbols", type=int, default=7)
@@ -80,6 +81,82 @@ def _write_trades_header(path: str) -> None:
 def _append_trade(path: str, row: str) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(row + "\n")
+
+
+def _append_log_line(path: str, line: str) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def _summarize_dtfx_events(path: str) -> Optional[dict]:
+    if not path or not os.path.exists(path):
+        return None
+    summary = {
+        "sweep_rejected_strong_breakout": 0,
+        "mss_rejected_soft_not_reached": 0,
+        "mss_rejected_confirm_not_reached": 0,
+        "mss_rejected_other": 0,
+        "zone_touch_seen": 0,
+        "entry_blocked_total": 0,
+        "entry_blocked_wick_ratio": 0,
+        "entry_blocked_body_atr": 0,
+        "entry_blocked_close_ratio": 0,
+        "entry_blocked_color": 0,
+        "entry_blocked_requires_full_close": 0,
+        "entry_blocked_doji": 0,
+        "entry_blocked_mss_dir": 0,
+    }
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            event = row.get("event")
+            context = row.get("context") if isinstance(row, dict) else None
+            if not isinstance(context, dict):
+                context = {}
+            if event == "SWEEP_REJECTED":
+                if context.get("reason") == "strong_breakout":
+                    summary["sweep_rejected_strong_breakout"] += 1
+                continue
+            if event == "MSS_REJECTED":
+                reason = context.get("reason")
+                if reason == "soft_not_reached":
+                    summary["mss_rejected_soft_not_reached"] += 1
+                elif reason == "confirm_not_reached":
+                    summary["mss_rejected_confirm_not_reached"] += 1
+                else:
+                    summary["mss_rejected_other"] += 1
+                continue
+            if event == "ZONE_TOUCH_SEEN":
+                summary["zone_touch_seen"] += 1
+                continue
+            if event == "ENTRY_BLOCKED":
+                summary["entry_blocked_total"] += 1
+                entry_conditions = context.get("entry_conditions")
+                failed = entry_conditions.get("failed") if isinstance(entry_conditions, dict) else None
+                if isinstance(failed, list):
+                    for reason in failed:
+                        if reason == "wick_ratio_ok":
+                            summary["entry_blocked_wick_ratio"] += 1
+                        elif reason == "body_atr_min":
+                            summary["entry_blocked_body_atr"] += 1
+                        elif reason == "confirm_close_ratio":
+                            summary["entry_blocked_close_ratio"] += 1
+                        elif reason == "candle_opposite_color":
+                            summary["entry_blocked_color"] += 1
+                        elif reason == "requires_full_close":
+                            summary["entry_blocked_requires_full_close"] += 1
+                        elif reason == "doji_block":
+                            summary["entry_blocked_doji"] += 1
+                        elif reason == "mss_dir_aligned":
+                            summary["entry_blocked_mss_dir"] += 1
+                continue
+    return summary
 
 
 def _to_candles(ohlcv: List[list]) -> List[Candle]:
@@ -400,7 +477,8 @@ def _format_summary(symbol: str, stats: Stats) -> str:
 
 
 def main():
-    os.environ["DTFX_LOG_PREFIX"] = "backtest"
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    os.environ["DTFX_LOG_PREFIX"] = f"backtest_{run_id}"
     os.environ["DTFX_LOG_MODE"] = "backtest"
     os.environ["DTFX_LOG_QUIET"] = "1"
     args = parse_args()
@@ -438,6 +516,7 @@ def main():
     log_path = os.path.join(log_dir, f"backtest_{run_day}.log")
     trades_csv = os.path.join(log_dir, f"backtest_trades_{run_day}.csv")
     _write_trades_header(trades_csv)
+    dtfx_log_path = os.path.join("logs", "dtfx", f"dtfx_backtest_{run_id}_{run_day}.jsonl")
 
     stats_map = run_backtest(
         symbols,
@@ -461,6 +540,26 @@ def main():
         print(_format_summary(symbol, stats))
         _merge_stats(total, stats)
     print(_format_summary("TOTAL", total))
+    event_summary = _summarize_dtfx_events(dtfx_log_path)
+    if event_summary:
+        summary_line = (
+            "[BACKTEST][FUNNEL] "
+            f"sweep_rejected_strong_breakout={event_summary['sweep_rejected_strong_breakout']} "
+            f"mss_rejected_soft_not_reached={event_summary['mss_rejected_soft_not_reached']} "
+            f"mss_rejected_confirm_not_reached={event_summary['mss_rejected_confirm_not_reached']} "
+            f"mss_rejected_other={event_summary['mss_rejected_other']} "
+            f"zone_touch_seen={event_summary['zone_touch_seen']} "
+            f"entry_blocked_total={event_summary['entry_blocked_total']} "
+            f"entry_blocked_wick_ratio={event_summary['entry_blocked_wick_ratio']} "
+            f"entry_blocked_body_atr={event_summary['entry_blocked_body_atr']} "
+            f"entry_blocked_close_ratio={event_summary['entry_blocked_close_ratio']} "
+            f"entry_blocked_color={event_summary['entry_blocked_color']} "
+            f"entry_blocked_requires_full_close={event_summary['entry_blocked_requires_full_close']} "
+            f"entry_blocked_doji={event_summary['entry_blocked_doji']} "
+            f"entry_blocked_mss_dir={event_summary['entry_blocked_mss_dir']}"
+        )
+        print(summary_line)
+        _append_log_line(log_path, summary_line)
 
 
 if __name__ == "__main__":

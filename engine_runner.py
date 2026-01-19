@@ -682,6 +682,26 @@ def _append_swaggy_atlas_lab_log(line: str) -> None:
     path = os.path.join("swaggy_atlas_lab", f"swaggy_atlas_lab-{date_tag}.log")
     _append_log_lines(path, [line])
 
+def _iso_kst(ts: Optional[float] = None) -> str:
+    tz = timezone(timedelta(hours=9))
+    try:
+        if ts is None:
+            dt = datetime.now(tz=tz)
+        else:
+            dt = datetime.fromtimestamp(float(ts), tz=tz)
+        return dt.isoformat(timespec="seconds")
+    except Exception:
+        return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+
+def _append_swaggy_trade_json(payload: Dict[str, Any]) -> None:
+    try:
+        path = os.path.join("logs", "swaggy_trades.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
 def _run_swaggy_atlas_lab_cycle(
     swaggy_atlas_lab_engine,
     swaggy_universe,
@@ -691,7 +711,74 @@ def _run_swaggy_atlas_lab_cycle(
     atlas_cfg,
     active_positions_total,
     send_alert,
+    cycle_id: Optional[int] = None,
 ):
+    def _fmt(v: Any) -> str:
+        if v is None or v == "":
+            return "N/A"
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v)
+
+    def _entry_quality_bucket(
+        atlas_pass_hard: Optional[bool],
+        confirm_pass: Optional[int],
+        overext_dist_at_entry: Optional[float],
+        trigger_combo: str,
+        trigger_parts: Dict[str, float],
+        strength_total: float,
+        strength_min_req: float,
+    ) -> tuple[str, List[str]]:
+        reasons: List[str] = []
+        if atlas_pass_hard:
+            reasons.append("ATLAS_HARD_OK")
+        if confirm_pass:
+            reasons.append("CONFIRM_OK")
+        if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry <= 1.0:
+            reasons.append("LOW_OVEREXT")
+        strong_combo = False
+        combo_set = {c.strip().upper() for c in (trigger_combo or "").split("+") if c.strip()}
+        if combo_set == {"SWEEP", "RECLAIM"}:
+            strong_combo = True
+        rej_strength = trigger_parts.get("REJECTION")
+        if rej_strength is not None and rej_strength >= 0.56:
+            strong_combo = True
+        if strong_combo:
+            reasons.append("TRIGGER_COMBO_STRONG")
+        if strength_total >= (strength_min_req + 0.08):
+            reasons.append("STRENGTH_ABOVE_MIN")
+
+        if (
+            atlas_pass_hard
+            and confirm_pass
+            and isinstance(overext_dist_at_entry, (int, float))
+            and overext_dist_at_entry <= 1.0
+            and strong_combo
+            and strength_total >= (strength_min_req + 0.08)
+        ):
+            return "A", reasons
+        if (
+            atlas_pass_hard
+            and confirm_pass
+            and isinstance(overext_dist_at_entry, (int, float))
+            and overext_dist_at_entry <= 1.35
+        ):
+            return "B", reasons
+        fail_reasons = []
+        if not atlas_pass_hard:
+            fail_reasons.append("ATLAS_HARD_FAIL")
+        if not confirm_pass:
+            fail_reasons.append("CONFIRM_FAIL")
+        if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry > 1.35:
+            fail_reasons.append("HIGH_OVEREXT")
+        if not strong_combo:
+            fail_reasons.append("WEAK_TRIGGER")
+        if strength_total < (strength_min_req + 0.08):
+            fail_reasons.append("LOW_STRENGTH")
+        return "C", reasons + fail_reasons
+
     result = {"long_hits": 0, "short_hits": 0}
     if (not SWAGGY_ATLAS_LAB_ENABLED) or (not swaggy_atlas_lab_engine) or (not swaggy_cfg) or (not atlas_cfg):
         return result
@@ -761,6 +848,29 @@ def _run_swaggy_atlas_lab_cycle(
                 % (symbol, prev_phase, new_phase, ",".join(signal.reasons or []))
             )
 
+        debug = signal.debug if isinstance(signal.debug, dict) else {}
+        event_list = debug.get("events") if isinstance(debug.get("events"), list) else []
+        if event_list:
+            for event in event_list:
+                if not isinstance(event, dict):
+                    continue
+                payload = {
+                    "ts": _iso_kst(),
+                    "event": event.get("event") or "SWAGGY_EVENT",
+                    "engine": "SWAGGY_ATLAS_LAB",
+                    "mode": "live" if LIVE_TRADING or LONG_LIVE_TRADING else "paper",
+                    "symbol": symbol,
+                    "side": event.get("side") or signal.side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": event.get("range_id") or debug.get("touch_key"),
+                }
+                payload.update(event)
+                _append_swaggy_trade_json(payload)
+
         if not signal.entry_ok or not signal.side or signal.entry_px is None:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -784,9 +894,23 @@ def _run_swaggy_atlas_lab_cycle(
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
+        atlas_metrics = atlas.metrics if atlas and isinstance(atlas.metrics, dict) else {}
+        entry_quality, entry_quality_reasons = _entry_quality_bucket(
+            bool(atlas.pass_hard) if atlas and atlas.pass_hard is not None else False,
+            int(debug.get("confirm_pass") or 0),
+            debug.get("overext_dist_at_entry"),
+            str(debug.get("trigger_combo") or ""),
+            debug.get("trigger_parts") if isinstance(debug.get("trigger_parts"), dict) else {},
+            float(debug.get("strength_total") or 0.0),
+            float(debug.get("strength_min_req") or 0.0),
+        )
         entry_line = (
             "SWAGGY_ATLAS_LAB_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
-            "final_usdt=%.2f atlas_pass=%s atlas_mult=%s atlas_reasons=%s policy_action=%s"
+            "final_usdt=%.2f atlas_pass=%s atlas_mult=%s atlas_reasons=%s policy_action=%s "
+            "level_score=%s touch_count=%s level_age=%s trigger_combo=%s confirm_pass=%s confirm_fail=%s "
+            "overext_dist_at_touch=%s overext_dist_at_entry=%s "
+            "atlas_rs_z=%s atlas_corr=%s atlas_beta=%s atlas_vol_ratio=%s atlas_pass_soft=%s atlas_pass_hard=%s "
+            "entry_quality=%s"
             % (
                 symbol,
                 side,
@@ -797,12 +921,67 @@ def _run_swaggy_atlas_lab_cycle(
                 policy.atlas_mult if policy.atlas_mult is not None else "N/A",
                 ",".join(policy.atlas_reasons or []),
                 policy.policy_action or "N/A",
+                _fmt(debug.get("level_score")),
+                _fmt(debug.get("touch_count")),
+                _fmt(debug.get("level_age_sec")),
+                _fmt(debug.get("trigger_combo")),
+                _fmt(debug.get("confirm_pass")),
+                _fmt(debug.get("confirm_fail")),
+                _fmt(debug.get("overext_dist_at_touch")),
+                _fmt(debug.get("overext_dist_at_entry")),
+                _fmt(atlas_metrics.get("rs_z")),
+                _fmt(atlas_metrics.get("corr")),
+                _fmt(atlas_metrics.get("beta")),
+                _fmt(atlas_metrics.get("vol_ratio")),
+                _fmt(atlas_metrics.get("pass_soft")),
+                _fmt(atlas_metrics.get("pass_hard")),
+                _fmt(entry_quality),
             )
         )
         _append_swaggy_atlas_lab_log(entry_line)
         if not policy.allow:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
+
+        if swaggy_cfg:
+            beta_val = atlas_metrics.get("beta")
+            if (
+                swaggy_cfg.skip_beta_mid
+                and isinstance(beta_val, (int, float))
+                and 1.0 <= float(beta_val) < 1.5
+            ):
+                _append_swaggy_atlas_lab_log(
+                    f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=SKIP_BETA_MID beta={beta_val:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            overext_val = debug.get("overext_dist_at_entry")
+            if isinstance(overext_val, (int, float)):
+                overext_val = abs(float(overext_val))
+            if (
+                swaggy_cfg.skip_overext_mid
+                and isinstance(overext_val, (int, float))
+                and 1.1 <= overext_val < 1.4
+            ):
+                _append_swaggy_atlas_lab_log(
+                    f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=SKIP_OVEREXT_MID overext={overext_val:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            body_ratio = None
+            confirm_metrics = debug.get("confirm_metrics")
+            if isinstance(confirm_metrics, dict):
+                body_ratio = confirm_metrics.get("body_ratio")
+            if (
+                swaggy_cfg.skip_confirm_body
+                and isinstance(body_ratio, (int, float))
+                and float(body_ratio) < 0.60
+            ):
+                _append_swaggy_atlas_lab_log(
+                    f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=SKIP_CONFIRM_BODY body_ratio={body_ratio:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
 
         cur_total = count_open_positions(force=True)
         if not isinstance(cur_total, int):
@@ -845,6 +1024,70 @@ def _run_swaggy_atlas_lab_cycle(
                 alert_reason="SWAGGY_ATLAS_LAB",
             )
             if req_id:
+                trade_payload = {
+                    "ts": _iso_kst(),
+                    "event": "SWAGGY_TRADE",
+                    "engine": "SWAGGY_ATLAS_LAB",
+                    "mode": "live" if live else "paper",
+                    "symbol": symbol,
+                    "side": side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": debug.get("touch_key"),
+                    "entry_ts": _iso_kst(),
+                    "entry_price": signal.entry_px,
+                    "atr14_ltf": debug.get("atr14_ltf"),
+                    "atr14_htf": debug.get("atr14_htf"),
+                    "ema20_ltf": debug.get("ema20_ltf"),
+                    "ema20_htf": debug.get("ema20_htf"),
+                    "level_type": debug.get("level_type"),
+                    "level_price": debug.get("level_price"),
+                    "level_score": debug.get("level_score"),
+                    "touch_count": debug.get("touch_count"),
+                    "level_age_bars": debug.get("level_age_bars"),
+                    "touch_pct": debug.get("touch_pct"),
+                    "touch_atr_mult": debug.get("touch_atr_mult"),
+                    "touch_pass": int(debug.get("touch_pass") or 0),
+                    "touch_fail_reason": debug.get("touch_fail_reason"),
+                    "trigger_combo": debug.get("trigger_combo"),
+                    "trigger_strength_best": debug.get("trigger_strength_best"),
+                    "trigger_strength_min": debug.get("trigger_strength_min"),
+                    "trigger_strength_avg": debug.get("trigger_strength_avg"),
+                    "trigger_strength_used": debug.get("trigger_strength_used"),
+                    "trigger_parts": debug.get("trigger_parts"),
+                    "strength_total": debug.get("strength_total"),
+                    "strength_min_req": debug.get("strength_min_req"),
+                    "trigger_threshold_used": debug.get("trigger_threshold_used"),
+                    "use_trigger_min": debug.get("use_trigger_min"),
+                    "confirm_pass": int(debug.get("confirm_pass") or 0),
+                    "confirm_fail_reason": debug.get("confirm_fail"),
+                "confirm_metrics": debug.get("confirm_metrics"),
+                "confirm_body_ratio": (debug.get("confirm_metrics") or {}).get("body_ratio")
+                if isinstance(debug.get("confirm_metrics"), dict)
+                else None,
+                    "overext_ema_len": debug.get("overext_ema_len"),
+                    "overext_atr_mult": debug.get("overext_atr_mult"),
+                    "overext_dist_at_touch": debug.get("overext_dist_at_touch"),
+                    "overext_dist_at_entry": debug.get("overext_dist_at_entry"),
+                    "overext_blocked": 0,
+                    "overext_state": "OK",
+                    "atlas_pass_soft": atlas_metrics.get("pass_soft"),
+                    "atlas_pass_hard": atlas_metrics.get("pass_hard"),
+                    "atlas_state": gate.get("reason") if isinstance(gate, dict) else None,
+                    "atlas_regime": atlas_metrics.get("regime") or (gate.get("regime") if isinstance(gate, dict) else None),
+                    "atlas_rs": atlas_metrics.get("rs"),
+                    "atlas_rs_z": atlas_metrics.get("rs_z"),
+                    "atlas_corr": atlas_metrics.get("corr"),
+                    "atlas_beta": atlas_metrics.get("beta"),
+                    "atlas_vol_ratio": atlas_metrics.get("vol_ratio"),
+                    "atlas_block_reason": policy.policy_action if policy and not policy.allow else None,
+                    "entry_quality_bucket": entry_quality,
+                    "entry_quality_reasons": entry_quality_reasons,
+                }
+                _append_swaggy_trade_json(trade_payload)
                 if side == "LONG":
                     result["long_hits"] += 1
                 else:
@@ -1147,6 +1390,16 @@ def _enqueue_entry_request(
     if _is_manage_pending(state, symbol, side):
         _append_entry_gate_log(engine.lower(), symbol, f"pending_request side={side}", side=side)
         return None
+    cur_total = None
+    try:
+        cur_total = count_open_positions(force=True)
+    except Exception:
+        cur_total = None
+    if not isinstance(cur_total, int):
+        cur_total = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+    if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+        _append_entry_gate_log(engine.lower(), symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
+        return None
     payload = {
         "type": "entry",
         "symbol": symbol,
@@ -1320,6 +1573,61 @@ def _display_engine_label(label: Optional[str]) -> str:
         "ATLASFABIO": "파비오",
     }
     return overrides.get(name, name)
+
+def _is_engine_enabled(engine: str) -> bool:
+    key = (engine or "").upper()
+    if key in ("SWAGGY_ATLAS_LAB", "SWAGGY"):
+        return SWAGGY_ATLAS_LAB_ENABLED if key == "SWAGGY_ATLAS_LAB" else SWAGGY_ENABLED
+    if key == "ATLASFABIO":
+        return ATLAS_FABIO_ENABLED
+    if key == "DTFX":
+        return DTFX_ENABLED
+    if key == "PUMPFADE":
+        return PUMPFADE_ENABLED
+    if key == "ATLAS_RS_FAIL_SHORT":
+        return ATLAS_RS_FAIL_SHORT_ENABLED
+    if key == "DIV15M_LONG":
+        return DIV15M_LONG_ENABLED
+    if key == "DIV15M_SHORT":
+        return DIV15M_SHORT_ENABLED
+    if key in ("RSI", "SCALP"):
+        return RSI_ENABLED
+    if key in ("MANUAL", "UNKNOWN", ""):
+        return True
+    return True
+
+def _normalize_engine_key(engine: str) -> str:
+    return (engine or "").strip().upper()
+
+def _format_engine_exit_overrides() -> str:
+    if not ENGINE_EXIT_OVERRIDES:
+        return "none"
+    parts = []
+    for eng, val in ENGINE_EXIT_OVERRIDES.items():
+        if not isinstance(val, dict):
+            continue
+        for side, cfg in val.items():
+            if not isinstance(cfg, dict):
+                continue
+            tp = cfg.get("tp")
+            sl = cfg.get("sl")
+            parts.append(f"{eng}:{side} tp={_fmt_pct_safe(tp)} sl={_fmt_pct_safe(sl)}")
+    return ", ".join(parts) if parts else "none"
+
+def _get_engine_exit_thresholds(engine_label: Optional[str], side: str) -> tuple[float, float]:
+    side_key = (side or "").upper()
+    tp = AUTO_EXIT_SHORT_TP_PCT if side_key == "SHORT" else AUTO_EXIT_LONG_TP_PCT
+    sl = AUTO_EXIT_SHORT_SL_PCT if side_key == "SHORT" else AUTO_EXIT_LONG_SL_PCT
+    label_key = (engine_label or "").upper()
+    overrides = ENGINE_EXIT_OVERRIDES.get(label_key) or ENGINE_EXIT_OVERRIDES.get(label_key.lower())
+    if isinstance(overrides, dict):
+        side_override = overrides.get(side_key) or overrides.get(side_key.lower())
+        if isinstance(side_override, dict):
+            if isinstance(side_override.get("tp"), (int, float)):
+                tp = float(side_override.get("tp"))
+            if isinstance(side_override.get("sl"), (int, float)):
+                sl = float(side_override.get("sl"))
+    return float(tp), float(sl)
 
 def _close_trade(
     state: Dict[str, dict],
@@ -4982,12 +5290,34 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
     side = str(req.get("side") or "").upper()
     if not symbol or side not in ("LONG", "SHORT"):
         return False
+    engine = str(req.get("engine") or "").upper()
+    if engine and not _is_engine_enabled(engine):
+        _clear_manage_pending(state, symbol, side)
+        _append_entry_gate_log(engine.lower(), symbol, "engine_disabled", side=side)
+        return False
+    try:
+        refresh_positions_cache(force=True)
+    except Exception:
+        pass
+    cur_total = None
+    try:
+        cur_total = count_open_positions(force=True)
+    except Exception:
+        cur_total = None
+    if not isinstance(cur_total, int):
+        cur_total = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+    if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+        _clear_manage_pending(state, symbol, side)
+        _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
+        return False
     try:
         if side == "SHORT" and get_short_position_amount(symbol) > 0:
             _clear_manage_pending(state, symbol, side)
+            _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, "already_in_position", side=side)
             return True
         if side == "LONG" and get_long_position_amount(symbol) > 0:
             _clear_manage_pending(state, symbol, side)
+            _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, "already_in_position", side=side)
             return True
     except Exception:
         pass
@@ -5045,7 +5375,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
     except Exception:
         pass
     _send_entry_alert(
-        send_telegram,
+        (lambda text: send_telegram(text, allow_early=True)),
         side=side,
         symbol=symbol,
         engine=req.get("engine") or "UNKNOWN",
@@ -5055,11 +5385,11 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         live=live,
         order_info=None,
         entry_order_id=entry_order_id,
-        sl=_fmt_price_safe(
-            fill_price if isinstance(fill_price, (int, float)) else None,
-            AUTO_EXIT_SHORT_SL_PCT if side == "SHORT" else AUTO_EXIT_LONG_SL_PCT,
-            side=side,
-        ),
+    sl=_fmt_price_safe(
+        fill_price if isinstance(fill_price, (int, float)) else None,
+        _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
+        side=side,
+    ),
         tp=None,
     )
     _clear_manage_pending(state, symbol, side)
@@ -5238,11 +5568,12 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                             profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
                     except Exception:
                         profit_unlev = None
-                if profit_unlev is not None and profit_unlev >= AUTO_EXIT_SHORT_TP_PCT:
-                    open_tr = _get_open_trade(state, "SHORT", sym)
-                    engine_label = _engine_label_from_reason(
-                        (open_tr.get("meta") or {}).get("reason") if open_tr else None
-                    )
+                open_tr = _get_open_trade(state, "SHORT", sym)
+                engine_label = _engine_label_from_reason(
+                    (open_tr.get("meta") or {}).get("reason") if open_tr else None
+                )
+                tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "SHORT")
+                if profit_unlev is not None and profit_unlev >= tp_pct:
                     pnl_usdt = pos_detail.get("pnl") if isinstance(pos_detail, dict) else None
                     try:
                         set_dry_run(False if LIVE_TRADING else True)
@@ -5306,11 +5637,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     )
                     time.sleep(0.15)
                     continue
-                if profit_unlev is not None and profit_unlev <= -AUTO_EXIT_SHORT_SL_PCT:
-                    open_tr = _get_open_trade(state, "SHORT", sym)
-                    engine_label = _engine_label_from_reason(
-                        (open_tr.get("meta") or {}).get("reason") if open_tr else None
-                    )
+                if profit_unlev is not None and profit_unlev <= -sl_pct:
                     pnl_usdt = pos_detail.get("pnl") if isinstance(pos_detail, dict) else None
                     try:
                         set_dry_run(False if LIVE_TRADING else True)
@@ -5469,7 +5796,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             continue
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
         closed = False
-        if AUTO_EXIT_ENABLED and profit_unlev >= AUTO_EXIT_LONG_TP_PCT:
+        tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "LONG")
+        if AUTO_EXIT_ENABLED and profit_unlev >= tp_pct:
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
@@ -5521,7 +5849,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             )
             time.sleep(0.15)
             closed = True
-        elif AUTO_EXIT_ENABLED and profit_unlev <= -AUTO_EXIT_LONG_SL_PCT:
+        elif AUTO_EXIT_ENABLED and profit_unlev <= -sl_pct:
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
@@ -5627,6 +5955,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_auto_exit_long_sl_pct",
         "_auto_exit_short_tp_pct",
         "_auto_exit_short_sl_pct",
+        "_engine_exit_overrides",
         "_live_trading",
         "_long_live",
         "_max_open_positions",
@@ -5654,6 +5983,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         if key in disk:
             state[key] = disk.get(key)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
+    global ENGINE_EXIT_OVERRIDES
+    global ENGINE_EXIT_OVERRIDES
     global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
@@ -5667,6 +5998,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         AUTO_EXIT_SHORT_TP_PCT = float(state.get("_auto_exit_short_tp_pct"))
     if isinstance(state.get("_auto_exit_short_sl_pct"), (int, float)):
         AUTO_EXIT_SHORT_SL_PCT = float(state.get("_auto_exit_short_sl_pct"))
+    if isinstance(state.get("_engine_exit_overrides"), dict):
+        ENGINE_EXIT_OVERRIDES = dict(state.get("_engine_exit_overrides"))
     if isinstance(state.get("_live_trading"), bool):
         LIVE_TRADING = bool(state.get("_live_trading"))
     if isinstance(state.get("_long_live"), bool):
@@ -5819,6 +6152,7 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_auto_exit_long_sl_pct",
         "_auto_exit_short_tp_pct",
         "_auto_exit_short_sl_pct",
+        "_engine_exit_overrides",
         "_live_trading",
         "_long_live",
         "_max_open_positions",
@@ -6311,6 +6645,106 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         print(f"[telegram] auto_exit cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
 
+                if cmd in ("/engine_exit", "engine_exit") and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("status", "list"):
+                        resp = f"ℹ️ engine-exit: {_format_engine_exit_overrides()}\n사용법: /engine_exit ENGINE SIDE tp sl"
+                    else:
+                        if len(parts) < 3:
+                            resp = "⛔ 사용법: /engine_exit ENGINE SIDE tp sl | /engine_exit ENGINE off"
+                        else:
+                            engine_key = _normalize_engine_key(parts[1])
+                            side_key = parts[2].upper()
+                            if side_key == "OFF":
+                                if ENGINE_EXIT_OVERRIDES.pop(engine_key, None) is not None:
+                                    state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
+                                    state_dirty = True
+                                resp = f"✅ engine-exit cleared: {engine_key}"
+                            elif side_key not in ("LONG", "SHORT"):
+                                resp = "⛔ SIDE는 LONG 또는 SHORT (또는 off)만 가능"
+                            else:
+                                if len(parts) >= 4 and parts[3].lower() == "off":
+                                    entry = ENGINE_EXIT_OVERRIDES.get(engine_key) if isinstance(ENGINE_EXIT_OVERRIDES, dict) else None
+                                    if isinstance(entry, dict):
+                                        entry.pop(side_key, None)
+                                        if not entry:
+                                            ENGINE_EXIT_OVERRIDES.pop(engine_key, None)
+                                        else:
+                                            ENGINE_EXIT_OVERRIDES[engine_key] = entry
+                                        state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
+                                        state_dirty = True
+                                    resp = f"✅ engine-exit cleared: {engine_key} {side_key}"
+                                elif len(parts) < 5:
+                                    resp = "⛔ 사용법: /engine_exit ENGINE SIDE tp sl (예: /engine_exit SWAGGY_ATLAS_LAB SHORT 2 6)"
+                                else:
+                                    tp_raw = parts[3]
+                                    sl_raw = parts[4]
+                                    try:
+                                        tp = float(tp_raw)
+                                        sl = float(sl_raw)
+                                        if tp <= 0 or sl <= 0:
+                                            raise ValueError("non-positive")
+                                        entry = ENGINE_EXIT_OVERRIDES.get(engine_key) if isinstance(ENGINE_EXIT_OVERRIDES, dict) else None
+                                        if not isinstance(entry, dict):
+                                            entry = {}
+                                        entry[side_key] = {"tp": tp, "sl": sl}
+                                        ENGINE_EXIT_OVERRIDES[engine_key] = entry
+                                        state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
+                                        state_dirty = True
+                                        resp = f"✅ engine-exit set: {engine_key} {side_key} tp={tp:.2f}% sl={sl:.2f}%"
+                                    except Exception:
+                                        resp = "⛔ TP/SL은 0보다 큰 숫자여야 함"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] engine_exit cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+
+                if cmd in ("/positions", "/pos", "positions", "pos") and not responded:
+                    try:
+                        refresh_positions_cache(force=True)
+                    except Exception:
+                        pass
+                    pos_map = executor_mod._POS_ALL_CACHE.get("positions_by_symbol") if executor_mod else None
+                    pos_map = pos_map or {}
+                    open_trades = [tr for tr in (_get_trade_log(state) or []) if tr.get("status") == "open"]
+                    engine_by_key = {}
+                    for tr in open_trades:
+                        sym = tr.get("symbol")
+                        side = (tr.get("side") or "").upper()
+                        if not sym or not side:
+                            continue
+                        engine = tr.get("engine_label") or (tr.get("meta") or {}).get("engine") or (tr.get("meta") or {}).get("reason")
+                        if engine:
+                            engine_by_key[(sym, side)] = engine
+                    lines = ["ℹ️ positions"]
+                    rows = []
+                    sym_col = 0
+                    for sym, positions in pos_map.items():
+                        if not positions:
+                            continue
+                        for p in positions:
+                            try:
+                                size = executor_mod._position_size_abs(p)
+                            except Exception:
+                                size = 0.0
+                            if not size:
+                                continue
+                            side = "LONG" if executor_mod._is_long_position(p) else "SHORT" if executor_mod._is_short_position(p) else "UNKNOWN"
+                            engine = engine_by_key.get((sym, side), "UNKNOWN")
+                            base = (sym or "").replace("/USDT:USDT", "")
+                            sym_col = max(sym_col, len(base))
+                            rows.append((base, side, engine))
+                    if not rows:
+                        lines.append("none")
+                    else:
+                        for base, side, engine in sorted(rows, key=lambda r: (r[2], r[0], r[1])):
+                            lines.append(f"{base.ljust(sym_col)}  {side.ljust(5)}  {engine}")
+                    ok = _reply("\n".join(lines))
+                    print(f"[telegram] positions cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
+
                 if cmd in ("/live", "live"):
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -6365,6 +6799,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
+                            f"/engine_exit: {_format_engine_exit_overrides()}\n"
                             "--------------\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
@@ -6412,6 +6847,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
+                        f"/engine_exit: {_format_engine_exit_overrides()}\n"
                         "--------------\n"
                         f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                         f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
@@ -7055,6 +7491,7 @@ AUTO_EXIT_LONG_TP_PCT = 3.0
 AUTO_EXIT_LONG_SL_PCT = 3.0
 AUTO_EXIT_SHORT_TP_PCT = 3.0
 AUTO_EXIT_SHORT_SL_PCT = 3.0
+ENGINE_EXIT_OVERRIDES: Dict[str, Any] = {}
 LIVE_TRADING = True  # True이면 신호 발생 시 실제 주문 실행
 
 COOLDOWN_SEC = 3600
@@ -7365,6 +7802,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_auto_exit_long_sl_pct",
                 "_auto_exit_short_tp_pct",
                 "_auto_exit_short_sl_pct",
+                "_engine_exit_overrides",
                 "_live_trading",
                 "_long_live",
                 "_max_open_positions",
@@ -7431,7 +7869,7 @@ def run():
     div15m_engine = Div15mLongEngine() if Div15mLongEngine else None
     div15m_short_engine = Div15mShortEngine() if Div15mShortEngine else None
     dtfx_engine = DTFXEngine() if DTFXEngine else None
-    dtfx_cfg = DTFXConfig() if DTFXConfig else None
+    dtfx_cfg = DTFXConfig(tf_ltf="5m") if DTFXConfig else None
     pumpfade_engine = PumpFadeEngine() if PumpFadeEngine else None
     pumpfade_cfg = PumpFadeConfig() if PumpFadeConfig else None
     atlas_rs_fail_short_engine = AtlasRsFailShortEngine() if AtlasRsFailShortEngine else None
@@ -7598,7 +8036,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -7741,6 +8179,7 @@ def run():
                 base_label = str(cycle_count)
             cycle_label = f"{base_label}-RT{realtime_count}"
             print(f"\n[사이클 {cycle_label}] (동일 캔들) realtime only (heavy_scan=N)")
+        cycle_id = cycle_label
         cycle_start = time.time()
         run_rsi_short = bool(RSI_ENABLED and (not ONLY_DIV15M_SHORT))
         run_div15m_long = bool((not ONLY_DIV15M_SHORT) and DIV15M_LONG_ENABLED and div15m_engine)
@@ -8239,6 +8678,13 @@ def run():
         # --- SYNC from exchange: manage mode baseline (universe 포함) ---
         sync_syms = list(set(list(state.keys()) + list(universe_union)))
         _sync_positions_state(state, sync_syms)
+        # Sync 이후 다시 계산해 max_pos를 정확히 반영
+        active_positions_total = count_open_positions(force=True)
+        if not isinstance(active_positions_total, int):
+            active_positions_total = sum(
+                1 for st in state.values() if isinstance(st, dict) and st.get("in_pos")
+            )
+        state["_active_positions_total"] = int(active_positions_total)
 
         # 관리 대상(실포지션)만 WebSocket 감시 목록에 반영
         if ws_manager and ws_manager.is_running():
@@ -8378,6 +8824,7 @@ def run():
                         swaggy_atlas_lab_atlas_cfg,
                         active_positions,
                         send_telegram,
+                        cycle_id,
                     )
                 ),
                 daemon=True,

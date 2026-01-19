@@ -21,21 +21,21 @@ MSS_SOFT_TO_CONFIRM_MAX_BARS = 6
 MSS_SOFT_TO_CONFIRM_MAX_SEC = 1800
 ATR_PERIOD = 14
 ZONE_PIERCE_ATR_MULT = 0.1
-STRONGBREAKOUT_DEADBAND_ATR_MULT = 0.08 
+STRONGBREAKOUT_DEADBAND_ATR_MULT = 0.10
 TICK_SIZE_MULTIPLIER = 3 # Added
 BODY_RATIO_MIN = 0.60 # Added
 SUMMARY_INTERVAL_SECONDS = 900 # 15 minutes, Added
 MAJOR_PCT_WEIGHT = 0.6 # Added
-ZONE_TOO_WIDE_ATR_MULT = 1.5 # Added
-ZONE_TOO_FAR_ATR_MULT = 10 # Changed from CANDLE_DIST
+ZONE_TOO_WIDE_ATR_MULT = 0.9 # Added
+ZONE_TOO_FAR_ATR_MULT = 5.0 # Changed from CANDLE_DIST
 WICK_RATIO_MIN = 0.6 # Added
-ENTRY_WICK_RATIO_MIN_MAJOR = 0.55
-ENTRY_WICK_RATIO_MIN_ALT = 0.50
+ENTRY_WICK_RATIO_MIN_MAJOR = 0.45
+ENTRY_WICK_RATIO_MIN_ALT = 0.45
 ENTRY_BODY_ATR_MIN_MAJOR = 0.30
 ENTRY_BODY_ATR_MIN_ALT = 0.25
 ENTRY_REQUIRE_COLOR_STRICT = False
 ENTRY_BODY_ATR_MIN = 0.6
-ENTRY_CONFIRM_CLOSE_RATIO = 0.55
+ENTRY_CONFIRM_CLOSE_RATIO = 0.60
 ENTRY_REQUIRES_FULL_CLOSE = False
 
 # CORE_MAJOR: BTC, ETH (anchors)
@@ -63,6 +63,10 @@ def get_default_params():
         "alt_min_depth_atr_mult": ALT_MIN_DEPTH_ATR_MULT,
         "alt_atr_blend": ALT_ATR_BLEND,
         "mss_soft_enabled": MSS_SOFT_ENABLED,
+        "mss_soft_zone_enabled": False,
+        "mss_soft_confirm_required": True,
+        "mss_soft_zone_enabled": True,
+        "mss_soft_confirm_required": True,
         "mss_soft_deadband_mult": MSS_SOFT_DEADBAND_MULT,
         "mss_confirm_deadband_mult": MSS_CONFIRM_DEADBAND_MULT,
         "mss_soft_tick_mult": MSS_SOFT_TICK_MULT,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -30,6 +30,7 @@ class Trade:
     mfe: float = 0.0
     mae: float = 0.0
     bars: int = 0
+    context: Optional[Dict[str, Any]] = None
 
 
 class BrokerSim:
@@ -62,6 +63,7 @@ class BrokerSim:
         policy_action: Optional[str] = None,
         overext_dist_at_entry: Optional[float] = None,
         overext_blocked: Optional[bool] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Trade:
         side = side.upper()
         if side == "LONG":
@@ -89,6 +91,7 @@ class BrokerSim:
             policy_action=policy_action,
             overext_dist_at_entry=overext_dist_at_entry,
             overext_blocked=overext_blocked,
+            context=context,
         )
         self.positions[sym] = trade
         return trade

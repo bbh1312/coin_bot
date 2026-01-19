@@ -16,6 +16,7 @@ load_env()
 import ws_manager
 import executor as executor_mod
 import engine_runner as er
+import db_reconcile as dbrecon
 
 _ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_TTL_SEC = 5.0
@@ -98,6 +99,23 @@ def _get_tickers(cache: dict) -> dict:
     except Exception as e:
         print("[manage-ws] tickers fetch failed:", e)
         return cache.get("tickers") or {}
+
+
+def _force_in_pos_from_api(state: dict, api_set: set) -> None:
+    if not api_set:
+        return
+    now = time.time()
+    for sym in api_set:
+        st = state.get(sym)
+        if not isinstance(st, dict):
+            st = {}
+        st["in_pos"] = True
+        st.setdefault("dca_adds", 0)
+        st.setdefault("dca_adds_long", 0)
+        st.setdefault("dca_adds_short", 0)
+        st.setdefault("last_entry", now)
+        st.setdefault("manage_ping_ts", now - er.MANAGE_PING_COOLDOWN_SEC)
+        state[sym] = st
 
 
 def _drain_entry_events(state) -> None:
@@ -237,6 +255,24 @@ def _trade_engine_label(tr: Optional[dict]) -> str:
     return "UNKNOWN"
 
 
+def _within_auto_exit_grace(state: dict, symbol: str, side: str, now_ts: float) -> bool:
+    open_tr = er._get_open_trade(state, side, symbol)
+    entry_ts = None
+    if isinstance(open_tr, dict):
+        entry_ts = open_tr.get("entry_ts")
+        if entry_ts is None:
+            entry_ts_ms = open_tr.get("entry_ts_ms")
+            if isinstance(entry_ts_ms, (int, float)):
+                entry_ts = float(entry_ts_ms) / 1000.0
+    if entry_ts is None:
+        st = state.get(symbol, {}) if isinstance(state, dict) else {}
+        if isinstance(st, dict):
+            entry_ts = st.get("last_entry")
+    if isinstance(entry_ts, (int, float)):
+        return (now_ts - float(entry_ts)) < er.AUTO_EXIT_GRACE_SEC
+    return False
+
+
 def _recent_auto_exit_disk(symbol: str, now_ts: float) -> bool:
     try:
         disk = er.load_state()
@@ -282,6 +318,19 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
         pnl_usdt=None,
         reason="manual_close",
     )
+    try:
+        er._record_position_event(
+            symbol=symbol,
+            side="LONG",
+            event_type="EXIT",
+            source="MANUAL",
+            qty=open_tr.get("qty") if isinstance(open_tr, dict) else None,
+            avg_entry=open_tr.get("entry_price") if isinstance(open_tr, dict) else None,
+            price=None,
+            meta={"source": "manage_ws"},
+        )
+    except Exception:
+        pass
     st = state.get(symbol, {}) if isinstance(state, dict) else {}
     st["in_pos"] = False
     st["last_ok"] = False
@@ -331,6 +380,19 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
         pnl_usdt=None,
         reason="manual_close",
     )
+    try:
+        er._record_position_event(
+            symbol=symbol,
+            side="SHORT",
+            event_type="EXIT",
+            source="MANUAL",
+            qty=open_tr.get("qty") if isinstance(open_tr, dict) else None,
+            avg_entry=open_tr.get("entry_price") if isinstance(open_tr, dict) else None,
+            price=None,
+            meta={"source": "manage_ws"},
+        )
+    except Exception:
+        pass
     st = state.get(symbol, {}) if isinstance(state, dict) else {}
     st["in_pos"] = False
     st["last_ok"] = False
@@ -353,11 +415,14 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
 
 
 def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
+    if _within_auto_exit_grace(state, symbol, "LONG", now_ts):
+        return False
     entry_px = detail.get("entry")
     if not isinstance(entry_px, (int, float)) or entry_px <= 0:
         return False
     profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
-    if profit_unlev < er.AUTO_EXIT_LONG_TP_PCT:
+    tp_pct, _ = er._get_engine_exit_thresholds(_trade_engine_label(er._get_open_trade(state, "LONG", symbol)), "LONG")
+    if profit_unlev < tp_pct:
         return False
     open_tr = er._get_open_trade(state, "LONG", symbol)
     engine_label = _trade_engine_label(open_tr)
@@ -414,11 +479,14 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
 
 
 def _handle_short_tp(state, symbol, detail, mark_px, now_ts) -> bool:
+    if _within_auto_exit_grace(state, symbol, "SHORT", now_ts):
+        return False
     entry_px = detail.get("entry")
     if not isinstance(entry_px, (int, float)) or entry_px <= 0:
         return False
     profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
-    if profit_unlev < er.AUTO_EXIT_SHORT_TP_PCT:
+    tp_pct, _ = er._get_engine_exit_thresholds(_trade_engine_label(er._get_open_trade(state, "SHORT", symbol)), "SHORT")
+    if profit_unlev < tp_pct:
         return False
     open_tr = er._get_open_trade(state, "SHORT", symbol)
     engine_label = _trade_engine_label(open_tr)
@@ -475,11 +543,14 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts) -> bool:
 
 
 def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
+    if _within_auto_exit_grace(state, symbol, "LONG", now_ts):
+        return False
     entry_px = detail.get("entry")
     if not isinstance(entry_px, (int, float)) or entry_px <= 0:
         return False
     profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
-    if profit_unlev > -er.AUTO_EXIT_LONG_SL_PCT:
+    _, sl_pct = er._get_engine_exit_thresholds(_trade_engine_label(er._get_open_trade(state, "LONG", symbol)), "LONG")
+    if profit_unlev > -sl_pct:
         return False
     open_tr = er._get_open_trade(state, "LONG", symbol)
     engine_label = _trade_engine_label(open_tr)
@@ -534,11 +605,14 @@ def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
 
 
 def _handle_short_sl(state, symbol, detail, mark_px, now_ts) -> bool:
+    if _within_auto_exit_grace(state, symbol, "SHORT", now_ts):
+        return False
     entry_px = detail.get("entry")
     if not isinstance(entry_px, (int, float)) or entry_px <= 0:
         return False
     profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
-    if profit_unlev > -er.AUTO_EXIT_SHORT_SL_PCT:
+    _, sl_pct = er._get_engine_exit_thresholds(_trade_engine_label(er._get_open_trade(state, "SHORT", symbol)), "SHORT")
+    if profit_unlev > -sl_pct:
         return False
     open_tr = er._get_open_trade(state, "SHORT", symbol)
     engine_label = _trade_engine_label(open_tr)
@@ -603,6 +677,47 @@ def main():
         ws_manager.start()
     else:
         print("[manage-ws] ws_manager unavailable")
+    # Startup sync: ensure state/db reflect current positions without alert spam.
+    try:
+        executor_mod.refresh_positions_cache(force=True)
+    except Exception:
+        pass
+    try:
+        pos_syms = executor_mod.list_open_position_symbols(force=True)
+        api_syms = set()
+        api_syms.update(pos_syms.get("long") or [])
+        api_syms.update(pos_syms.get("short") or [])
+        api_syms = {s for s in api_syms if isinstance(s, str) and "/" in s}
+        for sym, st in list(state.items()):
+            if not isinstance(st, dict):
+                continue
+            if st.get("in_pos") and sym not in api_syms:
+                st["in_pos"] = False
+                state[sym] = st
+        if api_syms:
+            er._sync_positions_state(state, list(api_syms))
+            _force_in_pos_from_api(state, api_syms)
+            try:
+                dbrecon.sync_exchange_state(executor_mod.exchange, symbols=list(api_syms))
+            except Exception:
+                pass
+            try:
+                state["_active_positions_total"] = len(api_syms)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        tickers_cache = {"ts": 0.0, "tickers": {}}
+        cached_long_ex = er.CachedExchange(executor_mod.exchange)
+        tickers = _get_tickers(tickers_cache)
+        er._reconcile_long_trades(state, cached_long_ex, tickers)
+        er._reconcile_short_trades(state, tickers)
+        er._detect_position_events(state, lambda *args, **kwargs: None)
+        er.save_state(state)
+        print("[manage-ws] startup sync complete")
+    except Exception as e:
+        print(f"[manage-ws] startup sync failed: {e}")
     last_sync_ts = 0.0
     last_cfg_save_ts = 0.0
     last_watch_ts = 0.0
@@ -615,9 +730,14 @@ def main():
     cached_long_ex = er.CachedExchange(executor_mod.exchange)
     while True:
         _drain_entry_events(state)
+        try:
+            er._process_manage_queue(state, er.send_telegram)
+        except Exception:
+            pass
         er.handle_telegram_commands(state)
         if (time.time() - last_cfg_save_ts) >= 2.0:
             try:
+                er._reload_runtime_settings_from_disk(state)
                 er._save_runtime_settings_only(state)
             except Exception:
                 pass
@@ -627,6 +747,25 @@ def main():
             active_count = len(new_watch_syms)
             state["_active_positions_total"] = int(active_count)
             state["_pos_limit_reached"] = bool(active_count >= er.MAX_OPEN_POSITIONS)
+            try:
+                api_set = set(new_watch_syms or [])
+                for sym, st in list(state.items()):
+                    if not isinstance(st, dict):
+                        continue
+                    if st.get("in_pos") and sym not in api_set:
+                        st["in_pos"] = False
+                        state[sym] = st
+                if api_set:
+                    er._sync_positions_state(state, list(api_set))
+                    _force_in_pos_from_api(state, api_set)
+                if api_set:
+                    missing = sorted(api_set - {s for s, st in state.items() if isinstance(st, dict) and st.get("in_pos")})
+                    if missing:
+                        print(f"[manage-ws] api_inpos_missing_in_state={len(missing)} {missing}")
+                    else:
+                        print(f"[manage-ws] api_inpos_sync_ok count={len(api_set)}")
+            except Exception:
+                pass
             if new_watch_syms != watch_syms:
                 if first_watch:
                     print(f"[manage-ws] watch_symbols={_format_symbol_list(new_watch_syms)}")

@@ -57,6 +57,48 @@ def _cluster_levels(levels: List[Level], cluster_pct: float) -> List[Level]:
     return clustered
 
 
+def _level_key(level: Level, tick_size: float) -> int:
+    if tick_size and tick_size > 0:
+        return int(round(level.price / tick_size))
+    return int(round(level.price * 1e8))
+
+
+def _level_type(kind: str) -> str:
+    kind = (kind or "").upper()
+    if "VP" in kind:
+        return "VP"
+    if "SWING" in kind:
+        return "SWING"
+    if "ROUND" in kind:
+        return "ROUND"
+    return kind or "UNKNOWN"
+
+
+def _ts_to_sec(ts_val: float) -> float:
+    if ts_val > 1e12:
+        return float(ts_val) / 1000.0
+    return float(ts_val)
+
+
+def _level_age_bars(df_htf: pd.DataFrame, level_ts: Optional[float]) -> Optional[int]:
+    if level_ts is None or df_htf.empty or "ts" not in df_htf.columns:
+        return None
+    try:
+        level_ts = float(level_ts)
+    except Exception:
+        return None
+    ts_vals = df_htf["ts"].tolist()
+    count = 0
+    for ts_val in ts_vals:
+        try:
+            ts_sec = _ts_to_sec(float(ts_val))
+        except Exception:
+            continue
+        if ts_sec >= level_ts:
+            count += 1
+    return count if count > 0 else None
+
+
 def _merge_bucket(bucket: List[Level]) -> Level:
     prices = [b.price for b in bucket]
     kinds = {b.kind for b in bucket}
@@ -381,6 +423,7 @@ class SwaggySignalEngine:
     ) -> SwaggySignal:
         cfg = self.config
         state = self._state.setdefault(sym, {})
+        events: List[Dict[str, Any]] = []
         if candles_5m.empty or len(candles_5m) < 31:
             return SwaggySignal(False, None, 0.0, ["NO_DATA"], "-", None)
         last = candles_5m.iloc[-1]
@@ -424,6 +467,9 @@ class SwaggySignalEngine:
         if not target_level:
             return SwaggySignal(False, None, 0.0, ["NO_LEVEL"], "-", None, debug={"regime": regime_state.regime})
 
+        level_type = _level_type(target_level.kind)
+        level_age_bars = _level_age_bars(candles_1h, target_level.ts)
+
         phase = state.get("phase") or "WAIT_TOUCH"
         if phase == "CHASE":
             chase_ok, _ = _overextension_ok(candles_5m, state.get("chase_side"), cfg)
@@ -431,11 +477,53 @@ class SwaggySignalEngine:
                 return SwaggySignal(False, None, 0.0, ["CHASE"], "-", None, debug={"regime": regime_state.regime})
             state["phase"] = "WAIT_TRIGGER"
         if phase == "WAIT_TOUCH":
-            touch_hit, _ = _is_level_touch(candles_5m, target_level, cfg, regime_state.regime)
+            touch_hit, touch_meta = _is_level_touch(candles_5m, target_level, cfg, regime_state.regime)
             if not touch_hit:
                 return SwaggySignal(False, None, 0.0, ["NO_TOUCH"], "-", None, debug={"regime": regime_state.regime})
             state["phase"] = "WAIT_TRIGGER"
-            state["touch_level"] = {"price": target_level.price, "kind": target_level.kind}
+            touch_key = _level_key(target_level, tick_size)
+            if state.get("touch_key") == touch_key:
+                state["touch_count"] = int(state.get("touch_count", 0) or 0) + 1
+            else:
+                state["touch_count"] = 1
+            state["touch_key"] = touch_key
+            state["touch_level"] = {"price": target_level.price, "kind": target_level.kind, "ts": target_level.ts}
+            state["touch_ts"] = now_ts
+            _, dist_long = _overextension_ok(candles_5m, "LONG", cfg)
+            _, dist_short = _overextension_ok(candles_5m, "SHORT", cfg)
+            dist_long_abs = abs(dist_long) if isinstance(dist_long, (int, float)) else None
+            dist_short_abs = abs(dist_short) if isinstance(dist_short, (int, float)) else None
+            state["touch_overext"] = {"LONG": dist_long_abs, "SHORT": dist_short_abs}
+            state["touch_meta"] = touch_meta
+            dist_pct = float(touch_meta.get("min_dist_pct_to_level") or 0.0)
+            level_score = max(0.0, 1.0 - (dist_pct / cfg.max_dist)) if cfg.max_dist > 0 else None
+            touch_atr_mult = None
+            try:
+                atr_val = float(touch_meta.get("atr") or 0.0)
+                tol = float(touch_meta.get("touch_tol") or 0.0)
+                if atr_val > 0:
+                    touch_atr_mult = tol / atr_val
+            except Exception:
+                touch_atr_mult = None
+            state["touch_pct"] = touch_meta.get("min_dist_pct_to_level")
+            state["touch_atr_mult"] = touch_atr_mult
+            overext_touch = dist_long_abs if dist_long_abs is not None else dist_short_abs
+            events.append(
+                {
+                    "event": "SWAGGY_TOUCH",
+                    "level_type": level_type,
+                    "level_price": target_level.price,
+                    "level_score": level_score,
+                    "touch_count": state.get("touch_count"),
+                    "level_age_bars": level_age_bars,
+                    "touch_pct": state.get("touch_pct"),
+                    "touch_atr_mult": touch_atr_mult,
+                    "touch_pass": 1,
+                    "touch_fail_reason": "",
+                    "overext_dist_at_touch": overext_touch,
+                    "range_id": touch_key,
+                }
+            )
 
         touch_meta = state.get("touch_level") or {}
         touch_price = touch_meta.get("price")
@@ -448,18 +536,50 @@ class SwaggySignalEngine:
         candidates = [c for c in [reclaim, rejection, sweep, retest] if c is not None]
         if not candidates:
             return SwaggySignal(False, None, 0.0, ["NO_TRIGGER"], "-", None, debug={"regime": regime_state.regime})
+        trigger_combo = "+".join(sorted({c.kind.upper() for c in candidates}))
 
         for trig in candidates:
             trig.strength = _compute_strength(trig, last_price, regime_state.regime, cfg)
 
         best = max(candidates, key=lambda x: x.strength)
+        strength_comps = _strength_components(best, last_price, regime_state.regime, cfg)
         side = best.side.upper()
         strength = float(best.strength)
+        trigger_parts = {t.kind.upper(): float(t.strength or 0.0) for t in candidates}
+        trigger_strength_best = float(best.strength or 0.0)
+        trigger_strength_min = min(trigger_parts.values()) if trigger_parts else 0.0
+        trigger_strength_avg = (
+            sum(trigger_parts.values()) / len(trigger_parts) if trigger_parts else 0.0
+        )
 
         entry_min = _entry_min_for_regime(regime_state.regime, cfg)
         min_by_kind = _min_strength_for_trigger(best.kind, cfg)
-        if best.kind != "SWEEP" and strength < max(cfg.weak_cut, entry_min, min_by_kind):
-            return SwaggySignal(False, side, strength, ["WEAK_SIGNAL"], best.kind, None, debug={"regime": regime_state.regime})
+        trigger_threshold_used = max(cfg.weak_cut, entry_min, min_by_kind)
+        trigger_strength_used = trigger_strength_min if cfg.use_trigger_min else trigger_strength_best
+        if best.kind != "SWEEP" and trigger_strength_used < trigger_threshold_used:
+            return SwaggySignal(
+                False,
+                side,
+                strength,
+                ["WEAK_SIGNAL"],
+                best.kind,
+                None,
+                debug={"regime": regime_state.regime, "trigger_threshold_used": trigger_threshold_used},
+            )
+        events.append(
+            {
+                "event": "SWAGGY_TRIGGER",
+                "trigger_combo": "+".join(sorted({t.kind.upper() for t in candidates})),
+                "trigger_strength_best": trigger_strength_best,
+                "trigger_strength_min": trigger_strength_min,
+                "trigger_strength_avg": trigger_strength_avg,
+                "trigger_parts": trigger_parts,
+                "strength_total": strength,
+                "strength_min_req": trigger_threshold_used,
+                "trigger_threshold_used": trigger_threshold_used,
+                "trigger_strength_used": trigger_strength_used,
+            }
+        )
 
         allow_countertrend = cfg.allow_countertrend
         ok_regime, _ = regime_ok(regime_state.regime, side, allow_countertrend, cfg.range_short_allowed)
@@ -497,9 +617,21 @@ class SwaggySignalEngine:
             )
 
         chase_ok, chase_dist = _overextension_ok(candles_5m, side, cfg)
+        chase_dist_abs = abs(chase_dist) if isinstance(chase_dist, (int, float)) else None
         if not chase_ok:
             state["phase"] = "CHASE"
             state["chase_side"] = side
+            events.append(
+                {
+                    "event": "SWAGGY_CONFIRM",
+                    "confirm_pass": 0,
+                    "confirm_fail_reason": "OVEREXT_CHASE",
+                    "confirm_metrics": {},
+                    "overext_blocked": 1,
+                    "overext_state": "CHASE",
+                    "overext_dist_at_entry": chase_dist_abs,
+                }
+            )
             return SwaggySignal(
                 False,
                 side,
@@ -507,15 +639,62 @@ class SwaggySignalEngine:
                 ["CHASE"],
                 best.kind,
                 None,
-                debug={"regime": regime_state.regime, "chase_dist": chase_dist},
+                debug={"regime": regime_state.regime, "chase_dist": chase_dist, "events": events},
             )
 
         if candles_3m.empty or len(candles_3m) < 9:
-            return SwaggySignal(False, side, strength, ["EMA7_WARMUP"], best.kind, None, debug={"regime": regime_state.regime})
+            events.append(
+                {
+                    "event": "SWAGGY_CONFIRM",
+                    "confirm_pass": 0,
+                    "confirm_fail_reason": "EMA7_WARMUP",
+                    "confirm_metrics": {},
+                    "overext_blocked": 0,
+                    "overext_state": "OK",
+                }
+            )
+            return SwaggySignal(
+                False,
+                side,
+                strength,
+                ["EMA7_WARMUP"],
+                best.kind,
+                None,
+                debug={"regime": regime_state.regime, "confirm_pass": 0, "confirm_fail": "EMA7_WARMUP", "events": events},
+            )
         ema7_series = ema(candles_3m["close"], 7)
         if not ema7_series.empty:
             ema7_val = float(ema7_series.iloc[-1])
+            last3 = candles_3m.iloc[-1]
+            hi3 = float(last3["high"])
+            lo3 = float(last3["low"])
+            op3 = float(last3["open"])
+            cl3 = float(last3["close"])
+            rng3 = max(1e-9, hi3 - lo3)
+            body_ratio = abs(cl3 - op3) / rng3
+            if side == "LONG":
+                opp_wick = (hi3 - max(op3, cl3)) / rng3
+                close_pos = (cl3 - lo3) / rng3
+            else:
+                opp_wick = (min(op3, cl3) - lo3) / rng3
+                close_pos = (hi3 - cl3) / rng3
+            confirm_metrics = {
+                "body_ratio": body_ratio,
+                "opp_wick_ratio": opp_wick,
+                "close_pos": close_pos,
+                "ema7": ema7_val,
+            }
             if side == "LONG" and last_price > ema7_val:
+                events.append(
+                    {
+                        "event": "SWAGGY_CONFIRM",
+                        "confirm_pass": 0,
+                        "confirm_fail_reason": "EMA7_DIR",
+                        "confirm_metrics": confirm_metrics,
+                        "overext_blocked": 0,
+                        "overext_state": "OK",
+                    }
+                )
                 return SwaggySignal(
                     False,
                     side,
@@ -523,9 +702,26 @@ class SwaggySignalEngine:
                     ["EMA7_DIR"],
                     best.kind,
                     None,
-                    debug={"regime": regime_state.regime, "ema7": ema7_val},
+                    debug={
+                        "regime": regime_state.regime,
+                        "ema7": ema7_val,
+                        "confirm_pass": 0,
+                        "confirm_fail": "EMA7_DIR",
+                        "confirm_metrics": confirm_metrics,
+                        "events": events,
+                    },
                 )
             if side == "SHORT" and last_price < ema7_val:
+                events.append(
+                    {
+                        "event": "SWAGGY_CONFIRM",
+                        "confirm_pass": 0,
+                        "confirm_fail_reason": "EMA7_DIR",
+                        "confirm_metrics": confirm_metrics,
+                        "overext_blocked": 0,
+                        "overext_state": "OK",
+                    }
+                )
                 return SwaggySignal(
                     False,
                     side,
@@ -533,14 +729,82 @@ class SwaggySignalEngine:
                     ["EMA7_DIR"],
                     best.kind,
                     None,
-                    debug={"regime": regime_state.regime, "ema7": ema7_val},
+                    debug={
+                        "regime": regime_state.regime,
+                        "ema7": ema7_val,
+                        "confirm_pass": 0,
+                        "confirm_fail": "EMA7_DIR",
+                        "confirm_metrics": confirm_metrics,
+                        "events": events,
+                    },
                 )
+            events.append(
+                {
+                    "event": "SWAGGY_CONFIRM",
+                    "confirm_pass": 1,
+                    "confirm_fail_reason": "",
+                    "confirm_metrics": confirm_metrics,
+                    "overext_blocked": 0,
+                    "overext_state": "OK",
+                }
+            )
+            state["confirm_metrics"] = confirm_metrics
 
         state["last_signal_ts"] = now_ts
         state["phase"] = "COOLDOWN"
         state["cooldown_until"] = now_ts + cfg.cooldown_min * 60
         entry_px = last_price
-        return SwaggySignal(True, side, strength, ["ENTRY_READY"], best.kind, entry_px, debug={"regime": regime_state.regime})
+        touch_overext = state.get("touch_overext") or {}
+        level_ts = (state.get("touch_level") or {}).get("ts")
+        level_age = (now_ts - float(level_ts)) if isinstance(level_ts, (int, float)) else None
+        atr14_ltf = atr(candles_5m, 14)
+        atr14_htf = atr(candles_1h, 14)
+        ema20_ltf = ema(candles_5m["close"], 20)
+        ema20_htf = ema(candles_1h["close"], 20)
+        return SwaggySignal(
+            True,
+            side,
+            strength,
+            ["ENTRY_READY"],
+            best.kind,
+            entry_px,
+            debug={
+                "regime": regime_state.regime,
+                "level_score": strength_comps.get("distance_score"),
+                "touch_count": state.get("touch_count"),
+                "touch_key": state.get("touch_key"),
+                "level_age_sec": level_age,
+                "trigger_combo": trigger_combo,
+                "trigger_parts": trigger_parts,
+                "trigger_strength_best": trigger_strength_best,
+                "trigger_strength_min": trigger_strength_min,
+                "trigger_strength_avg": trigger_strength_avg,
+                "trigger_strength_used": trigger_strength_used,
+                "strength_total": strength,
+                "strength_min_req": trigger_threshold_used,
+                "trigger_threshold_used": trigger_threshold_used,
+                "use_trigger_min": 1 if cfg.use_trigger_min else 0,
+                "confirm_pass": 1,
+                "confirm_fail": "",
+                "confirm_metrics": state.get("confirm_metrics") or {},
+                "overext_dist_at_touch": touch_overext.get(side),
+                "overext_dist_at_entry": chase_dist_abs,
+                "overext_ema_len": cfg.overext_ema_len,
+                "overext_atr_mult": cfg.overext_atr_mult,
+                "level_type": level_type,
+                "level_price": target_level.price,
+                "level_age_bars": level_age_bars,
+                "touch_pct": state.get("touch_pct"),
+                "touch_atr_mult": state.get("touch_atr_mult"),
+                "touch_pass": 1,
+                "touch_fail_reason": "",
+                "atr14_ltf": atr14_ltf,
+                "atr14_htf": atr14_htf,
+                "ema20_ltf": float(ema20_ltf.iloc[-1]) if not ema20_ltf.empty else None,
+                "ema20_htf": float(ema20_htf.iloc[-1]) if not ema20_htf.empty else None,
+                "events": events,
+            },
+        )
 
 
 def _min_strength_for_trigger(kind: str, cfg: SwaggyConfig) -> float:

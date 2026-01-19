@@ -71,6 +71,10 @@ class SwaggyConfig:
     level_recent_secs: int = 14400
     level_max_dist_pct: float = 0.06
     level_cap: int = 25
+    skip_beta_mid: bool = True
+    skip_overext_mid: bool = True
+    skip_confirm_body: bool = False
+    use_trigger_min: bool = False
 
 
 @dataclass
