@@ -26,10 +26,11 @@ pip install ccxt pandas requests websocket-client
   - 백테스트
     ```
      python3 engines/rsi/run_backtest.py \
-    --days 3 \
+    --days 7 \
     --sl-pct 0.30 \
     --tp-pct 0.03 \
-    --max-symbols 7
+    --reentry-minutes 60 \
+    --max-symbols 40
 
     ```
   - 예시

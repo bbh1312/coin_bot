@@ -27,6 +27,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Atlas RS Fail Short Backtest Runner")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--ltf", type=str, default="15m")
+    parser.add_argument("--reentry-minutes", type=int, default=120)
     parser.add_argument("--sl-pct", type=float, default=0.03)
     parser.add_argument("--tp-pct", type=float, default=0.03)
     parser.add_argument("--out", type=str, default="")
@@ -143,6 +144,7 @@ def run_backtest(
     out_decisions: str,
     sl_pct: float,
     tp_pct: float,
+    reentry_minutes: int,
     log_path: str,
     sleep_ms: int,
     max_retries: int,
@@ -164,6 +166,7 @@ def run_backtest(
     signal_logs: Dict[str, str] = {}
     stats_map: Dict[str, Dict[str, float]] = {}
     trades: Dict[str, Optional[dict]] = {}
+    reentry_until: Dict[str, float] = {}
     idx_ref = -1
 
     for symbol in symbols:
@@ -195,6 +198,7 @@ def run_backtest(
         block_counts[symbol] = {}
         eval_counts[symbol] = 0
         trades[symbol] = None
+        reentry_until[symbol] = 0.0
 
     if not symbol_data:
         return stats_map
@@ -306,6 +310,8 @@ def run_backtest(
                     ),
                 )
                 trades[symbol] = None
+                if reentry_minutes and reentry_minutes > 0:
+                    reentry_until[symbol] = (ts / 1000.0) + (reentry_minutes * 60)
                 st = state.get(symbol, {})
                 if isinstance(st, dict):
                     st["in_pos"] = False
@@ -344,6 +350,13 @@ def run_backtest(
         _append_line(out_decisions, ",".join(decision_row))
         if not sig.entry_ready or sig.entry_price is None:
             continue
+        if reentry_minutes and reentry_minutes > 0:
+            if (ts / 1000.0) < float(reentry_until.get(symbol) or 0.0):
+                bc = block_counts[symbol]
+                bc["reentry_cooldown"] = bc.get("reentry_cooldown", 0) + 1
+                if log_path:
+                    _log_file(f"[BACKTEST] SKIP reentry_cooldown symbol={symbol} ts={dt}", log_path)
+                continue
 
         _append_line(
             out_path,
@@ -522,6 +535,7 @@ def main():
         out_decisions,
         args.sl_pct,
         args.tp_pct,
+        args.reentry_minutes,
         log_path,
         args.sleep_ms,
         args.retry,
