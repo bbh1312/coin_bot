@@ -77,6 +77,8 @@ try:
     from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine as SwaggyAtlasLabEngine
     from engines.swaggy_atlas_lab.config import SwaggyConfig as SwaggyAtlasLabConfig
     from engines.swaggy_atlas_lab.config import AtlasConfig as SwaggyAtlasLabAtlasConfig
+    from engines.swaggy_no_atlas.engine import SwaggyNoAtlasEngine
+    from engines.swaggy_no_atlas.config import SwaggyNoAtlasConfig
     from engines.swaggy_atlas_lab.atlas_eval import (
         evaluate_global_gate as lab_evaluate_global_gate,
         evaluate_local as lab_evaluate_local,
@@ -103,6 +105,8 @@ except Exception:
     SwaggyAtlasLabEngine = None
     SwaggyAtlasLabConfig = None
     SwaggyAtlasLabAtlasConfig = None
+    SwaggyNoAtlasEngine = None
+    SwaggyNoAtlasConfig = None
     lab_evaluate_global_gate = None
     lab_evaluate_local = None
     lab_apply_policy = None
@@ -153,6 +157,7 @@ from executor import (
 
 swaggy_engine = None
 swaggy_atlas_lab_engine = None
+swaggy_no_atlas_engine = None
 atlas_engine = None
 atlas_swaggy_cfg = None
 rsi_engine = None
@@ -682,6 +687,11 @@ def _append_swaggy_atlas_lab_log(line: str) -> None:
     path = os.path.join("swaggy_atlas_lab", f"swaggy_atlas_lab-{date_tag}.log")
     _append_log_lines(path, [line])
 
+def _append_swaggy_no_atlas_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    path = os.path.join("swaggy_no_atlas", f"swaggy_no_atlas-{date_tag}.log")
+    _append_log_lines(path, [line])
+
 def _iso_kst(ts: Optional[float] = None) -> str:
     tz = timezone(timedelta(hours=9))
     try:
@@ -1097,6 +1107,299 @@ def _run_swaggy_atlas_lab_cycle(
         finally:
             _entry_guard_release(state, symbol, key=guard_key)
             _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+
+        time.sleep(PER_SYMBOL_SLEEP)
+    return result
+
+def _run_swaggy_no_atlas_cycle(
+    swaggy_no_atlas_engine,
+    swaggy_universe,
+    cached_ex,
+    state,
+    swaggy_cfg,
+    active_positions_total,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    def _fmt(v: Any) -> str:
+        if v is None or v == "":
+            return "N/A"
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v)
+
+    result = {"long_hits": 0, "short_hits": 0}
+    if (not SWAGGY_NO_ATLAS_ENABLED) or (not swaggy_no_atlas_engine) or (not swaggy_cfg):
+        return result
+    if not swaggy_universe:
+        return result
+
+    now_ts = time.time()
+    ltf_limit = max(int(swaggy_cfg.ltf_limit), 120)
+    mtf_limit = 200
+    htf_limit = max(int(swaggy_cfg.vp_lookback_1h), 120)
+    htf2_limit = 200
+    d1_limit = 120
+
+    for symbol in swaggy_universe:
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if st.get("in_pos"):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            long_amt = get_long_position_amount(symbol)
+        except Exception:
+            long_amt = 0.0
+        try:
+            short_amt = get_short_position_amount(symbol)
+        except Exception:
+            short_amt = 0.0
+        if (long_amt > 0) or (short_amt > 0):
+            st["in_pos"] = True
+            now_seen = time.time()
+            if long_amt > 0:
+                _set_last_entry_state(st, "LONG", now_seen)
+            if short_amt > 0:
+                _set_last_entry_state(st, "SHORT", now_seen)
+            state[symbol] = st
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        df_5m = cycle_cache.get_df(symbol, swaggy_cfg.tf_ltf, limit=ltf_limit)
+        df_15m = cycle_cache.get_df(symbol, swaggy_cfg.tf_mtf, limit=mtf_limit)
+        df_1h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf, limit=htf_limit)
+        df_4h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf2, limit=htf2_limit)
+        df_1d = cycle_cache.get_df(symbol, swaggy_cfg.tf_d1, limit=d1_limit)
+        df_3m = cycle_cache.get_df(symbol, "3m", limit=30)
+        if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty or df_3m.empty:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        prev_phase = swaggy_no_atlas_engine._state.get(symbol, {}).get("phase")
+        signal = swaggy_no_atlas_engine.evaluate_symbol(
+            symbol,
+            df_4h,
+            df_1h,
+            df_15m,
+            df_5m,
+            df_3m,
+            df_1d if isinstance(df_1d, pd.DataFrame) else pd.DataFrame(),
+            now_ts,
+        )
+        new_phase = swaggy_no_atlas_engine._state.get(symbol, {}).get("phase")
+        if prev_phase != new_phase and new_phase:
+            _append_swaggy_no_atlas_log(
+                "SWAGGY_NO_ATLAS_PHASE sym=%s prev=%s now=%s reasons=%s"
+                % (symbol, prev_phase, new_phase, ",".join(signal.reasons or []))
+            )
+
+        debug = signal.debug if isinstance(signal.debug, dict) else {}
+        event_list = debug.get("events") if isinstance(debug.get("events"), list) else []
+        if event_list:
+            for event in event_list:
+                if not isinstance(event, dict):
+                    continue
+                payload = {
+                    "ts": _iso_kst(),
+                    "event": event.get("event") or "SWAGGY_EVENT",
+                    "engine": "SWAGGY_NO_ATLAS",
+                    "mode": "live" if LIVE_TRADING or LONG_LIVE_TRADING else "paper",
+                    "symbol": symbol,
+                    "side": event.get("side") or signal.side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": event.get("range_id") or debug.get("touch_key"),
+                }
+                payload.update(event)
+                _append_swaggy_trade_json(payload)
+
+        if not signal.entry_ok or not signal.side or signal.entry_px is None:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        side = signal.side.upper()
+        last_entry = _get_last_entry_ts_by_side(st, side)
+        if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if _exit_cooldown_blocked(state, symbol, "swaggy_no_atlas", side):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        entry_quality = "NA"
+        entry_quality_reasons = ["NO_ATLAS"]
+        entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE)
+        entry_line = (
+            "SWAGGY_NO_ATLAS_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
+            "final_usdt=%.2f "
+            "level_score=%s touch_count=%s level_age=%s trigger_combo=%s confirm_pass=%s confirm_fail=%s "
+            "overext_dist_at_touch=%s overext_dist_at_entry=%s entry_quality=%s"
+            % (
+                symbol,
+                side,
+                float(signal.strength or 0.0),
+                ",".join(signal.reasons or []),
+                float(entry_usdt or 0.0),
+                _fmt(debug.get("level_score")),
+                _fmt(debug.get("touch_count")),
+                _fmt(debug.get("level_age_sec")),
+                _fmt(debug.get("trigger_combo")),
+                _fmt(debug.get("confirm_pass")),
+                _fmt(debug.get("confirm_fail")),
+                _fmt(debug.get("overext_dist_at_touch")),
+                _fmt(debug.get("overext_dist_at_entry")),
+                _fmt(entry_quality),
+            )
+        )
+        _append_swaggy_no_atlas_log(entry_line)
+
+        if swaggy_cfg:
+            overext_val = debug.get("overext_dist_at_entry")
+            if isinstance(overext_val, (int, float)):
+                overext_val = abs(float(overext_val))
+            if (
+                swaggy_cfg.skip_overext_mid
+                and isinstance(overext_val, (int, float))
+                and 1.1 <= overext_val < 1.4
+            ):
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=SKIP_OVEREXT_MID overext={overext_val:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            body_ratio = None
+            confirm_metrics = debug.get("confirm_metrics")
+            if isinstance(confirm_metrics, dict):
+                body_ratio = confirm_metrics.get("body_ratio")
+            if (
+                swaggy_cfg.skip_confirm_body
+                and isinstance(body_ratio, (int, float))
+                and float(body_ratio) < 0.60
+            ):
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=SKIP_CONFIRM_BODY body_ratio={body_ratio:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+        cur_total = count_open_positions(force=True)
+        if not isinstance(cur_total, int):
+            cur_total = active_positions_total
+        if cur_total >= MAX_OPEN_POSITIONS:
+            _append_entry_gate_log(
+                "swaggy_no_atlas",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+                side=side,
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_no_atlas", side=side)
+        if not lock_ok:
+            _append_swaggy_no_atlas_log(
+                f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=ENTRY_LOCK owner={lock_owner} age_s={lock_age:.1f}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        guard_key = _entry_guard_key(state, symbol, side)
+        if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_no_atlas", side=side):
+            _entry_lock_release(state, symbol, owner="swaggy_no_atlas")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        try:
+            live = LONG_LIVE_TRADING if side == "LONG" else LIVE_TRADING
+            req_id = _enqueue_entry_request(
+                state,
+                symbol=symbol,
+                side=side,
+                engine="SWAGGY_NO_ATLAS",
+                reason="swaggy_no_atlas",
+                usdt=entry_usdt,
+                live=live,
+                alert_reason="SWAGGY_NO_ATLAS",
+            )
+            if req_id:
+                trade_payload = {
+                    "ts": _iso_kst(),
+                    "event": "SWAGGY_TRADE",
+                    "engine": "SWAGGY_NO_ATLAS",
+                    "mode": "live" if live else "paper",
+                    "symbol": symbol,
+                    "side": side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": debug.get("touch_key"),
+                    "entry_ts": _iso_kst(),
+                    "entry_price": signal.entry_px,
+                    "atr14_ltf": debug.get("atr14_ltf"),
+                    "atr14_htf": debug.get("atr14_htf"),
+                    "ema20_ltf": debug.get("ema20_ltf"),
+                    "ema20_htf": debug.get("ema20_htf"),
+                    "level_type": debug.get("level_type"),
+                    "level_price": debug.get("level_price"),
+                    "level_score": debug.get("level_score"),
+                    "touch_count": debug.get("touch_count"),
+                    "level_age_bars": debug.get("level_age_bars"),
+                    "touch_pct": debug.get("touch_pct"),
+                    "touch_atr_mult": debug.get("touch_atr_mult"),
+                    "touch_pass": int(debug.get("touch_pass") or 0),
+                    "touch_fail_reason": debug.get("touch_fail_reason"),
+                    "trigger_combo": debug.get("trigger_combo"),
+                    "trigger_strength_best": debug.get("trigger_strength_best"),
+                    "trigger_strength_min": debug.get("trigger_strength_min"),
+                    "trigger_strength_avg": debug.get("trigger_strength_avg"),
+                    "trigger_strength_used": debug.get("trigger_strength_used"),
+                    "trigger_parts": debug.get("trigger_parts"),
+                    "strength_total": debug.get("strength_total"),
+                    "strength_min_req": debug.get("strength_min_req"),
+                    "trigger_threshold_used": debug.get("trigger_threshold_used"),
+                    "use_trigger_min": debug.get("use_trigger_min"),
+                    "confirm_pass": int(debug.get("confirm_pass") or 0),
+                    "confirm_fail_reason": debug.get("confirm_fail"),
+                    "confirm_metrics": debug.get("confirm_metrics"),
+                    "confirm_body_ratio": (debug.get("confirm_metrics") or {}).get("body_ratio")
+                    if isinstance(debug.get("confirm_metrics"), dict)
+                    else None,
+                    "overext_ema_len": debug.get("overext_ema_len"),
+                    "overext_atr_mult": debug.get("overext_atr_mult"),
+                    "overext_dist_at_touch": debug.get("overext_dist_at_touch"),
+                    "overext_dist_at_entry": debug.get("overext_dist_at_entry"),
+                    "overext_blocked": 0,
+                    "overext_state": "OK",
+                    "atlas_pass_soft": None,
+                    "atlas_pass_hard": None,
+                    "atlas_state": None,
+                    "atlas_regime": None,
+                    "atlas_rs": None,
+                    "atlas_rs_z": None,
+                    "atlas_corr": None,
+                    "atlas_beta": None,
+                    "atlas_vol_ratio": None,
+                    "atlas_block_reason": None,
+                    "entry_quality_bucket": entry_quality,
+                    "entry_quality_reasons": entry_quality_reasons,
+                }
+                _append_swaggy_trade_json(trade_payload)
+                if side == "LONG":
+                    result["long_hits"] += 1
+                else:
+                    result["short_hits"] += 1
+        except Exception as e:
+            _append_swaggy_no_atlas_log(f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
+        finally:
+            _entry_guard_release(state, symbol, key=guard_key)
+            _entry_lock_release(state, symbol, owner="swaggy_no_atlas")
 
         time.sleep(PER_SYMBOL_SLEEP)
     return result
@@ -1547,6 +1850,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "SWAGGY"
     if key == "swaggy_atlas_lab":
         return "SWAGGY_ATLAS_LAB"
+    if key == "swaggy_no_atlas":
+        return "SWAGGY_NO_ATLAS"
     if key in ("dtfx_long", "dtfx_short"):
         return "DTFX"
     if key == "div15m_long":
@@ -1570,14 +1875,19 @@ def _display_engine_label(label: Optional[str]) -> str:
     overrides = {
         "ATLAS_RS_FAIL_SHORT": "아틀라스 숏",
         "SWAGGY_ATLAS_LAB": "스웨기랩",
+        "SWAGGY_NO_ATLAS": "스웨기노아틀라스",
         "ATLASFABIO": "파비오",
     }
     return overrides.get(name, name)
 
 def _is_engine_enabled(engine: str) -> bool:
     key = (engine or "").upper()
-    if key in ("SWAGGY_ATLAS_LAB", "SWAGGY"):
-        return SWAGGY_ATLAS_LAB_ENABLED if key == "SWAGGY_ATLAS_LAB" else SWAGGY_ENABLED
+    if key in ("SWAGGY_ATLAS_LAB", "SWAGGY", "SWAGGY_NO_ATLAS"):
+        if key == "SWAGGY_ATLAS_LAB":
+            return SWAGGY_ATLAS_LAB_ENABLED
+        if key == "SWAGGY_NO_ATLAS":
+            return SWAGGY_NO_ATLAS_ENABLED
+        return SWAGGY_ENABLED
     if key == "ATLASFABIO":
         return ATLAS_FABIO_ENABLED
     if key == "DTFX":
@@ -5967,6 +6277,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_exit_cooldown_hours",
         "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
+        "_swaggy_no_atlas_enabled",
         "_div15m_long_enabled",
         "_div15m_short_enabled",
         "_rsi_enabled",
@@ -5988,7 +6299,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global ENGINE_EXIT_OVERRIDES
     global ENGINE_EXIT_OVERRIDES
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if isinstance(state.get("_auto_exit"), bool):
@@ -6018,6 +6329,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
     if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
+    if isinstance(state.get("_swaggy_no_atlas_enabled"), bool):
+        SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
     if isinstance(state.get("_div15m_long_enabled"), bool):
         DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
     if isinstance(state.get("_div15m_short_enabled"), bool):
@@ -6168,6 +6481,7 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_exit_cooldown_hours",
         "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
+        "_swaggy_no_atlas_enabled",
         "_div15m_long_enabled",
         "_div15m_short_enabled",
         "_rsi_enabled",
@@ -6543,7 +6857,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -6805,6 +7119,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/engine_exit: {_format_engine_exit_overrides()}\n"
                             "--------------\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
+                            f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
                             f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -6853,6 +7168,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/engine_exit: {_format_engine_exit_overrides()}\n"
                         "--------------\n"
                         f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
+                        f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
                         f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -7193,6 +7509,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_atlas_lab cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas", "swaggy_no_atlas")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SWAGGY_NO_ATLAS_ENABLED = True
+                        state["_swaggy_no_atlas_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ swaggy_no_atlas ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SWAGGY_NO_ATLAS_ENABLED = False
+                        state["_swaggy_no_atlas_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ swaggy_no_atlas OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas 상태: {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_no_atlas on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/div15m_long", "div15m_long")) and not responded:
                     parts = lower.split()
@@ -7562,6 +7901,7 @@ ATLAS_FABIO_ENABLED = True
 ATLAS_FABIO_PAPER = False
 SWAGGY_ENABLED = False
 SWAGGY_ATLAS_LAB_ENABLED = False
+SWAGGY_NO_ATLAS_ENABLED = False
 DTFX_ENABLED = True
 PUMPFADE_ENABLED = False
 ATLAS_RS_FAIL_SHORT_ENABLED = False
@@ -7819,6 +8159,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_atlas_fabio_enabled",
                 "_swaggy_enabled",
                 "_swaggy_atlas_lab_enabled",
+                "_swaggy_no_atlas_enabled",
                 "_dtfx_enabled",
                 "_pumpfade_enabled",
                 "_div15m_long_enabled",
@@ -7858,9 +8199,10 @@ def run():
     state = load_state()
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
-    global swaggy_engine, swaggy_atlas_lab_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
+    global swaggy_engine, swaggy_atlas_lab_engine, swaggy_no_atlas_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     swaggy_atlas_lab_engine = SwaggyAtlasLabEngine() if SwaggyAtlasLabEngine else None
+    swaggy_no_atlas_engine = SwaggyNoAtlasEngine() if SwaggyNoAtlasEngine else None
     atlas_engine = AtlasEngine() if AtlasEngine else None
     atlas_swaggy_cfg = AtlasSwaggyConfig() if AtlasSwaggyConfig else None
     global rsi_engine
@@ -7886,7 +8228,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
@@ -7962,6 +8304,10 @@ def run():
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     else:
         state["_swaggy_atlas_lab_enabled"] = SWAGGY_ATLAS_LAB_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_enabled"), bool):
+        SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
+    else:
+        state["_swaggy_no_atlas_enabled"] = SWAGGY_NO_ATLAS_ENABLED
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
@@ -7987,6 +8333,8 @@ def run():
         PUMPFADE_ENABLED = False
         ATLAS_RS_FAIL_SHORT_ENABLED = False
         ATLAS_FABIO_ENABLED = False
+        SWAGGY_ATLAS_LAB_ENABLED = False
+        SWAGGY_NO_ATLAS_ENABLED = False
         state["_div15m_long_enabled"] = False
         state["_div15m_short_enabled"] = True
         state["_rsi_enabled"] = False
@@ -7994,6 +8342,8 @@ def run():
         state["_pumpfade_enabled"] = False
         state["_atlas_rs_fail_short_enabled"] = False
         state["_atlas_fabio_enabled"] = False
+        state["_swaggy_atlas_lab_enabled"] = False
+        state["_swaggy_no_atlas_enabled"] = False
         print("[모드] ONLY_DIV15M_SHORT 활성화: div15m_short만 스캔")
     if isinstance(state.get("_entry_usdt"), (int, float)):
         try:
@@ -8043,7 +8393,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /swaggy_no_atlas on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -8342,7 +8692,8 @@ def run():
         swaggy_cfg = None
         swaggy_atlas_lab_cfg = None
         swaggy_atlas_lab_atlas_cfg = None
-        if (SWAGGY_ENABLED or SWAGGY_ATLAS_LAB_ENABLED) and swaggy_engine and SwaggyConfig and EngineContext:
+        swaggy_no_atlas_cfg = None
+        if (SWAGGY_ENABLED or SWAGGY_ATLAS_LAB_ENABLED or SWAGGY_NO_ATLAS_ENABLED) and swaggy_engine and SwaggyConfig and EngineContext:
             swaggy_cfg = SwaggyConfig()
             ctx = EngineContext(
                 exchange=exchange,
@@ -8353,7 +8704,7 @@ def run():
             )
             swaggy_universe = swaggy_engine.build_universe(ctx)
             state["_swaggy_universe"] = swaggy_universe
-        elif SWAGGY_ATLAS_LAB_ENABLED:
+        elif SWAGGY_ATLAS_LAB_ENABLED or SWAGGY_NO_ATLAS_ENABLED:
             dtfx_cfg = dtfx_cfg if dtfx_cfg else DTFXConfig()
             dtfx_min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
             anchors = []
@@ -8370,6 +8721,8 @@ def run():
         if SWAGGY_ATLAS_LAB_ENABLED and SwaggyAtlasLabConfig and SwaggyAtlasLabAtlasConfig:
             swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig()
             swaggy_atlas_lab_atlas_cfg = SwaggyAtlasLabAtlasConfig()
+        if SWAGGY_NO_ATLAS_ENABLED and SwaggyNoAtlasConfig:
+            swaggy_no_atlas_cfg = SwaggyNoAtlasConfig()
 
             structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
             if STRUCTURE_TOP_N:
@@ -8483,6 +8836,7 @@ def run():
         fabio_universe_len = len(fabio_universe)
         swaggy_universe_len = len(swaggy_universe) if swaggy_universe else 0
         swaggy_atlas_lab_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_ENABLED else 0
+        swaggy_no_atlas_universe_len = swaggy_universe_len if SWAGGY_NO_ATLAS_ENABLED else 0
         dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
         pumpfade_universe_len = len(pumpfade_universe) if pumpfade_universe else 0
         atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
@@ -8499,6 +8853,13 @@ def run():
             and swaggy_atlas_lab_cfg
             and swaggy_atlas_lab_atlas_cfg
             and swaggy_atlas_lab_engine
+            and swaggy_universe
+        )
+        swaggy_no_atlas_ran = bool(
+            heavy_scan
+            and SWAGGY_NO_ATLAS_ENABLED
+            and swaggy_no_atlas_cfg
+            and swaggy_no_atlas_engine
             and swaggy_universe
         )
         dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
@@ -8570,6 +8931,9 @@ def run():
         if swaggy_atlas_lab_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_atlas_lab_cfg.vp_lookback_1h))
+        if swaggy_no_atlas_cfg:
+            mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
+            mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_no_atlas_cfg.vp_lookback_1h))
         if pumpfade_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), int(max(80, pumpfade_cfg.lookback_hh + 10)))
             mid_plan["1h"] = max(mid_plan.get("1h", 0), 40)
@@ -8589,6 +8953,8 @@ def run():
         if swaggy_cfg:
             slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
         if swaggy_atlas_lab_cfg:
+            slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
+        if swaggy_no_atlas_cfg:
             slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
         if "4h" in slow_plan:
             slow_plan["4h"] = min(slow_plan.get("4h", 0), SLOW_LIMIT_CAP)
@@ -8794,6 +9160,8 @@ def run():
         swaggy_thread = None
         swaggy_atlas_lab_result = {}
         swaggy_atlas_lab_thread = None
+        swaggy_no_atlas_result = {}
+        swaggy_no_atlas_thread = None
         dtfx_result = {}
         dtfx_thread = None
         pumpfade_result = {}
@@ -8854,6 +9222,23 @@ def run():
                 daemon=True,
             )
             swaggy_atlas_lab_thread.start()
+        if SWAGGY_NO_ATLAS_ENABLED and swaggy_no_atlas_cfg and swaggy_no_atlas_engine:
+            swaggy_no_atlas_thread = threading.Thread(
+                target=lambda: swaggy_no_atlas_result.update(
+                    _run_swaggy_no_atlas_cycle(
+                        swaggy_no_atlas_engine,
+                        swaggy_universe,
+                        cached_ex,
+                        state,
+                        swaggy_no_atlas_cfg,
+                        active_positions,
+                        send_telegram,
+                        cycle_id,
+                    )
+                ),
+                daemon=True,
+            )
+            swaggy_no_atlas_thread.start()
         if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
             dtfx_thread = threading.Thread(
                 target=lambda: dtfx_result.update(
@@ -9372,6 +9757,8 @@ def run():
             swaggy_thread.join()
         if swaggy_atlas_lab_thread:
             swaggy_atlas_lab_thread.join()
+        if swaggy_no_atlas_thread:
+            swaggy_no_atlas_thread.join()
         if dtfx_thread:
             dtfx_thread.join()
         if pumpfade_thread:
@@ -9410,7 +9797,7 @@ def run():
         )
         print(
             "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) atlasfabio=%s(%d) "
-            "swaggy_atlas_lab=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
+            "swaggy_atlas_lab=%s(%d) swaggy_no_atlas=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
             % (
                 "ON" if rsi_ran else "OFF",
                 rsi_universe_len,
@@ -9422,6 +9809,8 @@ def run():
                 fabio_universe_len,
                 "ON" if swaggy_atlas_lab_ran else "OFF",
                 swaggy_atlas_lab_universe_len,
+                "ON" if swaggy_no_atlas_ran else "OFF",
+                swaggy_no_atlas_universe_len,
                 "ON" if dtfx_ran else "OFF",
                 dtfx_universe_len,
                 "ON" if pumpfade_ran else "OFF",
