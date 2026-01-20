@@ -567,16 +567,6 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
     if not open_tr:
         return
     st = state.get(symbol, {}) if isinstance(state, dict) else {}
-    last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
-    last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
-    if (
-        isinstance(last_exit_ts, (int, float))
-        and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
-        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
-    ):
-        return
-    if _recent_auto_exit_disk(symbol, now_ts):
-        return
     engine_label = _trade_engine_label(open_tr)
     st = state.get(symbol, {})
     seen_ts = st.get("long_pos_seen_ts") if isinstance(st, dict) else None
@@ -590,6 +580,17 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
             exit_reason = "auto_exit_tp"
         elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
             exit_reason = "auto_exit_sl"
+    if exit_reason in ("auto_exit_tp", "auto_exit_sl"):
+        last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
+        last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
+        if (
+            isinstance(last_exit_ts, (int, float))
+            and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
+            and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
+        ):
+            return
+        if _recent_auto_exit_disk(symbol, now_ts):
+            return
     er._close_trade(
         state,
         side="LONG",
@@ -642,16 +643,6 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
     if not open_tr:
         return
     st = state.get(symbol, {}) if isinstance(state, dict) else {}
-    last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
-    last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
-    if (
-        isinstance(last_exit_ts, (int, float))
-        and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
-        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
-    ):
-        return
-    if _recent_auto_exit_disk(symbol, now_ts):
-        return
     engine_label = _trade_engine_label(open_tr)
     st = state.get(symbol, {})
     seen_ts = st.get("short_pos_seen_ts") if isinstance(st, dict) else None
@@ -665,6 +656,17 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
             exit_reason = "auto_exit_tp"
         elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
             exit_reason = "auto_exit_sl"
+    if exit_reason in ("auto_exit_tp", "auto_exit_sl"):
+        last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
+        last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
+        if (
+            isinstance(last_exit_ts, (int, float))
+            and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
+            and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
+        ):
+            return
+        if _recent_auto_exit_disk(symbol, now_ts):
+            return
     er._close_trade(
         state,
         side="SHORT",
@@ -1132,35 +1134,81 @@ def main():
                     )
                     st["in_pos"] = True
                     st["last_entry"] = now_ts
-            if short_amt > 0:
-                open_tr = er._get_open_trade(state, "SHORT", symbol)
-                if not open_tr:
-                    detail = executor_mod.get_short_position_detail(symbol) or {}
-                    entry_price = detail.get("entry") if isinstance(detail, dict) else None
-                    qty = detail.get("qty") if isinstance(detail, dict) else None
-                    meta = {"reason": "manual_entry"}
-                    entry_order_id = None
-                    recent = _get_recent_entry_event(symbol, "SHORT", now_ts=now_ts)
-                    if isinstance(recent, dict):
-                        eng = str(recent.get("engine") or "").upper()
-                        reason = _reason_from_engine_label(eng, "SHORT")
-                        if reason:
-                            meta["reason"] = reason
-                        meta["engine"] = eng
-                        entry_order_id = recent.get("entry_order_id")
-                    er._log_trade_entry(
-                        state,
-                        side="SHORT",
-                        symbol=symbol,
-                        entry_ts=now_ts,
-                        entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=None,
-                        entry_order_id=entry_order_id,
-                        meta=meta,
-                    )
-                    st["in_pos"] = True
-                    st["last_entry"] = now_ts
+                    engine_label = str(meta.get("engine") or "MANUAL").upper()
+                    if engine_label in ("", "UNKNOWN"):
+                        engine_label = "MANUAL"
+                    alert_key = "manual_entry_alerted_long"
+                    if engine_label == "MANUAL" and not st.get(alert_key):
+                        sl_pct = er.AUTO_EXIT_LONG_SL_PCT
+                        sl_price = er._fmt_price_safe(entry_price, sl_pct, side="LONG")
+                        er._send_entry_alert(
+                            er.send_telegram,
+                            side="LONG",
+                            symbol=symbol,
+                            engine=engine_label,
+                            entry_price=entry_price,
+                            usdt=None,
+                            reason="manual_entry",
+                            live=True,
+                            order_info="(manage-ws)",
+                            entry_order_id=entry_order_id,
+                            sl=sl_price,
+                            tp=None,
+                        )
+                        st[alert_key] = True
+                    state[symbol] = st
+                if short_amt > 0:
+                    open_tr = er._get_open_trade(state, "SHORT", symbol)
+                    if not open_tr:
+                        detail = executor_mod.get_short_position_detail(symbol) or {}
+                        entry_price = detail.get("entry") if isinstance(detail, dict) else None
+                        qty = detail.get("qty") if isinstance(detail, dict) else None
+                        meta = {"reason": "manual_entry"}
+                        entry_order_id = None
+                        recent = _get_recent_entry_event(symbol, "SHORT", now_ts=now_ts)
+                        if isinstance(recent, dict):
+                            eng = str(recent.get("engine") or "").upper()
+                            reason = _reason_from_engine_label(eng, "SHORT")
+                            if reason:
+                                meta["reason"] = reason
+                            meta["engine"] = eng
+                            entry_order_id = recent.get("entry_order_id")
+                        er._log_trade_entry(
+                            state,
+                            side="SHORT",
+                            symbol=symbol,
+                            entry_ts=now_ts,
+                            entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+                            qty=qty if isinstance(qty, (int, float)) else None,
+                            usdt=None,
+                            entry_order_id=entry_order_id,
+                            meta=meta,
+                        )
+                        st["in_pos"] = True
+                        st["last_entry"] = now_ts
+                        engine_label = str(meta.get("engine") or "MANUAL").upper()
+                        if engine_label in ("", "UNKNOWN"):
+                            engine_label = "MANUAL"
+                        alert_key = "manual_entry_alerted_short"
+                        if engine_label == "MANUAL" and not st.get(alert_key):
+                            sl_pct = er.AUTO_EXIT_SHORT_SL_PCT
+                            sl_price = er._fmt_price_safe(entry_price, sl_pct, side="SHORT")
+                            er._send_entry_alert(
+                                er.send_telegram,
+                                side="SHORT",
+                                symbol=symbol,
+                                engine=engine_label,
+                                entry_price=entry_price,
+                                usdt=None,
+                                reason="manual_entry",
+                                live=True,
+                                order_info="(manage-ws)",
+                                entry_order_id=entry_order_id,
+                                sl=sl_price,
+                                tp=None,
+                            )
+                            st[alert_key] = True
+                        state[symbol] = st
             if long_amt > 0:
                 st["long_pos_seen_ts"] = now_ts
             if short_amt > 0:

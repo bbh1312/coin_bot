@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import ccxt
 
@@ -101,6 +101,19 @@ def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
     return (last_price - ema_val) / atr_val
 
 
+def _d1_dist_atr(df, last_price: float, cfg: SwaggyConfig) -> Optional[float]:
+    if df.empty or len(df) < max(cfg.d1_ema_len, cfg.d1_atr_len) + 2:
+        return None
+    ema_series = ema(df["close"], cfg.d1_ema_len)
+    if ema_series.empty:
+        return None
+    ema_val = float(ema_series.iloc[-1])
+    atr_val = atr(df, cfg.d1_atr_len)
+    if atr_val <= 0:
+        return None
+    return abs(last_price - ema_val) / atr_val
+
+
 def main() -> None:
     args = parse_args()
     if args.sl_pct <= 0:
@@ -184,6 +197,8 @@ def main() -> None:
     open_trades: Dict[tuple[str, str], Dict[str, object]] = {}
     overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
     d1_block_by_key: Dict[tuple[str, str], int] = {}
+    last_close_by_sym: Dict[str, float] = {}
+    last_ts_by_sym: Dict[str, int] = {}
 
     with open(log_path, "a", encoding="utf-8") as log_fp:
         run_line = f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms}"
@@ -198,6 +213,12 @@ def main() -> None:
             df_htf = data_by_sym[sym][sw_cfg.tf_htf]
             df_htf2 = data_by_sym[sym][sw_cfg.tf_htf2]
             df_d1 = data_by_sym[sym][sw_cfg.tf_d1]
+            if not df_ltf.empty:
+                try:
+                    last_close_by_sym[sym] = float(df_ltf.iloc[-1]["close"])
+                    last_ts_by_sym[sym] = int(df_ltf.iloc[-1]["ts"])
+                except Exception:
+                    pass
             for i in range(30, len(df_ltf)):
                 cur = df_ltf.iloc[i]
                 ts_ms = int(cur["ts"])
@@ -353,9 +374,10 @@ def main() -> None:
                 if not signal.entry_ok or not side or entry_px is None:
                     continue
 
+                d1_dist = _d1_dist_atr(d1d, float(entry_px), sw_cfg) if isinstance(entry_px, (int, float)) else None
                 entry_line = (
                     "ENTRY ts=%d sym=%s side=%s mode=%s sw_ok=%s sw_strength=%.3f sw_reasons=%s "
-                    "base_usdt=%.2f final_usdt=%.2f policy_action=%s"
+                    "base_usdt=%.2f final_usdt=%.2f policy_action=%s d1_dist_atr=%s"
                     % (
                         ts_ms,
                         sym,
@@ -367,6 +389,7 @@ def main() -> None:
                         bt_cfg.base_usdt,
                         bt_cfg.base_usdt,
                         "NO_ATLAS",
+                        "N/A" if d1_dist is None else f"{d1_dist:.4f}",
                     )
                 )
                 log_fp.write(entry_line + "\n")
@@ -376,7 +399,7 @@ def main() -> None:
                 sym_state["overext_blocked"] = False
                 _append_backtest_entry_log(
                     "engine=swaggy_no_atlas mode=%s symbol=%s side=%s entry=%.6g "
-                    "final_usdt=%.2f sw_strength=%.3f sw_reasons=%s policy_action=%s"
+                    "final_usdt=%.2f sw_strength=%.3f sw_reasons=%s policy_action=%s d1_dist_atr=%s"
                     % (
                         mode_name,
                         sym,
@@ -386,6 +409,7 @@ def main() -> None:
                         float(signal.strength or 0.0),
                         ",".join(signal.reasons or []),
                         "NO_ATLAS",
+                        "N/A" if d1_dist is None else f"{d1_dist:.4f}",
                     )
                 )
                 broker.enter(
@@ -650,6 +674,28 @@ def main() -> None:
             line = f"[BACKTEST] TOTAL block=D1_EMA7_DIST count={total_blocks}"
             print(line)
             _append_backtest_log(line)
+    if open_trades:
+        for (_mode, _sym), open_trade in sorted(open_trades.items(), key=lambda x: (x[0][0], x[0][1])):
+            entry_px = open_trade.get("entry_price")
+            side = (open_trade.get("side") or "").upper()
+            last_px = last_close_by_sym.get(_sym)
+            last_ts = last_ts_by_sym.get(_sym)
+            last_dt = ""
+            if isinstance(last_ts, (int, float)) and last_ts > 0:
+                last_dt = datetime.fromtimestamp(float(last_ts) / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            unrealized = None
+            if isinstance(entry_px, (int, float)) and isinstance(last_px, (int, float)) and entry_px > 0:
+                if side == "SHORT":
+                    unrealized = (float(entry_px) - float(last_px)) / float(entry_px) * 100.0
+                else:
+                    unrealized = (float(last_px) - float(entry_px)) / float(entry_px) * 100.0
+            entry_disp = f"{float(entry_px):.6g}" if isinstance(entry_px, (int, float)) else "N/A"
+            last_disp = f"{float(last_px):.6g}" if isinstance(last_px, (int, float)) else "N/A"
+            pnl_disp = f"{float(unrealized):.2f}%" if isinstance(unrealized, (int, float)) else "N/A"
+            print(
+                "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_px=%s last_px=%s last_dt=%s unrealized_pct=%s"
+                % (_sym, open_trade.get("mode"), side or "N/A", entry_disp, last_disp, last_dt or "N/A", pnl_disp)
+            )
 
 
 if __name__ == "__main__":
