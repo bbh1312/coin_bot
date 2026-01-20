@@ -485,6 +485,30 @@ def _send_entry_alert(
     reason_disp = reason if (reason and str(reason).strip()) else "N/A"
     lines.append(f"사유: {reason_disp}")
     send_alert("\n".join(lines))
+    if dbrec:
+        try:
+            dbrec.record_event(
+                symbol=symbol,
+                side=side_key,
+                event_type="ALERT_ENTRY",
+                source="engine_runner",
+                qty=None,
+                avg_entry=entry_price,
+                price=None,
+                meta={
+                    "engine": engine,
+                    "reason": reason_disp,
+                    "entry_price": entry_price,
+                    "entry_usdt": usdt,
+                    "entry_order_id": entry_order_id,
+                    "sl": sl_disp,
+                    "tp": tp_disp,
+                    "live": live,
+                    "order_info": order_info,
+                },
+            )
+        except Exception:
+            pass
 
 
 def _compute_impulse_metrics(symbol: str) -> Optional[dict]:
@@ -7034,6 +7058,54 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                 reply_chat_id = chat_id
                 def _reply(msg: str) -> bool:
                     return send_telegram(msg, allow_early=True, chat_id=reply_chat_id)
+                def _build_positions_message() -> str:
+                    try:
+                        refresh_positions_cache(force=True)
+                    except Exception:
+                        pass
+                    pos_map = executor_mod._POS_ALL_CACHE.get("positions_by_symbol") if executor_mod else None
+                    pos_map = pos_map or {}
+                    open_trades = [tr for tr in (_get_trade_log(state) or []) if tr.get("status") == "open"]
+                    engine_by_key = {}
+                    for tr in open_trades:
+                        sym = tr.get("symbol")
+                        side = (tr.get("side") or "").upper()
+                        if not sym or not side:
+                            continue
+                        engine = tr.get("engine_label") or (tr.get("meta") or {}).get("engine") or (tr.get("meta") or {}).get("reason")
+                        if engine:
+                            engine_by_key[(sym, side)] = engine
+                    rows = []
+                    sym_col = 0
+                    eng_col = 0
+                    for sym, positions in pos_map.items():
+                        if not positions:
+                            continue
+                        for p in positions:
+                            try:
+                                size = executor_mod._position_size_abs(p)
+                            except Exception:
+                                size = 0.0
+                            if not size:
+                                continue
+                            side = "LONG" if executor_mod._is_long_position(p) else "SHORT" if executor_mod._is_short_position(p) else "UNKNOWN"
+                            engine = engine_by_key.get((sym, side), "UNKNOWN")
+                            base = (sym or "").replace("/USDT:USDT", "")
+                            sym_col = max(sym_col, len(base))
+                            eng_col = max(eng_col, len(str(engine)))
+                            tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
+                            rows.append((base, side, engine, tp_pct, sl_pct))
+                    lines = [f"ℹ️ positions total={len(rows)}"]
+                    if not rows:
+                        lines.append("none")
+                    else:
+                        for base, side, engine, tp_pct, sl_pct in sorted(rows, key=lambda r: (r[2], r[0], r[1])):
+                            tp_str = f"{tp_pct:.2f}%" if isinstance(tp_pct, (int, float)) else "N/A"
+                            sl_str = f"{sl_pct:.2f}%" if isinstance(sl_pct, (int, float)) else "N/A"
+                            lines.append(
+                                f"{base.ljust(sym_col)}  {side.ljust(5)}  {str(engine).ljust(eng_col)}  tp={tp_str} sl={sl_str}"
+                            )
+                    return "\n".join(lines)
 
                 lower = text.lower()
                 if "status" in lower:
@@ -7131,53 +7203,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         responded = True
 
                 if cmd in ("/positions", "/pos", "positions", "pos") and not responded:
-                    try:
-                        refresh_positions_cache(force=True)
-                    except Exception:
-                        pass
-                    pos_map = executor_mod._POS_ALL_CACHE.get("positions_by_symbol") if executor_mod else None
-                    pos_map = pos_map or {}
-                    open_trades = [tr for tr in (_get_trade_log(state) or []) if tr.get("status") == "open"]
-                    engine_by_key = {}
-                    for tr in open_trades:
-                        sym = tr.get("symbol")
-                        side = (tr.get("side") or "").upper()
-                        if not sym or not side:
-                            continue
-                        engine = tr.get("engine_label") or (tr.get("meta") or {}).get("engine") or (tr.get("meta") or {}).get("reason")
-                        if engine:
-                            engine_by_key[(sym, side)] = engine
-                    rows = []
-                    sym_col = 0
-                    eng_col = 0
-                    for sym, positions in pos_map.items():
-                        if not positions:
-                            continue
-                        for p in positions:
-                            try:
-                                size = executor_mod._position_size_abs(p)
-                            except Exception:
-                                size = 0.0
-                            if not size:
-                                continue
-                            side = "LONG" if executor_mod._is_long_position(p) else "SHORT" if executor_mod._is_short_position(p) else "UNKNOWN"
-                            engine = engine_by_key.get((sym, side), "UNKNOWN")
-                            base = (sym or "").replace("/USDT:USDT", "")
-                            sym_col = max(sym_col, len(base))
-                            eng_col = max(eng_col, len(str(engine)))
-                            tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
-                            rows.append((base, side, engine, tp_pct, sl_pct))
-                    lines = [f"ℹ️ positions total={len(rows)}"]
-                    if not rows:
-                        lines.append("none")
-                    else:
-                        for base, side, engine, tp_pct, sl_pct in sorted(rows, key=lambda r: (r[2], r[0], r[1])):
-                            tp_str = f"{tp_pct:.2f}%" if isinstance(tp_pct, (int, float)) else "N/A"
-                            sl_str = f"{sl_pct:.2f}%" if isinstance(sl_pct, (int, float)) else "N/A"
-                            lines.append(
-                                f"{base.ljust(sym_col)}  {side.ljust(5)}  {str(engine).ljust(eng_col)}  tp={tp_str} sl={sl_str}"
-                            )
-                    ok = _reply("\n".join(lines))
+                    ok = _reply(_build_positions_message())
                     print(f"[telegram] positions cmd 처리 send={'ok' if ok else 'fail'}")
                     responded = True
 
@@ -7258,7 +7284,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/div15m_short(추가진입): {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n"
                             "--------------\n"
                             "/report(리포트): /report today|yesterday|YYYY-MM-DD\n"
-                            f"open positions: {open_pos} (over_limit={over_limit})"
+                            f"open positions: {open_pos} (over_limit={over_limit})\n"
+                            "--------------\n"
+                            f"{_build_positions_message()}"
                         )
                     except Exception as e:
                         print(f"[telegram] status build error: {e}")
@@ -7317,7 +7345,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/div15m_short(추가진입): {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n"
                         "--------------\n"
                         "/report(리포트): /report today|yesterday|YYYY-MM-DD\n"
-                        f"open positions: {open_pos} (over_limit={over_limit})"
+                        f"open positions: {open_pos} (over_limit={over_limit})\n"
+                        "--------------\n"
+                        f"{_build_positions_message()}"
                     )
                     ok = _reply(status_msg)
                     print(f"[telegram] status cmd fallback send={'ok' if ok else 'fail'}")
@@ -8865,19 +8895,23 @@ def run():
         if SWAGGY_NO_ATLAS_ENABLED and SwaggyNoAtlasConfig:
             swaggy_no_atlas_cfg = SwaggyNoAtlasConfig()
 
-            structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
-            if STRUCTURE_TOP_N:
-                structure_candidates = structure_candidates[:STRUCTURE_TOP_N]
-            _prefetch_ohlcv_for_cycle(
-                structure_candidates,
-                exchange,
-                {"15m": 120, "4h": 120},
-                label="structure-pre",
-                ttl_by_tf={"4h": TTL_4H_SEC},
+            atlas_enabled_any = bool(
+                ATLAS_FABIO_ENABLED or SWAGGY_ATLAS_LAB_ENABLED or ATLAS_RS_FAIL_SHORT_ENABLED
             )
-            for s in structure_candidates:
-                if _ema_align_ok(s, "15m", 120) or _ema_align_ok(s, "4h", 120):
-                    universe_structure.append(s)
+            if atlas_enabled_any:
+                structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
+                if STRUCTURE_TOP_N:
+                    structure_candidates = structure_candidates[:STRUCTURE_TOP_N]
+                _prefetch_ohlcv_for_cycle(
+                    structure_candidates,
+                    exchange,
+                    {"15m": 120, "4h": 120},
+                    label="structure-pre",
+                    ttl_by_tf={"4h": TTL_4H_SEC},
+                )
+                for s in structure_candidates:
+                    if _ema_align_ok(s, "15m", 120) or _ema_align_ok(s, "4h", 120):
+                        universe_structure.append(s)
 
         dtfx_universe = []
         if DTFX_ENABLED and dtfx_engine and dtfx_cfg and EngineContext:
@@ -9111,11 +9145,18 @@ def run():
 
         # cycle ts debug moved earlier (after prefetch plan)
 
-        do_prefetch = bool(heavy_scan)
-        print(f"[prefetch] cycle={cycle_label}")
+        prefetch_enabled = bool(
+            heavy_scan
+            and (
+                ATLAS_FABIO_ENABLED
+                or SWAGGY_ATLAS_LAB_ENABLED
+                or ATLAS_RS_FAIL_SHORT_ENABLED
+            )
+        )
+        print(f"[prefetch] cycle={cycle_label} enabled={'Y' if prefetch_enabled else 'N'}")
         fast_momentum = [s for s in fast_symbols if s in universe_momentum]
         fast_structure = [s for s in fast_symbols if s in universe_structure]
-        if do_prefetch:
+        if prefetch_enabled:
             print(f"[prefetch-fast] total={len(fast_symbols)} {fast_symbols}")
             print(f"[prefetch-fast] momentum={len(fast_momentum)} {fast_momentum}")
             print(f"[prefetch-fast] structure={len(fast_structure)} {fast_structure}")
@@ -9123,7 +9164,7 @@ def run():
         mid_skipped = len(slow_symbols)
         mid_stats = {"symbols": len(slow_symbols), "tfs": list(mid_plan.keys()), "fetched": 0, "failed": 0, "fresh_hits": {}}
         slow_stats = {"symbols": len(slow_symbols), "tfs": list(slow_plan.keys()), "fetched": 0, "failed": 0, "fresh_hits": {}, "fetched_by_tf": {}}
-        if do_prefetch:
+        if prefetch_enabled:
             mid_skipped = 0
             force_mid = bool(cycle_ts and cycle_ts != last_cycle_ts)
             if force_mid or cycle_count % MID_TF_PREFETCH_EVERY_N == 0:

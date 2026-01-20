@@ -71,6 +71,8 @@ def parse_args():
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
+    parser.add_argument("--last-day-entry", choices=["on", "off"], default="on")
+    parser.add_argument("--last-day-entry-days", type=int, default=1)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -199,6 +201,12 @@ def main() -> None:
     d1_block_by_key: Dict[tuple[str, str], int] = {}
     last_close_by_sym: Dict[str, float] = {}
     last_ts_by_sym: Dict[str, int] = {}
+    last_day_entry_days = int(args.last_day_entry_days or 1)
+    if last_day_entry_days < 1:
+        last_day_entry_days = 1
+    last_day_start_ms = end_ms - last_day_entry_days * 24 * 60 * 60 * 1000
+    last_day_exits_by_mode: Dict[str, int] = {}
+    last_day_entry = str(args.last_day_entry or "on").lower()
 
     with open(log_path, "a", encoding="utf-8") as log_fp:
         run_line = f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms}"
@@ -306,6 +314,8 @@ def main() -> None:
                                 "atlas_shadow_reasons": trade.atlas_shadow_reasons,
                             }
                         )
+                        if isinstance(trade.exit_ts, (int, float)) and trade.exit_ts >= last_day_start_ms:
+                            last_day_exits_by_mode[mode_name] = last_day_exits_by_mode.get(mode_name, 0) + 1
                         log_fp.write(
                             f"EXIT ts={trade.exit_ts} sym={sym} pnl_usdt={pnl_usdt:.4f} "
                             f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars}\n"
@@ -372,6 +382,8 @@ def main() -> None:
                     continue
 
                 if not signal.entry_ok or not side or entry_px is None:
+                    continue
+                if last_day_entry == "off" and ts_ms >= last_day_start_ms:
                     continue
 
                 d1_dist = _d1_dist_atr(d1d, float(entry_px), sw_cfg) if isinstance(entry_px, (int, float)) else None
@@ -626,9 +638,10 @@ def main() -> None:
             avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
             label = f"TOTAL@{mode}" if multi_mode else "TOTAL"
+            last_day_exits = last_day_exits_by_mode.get(mode, 0)
             total_lines.append(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d"
                 % (
                     label,
                     entries,
@@ -642,6 +655,7 @@ def main() -> None:
                     avg_mfe,
                     avg_mae,
                     avg_hold,
+                    last_day_exits,
                 )
             )
             for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
@@ -665,7 +679,7 @@ def main() -> None:
         if multi_mode:
             total_lines.append(
                 "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d"
                 % (
                     total_entries,
                     total_exits,
@@ -678,6 +692,7 @@ def main() -> None:
                     total_avg_mfe,
                     total_avg_mae,
                     total_avg_hold,
+                    sum(last_day_exits_by_mode.values()),
                 )
             )
         if args.verbose and d1_block_by_key:
