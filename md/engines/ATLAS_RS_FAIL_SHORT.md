@@ -104,3 +104,11 @@ Atlas 게이트는 `compute_global_gate()` + `compute_atlas_local()` 결과로 �
 - HTF/MTF 별도 게이트는 없음 (LTF 단일 로직)
 - `size_mult`는 현재 1.0 고정
 - 실제 주문 실행 전에는 공통 게이트(포지션 중복/락/최대포지션/실주문 ON/OFF 등)가 추가로 적용됨
+
+## 백테스트 로그 (atlas_rs_fail_short)
+- 경로: `logs/atlas_rs_fail_short/backtest/backtest_YYYYMMDD.log`
+- 로그 특성: 날짜별 파일 생성
+- 심볼 요약 아래에 아래 항목이 출력됨
+  - `[BACKTEST][OPEN]` 미청산 진입(OPEN) 정보
+  - `[BACKTEST][EXIT]` 청산 완료 정보 (entry_dt/exit_dt 포함)
+- 정렬: OPEN/EXIT 로그는 entry_dt 기준 내림차순으로 출력

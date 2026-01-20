@@ -164,7 +164,7 @@ def run_backtest(
     block_counts: Dict[str, Dict[str, int]] = {}
     eval_counts: Dict[str, int] = {}
     stats_map: Dict[str, Dict[str, float]] = {}
-    trade_logs: Dict[str, List[str]] = {}
+    trade_logs: Dict[str, List[dict]] = {}
     trades: Dict[str, Optional[dict]] = {}
     reentry_until: Dict[str, float] = {}
     idx_ref = -1
@@ -248,8 +248,18 @@ def run_backtest(
             if exit_reason:
                 pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
                 trade_logs[symbol].append(
-                    "[BACKTEST][EXIT] symbol=%s entry_px=%.6g exit_px=%.6g reason=%s"
-                    % (symbol, trade["entry_px"], exit_px, exit_reason)
+                    {
+                        "entry_ts": trade.get("entry_ts") or 0,
+                        "line": "[BACKTEST][EXIT] symbol=%s entry_dt=%s exit_dt=%s entry_px=%.6g exit_px=%.6g reason=%s"
+                        % (
+                            symbol,
+                            trade.get("entry_dt"),
+                            datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            trade["entry_px"],
+                            exit_px,
+                            exit_reason,
+                        ),
+                    }
                 )
                 stats = stats_map[symbol]
                 stats["exits"] += 1
@@ -441,9 +451,6 @@ def run_backtest(
             "trigger_bits": tech.get("trigger_bits"),
         }
         stats_map[symbol]["entries"] += 1
-        trade_logs[symbol].append(
-            "[BACKTEST][ENTRY] symbol=%s entry_px=%.6g" % (symbol, sig.entry_price)
-        )
         st = state.get(symbol, {})
         if isinstance(st, dict):
             st["in_pos"] = True
@@ -461,19 +468,23 @@ def run_backtest(
             f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}",
             log_path,
         )
-        for line in trade_logs.get(symbol, []):
-            _log_summary(line, log_path)
+        entries = list(trade_logs.get(symbol, []))
         open_trade = trades.get(symbol)
         if isinstance(open_trade, dict):
-            _log_summary(
-                "[BACKTEST][OPEN] symbol=%s entry_px=%.6g entry_dt=%s"
-                % (
-                    symbol,
-                    open_trade.get("entry_px") or 0.0,
-                    open_trade.get("entry_dt") or "",
-                ),
-                log_path,
+            entries.append(
+                {
+                    "entry_ts": open_trade.get("entry_ts") or 0,
+                    "line": "[BACKTEST][OPEN] symbol=%s entry_px=%.6g entry_dt=%s"
+                    % (
+                        symbol,
+                        open_trade.get("entry_px") or 0.0,
+                        open_trade.get("entry_dt") or "",
+                    ),
+                }
             )
+        entries.sort(key=lambda item: item.get("entry_ts") or 0, reverse=True)
+        for entry in entries:
+            _log_summary(entry.get("line", ""), log_path)
         eval_count = eval_counts.get(symbol, 0)
         if eval_count:
             for reason, count in sorted(block_counts[symbol].items(), key=lambda x: x[1], reverse=True):

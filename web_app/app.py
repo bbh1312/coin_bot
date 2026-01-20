@@ -186,6 +186,10 @@ def status():
     for item in COMMAND_DEFS:
         key = item["key"]
         value = state.get(key)
+        if item.get("type") == "toggle" and not isinstance(value, bool):
+            value = None
+        if item.get("type") in ("number", "int") and not isinstance(value, (int, float)):
+            value = None
         if value is None and key in DEFAULTS:
             value = DEFAULTS[key]
         payload[key] = value

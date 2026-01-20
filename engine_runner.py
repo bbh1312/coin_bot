@@ -6296,6 +6296,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         state["_atlas_rs_fail_short_enabled"] = False
     if isinstance(state.get("_atlas_rs_fail_short_universe"), dict):
         state["_atlas_rs_fail_short_universe"] = []
+    if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
+        state["_swaggy_no_atlas_enabled"] = False
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global ENGINE_EXIT_OVERRIDES
     global ENGINE_EXIT_OVERRIDES
@@ -8336,6 +8338,8 @@ def run():
         PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
     else:
         state["_pumpfade_enabled"] = PUMPFADE_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
+        state["_swaggy_no_atlas_enabled"] = False
     if isinstance(state.get("_atlas_rs_fail_short_enabled"), dict):
         state["_atlas_rs_fail_short_enabled"] = False
     if isinstance(state.get("_atlas_rs_fail_short_universe"), dict):
