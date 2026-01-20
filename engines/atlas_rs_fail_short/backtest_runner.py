@@ -351,6 +351,22 @@ def run_backtest(
             str(tech.get("trigger_bits") or ""),
         ]
         _append_line(out_decisions, ",".join(decision_row))
+        if reason == "TRIGGER_BLOCK_WICK_MACD_ONLY" and log_path:
+            _log_file(
+                "[BACKTEST][BLOCKED] symbol=%s dt=%s close=%s ema20=%s atr=%s rsi=%s trigger=%s risk_tags=%s block_reason=%s"
+                % (
+                    symbol,
+                    dt,
+                    str(tech.get("close") or ""),
+                    str(tech.get("ema20") or ""),
+                    str(tech.get("atr") or ""),
+                    str(tech.get("rsi") or ""),
+                    str(tech.get("trigger_bits") or ""),
+                    _fmt_tags(meta.get("risk_tags") if isinstance(meta.get("risk_tags"), list) else None),
+                    reason,
+                ),
+                log_path,
+            )
         if not sig.entry_ready or sig.entry_price is None:
             continue
         if reentry_minutes and reentry_minutes > 0:
