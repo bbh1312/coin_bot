@@ -8342,8 +8342,8 @@ def run():
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     swaggy_atlas_lab_engine = SwaggyAtlasLabEngine() if SwaggyAtlasLabEngine else None
     swaggy_no_atlas_engine = SwaggyNoAtlasEngine() if SwaggyNoAtlasEngine else None
-    atlas_engine = AtlasEngine() if AtlasEngine else None
-    atlas_swaggy_cfg = AtlasSwaggyConfig() if AtlasSwaggyConfig else None
+    atlas_engine = None
+    atlas_swaggy_cfg = None
     global rsi_engine
     rsi_engine = RsiEngine() if RsiEngine else None
     _maybe_reload_rsi_config()
@@ -8957,7 +8957,14 @@ def run():
         cached_ex = CachedExchange(exchange)
         cached_long_ex = CachedExchange(exchange)
 
-        atlas_cfg = atlas_fabio_engine.Config() if (heavy_scan and ATLAS_FABIO_ENABLED and atlas_fabio_engine) else None
+        atlas_cfg = None
+        if (ATLAS_FABIO_ENABLED or SWAGGY_ATLAS_LAB_ENABLED or ATLAS_RS_FAIL_SHORT_ENABLED):
+            if not atlas_engine and AtlasEngine:
+                atlas_engine = AtlasEngine()
+            if not atlas_swaggy_cfg and AtlasSwaggyConfig:
+                atlas_swaggy_cfg = AtlasSwaggyConfig()
+        if ATLAS_FABIO_ENABLED and atlas_fabio_engine and heavy_scan:
+            atlas_cfg = atlas_fabio_engine.Config()
         fabio_cfg_atlas = None
         fabio_cfg_atlas_mid = None
         if atlas_cfg and fabio_entry_engine:
