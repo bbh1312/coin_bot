@@ -1870,6 +1870,36 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "MANUAL"
     return "UNKNOWN"
 
+def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
+    label = (engine_label or "").upper()
+    if label == "SWAGGY_ATLAS_LAB":
+        return "swaggy_atlas_lab"
+    if label == "SWAGGY_NO_ATLAS":
+        return "swaggy_no_atlas"
+    if label == "SWAGGY":
+        return "swaggy_long" if side == "LONG" else "swaggy_short"
+    if label == "ATLASFABIO":
+        return "atlasfabio_long" if side == "LONG" else "atlasfabio_short"
+    if label == "FABIO":
+        return "fabio_long" if side == "LONG" else "fabio_short"
+    if label == "DIV15M_LONG":
+        return "div15m_long"
+    if label == "DIV15M_SHORT":
+        return "div15m_short"
+    if label == "PUMPFADE":
+        return "pumpfade_short"
+    if label == "ATLAS_RS_FAIL_SHORT":
+        return "atlas_rs_fail_short"
+    if label == "DTFX":
+        return "dtfx_long" if side == "LONG" else "dtfx_short"
+    if label == "RSI":
+        return "short_entry"
+    if label == "SCALP":
+        return "long_entry"
+    if label == "MANUAL":
+        return "manual_entry"
+    return None
+
 def _display_engine_label(label: Optional[str]) -> str:
     name = (label or "").strip() or "UNKNOWN"
     overrides = {
@@ -5404,6 +5434,23 @@ def _detect_position_events(state: dict, send_telegram) -> None:
         pos_syms = list_open_position_symbols(force=True)
     except Exception:
         return
+    def _recent_entry_event(symbol: str, side: str, now_ts: float, window_sec: float = 180.0) -> Optional[dict]:
+        report_date = _report_day_str(now_ts)
+        _by_id, by_symbol = _load_entry_events_map(report_date)
+        recs = by_symbol.get((symbol, side)) or []
+        if not recs:
+            return None
+        recs = sorted(recs, key=lambda r: float(r.get("entry_ts") or 0.0), reverse=True)
+        for rec in recs:
+            ts_val = rec.get("entry_ts")
+            if not isinstance(ts_val, (int, float)):
+                continue
+            if (now_ts - float(ts_val)) > window_sec:
+                continue
+            engine = str(rec.get("engine") or "").upper()
+            if engine and engine not in ("UNKNOWN", "MANUAL"):
+                return rec
+        return None
     snap = state.setdefault("_pos_snapshot", {})
     now = time.time()
     def _handle(symbol: str, side: str, detail: Optional[dict]) -> None:
@@ -5436,6 +5483,23 @@ def _detect_position_events(state: dict, send_telegram) -> None:
             qty = None
         if prev_qty is None and qty is not None:
             if not managed:
+                recent = _recent_entry_event(symbol, side, now)
+                if isinstance(recent, dict):
+                    engine_label = str(recent.get("engine") or "").upper()
+                    reason = _reason_from_engine_label(engine_label, side)
+                    entry_price = avg_entry if isinstance(avg_entry, (int, float)) else recent.get("entry_price")
+                    _log_trade_entry(
+                        state,
+                        side=side,
+                        symbol=symbol,
+                        entry_ts=float(recent.get("entry_ts") or now),
+                        entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+                        qty=qty if isinstance(qty, (int, float)) else None,
+                        usdt=None,
+                        entry_order_id=recent.get("entry_order_id"),
+                        meta={"reason": reason, "engine": engine_label} if reason else {"engine": engine_label},
+                    )
+                    return
                 _record_position_event(symbol, side, "ENTRY", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
                 changed = True
                 _send_entry_alert(
