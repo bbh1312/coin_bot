@@ -1237,6 +1237,11 @@ def _run_swaggy_no_atlas_cycle(
             df_1d if isinstance(df_1d, pd.DataFrame) else pd.DataFrame(),
             now_ts,
         )
+        _get_swaggy_no_atlas_last_signal(state)[symbol] = {
+            "ts": now_ts,
+            "entry_ok": bool(signal.entry_ok),
+            "side": str(signal.side or "").upper(),
+        }
         new_phase = swaggy_no_atlas_engine._state.get(symbol, {}).get("phase")
         if prev_phase != new_phase and new_phase:
             _append_swaggy_no_atlas_log(
@@ -1695,6 +1700,51 @@ def _clear_dca_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
     for key in list(cache.keys()):
         if str(key).startswith(prefix):
             cache.pop(key, None)
+
+def _get_swaggy_no_atlas_last_signal(state: Dict[str, dict]) -> Dict[str, dict]:
+    cache = state.get("_swaggy_no_atlas_last_signal")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_swaggy_no_atlas_last_signal"] = cache
+    return cache
+
+def _swaggy_no_atlas_entry_ok_for_dca(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    now_ts: float,
+    max_age_sec: float = 30.0,
+) -> bool:
+    cache = _get_swaggy_no_atlas_last_signal(state)
+    sig = cache.get(symbol) if isinstance(cache, dict) else None
+    if not isinstance(sig, dict):
+        return False
+    ts = float(sig.get("ts", 0.0) or 0.0)
+    if ts <= 0 or (now_ts - ts) > max_age_sec:
+        return False
+    if not sig.get("entry_ok"):
+        return False
+    sig_side = str(sig.get("side") or "").upper()
+    return sig_side == str(side or "").upper()
+
+def _with_dca_threshold_override(first_pct: float, second_pct: float, third_pct: float, func):
+    if not executor_mod:
+        return func()
+    prev_first = getattr(executor_mod, "DCA_FIRST_PCT", None)
+    prev_second = getattr(executor_mod, "DCA_SECOND_PCT", None)
+    prev_third = getattr(executor_mod, "DCA_THIRD_PCT", None)
+    executor_mod.DCA_FIRST_PCT = float(first_pct)
+    executor_mod.DCA_SECOND_PCT = float(second_pct)
+    executor_mod.DCA_THIRD_PCT = float(third_pct)
+    try:
+        return func()
+    finally:
+        if prev_first is not None:
+            executor_mod.DCA_FIRST_PCT = prev_first
+        if prev_second is not None:
+            executor_mod.DCA_SECOND_PCT = prev_second
+        if prev_third is not None:
+            executor_mod.DCA_THIRD_PCT = prev_third
 
 def _manage_pending_key(symbol: str, side: str) -> str:
     return f"{symbol}|{side.upper()}"
@@ -6129,11 +6179,43 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         state[sym] = st
 
         adds_done = int(st.get("dca_adds_short", st.get("dca_adds", 0)))
-        dca_res = dca_short_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
+        open_tr = _get_open_trade(state, "SHORT", sym)
+        engine_label = _engine_label_from_reason(
+            (open_tr.get("meta") or {}).get("reason") if open_tr else None
+        )
+        use_swaggy_override = engine_label == "SWAGGY_NO_ATLAS"
+        if engine_label == "SWAGGY_NO_ATLAS":
+            if not _swaggy_no_atlas_entry_ok_for_dca(state, sym, "SHORT", now):
+                continue
+        if use_swaggy_override:
+            dca_res = _with_dca_threshold_override(
+                20.0,
+                30.0,
+                40.0,
+                lambda: dca_short_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE),
+            )
+        else:
+            dca_res = dca_short_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
         if dca_res.get("status") not in ("skip", "warn"):
             if not _dca_alerted(state, sym, "SHORT", adds_done + 1):
                 st["dca_adds_short"] = adds_done + 1
                 state[sym] = st
+                qty = dca_res.get("amount") or (dca_res.get("order") or {}).get("amount")
+                _record_position_event(
+                    sym,
+                    "SHORT",
+                    "DCA",
+                    engine_label or "AUTO",
+                    qty if isinstance(qty, (int, float)) else None,
+                    dca_res.get("entry") if isinstance(dca_res.get("entry"), (int, float)) else None,
+                    dca_res.get("mark") if isinstance(dca_res.get("mark"), (int, float)) else None,
+                    {
+                        "engine": engine_label or "AUTO",
+                        "adds_done": adds_done + 1,
+                        "dca_usdt": dca_res.get("dca_usdt"),
+                        "source": "manage_dca",
+                    },
+                )
                 send_telegram(
                     f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
                 )
@@ -6334,11 +6416,43 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 st["manage_eval_long_ts"] = now
                 state[sym] = st
                 adds_done = int(st.get("dca_adds_long", st.get("dca_adds", 0)))
-                dca_res = dca_long_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
+                open_tr = _get_open_trade(state, "LONG", sym)
+                engine_label = _engine_label_from_reason(
+                    (open_tr.get("meta") or {}).get("reason") if open_tr else None
+                )
+                use_swaggy_override = engine_label == "SWAGGY_NO_ATLAS"
+                if engine_label == "SWAGGY_NO_ATLAS":
+                    if not _swaggy_no_atlas_entry_ok_for_dca(state, sym, "LONG", now):
+                        continue
+                if use_swaggy_override:
+                    dca_res = _with_dca_threshold_override(
+                        20.0,
+                        30.0,
+                        40.0,
+                        lambda: dca_long_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE),
+                    )
+                else:
+                    dca_res = dca_long_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
                 if dca_res.get("status") not in ("skip", "warn"):
                     if not _dca_alerted(state, sym, "LONG", adds_done + 1):
                         st["dca_adds_long"] = adds_done + 1
                         state[sym] = st
+                        qty = dca_res.get("amount") or (dca_res.get("order") or {}).get("amount")
+                        _record_position_event(
+                            sym,
+                            "LONG",
+                            "DCA",
+                            engine_label or "AUTO",
+                            qty if isinstance(qty, (int, float)) else None,
+                            dca_res.get("entry") if isinstance(dca_res.get("entry"), (int, float)) else None,
+                            dca_res.get("mark") if isinstance(dca_res.get("mark"), (int, float)) else None,
+                            {
+                                "engine": engine_label or "AUTO",
+                                "adds_done": adds_done + 1,
+                                "dca_usdt": dca_res.get("dca_usdt"),
+                                "source": "manage_dca",
+                            },
+                        )
                         send_telegram(
                             f"➕ <b>DCA</b> {sym} LONG adds {adds_done}->{adds_done+1} "
                             f"mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
@@ -7259,6 +7373,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                             f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                             f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
+                            f"/swaggy_no_atlas dca: 20/30/40 (entry_ok<=30s)\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                             f"/engine_exit: {_format_engine_exit_overrides()}\n"
@@ -7320,6 +7435,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                         f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
+                        f"/swaggy_no_atlas dca: 20/30/40 (entry_ok<=30s)\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                         f"/engine_exit: {_format_engine_exit_overrides()}\n"
