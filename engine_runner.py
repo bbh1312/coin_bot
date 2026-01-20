@@ -1688,7 +1688,7 @@ def _enqueue_entry_request(
     alert_reason: Optional[str] = None,
     entry_price_hint: Optional[float] = None,
     size_mult: Optional[float] = None,
-    notify: bool = True,
+    notify: bool = False,
 ) -> Optional[str]:
     if _is_manage_pending(state, symbol, side):
         _append_entry_gate_log(engine.lower(), symbol, f"pending_request side={side}", side=side)
@@ -7101,9 +7101,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         engine = tr.get("engine_label") or (tr.get("meta") or {}).get("engine") or (tr.get("meta") or {}).get("reason")
                         if engine:
                             engine_by_key[(sym, side)] = engine
-                    lines = ["ℹ️ positions"]
                     rows = []
                     sym_col = 0
+                    eng_col = 0
                     for sym, positions in pos_map.items():
                         if not positions:
                             continue
@@ -7118,12 +7118,19 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             engine = engine_by_key.get((sym, side), "UNKNOWN")
                             base = (sym or "").replace("/USDT:USDT", "")
                             sym_col = max(sym_col, len(base))
-                            rows.append((base, side, engine))
+                            eng_col = max(eng_col, len(str(engine)))
+                            tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
+                            rows.append((base, side, engine, tp_pct, sl_pct))
+                    lines = [f"ℹ️ positions total={len(rows)}"]
                     if not rows:
                         lines.append("none")
                     else:
-                        for base, side, engine in sorted(rows, key=lambda r: (r[2], r[0], r[1])):
-                            lines.append(f"{base.ljust(sym_col)}  {side.ljust(5)}  {engine}")
+                        for base, side, engine, tp_pct, sl_pct in sorted(rows, key=lambda r: (r[2], r[0], r[1])):
+                            tp_str = f"{tp_pct:.2f}%" if isinstance(tp_pct, (int, float)) else "N/A"
+                            sl_str = f"{sl_pct:.2f}%" if isinstance(sl_pct, (int, float)) else "N/A"
+                            lines.append(
+                                f"{base.ljust(sym_col)}  {side.ljust(5)}  {str(engine).ljust(eng_col)}  tp={tp_str} sl={sl_str}"
+                            )
                     ok = _reply("\n".join(lines))
                     print(f"[telegram] positions cmd 처리 send={'ok' if ok else 'fail'}")
                     responded = True

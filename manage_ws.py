@@ -8,6 +8,7 @@ WebSocket 기반 관리 모듈(테스트용).
 import time
 import os
 import json
+from datetime import datetime
 from typing import Optional
 
 from env_loader import load_env
@@ -19,6 +20,7 @@ import engine_runner as er
 import db_reconcile as dbrecon
 
 _ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
+_ENTRY_EVENTS_BY_SYMBOL_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_TTL_SEC = 5.0
 
 
@@ -61,6 +63,118 @@ def _get_entry_event_engine(entry_order_id: Optional[str]) -> Optional[str]:
     _ENTRY_EVENTS_CACHE["mtime"] = float(mtime or 0.0)
     _ENTRY_EVENTS_CACHE["map"] = entry_map
     return entry_map.get(str(entry_order_id), {}).get("engine")
+
+
+def _get_entry_events_by_symbol(now_ts: Optional[float] = None) -> dict:
+    date_tag = time.strftime("%Y-%m-%d")
+    path = os.path.join("logs", "entry", f"entry_events-{date_tag}.log")
+    legacy = os.path.join("logs", "entry_events.log")
+    use_path = path if os.path.exists(path) else legacy
+    try:
+        mtime = os.path.getmtime(use_path) if os.path.exists(use_path) else 0.0
+    except Exception:
+        mtime = 0.0
+    now = now_ts if isinstance(now_ts, (int, float)) else time.time()
+    cached = _ENTRY_EVENTS_BY_SYMBOL_CACHE
+    if (
+        cached.get("map")
+        and (now - float(cached.get("ts", 0.0) or 0.0)) <= _ENTRY_EVENTS_TTL_SEC
+        and float(cached.get("mtime", 0.0) or 0.0) == float(mtime or 0.0)
+    ):
+        return cached["map"]
+    _, by_symbol = er._load_entry_events_map(None)
+    _ENTRY_EVENTS_BY_SYMBOL_CACHE["ts"] = now
+    _ENTRY_EVENTS_BY_SYMBOL_CACHE["mtime"] = float(mtime or 0.0)
+    _ENTRY_EVENTS_BY_SYMBOL_CACHE["map"] = by_symbol
+    return by_symbol
+
+
+def _load_entry_events_map_local() -> tuple[dict, dict]:
+    by_id = {}
+    by_symbol = {}
+    paths: list[str] = []
+    entry_dir = os.path.join("logs", "entry")
+    if os.path.isdir(entry_dir):
+        try:
+            for name in sorted(os.listdir(entry_dir)):
+                if name.startswith("entry_events-") and name.endswith(".log"):
+                    paths.append(os.path.join(entry_dir, name))
+        except Exception:
+            pass
+    legacy_path = os.path.join("logs", "entry_events.log")
+    if os.path.exists(legacy_path):
+        paths.append(legacy_path)
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except Exception:
+                        continue
+                    entry_ts = payload.get("entry_ts")
+                    entry_ts_val = None
+                    if isinstance(entry_ts, (int, float)):
+                        entry_ts_val = float(entry_ts)
+                    elif isinstance(entry_ts, str):
+                        try:
+                            entry_ts_val = datetime.strptime(entry_ts, "%Y-%m-%d %H:%M:%S").timestamp()
+                        except Exception:
+                            entry_ts_val = None
+                    if entry_ts_val is None:
+                        continue
+                    entry_id = payload.get("entry_order_id")
+                    symbol = payload.get("symbol") or ""
+                    side = (payload.get("side") or "").upper()
+                    engine = payload.get("engine") or "unknown"
+                    record = {
+                        "entry_ts": entry_ts_val,
+                        "entry_order_id": entry_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "engine": engine,
+                        "entry_price": payload.get("entry_price"),
+                    }
+                    if entry_id:
+                        by_id[str(entry_id)] = record
+                    if symbol and side:
+                        by_symbol.setdefault((symbol, side), []).append(record)
+        except Exception:
+            continue
+    return by_id, by_symbol
+
+
+def _get_recent_entry_event(symbol: str, side: str, now_ts: Optional[float] = None, window_sec: float = 2592000.0) -> Optional[dict]:
+    if not symbol or not side:
+        return None
+    by_symbol = _get_entry_events_by_symbol(now_ts)
+    key = (symbol, (side or "").upper())
+    recs = by_symbol.get(key) if isinstance(by_symbol, dict) else None
+    if not recs:
+        return None
+    now_ts = now_ts if isinstance(now_ts, (int, float)) else time.time()
+    best = None
+    best_ts = 0.0
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        ts_val = rec.get("entry_ts")
+        if not isinstance(ts_val, (int, float)):
+            continue
+        if (now_ts - float(ts_val)) > window_sec:
+            continue
+        eng = str(rec.get("engine") or "").upper()
+        if not eng or eng in ("UNKNOWN", "MANUAL"):
+            continue
+        if float(ts_val) >= best_ts:
+            best = rec
+            best_ts = float(ts_val)
+    return best
 
 
 def _last_ws_close(symbol: str):
@@ -272,6 +386,147 @@ def _trade_engine_label(tr: Optional[dict]) -> str:
     return "UNKNOWN"
 
 
+def _find_entry_event_for_trade(symbol: str, side: str, entry_ts: Optional[float] = None, now_ts: Optional[float] = None, window_sec: float = 2592000.0) -> Optional[dict]:
+    if not symbol or not side:
+        return None
+    now_ts = now_ts if isinstance(now_ts, (int, float)) else time.time()
+    by_symbol = _get_entry_events_by_symbol(now_ts)
+    key = (symbol, (side or "").upper())
+    recs = by_symbol.get(key) if isinstance(by_symbol, dict) else None
+    if not recs:
+        _, by_symbol = er._load_entry_events_map(None)
+        _ENTRY_EVENTS_BY_SYMBOL_CACHE["ts"] = now_ts
+        _ENTRY_EVENTS_BY_SYMBOL_CACHE["mtime"] = _ENTRY_EVENTS_BY_SYMBOL_CACHE.get("mtime", 0.0)
+        _ENTRY_EVENTS_BY_SYMBOL_CACHE["map"] = by_symbol
+        recs = by_symbol.get(key) if isinstance(by_symbol, dict) else None
+    if not recs:
+        return None
+    best = None
+    best_gap = None
+    entry_ts_val = float(entry_ts) if isinstance(entry_ts, (int, float)) else None
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        rec_ts = rec.get("entry_ts")
+        if not isinstance(rec_ts, (int, float)):
+            continue
+        eng = str(rec.get("engine") or "").upper()
+        if not eng or eng in ("UNKNOWN", "MANUAL"):
+            continue
+        if entry_ts_val is not None:
+            gap = abs(float(rec_ts) - entry_ts_val)
+            if gap > window_sec:
+                continue
+            if best_gap is None or gap < best_gap:
+                best = rec
+                best_gap = gap
+        else:
+            if (now_ts - float(rec_ts)) > 7 * 24 * 3600:
+                continue
+            if best is None or float(rec_ts) > float(best.get("entry_ts") or 0.0):
+                best = rec
+    return best
+
+
+def _backfill_engine_labels_from_entry_events(state: dict, window_sec: float = 2592000.0) -> None:
+    log = er._get_trade_log(state)
+    if not isinstance(log, list):
+        return
+    entry_map, by_symbol = _load_entry_events_map_local()
+    now_ts = time.time()
+    for tr in log:
+        if not isinstance(tr, dict):
+            continue
+        if tr.get("status") != "open":
+            continue
+        cur_label = _trade_engine_label(tr)
+        if cur_label not in ("UNKNOWN", "MANUAL"):
+            continue
+        symbol = tr.get("symbol")
+        side = (tr.get("side") or "").upper()
+        if not symbol or side not in ("LONG", "SHORT"):
+            continue
+        entry_order_id = tr.get("entry_order_id")
+        rec = entry_map.get(str(entry_order_id)) if entry_order_id else None
+        if not isinstance(rec, dict):
+            recs = by_symbol.get((symbol, side)) if isinstance(by_symbol, dict) else None
+            best = None
+            best_gap = None
+            entry_ts = tr.get("entry_ts")
+            entry_ts_val = float(entry_ts) if isinstance(entry_ts, (int, float)) else None
+            if recs:
+                for cand in recs:
+                    if not isinstance(cand, dict):
+                        continue
+                    eng = str(cand.get("engine") or "").upper()
+                    if not eng or eng in ("UNKNOWN", "MANUAL"):
+                        continue
+                    cand_ts = cand.get("entry_ts")
+                    if not isinstance(cand_ts, (int, float)):
+                        continue
+                    if entry_ts_val is not None:
+                        gap = abs(float(cand_ts) - entry_ts_val)
+                        if gap > window_sec:
+                            continue
+                        if best_gap is None or gap < best_gap:
+                            best = cand
+                            best_gap = gap
+                    else:
+                        if (now_ts - float(cand_ts)) > 7 * 24 * 3600:
+                            continue
+                        if best is None or float(cand_ts) > float(best.get("entry_ts") or 0.0):
+                            best = cand
+            rec = best
+        if not isinstance(rec, dict):
+            continue
+        eng = str(rec.get("engine") or "").upper()
+        if not eng or eng in ("UNKNOWN", "MANUAL"):
+            continue
+        tr["engine_label"] = eng
+        meta = tr.get("meta") if isinstance(tr.get("meta"), dict) else {}
+        reason = _reason_from_engine_label(eng, side)
+        if reason:
+            meta["reason"] = reason
+        meta["engine"] = eng
+        tr["meta"] = meta
+        if not tr.get("entry_order_id") and rec.get("entry_order_id"):
+            tr["entry_order_id"] = rec.get("entry_order_id")
+            st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+            if not isinstance(st, dict):
+                st = {}
+            st[f"entry_order_id_{side.lower()}"] = rec.get("entry_order_id")
+            state[symbol] = st
+
+
+def _maybe_update_open_trade_engine(state: dict, symbol: str, side: str, now_ts: float) -> None:
+    open_tr = er._get_open_trade(state, side, symbol)
+    if not isinstance(open_tr, dict):
+        return
+    cur_label = _trade_engine_label(open_tr)
+    if cur_label not in ("UNKNOWN", "MANUAL"):
+        return
+    rec = _find_entry_event_for_trade(symbol, side, entry_ts=open_tr.get("entry_ts"), now_ts=now_ts)
+    if not isinstance(rec, dict):
+        return
+    eng = str(rec.get("engine") or "").upper()
+    if not eng or eng in ("UNKNOWN", "MANUAL"):
+        return
+    open_tr["engine_label"] = eng
+    meta = open_tr.get("meta") if isinstance(open_tr.get("meta"), dict) else {}
+    reason = _reason_from_engine_label(eng, side)
+    if reason:
+        meta["reason"] = reason
+    meta["engine"] = eng
+    open_tr["meta"] = meta
+    if not open_tr.get("entry_order_id") and rec.get("entry_order_id"):
+        open_tr["entry_order_id"] = rec.get("entry_order_id")
+        st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+        if not isinstance(st, dict):
+            st = {}
+        st[f"entry_order_id_{side.lower()}"] = rec.get("entry_order_id")
+        state[symbol] = st
+
+
 def _within_auto_exit_grace(state: dict, symbol: str, side: str, now_ts: float) -> bool:
     open_tr = er._get_open_trade(state, side, symbol)
     entry_ts = None
@@ -307,7 +562,7 @@ def _recent_auto_exit_disk(symbol: str, now_ts: float) -> bool:
     return (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
 
 
-def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
+def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: Optional[float] = None):
     open_tr = er._get_open_trade(state, "LONG", symbol)
     if not open_tr:
         return
@@ -326,14 +581,23 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
     st = state.get(symbol, {})
     seen_ts = st.get("long_pos_seen_ts") if isinstance(st, dict) else None
     # WS 감지 기반 수동 청산은 최근 확인 여부와 무관하게 알림
+    exit_reason = "manual_close"
+    entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
+    tp_pct, sl_pct = er._get_engine_exit_thresholds(_trade_engine_label(open_tr), "LONG")
+    if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
+        profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
+        if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
+            exit_reason = "auto_exit_tp"
+        elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
+            exit_reason = "auto_exit_sl"
     er._close_trade(
         state,
         side="LONG",
         symbol=symbol,
         exit_ts=now_ts,
-        exit_price=None,
+        exit_price=mark_px if isinstance(mark_px, (int, float)) else None,
         pnl_usdt=None,
-        reason="manual_close",
+        reason=exit_reason,
     )
     try:
         er._record_position_event(
@@ -354,22 +618,25 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True):
     st["dca_adds"] = 0
     st["dca_adds_long"] = 0
     st["dca_adds_short"] = 0
+    st["last_exit_ts"] = now_ts
+    st["last_exit_reason"] = exit_reason
     state[symbol] = st
     if report_ok:
         er._update_report_csv(open_tr)
     print(f"[manage-ws] long_manual_close sym={symbol} engine={engine_label}")
     order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
     order_line = f"{order_block}\n" if order_block else ""
+    reason_label = "TP" if exit_reason == "auto_exit_tp" else "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
     er.send_telegram(
         f"{er.EXIT_ICON} <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
-        f"사유: MANUAL\n"
+        f"사유: {reason_label}\n"
         f"{order_line}".rstrip()
     )
 
 
-def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
+def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: Optional[float] = None):
     open_tr = er._get_open_trade(state, "SHORT", symbol)
     if not open_tr:
         return
@@ -388,14 +655,23 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
     st = state.get(symbol, {})
     seen_ts = st.get("short_pos_seen_ts") if isinstance(st, dict) else None
     # WS 감지 기반 수동 청산은 최근 확인 여부와 무관하게 알림
+    exit_reason = "manual_close"
+    entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
+    tp_pct, sl_pct = er._get_engine_exit_thresholds(_trade_engine_label(open_tr), "SHORT")
+    if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
+        profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
+        if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
+            exit_reason = "auto_exit_tp"
+        elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
+            exit_reason = "auto_exit_sl"
     er._close_trade(
         state,
         side="SHORT",
         symbol=symbol,
         exit_ts=now_ts,
-        exit_price=None,
+        exit_price=mark_px if isinstance(mark_px, (int, float)) else None,
         pnl_usdt=None,
-        reason="manual_close",
+        reason=exit_reason,
     )
     try:
         er._record_position_event(
@@ -416,17 +692,20 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True):
     st["dca_adds"] = 0
     st["dca_adds_long"] = 0
     st["dca_adds_short"] = 0
+    st["last_exit_ts"] = now_ts
+    st["last_exit_reason"] = exit_reason
     state[symbol] = st
     if report_ok:
         er._update_report_csv(open_tr)
     print(f"[manage-ws] short_manual_close sym={symbol} engine={engine_label}")
     order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
     order_line = f"{order_block}\n" if order_block else ""
+    reason_label = "TP" if exit_reason == "auto_exit_tp" else "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
     er.send_telegram(
         f"🔴 <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
-        f"사유: MANUAL\n"
+        f"사유: {reason_label}\n"
         f"{order_line}".rstrip()
     )
 
@@ -731,6 +1010,7 @@ def main():
         er._reconcile_long_trades(state, cached_long_ex, tickers)
         er._reconcile_short_trades(state, tickers)
         er._detect_position_events(state, lambda *args, **kwargs: None)
+        _backfill_engine_labels_from_entry_events(state)
         er.save_state(state)
         print("[manage-ws] startup sync complete")
     except Exception as e:
@@ -819,12 +1099,24 @@ def main():
             st = state.get(symbol, {}) if isinstance(state, dict) else {}
             prev_long_amt = float(last_amt.get((symbol, "long"), 0.0) or 0.0)
             prev_short_amt = float(last_amt.get((symbol, "short"), 0.0) or 0.0)
+            _maybe_update_open_trade_engine(state, symbol, "LONG", now_ts)
+            _maybe_update_open_trade_engine(state, symbol, "SHORT", now_ts)
             if long_amt > 0:
                 open_tr = er._get_open_trade(state, "LONG", symbol)
                 if not open_tr:
                     detail = executor_mod.get_long_position_detail(symbol) or {}
                     entry_price = detail.get("entry") if isinstance(detail, dict) else None
                     qty = detail.get("qty") if isinstance(detail, dict) else None
+                    meta = {"reason": "manual_entry"}
+                    entry_order_id = None
+                    recent = _get_recent_entry_event(symbol, "LONG", now_ts=now_ts)
+                    if isinstance(recent, dict):
+                        eng = str(recent.get("engine") or "").upper()
+                        reason = _reason_from_engine_label(eng, "LONG")
+                        if reason:
+                            meta["reason"] = reason
+                        meta["engine"] = eng
+                        entry_order_id = recent.get("entry_order_id")
                     er._log_trade_entry(
                         state,
                         side="LONG",
@@ -833,7 +1125,8 @@ def main():
                         entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
                         qty=qty if isinstance(qty, (int, float)) else None,
                         usdt=None,
-                        meta={"reason": "manual_entry"},
+                        entry_order_id=entry_order_id,
+                        meta=meta,
                     )
                     st["in_pos"] = True
                     st["last_entry"] = now_ts
@@ -843,6 +1136,16 @@ def main():
                     detail = executor_mod.get_short_position_detail(symbol) or {}
                     entry_price = detail.get("entry") if isinstance(detail, dict) else None
                     qty = detail.get("qty") if isinstance(detail, dict) else None
+                    meta = {"reason": "manual_entry"}
+                    entry_order_id = None
+                    recent = _get_recent_entry_event(symbol, "SHORT", now_ts=now_ts)
+                    if isinstance(recent, dict):
+                        eng = str(recent.get("engine") or "").upper()
+                        reason = _reason_from_engine_label(eng, "SHORT")
+                        if reason:
+                            meta["reason"] = reason
+                        meta["engine"] = eng
+                        entry_order_id = recent.get("entry_order_id")
                     er._log_trade_entry(
                         state,
                         side="SHORT",
@@ -851,7 +1154,8 @@ def main():
                         entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
                         qty=qty if isinstance(qty, (int, float)) else None,
                         usdt=None,
-                        meta={"reason": "manual_entry"},
+                        entry_order_id=entry_order_id,
+                        meta=meta,
                     )
                     st["in_pos"] = True
                     st["last_entry"] = now_ts
@@ -860,9 +1164,23 @@ def main():
             if short_amt > 0:
                 st["short_pos_seen_ts"] = now_ts
             if prev_long_amt > 0 and long_amt <= 0:
-                _manual_close_long(state, symbol, now_ts, report_ok=True)
+                try:
+                    executor_mod.refresh_positions_cache(force=True)
+                    if executor_mod.get_long_position_amount(symbol) > 0:
+                        long_amt = executor_mod.get_long_position_amount(symbol)
+                except Exception:
+                    pass
+                if long_amt <= 0:
+                    _manual_close_long(state, symbol, now_ts, report_ok=True, mark_px=_last_ws_close(symbol))
             if prev_short_amt > 0 and short_amt <= 0:
-                _manual_close_short(state, symbol, now_ts, report_ok=True)
+                try:
+                    executor_mod.refresh_positions_cache(force=True)
+                    if executor_mod.get_short_position_amount(symbol) > 0:
+                        short_amt = executor_mod.get_short_position_amount(symbol)
+                except Exception:
+                    pass
+                if short_amt <= 0:
+                    _manual_close_short(state, symbol, now_ts, report_ok=True, mark_px=_last_ws_close(symbol))
             state[symbol] = st
             last_amt[(symbol, "long")] = float(long_amt or 0.0)
             last_amt[(symbol, "short")] = float(short_amt or 0.0)

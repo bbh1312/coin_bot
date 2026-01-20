@@ -112,14 +112,12 @@ def main() -> None:
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     log_dir = os.path.join("logs", "swaggy_no_atlas", "backtest")
-    rep_dir = os.path.join("reports", "swaggy_no_atlas")
     ensure_dir(log_dir)
-    ensure_dir(rep_dir)
     log_path = os.path.join(log_dir, f"bt_{run_id}.log")
-    trades_path = os.path.join(rep_dir, f"trades_{run_id}.csv")
-    summary_path = os.path.join(rep_dir, f"summary_{run_id}.json")
-    shadow_path = os.path.join(rep_dir, f"shadow_{run_id}.json")
-    universe_path = os.path.join(rep_dir, f"universe_{run_id}.json")
+    trades_path = os.path.join(log_dir, f"trades_{run_id}.csv")
+    summary_path = os.path.join(log_dir, f"summary_{run_id}.json")
+    shadow_path = os.path.join(log_dir, f"shadow_{run_id}.json")
+    universe_path = os.path.join(log_dir, f"universe_{run_id}.json")
 
     bt_cfg = BacktestConfig(
         tp_pct=args.tp_pct,
