@@ -487,6 +487,7 @@ def main() -> None:
             trades_by_key.setdefault(key, []).append(t)
         total_by_mode: Dict[str, Dict[str, float]] = {}
         multi_mode = len({k[0] for k in stats_by_key.keys()}) > 1
+        total_lines: List[str] = []
         for (mode, sym), stats in stats_by_key.items():
             trades_count = int(stats.get("trades") or 0)
             entries = int(stats.get("entries") or 0)
@@ -604,7 +605,7 @@ def main() -> None:
             avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
             label = f"TOTAL@{mode}" if multi_mode else "TOTAL"
-            print(
+            total_lines.append(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
                 "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
                 % (
@@ -641,7 +642,7 @@ def main() -> None:
         total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
         total_avg_hold = (grand_total.get("hold_sum", 0.0) / total_trades) if total_trades else 0.0
         if multi_mode:
-            print(
+            total_lines.append(
                 "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
                 "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
                 % (
@@ -682,7 +683,9 @@ def main() -> None:
             last_ts = last_ts_by_sym.get(_sym)
             last_dt = ""
             if isinstance(last_ts, (int, float)) and last_ts > 0:
-                last_dt = datetime.fromtimestamp(float(last_ts) / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                last_dt = datetime.fromtimestamp(
+                    float(last_ts) / 1000.0, tz=timezone(timedelta(hours=9))
+                ).strftime("%Y-%m-%d %H:%M")
             unrealized = None
             if isinstance(entry_px, (int, float)) and isinstance(last_px, (int, float)) and entry_px > 0:
                 if side == "SHORT":
@@ -696,6 +699,9 @@ def main() -> None:
                 "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_px=%s last_px=%s last_dt=%s unrealized_pct=%s"
                 % (_sym, open_trade.get("mode"), side or "N/A", entry_disp, last_disp, last_dt or "N/A", pnl_disp)
             )
+    if stats_by_key:
+        for line in total_lines:
+            print(line)
 
 
 if __name__ == "__main__":
