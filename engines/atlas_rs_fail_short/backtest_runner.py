@@ -163,19 +163,13 @@ def run_backtest(
     symbol_data: Dict[str, List[list]] = {}
     block_counts: Dict[str, Dict[str, int]] = {}
     eval_counts: Dict[str, int] = {}
-    signal_logs: Dict[str, str] = {}
     stats_map: Dict[str, Dict[str, float]] = {}
+    trade_logs: Dict[str, List[str]] = {}
     trades: Dict[str, Optional[dict]] = {}
     reentry_until: Dict[str, float] = {}
     idx_ref = -1
 
     for symbol in symbols:
-        sym_tag = symbol.replace("/", "_").replace(":", "_")
-        signal_log_path = ""
-        if log_path:
-            base_dir = os.path.dirname(log_path)
-            signal_log_path = os.path.join(base_dir, f"signals_{sym_tag}.log")
-        signal_logs[symbol] = signal_log_path
         _log_file(
             f"[BACKTEST] Fetching {symbol} LTF={cfg.ltf_tf} from last {days} days",
             log_path,
@@ -186,6 +180,8 @@ def run_backtest(
             continue
         symbol_data[symbol] = ltf_raw
         stats_map[symbol] = {
+            "entries": 0,
+            "exits": 0,
             "trades": 0,
             "wins": 0,
             "losses": 0,
@@ -195,6 +191,7 @@ def run_backtest(
             "mae_sum": 0.0,
             "hold_sum": 0.0,
         }
+        trade_logs[symbol] = []
         block_counts[symbol] = {}
         eval_counts[symbol] = 0
         trades[symbol] = None
@@ -250,7 +247,12 @@ def run_backtest(
                 exit_px = trade["tp_px"]
             if exit_reason:
                 pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
+                trade_logs[symbol].append(
+                    "[BACKTEST][EXIT] symbol=%s entry_px=%.6g exit_px=%.6g reason=%s"
+                    % (symbol, trade["entry_px"], exit_px, exit_reason)
+                )
                 stats = stats_map[symbol]
+                stats["exits"] += 1
                 stats["trades"] += 1
                 if pnl_pct >= 0:
                     stats["wins"] += 1
@@ -267,18 +269,19 @@ def run_backtest(
                 hold_minutes = holding_bars * ltf_minutes
                 if log_path:
                     _log_file(
-                        "[BACKTEST] TRADE symbol=%s entry=%s exit=%s pnl_pct=%.4f hold_min=%.1f reason=%s"
-                        % (symbol, trade.get("entry_dt"), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                           pnl_pct, hold_minutes, exit_reason),
+                        "[BACKTEST][EXIT] symbol=%s entry_dt=%s exit_dt=%s entry_px=%.6g exit_px=%.6g "
+                        "pnl_pct=%.4f hold_min=%.1f reason=%s"
+                        % (
+                            symbol,
+                            trade.get("entry_dt"),
+                            datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            trade.get("entry_px") or 0.0,
+                            exit_px,
+                            pnl_pct,
+                            hold_minutes,
+                            exit_reason,
+                        ),
                         log_path,
-                    )
-                signal_log_path = signal_logs.get(symbol)
-                if signal_log_path:
-                    _log_file(
-                        "TRADE entry=%s exit=%s pnl_pct=%.4f hold_min=%.1f reason=%s"
-                        % (trade.get("entry_dt"), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                           pnl_pct, hold_minutes, exit_reason),
-                        signal_log_path,
                     )
                 _append_line(
                     out_trades,
@@ -385,19 +388,21 @@ def run_backtest(
                 ]
             ),
         )
-        signal_log_path = signal_logs.get(symbol)
-        if signal_log_path:
+        if log_path:
             _log_file(
-                "SIGNAL entry=%s entry_px=%.6g confirm=%s rsi=%s atr=%s trigger=%s"
+                "[BACKTEST][ENTRY] symbol=%s entry_dt=%s entry_px=%.6g sl_px=%.6g tp_px=%.6g confirm=%s rsi=%s atr=%s trigger=%s"
                 % (
+                    symbol,
                     dt,
                     float(sig.entry_price or 0.0),
+                    float(sig.entry_price or 0.0) * (1 + sl_pct),
+                    float(sig.entry_price or 0.0) * (1 - tp_pct),
                     str(tech.get("confirm_type") or ""),
                     str(tech.get("rsi") or ""),
                     str(tech.get("atr") or ""),
                     str(tech.get("trigger_bits") or ""),
                 ),
-                signal_log_path,
+                log_path,
             )
         trades[symbol] = {
             "entry_px": sig.entry_price,
@@ -419,6 +424,10 @@ def run_backtest(
             "high_minus_ema20": tech.get("high_minus_ema20"),
             "trigger_bits": tech.get("trigger_bits"),
         }
+        stats_map[symbol]["entries"] += 1
+        trade_logs[symbol].append(
+            "[BACKTEST][ENTRY] symbol=%s entry_px=%.6g" % (symbol, sig.entry_price)
+        )
         st = state.get(symbol, {})
         if isinstance(st, dict):
             st["in_pos"] = True
@@ -436,6 +445,19 @@ def run_backtest(
             f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}",
             log_path,
         )
+        for line in trade_logs.get(symbol, []):
+            _log_summary(line, log_path)
+        open_trade = trades.get(symbol)
+        if isinstance(open_trade, dict):
+            _log_summary(
+                "[BACKTEST][OPEN] symbol=%s entry_px=%.6g entry_dt=%s"
+                % (
+                    symbol,
+                    open_trade.get("entry_px") or 0.0,
+                    open_trade.get("entry_dt") or "",
+                ),
+                log_path,
+            )
         eval_count = eval_counts.get(symbol, 0)
         if eval_count:
             for reason, count in sorted(block_counts[symbol].items(), key=lambda x: x[1], reverse=True):
@@ -451,7 +473,11 @@ def main():
 
     base_dir = os.path.join("logs", "atlas_rs_fail_short", "backtest")
     os.makedirs(base_dir, exist_ok=True)
-    log_path = os.path.join(base_dir, os.path.basename(args.log_path)) if args.log_path else os.path.join(base_dir, "backtest.log")
+    date_tag = time.strftime("%Y%m%d")
+    if args.log_path:
+        log_path = os.path.join(base_dir, os.path.basename(args.log_path))
+    else:
+        log_path = os.path.join(base_dir, f"backtest_{date_tag}.log")
 
     cfg = AtlasRsFailShortConfig()
     if args.ltf and args.ltf != cfg.ltf_tf:
@@ -515,6 +541,8 @@ def main():
     )
 
     total = {
+        "entries": 0,
+        "exits": 0,
         "trades": 0,
         "wins": 0,
         "losses": 0,
@@ -552,7 +580,8 @@ def main():
     avg_mae = (total["mae_sum"] / total["trades"]) if total["trades"] > 0 else 0.0
     avg_hold = (total["hold_sum"] / total["trades"]) if total["trades"] > 0 else 0.0
     _log_summary(
-        f"[BACKTEST] total trades={total['trades']} wins={total['wins']} losses={total['losses']} "
+        f"[BACKTEST] total entries={total['entries']} exits={total['exits']} trades={total['trades']} "
+        f"wins={total['wins']} losses={total['losses']} "
         f"winrate={winrate:.2f}% tp={total['tp']} sl={total['sl']} "
         f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}",
         log_path,

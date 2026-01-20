@@ -5,6 +5,7 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Dict, List
 
 import ccxt
@@ -181,6 +182,8 @@ def main() -> None:
     mode_name = "no_atlas"
     trades: List[Dict] = []
     stats_by_key: Dict[tuple[str, str], Dict[str, float]] = {}
+    trade_logs: Dict[tuple[str, str], List[str]] = {}
+    open_trades: Dict[tuple[str, str], Dict[str, object]] = {}
     overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
     d1_block_by_key: Dict[tuple[str, str], int] = {}
 
@@ -295,6 +298,8 @@ def main() -> None:
                         stats = stats_by_key.setdefault(
                             key,
                             {
+                                "entries": 0,
+                                "exits": 0,
                                 "trades": 0,
                                 "wins": 0,
                                 "losses": 0,
@@ -306,6 +311,7 @@ def main() -> None:
                             },
                         )
                         stats["trades"] += 1
+                        stats["exits"] += 1
                         if pnl_pct >= 0:
                             stats["wins"] += 1
                         else:
@@ -317,6 +323,17 @@ def main() -> None:
                         stats["mfe_sum"] += trade.mfe
                         stats["mae_sum"] += abs(trade.mae)
                         stats["hold_sum"] += float(trade.bars) * ltf_minutes
+                        trade_logs.setdefault(key, []).append(
+                            "[BACKTEST][EXIT] sym=%s mode=%s side=%s entry_px=%.6g exit_px=%.6g reason=%s"
+                            % (
+                                sym,
+                                mode_name,
+                                trade.side,
+                                trade.entry_price,
+                                trade.exit_price or 0.0,
+                                trade.exit_reason,
+                            )
+                        )
                     continue
 
                 if not signal.entry_ok or not side or entry_px is None:
@@ -370,6 +387,35 @@ def main() -> None:
                     overext_dist_at_entry=dist_at_entry,
                     overext_blocked=overext_blocked,
                 )
+                stats = stats_by_key.setdefault(
+                    key,
+                    {
+                        "entries": 0,
+                        "exits": 0,
+                        "trades": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp": 0,
+                        "sl": 0,
+                        "mfe_sum": 0.0,
+                        "mae_sum": 0.0,
+                        "hold_sum": 0.0,
+                    },
+                )
+                stats["entries"] += 1
+                trade_logs.setdefault(key, []).append(
+                    "[BACKTEST][ENTRY] sym=%s mode=%s side=%s entry_px=%.6g"
+                    % (sym, mode_name, side, float(entry_px or 0.0))
+                )
+
+    for sym, trade in broker.positions.items():
+        open_trades[(mode_name, sym)] = {
+            "sym": sym,
+            "mode": mode_name,
+            "side": trade.side,
+            "entry_price": trade.entry_price,
+            "entry_ts": trade.entry_ts,
+        }
 
     write_trades_csv(trades_path, trades)
     summary = build_summary(run_id, trades)
@@ -407,6 +453,8 @@ def main() -> None:
         total_by_mode: Dict[str, Dict[str, float]] = {}
         for (mode, sym), stats in stats_by_key.items():
             trades_count = int(stats.get("trades") or 0)
+            entries = int(stats.get("entries") or 0)
+            exits = int(stats.get("exits") or 0)
             wins = int(stats.get("wins") or 0)
             losses = int(stats.get("losses") or 0)
             tp = int(stats.get("tp") or 0)
@@ -421,11 +469,13 @@ def main() -> None:
             short_wins = sum(1 for t in sym_trades if t.get("side") == "SHORT" and float(t.get("pnl_pct") or 0.0) > 0)
             short_losses = sum(1 for t in sym_trades if t.get("side") == "SHORT" and float(t.get("pnl_pct") or 0.0) <= 0)
             print(
-                "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
                 "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f "
                 "long_wins=%d long_losses=%d short_wins=%d short_losses=%d"
                 % (
                     f"{sym}@{mode}",
+                    entries,
+                    exits,
                     trades_count,
                     wins,
                     losses,
@@ -441,6 +491,24 @@ def main() -> None:
                     short_losses,
                 )
             )
+            for line in trade_logs.get((mode, sym), []):
+                print(line)
+            open_trade = open_trades.get((mode, sym))
+            if isinstance(open_trade, dict):
+                entry_dt = ""
+                entry_ts = open_trade.get("entry_ts")
+                if isinstance(entry_ts, (int, float)) and entry_ts > 0:
+                    entry_dt = datetime.fromtimestamp(entry_ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                print(
+                    "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_px=%.6g entry_dt=%s"
+                    % (
+                        open_trade.get("sym"),
+                        open_trade.get("mode"),
+                        open_trade.get("side"),
+                        float(open_trade.get("entry_price") or 0.0),
+                        entry_dt,
+                    )
+                )
             for t in trades_by_key.get((mode, sym), []):
                 hold_min = float(t.get("duration_bars") or 0) * ltf_minutes
                 pnl_pct = float(t.get("pnl_pct") or 0.0)
@@ -462,6 +530,8 @@ def main() -> None:
             mode_total = total_by_mode.setdefault(
                 mode,
                 {
+                    "entries": 0,
+                    "exits": 0,
                     "trades": 0,
                     "wins": 0,
                     "losses": 0,
@@ -476,7 +546,7 @@ def main() -> None:
                     "short_losses": 0,
                 },
             )
-            for key in ("trades", "wins", "losses", "tp", "sl"):
+            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
                 mode_total[key] += int(stats.get(key) or 0)
             mode_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
             mode_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
@@ -486,6 +556,8 @@ def main() -> None:
             mode_total["short_wins"] += short_wins
             mode_total["short_losses"] += short_losses
         grand_total = {
+            "entries": 0,
+            "exits": 0,
             "trades": 0,
             "wins": 0,
             "losses": 0,
@@ -501,6 +573,8 @@ def main() -> None:
         }
         for mode, stats in total_by_mode.items():
             trades_count = int(stats.get("trades") or 0)
+            entries = int(stats.get("entries") or 0)
+            exits = int(stats.get("exits") or 0)
             wins = int(stats.get("wins") or 0)
             losses = int(stats.get("losses") or 0)
             tp = int(stats.get("tp") or 0)
@@ -510,11 +584,13 @@ def main() -> None:
             avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
             print(
-                "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
                 "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f "
                 "long_wins=%d long_losses=%d short_wins=%d short_losses=%d"
                 % (
                     f"TOTAL@{mode}",
+                    entries,
+                    exits,
                     trades_count,
                     wins,
                     losses,
@@ -530,7 +606,7 @@ def main() -> None:
                     int(stats.get("short_losses") or 0),
                 )
             )
-            for key in ("trades", "wins", "losses", "tp", "sl"):
+            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
                 grand_total[key] += int(stats.get(key) or 0)
             grand_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
             grand_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
@@ -538,6 +614,8 @@ def main() -> None:
             for key in ("long_wins", "long_losses", "short_wins", "short_losses"):
                 grand_total[key] += int(stats.get(key) or 0)
         total_trades = int(grand_total.get("trades") or 0)
+        total_entries = int(grand_total.get("entries") or 0)
+        total_exits = int(grand_total.get("exits") or 0)
         total_wins = int(grand_total.get("wins") or 0)
         total_losses = int(grand_total.get("losses") or 0)
         total_tp = int(grand_total.get("tp") or 0)
@@ -547,10 +625,12 @@ def main() -> None:
         total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
         total_avg_hold = (grand_total.get("hold_sum", 0.0) / total_trades) if total_trades else 0.0
         print(
-            "[BACKTEST] TOTAL trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+            "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
             "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f "
             "long_wins=%d long_losses=%d short_wins=%d short_losses=%d"
             % (
+                total_entries,
+                total_exits,
                 total_trades,
                 total_wins,
                 total_losses,

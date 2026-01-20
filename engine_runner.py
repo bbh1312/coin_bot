@@ -5293,7 +5293,6 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
     engine = str(req.get("engine") or "").upper()
     if engine and not _is_engine_enabled(engine):
         _clear_manage_pending(state, symbol, side)
-        _append_entry_gate_log(engine.lower(), symbol, "engine_disabled", side=side)
         return False
     try:
         refresh_positions_cache(force=True)

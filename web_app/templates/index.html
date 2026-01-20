@@ -151,6 +151,11 @@
             width: 100%;
             max-width: 11rem;
         }
+        .form-row textarea {
+            width: 100%;
+            min-height: 18rem;
+            resize: vertical;
+        }
         #risk-controls .divider {
             border-top: 1px dashed var(--line);
             margin: 0.6rem 0;
@@ -218,7 +223,7 @@
             </div>
             <div class="card">
                 <h2>Engines</h2>
-                <div class="hint">실행 엔진을 ON/OFF 하세요.</div>
+                <div class="hint">실행 엔진을 ON/OFF 하고 엔진별 TP/SL을 설정하세요.</div>
                 <div id="engine-controls"></div>
             </div>
             <div class="card">
@@ -254,7 +259,6 @@
             "_auto_exit_long_sl_pct",
             "_auto_exit_short_tp_pct",
             "_auto_exit_short_sl_pct",
-            "_engine_exit_overrides",
             "divider",
             "_dca_pct",
             "_dca_first_pct",
@@ -329,7 +333,7 @@
             const wrap = document.createElement("div");
             wrap.className = "form-row";
             const input = document.createElement("textarea");
-            input.rows = 4;
+            input.rows = 16;
             input.placeholder = '{"ENGINE":{"LONG":{"tp":2,"sl":4},"SHORT":{"tp":3,"sl":5}}}';
             if (current && typeof current === "object") {
                 input.value = JSON.stringify(current, null, 2);
@@ -374,6 +378,11 @@
                     }
                 }
             });
+            const engineExitItem = commandByKey.get("_engine_exit_overrides");
+            if (engineExitItem) {
+                const row = buildJsonRow(engineExitItem, data[engineExitItem.key]);
+                engineControls.appendChild(row);
+            }
             riskOrder.forEach((key) => {
                 if (key === "divider") {
                     riskControls.appendChild(buildDividerRow());
