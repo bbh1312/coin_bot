@@ -5982,6 +5982,10 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
     for key in keys:
         if key in disk:
             state[key] = disk.get(key)
+    if isinstance(state.get("_atlas_rs_fail_short_enabled"), dict):
+        state["_atlas_rs_fail_short_enabled"] = False
+    if isinstance(state.get("_atlas_rs_fail_short_universe"), dict):
+        state["_atlas_rs_fail_short_universe"] = []
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global ENGINE_EXIT_OVERRIDES
     global ENGINE_EXIT_OVERRIDES
@@ -7967,6 +7971,10 @@ def run():
         PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
     else:
         state["_pumpfade_enabled"] = PUMPFADE_ENABLED
+    if isinstance(state.get("_atlas_rs_fail_short_enabled"), dict):
+        state["_atlas_rs_fail_short_enabled"] = False
+    if isinstance(state.get("_atlas_rs_fail_short_universe"), dict):
+        state["_atlas_rs_fail_short_universe"] = []
     if isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
         ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
     else:
@@ -8078,12 +8086,21 @@ def run():
         except Exception:
             pass
         if state.get("_pos_limit_reached") is True:
-            last_warn = float(state.get("_pos_limit_skip_ts", 0.0) or 0.0)
-            if (now - last_warn) >= 60:
-                print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
-                state["_pos_limit_skip_ts"] = now
-            time.sleep(5)
-            continue
+            verified = None
+            try:
+                verified = count_open_positions(force=True)
+            except Exception:
+                verified = None
+            if isinstance(verified, int) and verified < MAX_OPEN_POSITIONS:
+                state["_pos_limit_reached"] = False
+                state["_active_positions_total"] = int(verified)
+            else:
+                last_warn = float(state.get("_pos_limit_skip_ts", 0.0) or 0.0)
+                if (now - last_warn) >= 60:
+                    print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
+                    state["_pos_limit_skip_ts"] = now
+                time.sleep(5)
+                continue
         active_positions_state = sum(
             1 for st in state.values() if isinstance(st, dict) and st.get("in_pos")
         )
@@ -8099,12 +8116,20 @@ def run():
             else active_positions_state
         )
         if isinstance(active_positions_total_est, int) and active_positions_total_est >= MAX_OPEN_POSITIONS:
-            last_warn = float(state.get("_pos_limit_skip_ts", 0.0) or 0.0)
-            if (now - last_warn) >= 60:
-                print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
-                state["_pos_limit_skip_ts"] = now
-            time.sleep(5)
-            continue
+            verified = None
+            try:
+                verified = count_open_positions(force=True)
+            except Exception:
+                verified = None
+            if isinstance(verified, int) and verified < MAX_OPEN_POSITIONS:
+                state["_active_positions_total"] = int(verified)
+            else:
+                last_warn = float(state.get("_pos_limit_skip_ts", 0.0) or 0.0)
+                if (now - last_warn) >= 60:
+                    print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
+                    state["_pos_limit_skip_ts"] = now
+                time.sleep(5)
+                continue
 
         # cycle ts debug (BTC 15m, prev candle only)
         cycle_ts = None
