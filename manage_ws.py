@@ -22,6 +22,21 @@ _ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_TTL_SEC = 5.0
 
 
+def _coerce_state_int(val) -> int:
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        try:
+            return int(val)
+        except Exception:
+            return 0
+    if isinstance(val, dict):
+        for key in ("value", "offset", "id", "last"):
+            if key in val:
+                return _coerce_state_int(val.get(key))
+    return 0
+
+
 def _get_entry_event_engine(entry_order_id: Optional[str]) -> Optional[str]:
     if not entry_order_id:
         return None
@@ -127,7 +142,7 @@ def _drain_entry_events(state) -> None:
             return
         use_path = path if os.path.exists(path) else legacy_path
         offset_key = "_entry_event_offset" if use_path == path else "_entry_event_offset_legacy"
-        offset = int(state.get(offset_key, 0) or 0)
+        offset = _coerce_state_int(state.get(offset_key, 0))
         with open(use_path, "r", encoding="utf-8") as f:
             f.seek(offset)
             lines = f.readlines()
