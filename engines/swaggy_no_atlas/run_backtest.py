@@ -5,7 +5,7 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import ccxt
@@ -531,17 +531,38 @@ def main() -> None:
                 entry_ts = open_trade.get("entry_ts")
                 if isinstance(entry_ts, (int, float)) and entry_ts > 0:
                     entry_dt = datetime.fromtimestamp(entry_ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                entry_px = open_trade.get("entry_price")
+                side = (open_trade.get("side") or "").upper()
+                last_px = last_close_by_sym.get(sym)
+                last_ts = last_ts_by_sym.get(sym)
+                last_dt = ""
+                if isinstance(last_ts, (int, float)) and last_ts > 0:
+                    last_dt = datetime.fromtimestamp(float(last_ts) / 1000.0, tz=timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+                unrealized = None
+                if isinstance(entry_px, (int, float)) and isinstance(last_px, (int, float)) and entry_px > 0:
+                    if side == "SHORT":
+                        unrealized = (float(entry_px) - float(last_px)) / float(entry_px) * 100.0
+                    else:
+                        unrealized = (float(last_px) - float(entry_px)) / float(entry_px) * 100.0
+                last_disp = f"{float(last_px):.6g}" if isinstance(last_px, (int, float)) else "N/A"
+                pnl_disp = f"{float(unrealized):.2f}%" if isinstance(unrealized, (int, float)) else "N/A"
                 entries_list.append(
                     {
                         "entry_ts": entry_ts or 0,
-                        "line": "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s entry_px=%.6g"
+                        "line": "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s entry_px=%.6g "
+                        "last_px=%s last_dt=%s unrealized_pct=%s"
                         % (
                             open_trade.get("sym"),
                             open_trade.get("mode"),
                             open_trade.get("side"),
                             entry_dt,
                             "",
-                            float(open_trade.get("entry_price") or 0.0),
+                            float(entry_px or 0.0),
+                            last_disp,
+                            last_dt or "N/A",
+                            pnl_disp,
                         ),
                     }
                 )
@@ -675,30 +696,6 @@ def main() -> None:
             line = f"[BACKTEST] TOTAL block=D1_EMA7_DIST count={total_blocks}"
             print(line)
             _append_backtest_log(line)
-    if open_trades:
-        for (_mode, _sym), open_trade in sorted(open_trades.items(), key=lambda x: (x[0][0], x[0][1])):
-            entry_px = open_trade.get("entry_price")
-            side = (open_trade.get("side") or "").upper()
-            last_px = last_close_by_sym.get(_sym)
-            last_ts = last_ts_by_sym.get(_sym)
-            last_dt = ""
-            if isinstance(last_ts, (int, float)) and last_ts > 0:
-                last_dt = datetime.fromtimestamp(
-                    float(last_ts) / 1000.0, tz=timezone(timedelta(hours=9))
-                ).strftime("%Y-%m-%d %H:%M")
-            unrealized = None
-            if isinstance(entry_px, (int, float)) and isinstance(last_px, (int, float)) and entry_px > 0:
-                if side == "SHORT":
-                    unrealized = (float(entry_px) - float(last_px)) / float(entry_px) * 100.0
-                else:
-                    unrealized = (float(last_px) - float(entry_px)) / float(entry_px) * 100.0
-            entry_disp = f"{float(entry_px):.6g}" if isinstance(entry_px, (int, float)) else "N/A"
-            last_disp = f"{float(last_px):.6g}" if isinstance(last_px, (int, float)) else "N/A"
-            pnl_disp = f"{float(unrealized):.2f}%" if isinstance(unrealized, (int, float)) else "N/A"
-            print(
-                "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_px=%s last_px=%s last_dt=%s unrealized_pct=%s"
-                % (_sym, open_trade.get("mode"), side or "N/A", entry_disp, last_disp, last_dt or "N/A", pnl_disp)
-            )
     if stats_by_key:
         for line in total_lines:
             print(line)

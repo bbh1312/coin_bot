@@ -407,6 +407,20 @@ def _fmt_price_safe(entry_price: Any, sl_pct: Any, side: str = "LONG") -> str:
     except Exception:
         return "N/A"
 
+def _fmt_tp_price_safe(entry_price: Any, tp_pct: Any, side: str = "LONG") -> str:
+    try:
+        entry = float(entry_price)
+        pct = float(tp_pct) / 100.0
+        if entry <= 0 or pct <= 0:
+            return "N/A"
+        if side.upper() == "SHORT":
+            price = entry * (1.0 - pct)
+        else:
+            price = entry * (1.0 + pct)
+        return f"{price:.6g}"
+    except Exception:
+        return "N/A"
+
 def _fmt_entry_price(val: Any) -> str:
     try:
         return f"{float(val):.6g}"
@@ -454,8 +468,18 @@ def _send_entry_alert(
             lines.append(f"진입가≈{entry_disp} (USDT {usdt_disp})")
         else:
             lines.append(f"진입가≈{entry_disp}")
-    sl_disp = sl if sl else "N/A"
-    tp_disp = tp if tp else "N/A"
+    sl_disp = sl if sl else None
+    tp_disp = tp if tp else None
+    if (sl_disp is None or tp_disp is None) and entry_price is not None:
+        tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side_key)
+        if sl_disp is None:
+            sl_disp = _fmt_price_safe(entry_price, sl_pct, side=side_key)
+        if tp_disp is None:
+            tp_disp = _fmt_tp_price_safe(entry_price, tp_pct, side=side_key)
+    if not sl_disp:
+        sl_disp = "N/A"
+    if not tp_disp:
+        tp_disp = "N/A"
     lines.append(f"손절가={sl_disp} 익절가={tp_disp}")
     lines.append(f"엔진: {_display_engine_label(engine)}")
     reason_disp = reason if (reason and str(reason).strip()) else "N/A"
