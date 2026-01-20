@@ -35,10 +35,10 @@ Atlas 게이트 없이 Swaggy 시그널만으로 진입하는 경량 버전이�
 
 ## 6) 백테스트 실행
 
-백테스트는 Swaggy 단독(Atlas 미사용) 러너를 사용한다.
+백테스트는 Swaggy 단독(Atlas 미사용) 전용 러너를 사용한다.
 
 ```bash
-python3 -m engines.swaggy_atlas_lab.run_backtest_no_atlas \
+python3 -m engines.swaggy_no_atlas.run_backtest \
   --days 7 \
   --tp-pct 0.03 \
   --sl-pct 0.30 \
@@ -47,6 +47,6 @@ python3 -m engines.swaggy_atlas_lab.run_backtest_no_atlas \
 ```
 
 메모
-- `run_backtest_no_atlas`는 Atlas 관련 `--mode` 옵션을 지원하지 않는다.
-- 로그/리포트 경로는 `logs/swaggy_atlas_lab/backtest/`, `reports/swaggy_atlas_lab/`에 생성된다.
+- `run_backtest`는 Atlas 관련 `--mode` 옵션을 지원하지 않는다.
+- 로그/리포트 경로는 `logs/swaggy_no_atlas/backtest/`, `reports/swaggy_no_atlas/`에 생성된다.
 - 콘솔 출력 형식은 `md/engines/BACKTEST_CONSOLE_FORMAT.md` 지침을 따른다.

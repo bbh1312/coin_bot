@@ -229,6 +229,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
     label = (engine_label or "").upper()
     if label == "SWAGGY_ATLAS_LAB":
         return "swaggy_atlas_lab"
+    if label == "SWAGGY_NO_ATLAS":
+        return "swaggy_no_atlas"
     if label == "SWAGGY":
         return "swaggy_long" if side == "LONG" else "swaggy_short"
     if label == "ATLASFABIO":
