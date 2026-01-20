@@ -174,7 +174,8 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CHAT_ID_RUNTIME = CHAT_ID
 START_TIME = time.time()
 TELEGRAM_STARTUP_GRACE_SEC = 15.0
-EXIT_ICON = os.getenv("EXIT_ICON", "✅")
+EXIT_ICON = os.getenv("EXIT_ICON", "😄😄😄")
+EXIT_SL_ICON = os.getenv("EXIT_SL_ICON", "🚨🚨🚨")
 MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "14"))
 MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "600"))
 MANUAL_ALERT_TTL_SEC = float(os.getenv("MANUAL_ALERT_TTL_SEC", "3600"))
@@ -1905,7 +1906,7 @@ def _display_engine_label(label: Optional[str]) -> str:
     overrides = {
         "ATLAS_RS_FAIL_SHORT": "아틀라스 숏",
         "SWAGGY_ATLAS_LAB": "스웨기랩",
-        "SWAGGY_NO_ATLAS": "스웨기노아틀라스",
+        "SWAGGY_NO_ATLAS": "스웨기 단독",
         "ATLASFABIO": "파비오",
     }
     return overrides.get(name, name)
@@ -5345,8 +5346,9 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
             exit_tag = "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
             order_block = _format_order_id_block(tr.get("entry_order_id"), tr.get("exit_order_id"))
             order_line = f"{order_block}\n" if order_block else ""
+            icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
             send_telegram(
-                f"🔴 <b>숏 청산</b>\n"
+                f"{icon} <b>숏 청산</b>\n"
                 f"<b>{symbol}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
@@ -5880,8 +5882,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             ):
                 order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
                 order_line = f"{order_block}\n" if order_block else ""
+                icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
                 send_telegram(
-                    f"🔴 <b>숏 청산</b>\n"
+                    f"{icon} <b>숏 청산</b>\n"
                     f"<b>{sym}</b>\n"
                     f"엔진: {_display_engine_label(engine_label)}\n"
                     f"사유: {exit_tag}\n"
@@ -5997,8 +6000,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         exit_order_id,
                     )
                     order_line = f"{order_block}\n" if order_block else ""
+                    icon = EXIT_ICON if exit_tag == "TP" else EXIT_SL_ICON
                     send_telegram(
-                        f"{EXIT_ICON} <b>숏 청산</b>\n"
+                        f"{icon} <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
@@ -6056,8 +6060,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         exit_order_id,
                     )
                     order_line = f"{order_block}\n" if order_block else ""
+                    icon = EXIT_ICON if exit_tag == "TP" else EXIT_SL_ICON
                     send_telegram(
-                        f"🔴 <b>숏 청산</b>\n"
+                        f"{icon} <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
@@ -6263,7 +6268,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             )
             order_line = f"{order_block}\n" if order_block else ""
             send_telegram(
-                        f"{EXIT_ICON} <b>롱 청산</b>\n"
+                f"{EXIT_SL_ICON} <b>롱 청산</b>\n"
                 f"<b>{sym}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
@@ -6914,6 +6919,23 @@ def _coerce_state_int(val: object) -> int:
             if key in val:
                 return _coerce_state_int(val.get(key))
     return 0
+
+
+def _coerce_state_float(val: object) -> float:
+    if isinstance(val, bool):
+        return float(val)
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+    if isinstance(val, dict):
+        for key in ("value", "offset", "id", "last"):
+            if key in val:
+                return _coerce_state_float(val.get(key))
+    return 0.0
 
 def handle_telegram_commands(state: Dict[str, dict]) -> None:
     """텔레그램으로부터 런타임 명령을 받아 AUTO_EXIT 토글/상태를 제어한다.
@@ -8539,7 +8561,7 @@ def run():
                 state["_pos_limit_reached"] = False
                 state["_active_positions_total"] = int(verified)
             else:
-                last_warn = float(state.get("_pos_limit_skip_ts", 0.0) or 0.0)
+                last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
                 if (now - last_warn) >= 60:
                     print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
                     state["_pos_limit_skip_ts"] = now
@@ -8568,7 +8590,7 @@ def run():
             if isinstance(verified, int) and verified < MAX_OPEN_POSITIONS:
                 state["_active_positions_total"] = int(verified)
             else:
-                last_warn = float(state.get("_pos_limit_skip_ts", 0.0) or 0.0)
+                last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
                 if (now - last_warn) >= 60:
                     print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
                     state["_pos_limit_skip_ts"] = now

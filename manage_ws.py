@@ -627,8 +627,9 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
     order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
     order_line = f"{order_block}\n" if order_block else ""
     reason_label = "TP" if exit_reason == "auto_exit_tp" else "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
+    icon = er.EXIT_SL_ICON if reason_label == "SL" else er.EXIT_ICON
     er.send_telegram(
-        f"{er.EXIT_ICON} <b>롱 청산</b>\n"
+        f"{icon} <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: {reason_label}\n"
@@ -701,8 +702,9 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
     order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
     order_line = f"{order_block}\n" if order_block else ""
     reason_label = "TP" if exit_reason == "auto_exit_tp" else "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
+    icon = er.EXIT_SL_ICON if reason_label == "SL" else er.EXIT_ICON
     er.send_telegram(
-        f"🔴 <b>숏 청산</b>\n"
+        f"{icon} <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: {reason_label}\n"
@@ -888,7 +890,7 @@ def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
     )
     order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
-        f"{er.EXIT_ICON} <b>롱 청산</b>\n"
+        f"{er.EXIT_SL_ICON} <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: SL\n"
@@ -950,7 +952,7 @@ def _handle_short_sl(state, symbol, detail, mark_px, now_ts) -> bool:
     )
     order_line = f"{order_block}\n" if order_block else ""
     er.send_telegram(
-        f"🔴 <b>숏 청산</b>\n"
+        f"{er.EXIT_SL_ICON} <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: SL\n"
