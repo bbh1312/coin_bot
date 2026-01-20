@@ -638,7 +638,7 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
         exit_reason == "manual_close"
         and isinstance(last_exit_ts, (int, float))
         and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
-        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
+        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl", "manual_close")
     ):
         return
     if exit_reason == "manual_close" and _recent_auto_exit_disk(symbol, now_ts):
@@ -718,7 +718,7 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
         exit_reason == "manual_close"
         and isinstance(last_exit_ts, (int, float))
         and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
-        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
+        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl", "manual_close")
     ):
         return
     if exit_reason == "manual_close" and _recent_auto_exit_disk(symbol, now_ts):
