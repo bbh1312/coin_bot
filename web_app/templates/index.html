@@ -321,6 +321,31 @@
             return row;
         }
 
+        function buildTextRow(item, current) {
+            const row = document.createElement("div");
+            row.className = "toggle";
+            const label = document.createElement("div");
+            label.textContent = item.label;
+            const wrap = document.createElement("div");
+            wrap.className = "form-row";
+            const input = document.createElement("input");
+            input.type = "text";
+            if (current !== undefined && current !== null) {
+                input.value = current;
+            }
+            const btn = document.createElement("button");
+            btn.textContent = "Apply";
+            btn.addEventListener("click", async () => {
+                await sendCommand({ key: item.key, value: input.value });
+                await refreshStatus();
+            });
+            wrap.appendChild(input);
+            wrap.appendChild(btn);
+            row.appendChild(label);
+            row.appendChild(wrap);
+            return row;
+        }
+
         function buildDividerRow() {
             const divider = document.createElement("div");
             divider.className = "divider";
@@ -378,6 +403,10 @@
                     } else {
                         engineControls.appendChild(row);
                     }
+                }
+                if (item.type === "text") {
+                    const row = buildTextRow(item, current ?? "");
+                    engineControls.appendChild(row);
                 }
             });
             const engineExitItem = commandByKey.get("_engine_exit_overrides");

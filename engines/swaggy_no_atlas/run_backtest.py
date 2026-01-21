@@ -82,6 +82,8 @@ def parse_args():
     parser.add_argument("--d1-overext-atr", type=float, default=None)
     parser.add_argument("--last-day-entry", choices=["on", "off"], default="on")
     parser.add_argument("--last-day-entry-days", type=int, default=1)
+    parser.add_argument("--entry-windows", default="", help="off windows (HH[:MM]-HH[:MM], comma-separated, UTC by default)")
+    parser.add_argument("--entry-tz-offset", type=float, default=0.0, help="hours offset from UTC for entry windows (e.g. 9 for KST)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -114,6 +116,60 @@ def _parse_universe_arg(text: str) -> int:
         except Exception:
             return 50
     return 0
+
+
+def _parse_entry_windows(text: str) -> List[tuple[int, int]]:
+    windows: List[tuple[int, int]] = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" not in part:
+            continue
+        start_raw, end_raw = part.split("-", 1)
+        start_raw = start_raw.strip()
+        end_raw = end_raw.strip()
+        try:
+            if ":" in start_raw:
+                sh, sm = start_raw.split(":", 1)
+            else:
+                sh, sm = start_raw, "0"
+            if ":" in end_raw:
+                eh, em = end_raw.split(":", 1)
+            else:
+                eh, em = end_raw, "0"
+            sh_i = int(sh)
+            sm_i = int(sm)
+            eh_i = int(eh)
+            em_i = int(em)
+        except Exception:
+            continue
+        if not (0 <= sh_i <= 23 and 0 <= eh_i <= 23 and 0 <= sm_i <= 59 and 0 <= em_i <= 59):
+            continue
+        windows.append((sh_i * 60 + sm_i, eh_i * 60 + em_i))
+    return windows
+
+
+def _in_entry_window(ts_ms: int, windows: List[tuple[int, int]], tz_offset_hours: float) -> bool:
+    if not windows:
+        return False
+    try:
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+    except Exception:
+        return True
+    if tz_offset_hours:
+        dt = dt + timedelta(hours=tz_offset_hours)
+    cur_min = dt.hour * 60 + dt.minute
+    for start_min, end_min in windows:
+        if start_min == end_min:
+            return False
+        if start_min < end_min:
+            if start_min <= cur_min < end_min:
+                return True
+        else:
+            if cur_min >= start_min or cur_min < end_min:
+                return True
+    return False
 
 
 def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
@@ -239,7 +295,7 @@ def main() -> None:
     trades: List[Dict] = []
     stats_by_key: Dict[tuple[str, str], Dict[str, float]] = {}
     trade_logs: Dict[tuple[str, str], List[dict]] = {}
-    open_trades: Dict[tuple[str, str], Dict[str, object]] = {}
+    open_trades: Dict[tuple[str, str, str], Dict[str, object]] = {}
     overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
     d1_block_by_key: Dict[tuple[str, str], int] = {}
     entry_syms_by_mode: Dict[str, set] = {}
@@ -253,6 +309,8 @@ def main() -> None:
     last_day_start_ms = end_ms - last_day_entry_days * 24 * 60 * 60 * 1000
     last_day_exits_by_mode: Dict[str, int] = {}
     last_day_entry = str(args.last_day_entry or "on").lower()
+    entry_windows = _parse_entry_windows(args.entry_windows)
+    entry_tz_offset = float(args.entry_tz_offset or 0.0)
     dca_enabled = str(args.dca or "off").lower() == "on"
     dca_thresholds: List[float] = []
     for part in str(args.dca_thresholds or "").split(","):
@@ -270,12 +328,20 @@ def main() -> None:
     with open(log_path, "a", encoding="utf-8") as log_fp:
         run_line = (
             f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms} "
-            f"overext_min={args.overext_min} d1_overext_atr={sw_cfg.d1_overext_atr_mult}"
+            f"overext_min={args.overext_min} d1_overext_atr={sw_cfg.d1_overext_atr_mult} "
+            f"off_windows={args.entry_windows or 'NONE'} entry_tz_offset={entry_tz_offset:.2f}"
         )
         log_fp.write(run_line + "\n")
         _append_backtest_log(run_line)
         engine = SwaggySignalEngine(sw_cfg)
-        broker = BrokerSim(bt_cfg.tp_pct, bt_cfg.sl_pct, bt_cfg.fee_rate, bt_cfg.slippage_pct, bt_cfg.timeout_bars)
+        broker = BrokerSim(
+            bt_cfg.tp_pct,
+            bt_cfg.sl_pct,
+            bt_cfg.fee_rate,
+            bt_cfg.slippage_pct,
+            bt_cfg.timeout_bars,
+            hedge_mode=True,
+        )
         for sym in symbols:
             sym_state = engine._state.setdefault(sym, {})
             df_ltf = data_by_sym[sym][sw_cfg.tf_ltf]
@@ -341,8 +407,20 @@ def main() -> None:
                 side = signal.side or ""
                 entry_px = signal.entry_px
 
-                if broker.has_position(sym):
-                    trade = broker.on_bar(sym, ts_ms, float(cur["high"]), float(cur["low"]), float(cur["close"]), i)
+                had_long = broker.has_position(sym, "LONG")
+                had_short = broker.has_position(sym, "SHORT")
+                for pos_side in ("LONG", "SHORT"):
+                    if not broker.has_position(sym, pos_side):
+                        continue
+                    trade = broker.on_bar(
+                        sym,
+                        ts_ms,
+                        float(cur["high"]),
+                        float(cur["low"]),
+                        float(cur["close"]),
+                        i,
+                        side=pos_side,
+                    )
                     if trade and trade.exit_reason == "TIME":
                         trade.exit_reason = "TIMEOUT"
                     if trade:
@@ -460,7 +538,7 @@ def main() -> None:
                         continue
                     # DCA (Swaggy No Atlas): apply adverse move thresholds (configurable).
                     if dca_enabled:
-                        trade_live = broker.positions.get(sym)
+                        trade_live = broker.get_position(sym, pos_side)
                         if trade_live:
                             adds_done = int(trade_live.dca_adds or 0)
                             if adds_done < dca_max_adds:
@@ -481,6 +559,7 @@ def main() -> None:
                                             dca_usdt,
                                             float(cur["high"]),
                                             float(cur["low"]),
+                                            side=trade_live.side,
                                         )
                                         log_fp.write(
                                             "DCA ts=%d sym=%s side=%s adds=%d->%d entry=%.6g mark=%.6g usdt=%.2f\n"
@@ -497,24 +576,30 @@ def main() -> None:
                                         )
                                     _append_backtest_log(
                                         "DCA ts=%d sym=%s side=%s adds=%d->%d entry=%.6g mark=%.6g usdt=%.2f"
-                                            % (
-                                                ts_ms,
-                                                sym,
-                                                trade_live.side,
-                                                adds_done,
-                                                adds_done + 1,
-                                                entry_ref,
-                                                close_px,
-                                                dca_usdt,
+                                        % (
+                                            ts_ms,
+                                            sym,
+                                            trade_live.side,
+                                            adds_done,
+                                            adds_done + 1,
+                                            entry_ref,
+                                            close_px,
+                                            dca_usdt,
                                         )
                                     )
                                     dca_adds_by_key[key] = dca_adds_by_key.get(key, 0) + 1
                                     dca_usdt_by_key[key] = dca_usdt_by_key.get(key, 0.0) + float(dca_usdt)
-                    continue
 
                 if not signal.entry_ok or not side or entry_px is None:
                     continue
                 if last_day_entry == "off" and ts_ms >= last_day_start_ms:
+                    continue
+                if _in_entry_window(ts_ms, entry_windows, entry_tz_offset):
+                    _append_backtest_log(
+                        f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=OFF_WINDOW"
+                    )
+                    continue
+                if (side == "LONG" and had_long) or (side == "SHORT" and had_short):
                     continue
 
                 dist_at_entry = _overext_dist(d5, side, sw_cfg)
@@ -594,8 +679,9 @@ def main() -> None:
                 stats["entries"] += 1
                 # ENTRY summary is represented by OPEN/EXIT logs (avoid duplicate lines).
 
-    for sym, trade in broker.positions.items():
-        open_trades[(mode_name, sym)] = {
+    for pos_key, trade in broker.positions.items():
+        sym = trade.sym
+        open_trades[(mode_name, sym, trade.side)] = {
             "sym": sym,
             "mode": mode_name,
             "side": trade.side,
@@ -609,7 +695,9 @@ def main() -> None:
     write_trades_csv(trades_path, trades)
     summary = build_summary(run_id, trades)
     open_stats_by_mode: Dict[str, Dict[str, float]] = {}
-    for (mode, sym), rec in open_trades.items():
+    for key_tuple, rec in open_trades.items():
+        mode = key_tuple[0]
+        sym = key_tuple[1]
         entry_px = rec.get("entry_price")
         size_usdt = rec.get("size_usdt")
         last_close = last_close_by_sym.get(sym)
@@ -708,8 +796,13 @@ def main() -> None:
                 )
             )
             entries_list = list(trade_logs.get((mode, sym), []))
-            open_trade = open_trades.get((mode, sym))
-            if isinstance(open_trade, dict):
+            open_trade_items = [
+                rec for (m_key, s_key, _side), rec in open_trades.items()
+                if m_key == mode and s_key == sym
+            ]
+            for open_trade in open_trade_items:
+                if not isinstance(open_trade, dict):
+                    continue
                 entry_dt = ""
                 entry_ts = open_trade.get("entry_ts")
                 if isinstance(entry_ts, (int, float)) and entry_ts > 0:

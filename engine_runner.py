@@ -202,6 +202,9 @@ SWAGGY_ATLAS_LAB_V2_ENABLED = False
 SWAGGY_NO_ATLAS_ENABLED = False
 SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = -0.7
 SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = True
+SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
+SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS", "").strip()
+SWAGGY_NO_ATLAS_OFF_WINDOWS = os.getenv("SWAGGY_NO_ATLAS_OFF_WINDOWS", "").strip()
 SWAGGY_D1_OVEREXT_ATR_MULT = 1.2
 DTFX_ENABLED = True
 ATLAS_RS_FAIL_SHORT_ENABLED = False
@@ -924,6 +927,60 @@ def _iso_kst(ts: Optional[float] = None) -> str:
     except Exception:
         return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
 
+def _parse_time_windows(text: str) -> List[tuple[int, int]]:
+    windows: List[tuple[int, int]] = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        start_raw, end_raw = part.split("-", 1)
+        start_raw = start_raw.strip()
+        end_raw = end_raw.strip()
+        try:
+            if ":" in start_raw:
+                sh, sm = start_raw.split(":", 1)
+            else:
+                sh, sm = start_raw, "0"
+            if ":" in end_raw:
+                eh, em = end_raw.split(":", 1)
+            else:
+                eh, em = end_raw, "0"
+            sh_i = int(sh)
+            sm_i = int(sm)
+            eh_i = int(eh)
+            em_i = int(em)
+        except Exception:
+            continue
+        if not (0 <= sh_i <= 23 and 0 <= eh_i <= 23 and 0 <= sm_i <= 59 and 0 <= em_i <= 59):
+            continue
+        windows.append((sh_i * 60 + sm_i, eh_i * 60 + em_i))
+    return windows
+
+
+def _is_in_off_window(text: str, now_ts: Optional[float] = None) -> bool:
+    if not text:
+        return False
+    windows = _parse_time_windows(text)
+    if not windows:
+        return False
+    try:
+        tz = timezone(timedelta(hours=9))
+        ts_val = time.time() if now_ts is None else float(now_ts)
+        dt = datetime.fromtimestamp(ts_val, tz=tz)
+    except Exception:
+        return False
+    cur_min = dt.hour * 60 + dt.minute
+    for start_min, end_min in windows:
+        if start_min == end_min:
+            continue
+        if start_min < end_min:
+            if start_min <= cur_min < end_min:
+                return True
+        else:
+            if cur_min >= start_min or cur_min < end_min:
+                return True
+    return False
+
 def _append_swaggy_trade_json(payload: Dict[str, Any]) -> None:
     try:
         path = os.path.join("logs", "swaggy_trades.jsonl")
@@ -1017,6 +1074,14 @@ def _run_swaggy_atlas_lab_cycle(
         return result
 
     now_ts = time.time()
+    if _is_in_off_window(SWAGGY_ATLAS_LAB_OFF_WINDOWS, now_ts):
+        _append_swaggy_atlas_lab_log("SWAGGY_ATLAS_LAB_SKIP reason=OFF_WINDOW")
+        return result
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
     btc_df = cycle_cache.get_df(atlas_cfg.ref_symbol, swaggy_cfg.tf_mtf, limit=200)
     if btc_df is None:
         btc_df = pd.DataFrame()
@@ -1029,7 +1094,7 @@ def _run_swaggy_atlas_lab_cycle(
 
     for symbol in swaggy_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if _both_sides_open(st):
+        if _both_sides_open(st) and not hedge_mode:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         try:
@@ -1433,6 +1498,14 @@ def _run_swaggy_atlas_lab_v2_cycle(
         return result
 
     now_ts = time.time()
+    if _is_in_off_window(SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, now_ts):
+        _append_swaggy_atlas_lab_v2_log("SWAGGY_ATLAS_LAB_V2_SKIP reason=OFF_WINDOW")
+        return result
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
     btc_df = cycle_cache.get_df(atlas_cfg.ref_symbol, swaggy_cfg.tf_mtf, limit=200)
     if btc_df is None:
         btc_df = pd.DataFrame()
@@ -1445,7 +1518,7 @@ def _run_swaggy_atlas_lab_v2_cycle(
 
     for symbol in swaggy_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if _both_sides_open(st):
+        if _both_sides_open(st) and not hedge_mode:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         try:
@@ -1757,6 +1830,14 @@ def _run_swaggy_no_atlas_cycle(
         return result
 
     now_ts = time.time()
+    if _is_in_off_window(SWAGGY_NO_ATLAS_OFF_WINDOWS, now_ts):
+        _append_swaggy_no_atlas_log("SWAGGY_NO_ATLAS_SKIP reason=OFF_WINDOW")
+        return result
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
     ltf_limit = max(int(swaggy_cfg.ltf_limit), 120)
     mtf_limit = 200
     htf_limit = max(int(swaggy_cfg.vp_lookback_1h), 120)
@@ -1765,7 +1846,7 @@ def _run_swaggy_no_atlas_cycle(
 
     for symbol in swaggy_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if _both_sides_open(st):
+        if _both_sides_open(st) and not hedge_mode:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         try:
@@ -6156,6 +6237,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global ENGINE_EXIT_OVERRIDES
     global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
+    global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
+    global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     try:
@@ -6184,6 +6267,9 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_swaggy_atlas_lab_enabled",
         "_swaggy_atlas_lab_v2_enabled",
         "_swaggy_no_atlas_enabled",
+        "_swaggy_atlas_lab_off_windows",
+        "_swaggy_atlas_lab_v2_off_windows",
+        "_swaggy_no_atlas_off_windows",
         "_swaggy_no_atlas_overext_min",
         "_swaggy_no_atlas_overext_min_enabled",
         "_swaggy_no_atlas_overext_min_enabled",
@@ -6240,6 +6326,12 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         SWAGGY_ATLAS_LAB_V2_ENABLED = bool(state.get("_swaggy_atlas_lab_v2_enabled"))
     if isinstance(state.get("_swaggy_no_atlas_enabled"), bool):
         SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
+    if isinstance(state.get("_swaggy_atlas_lab_off_windows"), str):
+        SWAGGY_ATLAS_LAB_OFF_WINDOWS = str(state.get("_swaggy_atlas_lab_off_windows") or "")
+    if isinstance(state.get("_swaggy_atlas_lab_v2_off_windows"), str):
+        SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = str(state.get("_swaggy_atlas_lab_v2_off_windows") or "")
+    if isinstance(state.get("_swaggy_no_atlas_off_windows"), str):
+        SWAGGY_NO_ATLAS_OFF_WINDOWS = str(state.get("_swaggy_no_atlas_off_windows") or "")
     if isinstance(state.get("_swaggy_no_atlas_overext_min"), (int, float)):
         SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(state.get("_swaggy_no_atlas_overext_min"))
     if isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), bool):
@@ -7060,6 +7152,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
                             f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
                             f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
+                            f"/swaggy_atlas_lab_off: {SWAGGY_ATLAS_LAB_OFF_WINDOWS or 'NONE'}\n"
+                            f"/swaggy_atlas_lab_v2_off: {SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS or 'NONE'}\n"
+                            f"/swaggy_no_atlas_off: {SWAGGY_NO_ATLAS_OFF_WINDOWS or 'NONE'}\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                             f"/engine_exit: {_format_engine_exit_overrides()}\n"
@@ -7121,6 +7216,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
                         f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
                         f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
+                        f"/swaggy_atlas_lab_off: {SWAGGY_ATLAS_LAB_OFF_WINDOWS or 'NONE'}\n"
+                        f"/swaggy_atlas_lab_v2_off: {SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS or 'NONE'}\n"
+                        f"/swaggy_no_atlas_off: {SWAGGY_NO_ATLAS_OFF_WINDOWS or 'NONE'}\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                         f"/engine_exit: {_format_engine_exit_overrides()}\n"
@@ -7456,6 +7554,21 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_atlas_lab cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/swaggy_atlas_lab_off", "swaggy_atlas_lab_off")) and not responded:
+                    raw_arg = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+                    arg = (raw_arg or "").strip()
+                    if not arg or arg.lower() in ("off", "0", "false", "clear", "none", "disable", "disabled"):
+                        SWAGGY_ATLAS_LAB_OFF_WINDOWS = ""
+                        state["_swaggy_atlas_lab_off_windows"] = ""
+                        resp = "✅ swaggy_atlas_lab_off cleared"
+                    else:
+                        SWAGGY_ATLAS_LAB_OFF_WINDOWS = arg
+                        state["_swaggy_atlas_lab_off_windows"] = arg
+                        resp = f"✅ swaggy_atlas_lab_off set: {arg}"
+                    state_dirty = True
+                    ok = _reply(resp)
+                    print(f"[telegram] swaggy_atlas_lab_off cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
                 if (cmd in ("/swaggy_atlas_lab_v2", "swaggy_atlas_lab_v2")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -7479,6 +7592,21 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_atlas_lab_v2 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/swaggy_atlas_lab_v2_off", "swaggy_atlas_lab_v2_off")) and not responded:
+                    raw_arg = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+                    arg = (raw_arg or "").strip()
+                    if not arg or arg.lower() in ("off", "0", "false", "clear", "none", "disable", "disabled"):
+                        SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = ""
+                        state["_swaggy_atlas_lab_v2_off_windows"] = ""
+                        resp = "✅ swaggy_atlas_lab_v2_off cleared"
+                    else:
+                        SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = arg
+                        state["_swaggy_atlas_lab_v2_off_windows"] = arg
+                        resp = f"✅ swaggy_atlas_lab_v2_off set: {arg}"
+                    state_dirty = True
+                    ok = _reply(resp)
+                    print(f"[telegram] swaggy_atlas_lab_v2_off cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
                 if (cmd in ("/swaggy_no_atlas", "swaggy_no_atlas")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -7502,6 +7630,21 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_no_atlas cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/swaggy_no_atlas_off", "swaggy_no_atlas_off")) and not responded:
+                    raw_arg = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+                    arg = (raw_arg or "").strip()
+                    if not arg or arg.lower() in ("off", "0", "false", "clear", "none", "disable", "disabled"):
+                        SWAGGY_NO_ATLAS_OFF_WINDOWS = ""
+                        state["_swaggy_no_atlas_off_windows"] = ""
+                        resp = "✅ swaggy_no_atlas_off cleared"
+                    else:
+                        SWAGGY_NO_ATLAS_OFF_WINDOWS = arg
+                        state["_swaggy_no_atlas_off_windows"] = arg
+                        resp = f"✅ swaggy_no_atlas_off set: {arg}"
+                    state_dirty = True
+                    ok = _reply(resp)
+                    print(f"[telegram] swaggy_no_atlas_off cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
                 if (cmd in ("/swaggy_no_atlas_overext", "swaggy_no_atlas_overext")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else ""
@@ -7919,6 +8062,7 @@ def run():
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
@@ -7986,10 +8130,22 @@ def run():
         SWAGGY_ATLAS_LAB_V2_ENABLED = bool(state.get("_swaggy_atlas_lab_v2_enabled"))
     else:
         state["_swaggy_atlas_lab_v2_enabled"] = SWAGGY_ATLAS_LAB_V2_ENABLED
+    if isinstance(state.get("_swaggy_atlas_lab_off_windows"), str):
+        SWAGGY_ATLAS_LAB_OFF_WINDOWS = str(state.get("_swaggy_atlas_lab_off_windows") or "")
+    else:
+        state["_swaggy_atlas_lab_off_windows"] = SWAGGY_ATLAS_LAB_OFF_WINDOWS
+    if isinstance(state.get("_swaggy_atlas_lab_v2_off_windows"), str):
+        SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = str(state.get("_swaggy_atlas_lab_v2_off_windows") or "")
+    else:
+        state["_swaggy_atlas_lab_v2_off_windows"] = SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS
     if isinstance(state.get("_swaggy_no_atlas_enabled"), bool):
         SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
     else:
         state["_swaggy_no_atlas_enabled"] = SWAGGY_NO_ATLAS_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_off_windows"), str):
+        SWAGGY_NO_ATLAS_OFF_WINDOWS = str(state.get("_swaggy_no_atlas_off_windows") or "")
+    else:
+        state["_swaggy_no_atlas_off_windows"] = SWAGGY_NO_ATLAS_OFF_WINDOWS
     if isinstance(state.get("_swaggy_no_atlas_overext_min"), (int, float)):
         SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(state.get("_swaggy_no_atlas_overext_min"))
     else:
@@ -8066,7 +8222,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None

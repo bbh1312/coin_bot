@@ -89,9 +89,9 @@ python3 -m engines.swaggy_no_atlas.run_backtest \
   --cooldown-min 30 \
   --max-symbols 40 \
   --base-usdt 10 \
-  --overext-min -0.70 \
-  --dca on \
-  --dca-thresholds "20,30,40"
+  --entry-windows "03:00-05:00,14:00-16:00" \
+  --entry-tz-offset 9
+  
 ```
 
 메모

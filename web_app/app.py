@@ -26,6 +26,9 @@ from engine_runner import (
     SWAGGY_ATLAS_LAB_ENABLED,
     SWAGGY_ATLAS_LAB_V2_ENABLED,
     SWAGGY_NO_ATLAS_ENABLED,
+    SWAGGY_ATLAS_LAB_OFF_WINDOWS,
+    SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS,
+    SWAGGY_NO_ATLAS_OFF_WINDOWS,
     SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
     SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED,
     SWAGGY_D1_OVEREXT_ATR_MULT,
@@ -53,6 +56,9 @@ COMMAND_DEFS = [
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas", "key": "_swaggy_no_atlas_enabled", "label": "Swaggy No Atlas", "type": "toggle"},
+    {"cmd": "/swaggy_atlas_lab_off", "key": "_swaggy_atlas_lab_off_windows", "label": "Swaggy Lab Off Windows", "type": "text"},
+    {"cmd": "/swaggy_atlas_lab_v2_off", "key": "_swaggy_atlas_lab_v2_off_windows", "label": "Swaggy Lab V2 Off Windows", "type": "text"},
+    {"cmd": "/swaggy_no_atlas_off", "key": "_swaggy_no_atlas_off_windows", "label": "Swaggy No Atlas Off Windows", "type": "text"},
     {"cmd": "/swaggy_no_atlas_overext", "key": "_swaggy_no_atlas_overext_min", "label": "No Atlas Overext Min", "type": "number", "step": 0.01},
     {"cmd": "/swaggy_no_atlas_overext_on", "key": "_swaggy_no_atlas_overext_min_enabled", "label": "No Atlas Overext Min On/Off", "type": "toggle"},
     {"cmd": "/swaggy_d1_overext", "key": "_swaggy_d1_overext_atr_mult", "label": "Swaggy D1 Overext ATR", "type": "number", "step": 0.1},
@@ -86,6 +92,9 @@ DEFAULTS = {
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
     "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
     "_swaggy_no_atlas_enabled": SWAGGY_NO_ATLAS_ENABLED,
+    "_swaggy_atlas_lab_off_windows": SWAGGY_ATLAS_LAB_OFF_WINDOWS,
+    "_swaggy_atlas_lab_v2_off_windows": SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS,
+    "_swaggy_no_atlas_off_windows": SWAGGY_NO_ATLAS_OFF_WINDOWS,
     "_swaggy_no_atlas_overext_min": SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
     "_swaggy_no_atlas_overext_min_enabled": SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED,
     "_swaggy_d1_overext_atr_mult": SWAGGY_D1_OVEREXT_ATR_MULT,
@@ -143,6 +152,8 @@ def _format_value(item: dict, value: object) -> str:
             return json.dumps(value, ensure_ascii=True)
         except Exception:
             return str(value)
+    if item.get("type") == "text":
+        return str(value or "")
     try:
         return f"{float(value):.2f}"
     except Exception:
@@ -190,6 +201,8 @@ def status():
         if item.get("type") == "toggle" and not isinstance(value, bool):
             value = None
         if item.get("type") in ("number", "int") and not isinstance(value, (int, float)):
+            value = None
+        if item.get("type") == "text" and not isinstance(value, str):
             value = None
         if value is None and key in DEFAULTS:
             value = DEFAULTS[key]
@@ -249,6 +262,11 @@ def command():
                 if not isinstance(parsed, dict):
                     return jsonify({"status": "json must be object", "key": key}), 400
                 state[key] = parsed
+        elif item["type"] == "text":
+            if value is None:
+                state[key] = ""
+            else:
+                state[key] = str(value).strip()
         state["_runtime_cfg_ts"] = time.time()
         save_state(state)
         _notify_change(item, state.get(key))

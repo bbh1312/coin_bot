@@ -81,6 +81,12 @@ def _pos_roi_text(symbol: str, pos_side: str) -> str:
     return "n/a"
 
 
+def _fmt_entry_px(entry_px: object) -> str:
+    if isinstance(entry_px, (int, float)):
+        return f"{float(entry_px):.6g}"
+    return "n/a"
+
+
 def _build_message(entries: list[dict]) -> str:
     lines = [
         "[CURR-POS-SWAGGY] 15m 진입 판단",
@@ -93,9 +99,18 @@ def _build_message(entries: list[dict]) -> str:
         roi_text = _pos_roi_text(item["symbol"], pos_side)
         entry_px = item.get("entry_px")
         entry_px_str = f"{float(entry_px):.6g}" if isinstance(entry_px, (int, float)) else "n/a"
+        candle_ts = item.get("candle_ts")
+        candle_str = "n/a"
+        if isinstance(candle_ts, (int, float)) and candle_ts > 0:
+            try:
+                kst = timezone(timedelta(hours=9))
+                candle_dt = datetime.fromtimestamp(float(candle_ts) / 1000.0, tz=kst)
+                candle_str = candle_dt.strftime("%Y-%m-%d %H:%M KST")
+            except Exception:
+                candle_str = "n/a"
         lines.append(
             f"{sym} / { _side_kr(pos_side) } / ROI: {roi_text} : "
-            f"{_side_kr(item['side'])} 판단(진입가: {entry_px_str})"
+            f"{_side_kr(item['side'])} 판단(진입가: {entry_px_str}, 캔들: {candle_str})"
         )
     return "\n".join(lines)
 
@@ -134,9 +149,10 @@ def main() -> None:
 
     print("[curr-pos-swaggy] start (15m)")
     while True:
+        cycle_ts = _fmt_kst_now()
         pos_map = _build_pos_side_map()
         if not pos_map:
-            print("[curr-pos-swaggy] no open positions")
+            print(f"[curr-pos-swaggy] cycle {cycle_ts} 결과: 없음 (포지션 없음)")
             _sleep_to_boundary(cfg.interval_sec)
             continue
         entries: list[dict] = []
@@ -154,14 +170,19 @@ def main() -> None:
             if not _fetch_and_cache(sym, "3m", tf_3m_limit):
                 continue
 
-            df_5m = cycle_cache.get_df(sym, swaggy_cfg.tf_ltf, limit=ltf_limit)
-            df_15m = cycle_cache.get_df(sym, swaggy_cfg.tf_mtf, limit=mtf_limit)
-            df_1h = cycle_cache.get_df(sym, swaggy_cfg.tf_htf, limit=htf_limit)
-            df_4h = cycle_cache.get_df(sym, swaggy_cfg.tf_htf2, limit=htf2_limit)
-            df_1d = cycle_cache.get_df(sym, swaggy_cfg.tf_d1, limit=d1_limit)
-            df_3m = cycle_cache.get_df(sym, "3m", limit=tf_3m_limit)
+            df_5m = cycle_cache.get_df(sym, swaggy_cfg.tf_ltf, limit=ltf_limit, force=True)
+            df_15m = cycle_cache.get_df(sym, swaggy_cfg.tf_mtf, limit=mtf_limit, force=True)
+            df_1h = cycle_cache.get_df(sym, swaggy_cfg.tf_htf, limit=htf_limit, force=True)
+            df_4h = cycle_cache.get_df(sym, swaggy_cfg.tf_htf2, limit=htf2_limit, force=True)
+            df_1d = cycle_cache.get_df(sym, swaggy_cfg.tf_d1, limit=d1_limit, force=True)
+            df_3m = cycle_cache.get_df(sym, "3m", limit=tf_3m_limit, force=True)
             if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty or df_3m.empty:
                 continue
+            candle_ts = None
+            try:
+                candle_ts = df_15m.iloc[-1]["ts"]
+            except Exception:
+                candle_ts = None
 
             signal = swaggy_engine.evaluate_symbol(
                 sym,
@@ -180,12 +201,20 @@ def main() -> None:
                         "pos_side": pos_side,
                         "side": signal.side.upper(),
                         "entry_px": signal.entry_px,
+                        "candle_ts": candle_ts,
                     }
                 )
         if not entries:
-            print("[curr-pos-swaggy] no entry-ready symbols")
+            print(f"[curr-pos-swaggy] cycle {cycle_ts} 결과: 없음")
             _sleep_to_boundary(cfg.interval_sec)
             continue
+        lines = [f"[curr-pos-swaggy] cycle {cycle_ts} 결과:"]
+        for item in entries:
+            sym = item["symbol"].replace("/USDT:USDT", "")
+            lines.append(
+                f"- {sym} / {item['pos_side']} / entry={_fmt_entry_px(item.get('entry_px'))}"
+            )
+        print("\n".join(lines))
         msg = _build_message(entries)
         ok = send_message(token, chat_id, msg)
         print(f"[curr-pos-swaggy] sent={ok} count={len(entries)}")

@@ -303,7 +303,7 @@ def main() -> None:
     trades: List[Dict] = []
     stats_by_key: Dict[tuple[str, str], Dict[str, float]] = {}
     trade_logs: Dict[tuple[str, str], List[dict]] = {}
-    open_trades: Dict[tuple[str, str], Dict[str, object]] = {}
+    open_trades: Dict[tuple[str, str, str], Dict[str, object]] = {}
     last_close_by_sym: Dict[str, float] = {}
     last_ts_by_sym: Dict[str, int] = {}
     overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
@@ -318,7 +318,14 @@ def main() -> None:
             log_fp.write(run_line + "\n")
             _append_backtest_log(run_line)
             engine = SwaggySignalEngine(sw_cfg)
-            broker = BrokerSim(bt_cfg.tp_pct, bt_cfg.sl_pct, bt_cfg.fee_rate, bt_cfg.slippage_pct, bt_cfg.timeout_bars)
+            broker = BrokerSim(
+                bt_cfg.tp_pct,
+                bt_cfg.sl_pct,
+                bt_cfg.fee_rate,
+                bt_cfg.slippage_pct,
+                bt_cfg.timeout_bars,
+                hedge_mode=True,
+            )
             for sym in symbols:
                 sym_state = engine._state.setdefault(sym, {})
                 df_ltf = data_by_sym[sym][sw_cfg.tf_ltf]
@@ -406,8 +413,20 @@ def main() -> None:
                     side = signal.side or ""
                     entry_px = signal.entry_px
 
-                    if broker.has_position(sym):
-                        trade = broker.on_bar(sym, ts_ms, float(cur["high"]), float(cur["low"]), float(cur["close"]), i)
+                    had_long = broker.has_position(sym, "LONG")
+                    had_short = broker.has_position(sym, "SHORT")
+                    for pos_side in ("LONG", "SHORT"):
+                        if not broker.has_position(sym, pos_side):
+                            continue
+                        trade = broker.on_bar(
+                            sym,
+                            ts_ms,
+                            float(cur["high"]),
+                            float(cur["low"]),
+                            float(cur["close"]),
+                            i,
+                            side=pos_side,
+                        )
                         if trade:
                             pnl_pct = broker.calc_pnl_pct(trade)
                             pnl_usdt = pnl_pct * trade.size_usdt
@@ -529,9 +548,10 @@ def main() -> None:
                                     ),
                                 }
                             )
-                        continue
 
                     if not signal.entry_ok or not side or entry_px is None:
+                        continue
+                    if (side == "LONG" and had_long) or (side == "SHORT" and had_short):
                         continue
 
                     atlas = None
@@ -739,8 +759,9 @@ def main() -> None:
                     )
                     stats["entries"] += 1
                     # ENTRY summary is represented by OPEN/EXIT logs (avoid duplicate lines).
-        for sym, trade in broker.positions.items():
-            open_trades[(mode.value, sym)] = {
+        for _key, trade in broker.positions.items():
+            sym = trade.sym
+            open_trades[(mode.value, sym, trade.side)] = {
                 "sym": sym,
                 "mode": mode.value,
                 "side": trade.side,
@@ -833,8 +854,13 @@ def main() -> None:
                 )
             )
             entries_list = list(trade_logs.get((mode, sym), []))
-            open_trade = open_trades.get((mode, sym))
-            if isinstance(open_trade, dict):
+            open_trade_items = [
+                rec for (m_key, s_key, _side), rec in open_trades.items()
+                if m_key == mode and s_key == sym
+            ]
+            for open_trade in open_trade_items:
+                if not isinstance(open_trade, dict):
+                    continue
                 entry_dt = ""
                 entry_ts = open_trade.get("entry_ts")
                 if isinstance(entry_ts, (int, float)) and entry_ts > 0:

@@ -585,7 +585,12 @@ class SwaggySignalEngine:
         ok_regime, _ = regime_ok(regime_state.regime, side, allow_countertrend, cfg.range_short_allowed)
         if not ok_regime:
             return SwaggySignal(False, side, strength, ["REGIME_BLOCK"], best.kind, None, debug={"regime": regime_state.regime})
-        ok_cooldown, _ = cooldown_ok(now_ts, state.get("last_signal_ts"), cfg.cooldown_min)
+        side_key = side.upper()
+        last_ts_key = f"last_signal_ts_{side_key}"
+        last_ts = state.get(last_ts_key)
+        if last_ts is None:
+            last_ts = state.get("last_signal_ts")
+        ok_cooldown, _ = cooldown_ok(now_ts, last_ts, cfg.cooldown_min)
         if not ok_cooldown:
             return SwaggySignal(False, side, strength, ["COOLDOWN"], best.kind, None, debug={"regime": regime_state.regime})
         ok_gap, _ = in_lvn_gap(last_price, vp)
@@ -750,6 +755,7 @@ class SwaggySignalEngine:
             )
             state["confirm_metrics"] = confirm_metrics
 
+        state[last_ts_key] = now_ts
         state["last_signal_ts"] = now_ts
         state["phase"] = "COOLDOWN"
         state["cooldown_until"] = now_ts + cfg.cooldown_min * 60

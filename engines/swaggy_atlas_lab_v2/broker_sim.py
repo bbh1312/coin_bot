@@ -34,16 +34,38 @@ class Trade:
 
 
 class BrokerSim:
-    def __init__(self, tp_pct: float, sl_pct: float, fee_rate: float, slippage_pct: float, timeout_bars: int):
+    def __init__(
+        self,
+        tp_pct: float,
+        sl_pct: float,
+        fee_rate: float,
+        slippage_pct: float,
+        timeout_bars: int,
+        hedge_mode: bool = False,
+    ):
         self.tp_pct = tp_pct
         self.sl_pct = sl_pct
         self.fee_rate = fee_rate
         self.slippage_pct = slippage_pct
         self.timeout_bars = timeout_bars
-        self.positions: Dict[str, Trade] = {}
+        self.hedge_mode = hedge_mode
+        self.positions: Dict[object, Trade] = {}
 
-    def has_position(self, sym: str) -> bool:
-        return sym in self.positions
+    def _key(self, sym: str, side: Optional[str]) -> object:
+        if not self.hedge_mode:
+            return sym
+        side_key = (side or "").upper()
+        return (sym, side_key)
+
+    def has_position(self, sym: str, side: Optional[str] = None) -> bool:
+        if not self.hedge_mode:
+            return sym in self.positions
+        if side:
+            return self._key(sym, side) in self.positions
+        for key in self.positions.keys():
+            if isinstance(key, tuple) and key[0] == sym:
+                return True
+        return False
 
     def enter(
         self,
@@ -93,11 +115,20 @@ class BrokerSim:
             overext_blocked=overext_blocked,
             context=context,
         )
-        self.positions[sym] = trade
+        self.positions[self._key(sym, side)] = trade
         return trade
 
-    def on_bar(self, sym: str, ts: int, high: float, low: float, close: float, bar_index: int) -> Optional[Trade]:
-        trade = self.positions.get(sym)
+    def on_bar(
+        self,
+        sym: str,
+        ts: int,
+        high: float,
+        low: float,
+        close: float,
+        bar_index: int,
+        side: Optional[str] = None,
+    ) -> Optional[Trade]:
+        trade = self.positions.get(self._key(sym, side)) if side or self.hedge_mode else self.positions.get(sym)
         if trade is None:
             return None
         trade.bars = max(0, bar_index - trade.entry_index + 1)
@@ -129,7 +160,7 @@ class BrokerSim:
             trade.exit_ts = ts
             trade.exit_price = float(exit_price)
             trade.exit_reason = exit_reason
-            self.positions.pop(sym, None)
+            self.positions.pop(self._key(sym, trade.side), None)
             return trade
         return None
 
