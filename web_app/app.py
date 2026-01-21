@@ -27,7 +27,6 @@ from engine_runner import (
     SWAGGY_ATLAS_LAB_ENABLED,
     SWAGGY_ATLAS_LAB_V2_ENABLED,
     SWAGGY_NO_ATLAS_ENABLED,
-    SWAGGY_NO_ATLAS_DCA_ENABLED,
     SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
     SWAGGY_D1_OVEREXT_ATR_MULT,
     DTFX_ENABLED,
@@ -58,7 +57,6 @@ COMMAND_DEFS = [
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas", "key": "_swaggy_no_atlas_enabled", "label": "Swaggy No Atlas", "type": "toggle"},
-    {"cmd": "/swaggy_no_atlas_dca", "key": "_swaggy_no_atlas_dca_enabled", "label": "Swaggy No Atlas DCA", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas_overext", "key": "_swaggy_no_atlas_overext_min", "label": "No Atlas Overext Min", "type": "number", "step": 0.01},
     {"cmd": "/swaggy_d1_overext", "key": "_swaggy_d1_overext_atr_mult", "label": "Swaggy D1 Overext ATR", "type": "number", "step": 0.1},
     {"cmd": "/dtfx", "key": "_dtfx_enabled", "label": "DTFX", "type": "toggle"},
@@ -95,7 +93,6 @@ DEFAULTS = {
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
     "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
     "_swaggy_no_atlas_enabled": SWAGGY_NO_ATLAS_ENABLED,
-    "_swaggy_no_atlas_dca_enabled": SWAGGY_NO_ATLAS_DCA_ENABLED,
     "_swaggy_no_atlas_overext_min": SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
     "_swaggy_d1_overext_atr_mult": SWAGGY_D1_OVEREXT_ATR_MULT,
     "_dtfx_enabled": DTFX_ENABLED,
@@ -195,7 +192,6 @@ def status():
     payload = {
         "timestamp": datetime.now().isoformat(),
         "positions": positions,
-        "swaggy_no_atlas_dca_rule": "20/30/40 entry_ok<=30s",
     }
     for item in COMMAND_DEFS:
         key = item["key"]
