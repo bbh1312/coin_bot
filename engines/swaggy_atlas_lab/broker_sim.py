@@ -160,15 +160,6 @@ class BrokerSim:
         self.positions[sym] = trade
         return trade
 
-    def exit_with_reason(self, sym: str, ts: int, close_px: float, reason: str) -> Optional[Trade]:
-        trade = self.positions.get(sym)
-        if trade is None:
-            return None
-        trade.exit_ts = ts
-        trade.exit_price = float(close_px)
-        trade.exit_reason = reason
-        self.positions.pop(sym, None)
-        return trade
 
     def calc_pnl_pct(self, trade: Trade) -> float:
         if trade.exit_price is None or trade.entry_price <= 0:

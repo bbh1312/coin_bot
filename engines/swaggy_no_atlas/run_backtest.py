@@ -35,12 +35,7 @@ from engines.swaggy_atlas_lab.indicators import atr, ema
 from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine
 
 MAX_HOLD_BARS = 240
-NO_PROGRESS_BARS = 120
-NO_PROGRESS_MFE_PCT = 0.005
-EXIT_MIN_PNL_PCT = -0.10
-TREND_D1_EMA_LEN = 7
-TREND_H1_EMA_LEN = 20
-TREND_H1_SLOPE_BARS = 6
+OVEREXT_ENTRY_MIN = -0.70
 
 
 def _append_backtest_log(line: str) -> None:
@@ -80,10 +75,9 @@ def parse_args():
     parser.add_argument("--dca-thresholds", default="20,30,40", help="adverse move % thresholds, e.g. 20,30,40")
     parser.add_argument("--fee", type=float, default=0.0)
     parser.add_argument("--slippage", type=float, default=0.0)
-    parser.add_argument("--timeout-bars", type=int, default=MAX_HOLD_BARS)
-    parser.add_argument("--exit-layer", choices=["on", "off"], default="off")
-    parser.add_argument("--exit-min-pnl", type=float, default=EXIT_MIN_PNL_PCT)
+    parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
+    parser.add_argument("--overext-min", type=float, default=OVEREXT_ENTRY_MIN)
     parser.add_argument("--last-day-entry", choices=["on", "off"], default="on")
     parser.add_argument("--last-day-entry-days", type=int, default=1)
     parser.add_argument("--verbose", action="store_true")
@@ -127,28 +121,6 @@ def _d1_dist_atr(df, last_price: float, cfg: SwaggyConfig) -> Optional[float]:
     if atr_val <= 0:
         return None
     return abs(last_price - ema_val) / atr_val
-
-
-def _trend_invalid(df_d1, df_1h, side: str) -> bool:
-    if df_d1.empty or df_1h.empty:
-        return False
-    if len(df_d1) < (TREND_D1_EMA_LEN + 2):
-        return False
-    if len(df_1h) < (TREND_H1_EMA_LEN + TREND_H1_SLOPE_BARS + 2):
-        return False
-    d1_ema = ema(df_d1["close"], TREND_D1_EMA_LEN)
-    h1_ema = ema(df_1h["close"], TREND_H1_EMA_LEN)
-    if d1_ema.empty or h1_ema.empty:
-        return False
-    d1_close = float(df_d1["close"].iloc[-1])
-    d1_ema_val = float(d1_ema.iloc[-1])
-    h1_slope = float(h1_ema.iloc[-1] - h1_ema.iloc[-1 - TREND_H1_SLOPE_BARS])
-    side = (side or "").upper()
-    if side == "LONG":
-        return d1_close < d1_ema_val and h1_slope < 0
-    if side == "SHORT":
-        return d1_close > d1_ema_val and h1_slope > 0
-    return False
 
 
 def main() -> None:
@@ -261,14 +233,10 @@ def main() -> None:
         dca_thresholds = [20.0, 30.0, 40.0]
     dca_max_adds = len(dca_thresholds)
 
-    exit_layer_enabled = args.exit_layer == "on"
-    exit_min_pnl = float(args.exit_min_pnl)
-    if not exit_layer_enabled:
-        bt_cfg.timeout_bars = 0
     with open(log_path, "a", encoding="utf-8") as log_fp:
         run_line = (
             f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms} "
-            f"exit_layer={args.exit_layer} exit_min_pnl={exit_min_pnl}"
+            f"overext_min={args.overext_min}"
         )
         log_fp.write(run_line + "\n")
         _append_backtest_log(run_line)
@@ -343,22 +311,6 @@ def main() -> None:
                     trade = broker.on_bar(sym, ts_ms, float(cur["high"]), float(cur["low"]), float(cur["close"]), i)
                     if trade and trade.exit_reason == "TIME":
                         trade.exit_reason = "TIMEOUT"
-                    if exit_layer_enabled and not trade:
-                        trade_live = broker.positions.get(sym)
-                        if trade_live:
-                            entry_px = float(trade_live.entry_price)
-                            close_px = float(cur["close"])
-                            if trade_live.side == "SHORT":
-                                exit_pnl_pct = (entry_px - close_px) / entry_px
-                            else:
-                                exit_pnl_pct = (close_px - entry_px) / entry_px
-                            if exit_pnl_pct <= exit_min_pnl:
-                                if trade_live.bars >= MAX_HOLD_BARS:
-                                    trade = broker.exit_with_reason(sym, ts_ms, close_px, "TIMEOUT")
-                                elif trade_live.bars >= NO_PROGRESS_BARS and float(trade_live.mfe or 0.0) < NO_PROGRESS_MFE_PCT:
-                                    trade = broker.exit_with_reason(sym, ts_ms, close_px, "NO_PROGRESS")
-                                elif _trend_invalid(d1d, d1h, trade_live.side):
-                                    trade = broker.exit_with_reason(sym, ts_ms, close_px, "TREND_INVALID")
                     if trade:
                         pnl_pct = broker.calc_pnl_pct(trade)
                         pnl_usdt = pnl_pct * trade.size_usdt
@@ -416,9 +368,6 @@ def main() -> None:
                                 "losses": 0,
                                 "tp": 0,
                                 "sl": 0,
-                                "timeout": 0,
-                                "no_progress": 0,
-                                "trend_invalid": 0,
                                 "loss_pnl_sum": 0.0,
                                 "dca_adds": 0,
                                 "mfe_sum": 0.0,
@@ -432,20 +381,11 @@ def main() -> None:
                             stats["wins"] += 1
                         else:
                             stats["losses"] += 1
-                        stats.setdefault("timeout", 0)
-                        stats.setdefault("no_progress", 0)
-                        stats.setdefault("trend_invalid", 0)
                         stats.setdefault("loss_pnl_sum", 0.0)
                         if trade.exit_reason == "TP":
                             stats["tp"] += 1
                         elif trade.exit_reason == "SL":
                             stats["sl"] += 1
-                        elif trade.exit_reason == "TIMEOUT":
-                            stats["timeout"] += 1
-                        elif trade.exit_reason == "NO_PROGRESS":
-                            stats["no_progress"] += 1
-                        elif trade.exit_reason == "TREND_INVALID":
-                            stats["trend_invalid"] += 1
                         if pnl_usdt < 0:
                             stats["loss_pnl_sum"] += float(pnl_usdt)
                         reason_key = (mode_name, trade.exit_reason or "UNKNOWN")
@@ -543,6 +483,13 @@ def main() -> None:
                 if last_day_entry == "off" and ts_ms >= last_day_start_ms:
                     continue
 
+                dist_at_entry = _overext_dist(d5, side, sw_cfg)
+                if isinstance(dist_at_entry, (int, float)) and dist_at_entry < float(args.overext_min):
+                    _append_backtest_log(
+                        f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=OVEREXT_DEEP dist={dist_at_entry:.4f}"
+                    )
+                    continue
+
                 d1_dist = _d1_dist_atr(d1d, float(entry_px), sw_cfg) if isinstance(entry_px, (int, float)) else None
                 entry_line = (
                     "ENTRY ts=%d sym=%s side=%s mode=%s sw_ok=%s sw_strength=%.3f sw_reasons=%s "
@@ -563,7 +510,6 @@ def main() -> None:
                 )
                 log_fp.write(entry_line + "\n")
                 _append_backtest_log(entry_line)
-                dist_at_entry = _overext_dist(d5, side, sw_cfg)
                 overext_blocked = bool(sym_state.get("overext_blocked"))
                 sym_state["overext_blocked"] = False
                 _append_backtest_entry_log(
@@ -812,9 +758,6 @@ def main() -> None:
             "losses": 0,
             "tp": 0,
             "sl": 0,
-            "timeout": 0,
-            "no_progress": 0,
-            "trend_invalid": 0,
             "loss_pnl_sum": 0.0,
             "dca_adds": 0,
             "mfe_sum": 0.0,
@@ -833,9 +776,6 @@ def main() -> None:
             losses = int(stats.get("losses") or 0)
             tp = int(stats.get("tp") or 0)
             sl = int(stats.get("sl") or 0)
-            timeout_count = int(stats.get("timeout") or 0)
-            no_progress_count = int(stats.get("no_progress") or 0)
-            trend_invalid_count = int(stats.get("trend_invalid") or 0)
             loss_sum_usdt = float(stats.get("loss_pnl_sum") or 0.0)
             win_rate = (wins / trades_count * 100.0) if trades_count else 0.0
             avg_mfe = (stats.get("mfe_sum", 0.0) / trades_count) if trades_count else 0.0
@@ -855,7 +795,7 @@ def main() -> None:
             open_count = int(open_bucket.get("count") or 0)
             open_notional = float(open_bucket.get("notional") or 0.0)
             open_pnl = float(open_bucket.get("pnl") or 0.0)
-            reason_order = ["TP", "SL", "TIMEOUT", "NO_PROGRESS", "TREND_INVALID", "UNKNOWN"]
+            reason_order = ["TP", "SL", "UNKNOWN"]
             reason_items = []
             for reason in reason_order:
                 key = (mode, reason)
@@ -868,7 +808,7 @@ def main() -> None:
             reason_text = " ".join(reason_items) if reason_items else "none"
             total_lines.append(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "timeout=%d no_progress=%d trend_invalid=%d avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
                 "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f "
                 "open_count=%d open_notional=%.2f open_pnl=%.3f loss_sum=%.3f exit_pnl={%s}"
                 % (
@@ -881,9 +821,6 @@ def main() -> None:
                     win_rate,
                     tp,
                     sl,
-                    timeout_count,
-                    no_progress_count,
-                    trend_invalid_count,
                     avg_mfe,
                     avg_mae,
                     avg_hold,
@@ -902,7 +839,7 @@ def main() -> None:
                     reason_text,
                 )
             )
-            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits", "timeout", "no_progress", "trend_invalid"):
+            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
                 grand_total[key] += int(stats.get(key) or 0)
             grand_total["loss_pnl_sum"] += float(stats.get("loss_pnl_sum") or 0.0)
             grand_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
@@ -918,9 +855,6 @@ def main() -> None:
         total_losses = int(grand_total.get("losses") or 0)
         total_tp = int(grand_total.get("tp") or 0)
         total_sl = int(grand_total.get("sl") or 0)
-        total_timeout = int(grand_total.get("timeout") or 0)
-        total_no_progress = int(grand_total.get("no_progress") or 0)
-        total_trend_invalid = int(grand_total.get("trend_invalid") or 0)
         total_loss_sum = float(grand_total.get("loss_pnl_sum") or 0.0)
         total_win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
         total_avg_mfe = (grand_total.get("mfe_sum", 0.0) / total_trades) if total_trades else 0.0
@@ -937,7 +871,7 @@ def main() -> None:
             total_open_pnl = sum(float(v.get("pnl") or 0.0) for v in open_stats_by_mode.values())
             total_reason_items = []
             reason_set = {r for (_m, r) in exit_pnl_by_reason.keys()}
-            for reason in ["TP", "SL", "TIMEOUT", "NO_PROGRESS", "TREND_INVALID", "UNKNOWN"]:
+            for reason in ["TP", "SL", "UNKNOWN"]:
                 if reason not in reason_set:
                     continue
                 pnl_sum = sum(
@@ -946,7 +880,7 @@ def main() -> None:
                     if r_key == reason
                 )
                 total_reason_items.append(f"{reason}={pnl_sum:.3f}")
-            for reason in sorted(r for r in reason_set if r not in ("TP", "SL", "TIMEOUT", "NO_PROGRESS", "TREND_INVALID", "UNKNOWN")):
+            for reason in sorted(r for r in reason_set if r not in ("TP", "SL", "UNKNOWN")):
                 pnl_sum = sum(
                     float(val)
                     for (m_key, r_key), val in exit_pnl_by_reason.items()
@@ -956,7 +890,7 @@ def main() -> None:
             total_reason_text = " ".join(total_reason_items) if total_reason_items else "none"
             total_lines.append(
                 "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "timeout=%d no_progress=%d trend_invalid=%d avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
                 "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f "
                 "open_count=%d open_notional=%.2f open_pnl=%.3f loss_sum=%.3f exit_pnl={%s}"
                 % (
@@ -968,9 +902,6 @@ def main() -> None:
                     total_win_rate,
                     total_tp,
                     total_sl,
-                    total_timeout,
-                    total_no_progress,
-                    total_trend_invalid,
                     total_avg_mfe,
                     total_avg_mae,
                     total_avg_hold,
