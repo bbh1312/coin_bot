@@ -59,12 +59,6 @@ except Exception:
     executor_mod = None
 from env_loader import load_env
 try:
-    from engines.fabio import fabio_entry_engine
-    from engines.fabio import atlas_fabio_engine
-except Exception:
-    fabio_entry_engine = None
-    atlas_fabio_engine = None
-try:
     from engines.base import EngineContext
     try:
         from engines.swaggy.swaggy_engine import SwaggyEngine, SwaggyConfig
@@ -99,8 +93,6 @@ try:
     from engines.universe import build_universe_from_tickers
     from engines.dtfx.engine import DTFXEngine, DTFXConfig
     from engines.dtfx.core.logger import write_dtfx_log
-    from engines.pumpfade.engine import PumpFadeEngine
-    from engines.pumpfade.config import PumpFadeConfig
     from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
     from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
     from engines.swaggy_atlas_lab.indicators import atr
@@ -138,8 +130,6 @@ if "Div15mShortEngine" not in globals():
     DTFXEngine = None
     DTFXConfig = None
     write_dtfx_log = None
-    PumpFadeEngine = None
-    PumpFadeConfig = None
     AtlasRsFailShortEngine = None
     AtlasRsFailShortConfig = None
 
@@ -181,7 +171,6 @@ atlas_engine = None
 atlas_swaggy_cfg = None
 rsi_engine = None
 dtfx_engine = None
-pumpfade_engine = None
 atlas_rs_fail_short_engine = None
 div15m_engine = None
 div15m_short_engine = None
@@ -2026,52 +2015,6 @@ def _count_open_positions_state(state: Dict[str, dict]) -> int:
     return total
 
 
-def _atlasfabio_entry_gate(
-    symbol: str,
-    side: str,
-    st: dict,
-    now_ts: float,
-    gate_tier: str,
-    gate_score: Optional[float],
-    live_ok: bool,
-    max_positions: Optional[int] = None,
-    active_positions: Optional[int] = None,
-) -> tuple[bool, str]:
-    if not live_ok:
-        return False, "live_off"
-    if _is_in_pos_side(st, side):
-        return False, "in_pos"
-    last_entry = _get_last_entry_ts_by_side(st, side)
-    if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
-        return False, "cooldown"
-    last_exit_ts = _get_last_exit_ts_by_side(st, side)
-    if isinstance(last_exit_ts, (int, float)) and (now_ts - float(last_exit_ts)) < EXIT_COOLDOWN_SEC:
-        _append_entry_gate_log(
-            "atlasfabio",
-            symbol,
-            f"청산쿨다운={int(EXIT_COOLDOWN_SEC)}s side={side}",
-        )
-        return False, "exit_cooldown"
-    if isinstance(max_positions, int) and isinstance(active_positions, int):
-        if active_positions >= max_positions:
-            _append_entry_gate_log(
-                "atlasfabio",
-                symbol,
-                f"포지션제한={active_positions}/{max_positions} side={side}",
-                side=side,
-            )
-            return False, "max_pos"
-    return True, "ok"
-
-
-def _atlas_tier_from_score(score: Optional[float]) -> str:
-    if isinstance(score, (int, float)):
-        if score >= ATLASFABIO_STRONG_SCORE:
-            return "STRONG"
-        if score >= ATLASFABIO_MID_SCORE:
-            return "MID"
-    return "NO"
-
 
 def _entry_guard_acquire(
     state: Dict[str, dict],
@@ -2385,8 +2328,6 @@ def _get_open_symbols(state: Dict[str, dict], side: str) -> List[str]:
 
 def _engine_label_from_reason(reason: Optional[str]) -> str:
     key = (reason or "").lower()
-    if key in ("atlasfabio_long", "atlasfabio_short"):
-        return "ATLASFABIO"
     if key in ("swaggy_long", "swaggy_short"):
         return "SWAGGY"
     if key == "swaggy_atlas_lab":
@@ -2397,8 +2338,6 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "SWAGGY_NO_ATLAS"
     if key in ("dtfx_long", "dtfx_short"):
         return "DTFX"
-    if key == "pumpfade_short":
-        return "PUMPFADE"
     if key == "atlas_rs_fail_short":
         return "ATLAS_RS_FAIL_SHORT"
     if key == "short_entry":
@@ -2419,12 +2358,6 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "swaggy_no_atlas"
     if label == "SWAGGY":
         return "swaggy_long" if side == "LONG" else "swaggy_short"
-    if label == "ATLASFABIO":
-        return "atlasfabio_long" if side == "LONG" else "atlasfabio_short"
-    if label == "FABIO":
-        return "fabio_long" if side == "LONG" else "fabio_short"
-    if label == "PUMPFADE":
-        return "pumpfade_short"
     if label == "ATLAS_RS_FAIL_SHORT":
         return "atlas_rs_fail_short"
     if label == "DTFX":
@@ -2444,7 +2377,6 @@ def _display_engine_label(label: Optional[str]) -> str:
         "SWAGGY_ATLAS_LAB": "스웨기랩",
         "SWAGGY_ATLAS_LAB_V2": "스웨기랩v2",
         "SWAGGY_NO_ATLAS": "스웨기 단독",
-        "ATLASFABIO": "파비오",
     }
     return overrides.get(name, name)
 
@@ -2458,12 +2390,8 @@ def _is_engine_enabled(engine: str) -> bool:
         if key == "SWAGGY_NO_ATLAS":
             return SWAGGY_NO_ATLAS_ENABLED
         return SWAGGY_ENABLED
-    if key == "ATLASFABIO":
-        return ATLAS_FABIO_ENABLED
     if key == "DTFX":
         return DTFX_ENABLED
-    if key == "PUMPFADE":
-        return PUMPFADE_ENABLED
     if key == "ATLAS_RS_FAIL_SHORT":
         return ATLAS_RS_FAIL_SHORT_ENABLED
     if key in ("RSI", "SCALP"):
@@ -3463,8 +3391,6 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
                     pnl_pct = (entry_price - exit_price) / entry_price * 100.0
             raw_reason = (tr.get("meta") or {}).get("reason") or tr.get("exit_reason") or "unknown"
             reason_map = {
-                "atlasfabio_long": "atlas-fabio",
-                "atlasfabio_short": "atlas-fabio",
                 "swaggy_long": "atlas-swaggy",
                 "swaggy_short": "atlas-swaggy",
                 "dtfx_long": "dtfx",
@@ -3716,738 +3642,6 @@ def _build_range_report(state: Dict[str, dict], start_date: str, end_date: str, 
     rows_out = symbol_trade_rows if use_trade_rows else symbol_rows
     return _format_report_output(totals, engine_totals, rows_out, label, compact, entry_count)
 
-def _run_atlas_fabio_cycle(
-    universe_structure,
-    cached_ex,
-    state,
-    fabio_cfg,
-    fabio_cfg_mid,
-    atlas_cfg,
-    active_positions_total,
-    dir_hint,
-    send_alert,
-    entry_callback=None,
-    now_ts: Optional[float] = None,
-):
-    result = {"long_hits": 0, "short_hits": 0}
-    buf = []
-    _set_thread_log_buffer(buf)
-
-    def _atlasfabio_log_path() -> str:
-        path = state.get("_atlasfabio_funnel_log_path") if isinstance(state, dict) else None
-        if isinstance(path, str) and path:
-            return path
-        return os.path.join("logs", "fabio", "atlasfabio_funnel.log")
-
-    def _append_atlasfabio_log(line: str) -> None:
-        try:
-            os.makedirs(os.path.dirname(_atlasfabio_log_path()), exist_ok=True)
-            with open(_atlasfabio_log_path(), "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-
-    def _strength_mult(strength: float) -> float:
-        if strength >= 0.85:
-            return 1.2
-        if strength >= 0.70:
-            return 1.0
-        if strength >= 0.55:
-            return 0.7
-        return 0.0
-
-    if not ATLAS_FABIO_ENABLED:
-        _set_thread_log_buffer(None)
-        result["log"] = buf
-        return result
-    if not (fabio_cfg and atlas_cfg and fabio_entry_engine and atlas_fabio_engine):
-        _set_thread_log_buffer(None)
-        result["log"] = buf
-        return result
-    if not isinstance(active_positions_total, int):
-        active_positions_total = _count_open_positions_state(state)
-    now_ts = now_ts if isinstance(now_ts, (int, float)) else time.time()
-
-    funnel = {
-        "candidates_total": 0,
-        "evaluated": 0,
-        "skip_precheck": 0,
-        "skip_eval_none": 0,
-        "skip_warmup": 0,
-        "skip_dup_candle": 0,
-        "trigger_seen": 0,
-        "entry_ready": 0,
-        "blocked_ltf": 0,
-        "blocked_cooldown": 0,
-        "blocked_in_pos": 0,
-        "no_signal": 0,
-        "entry_signal": 0,
-        "entry_order_ok": 0,
-        "entry_blocked_guard": 0,
-        "entry_lock_skip": 0,
-        "entry_paper_ok": 0,
-        "entry_gate_skip": 0,
-        "entry_gate_skip_in_pos": 0,
-        "entry_gate_skip_cooldown": 0,
-        "entry_gate_skip_lock": 0,
-        "entry_gate_skip_max_pos": 0,
-        "entry_gate_skip_live_off": 0,
-        "entry_gate_skip_exchange": 0,
-        "atlas_gate_calls_long": 0,
-        "atlas_gate_calls_short": 0,
-        "atlas_block": 0,
-        "d1_block": 0,
-        "side_block": 0,
-        "no_side_allowed": 0,
-        "no_pullback": 0,
-        "weak_signal": 0,
-        "no_trigger": 0,
-        "entry_live_off": 0,
-        "trigger_hard": 0,
-        "trigger_soft": 0,
-        "strength_lt_055": 0,
-        "strength_055_070": 0,
-        "strength_070_085": 0,
-        "strength_ge_085": 0,
-        "data_missing": 0,
-        "data_missing_rsi": 0,
-        "data_missing_atr": 0,
-        "data_missing_vol": 0,
-        "data_missing_dist": 0,
-    }
-
-    for symbol in universe_structure:
-        funnel["candidates_total"] += 1
-        allowed_dir = None
-        if isinstance(dir_hint, dict):
-            allowed_dir = dir_hint.get(symbol)
-        st = state.get(symbol, {"in_pos": False, "last_ok": False, "last_entry": 0})
-        if allowed_dir in ("LONG", "SHORT"):
-            if _is_in_pos_side(st, allowed_dir):
-                funnel["skip_precheck"] += 1
-                funnel["blocked_in_pos"] += 1
-                continue
-        else:
-            if _both_sides_open(st):
-                funnel["skip_precheck"] += 1
-                funnel["blocked_in_pos"] += 1
-                continue
-        if allowed_dir in ("LONG", "SHORT"):
-            last_entry = _get_last_entry_ts_by_side(st, allowed_dir)
-            if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
-                funnel["skip_precheck"] += 1
-                funnel["blocked_cooldown"] += 1
-                continue
-
-        if allowed_dir == "LONG":
-            funnel["atlas_gate_calls_long"] += 1
-            gate = _atlasfabio_gate_long(symbol, atlas_cfg)
-        elif allowed_dir == "SHORT":
-            funnel["atlas_gate_calls_short"] += 1
-            gate = _atlasfabio_gate_short(symbol, atlas_cfg)
-        else:
-            gate = _atlasfabio_gate(symbol, atlas_cfg) if atlas_cfg else {"status": "skip"}
-        if gate.get("status") != "ok":
-            funnel["skip_warmup"] += 1
-            continue
-
-        trade_allowed = bool(gate.get("trade_allowed"))
-        allow_long = bool(gate.get("allow_long"))
-        allow_short = bool(gate.get("allow_short"))
-        size_mult = float(gate.get("size_mult") or 1.0)
-        gate_line = (
-            "ATLASFABIO_GATE sym=%s trade_allowed=%s allow_long=%s allow_short=%s size_mult=%.2f"
-            % (
-                symbol,
-                "Y" if trade_allowed else "N",
-                "Y" if allow_long else "N",
-                "Y" if allow_short else "N",
-                size_mult,
-            )
-        )
-        print(gate_line)
-        _append_atlasfabio_log(gate_line)
-
-        if not trade_allowed:
-            funnel["atlas_block"] += 1
-            block_reason = gate.get("block_reason") or "ATLAS_BLOCK"
-            if block_reason == "D1_EMA7_DIST":
-                funnel["d1_block"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason={block_reason}")
-            continue
-
-        allowed_sides = []
-        if allow_long:
-            allowed_sides.append("LONG")
-        if allow_short:
-            allowed_sides.append("SHORT")
-        if not allowed_sides:
-            funnel["no_side_allowed"] += 1
-            _append_atlasfabio_log(
-                "ATLASFABIO_SKIP sym=%s reason=NO_SIDE_ALLOWED gate_allow_long=%s gate_allow_short=%s"
-                % (symbol, "Y" if allow_long else "N", "Y" if allow_short else "N")
-            )
-            continue
-
-        side_results = []
-        had_eval_none = False
-        had_warmup = False
-        had_dup = False
-        for side in allowed_sides:
-            bucket_key = f"_fabio_atlas_{side.lower()}"
-            fabio_res = fabio_entry_engine.evaluate_symbol(
-                symbol,
-                cached_ex,
-                state,
-                fabio_cfg,
-                bucket_key=bucket_key,
-                side_hint=side,
-            )
-            if not isinstance(fabio_res, dict) or not fabio_res:
-                had_eval_none = True
-                continue
-            if fabio_res.get("status") == "warmup":
-                had_warmup = True
-                continue
-            if fabio_res.get("block_reason") == "dup_candle":
-                had_dup = True
-                continue
-            side_results.append((side, fabio_res))
-
-        if not side_results:
-            if had_eval_none:
-                funnel["skip_eval_none"] += 1
-            if had_warmup:
-                funnel["skip_warmup"] += 1
-            if had_dup:
-                funnel["skip_dup_candle"] += 1
-            continue
-
-        funnel["evaluated"] += 1
-
-        def _fmt_num(val: Optional[float], digits: int = 4) -> str:
-            if isinstance(val, (int, float)):
-                return f"{val:.{digits}f}"
-            return "N/A"
-
-        rsi_3m_prev = None
-        rsi_3m_last = None
-        rsi_5m_prev = None
-        rsi_5m_last = None
-        if rsi_engine:
-            rsi_3m_prev, rsi_3m_last = rsi_engine.fetch_rsi_last2(symbol, "3m")
-            rsi_5m_prev, rsi_5m_last = rsi_engine.fetch_rsi_last2(symbol, "5m")
-
-        missing_side_results = []
-        valid_side_results = []
-        for side, fabio_res in side_results:
-            missing = []
-            if fabio_res.get("rsi") is None:
-                missing.append("rsi")
-            if fabio_res.get("atr_now") is None:
-                missing.append("atr")
-            if fabio_res.get("vol_avg") is None:
-                missing.append("vol_avg")
-            if fabio_res.get("vol_ratio") is None:
-                missing.append("vol_ratio")
-            if fabio_res.get("dist_to_ema20") is None:
-                missing.append("dist")
-            if missing:
-                missing_side_results.append((side, fabio_res, missing))
-            else:
-                valid_side_results.append((side, fabio_res))
-
-        if not valid_side_results:
-            funnel["data_missing"] += 1
-            side, fabio_res, missing = missing_side_results[0]
-            for miss_item in missing:
-                if miss_item == "rsi":
-                    funnel["data_missing_rsi"] += 1
-                elif miss_item == "atr":
-                    funnel["data_missing_atr"] += 1
-                elif miss_item in ("vol_avg", "vol_ratio"):
-                    funnel["data_missing_vol"] += 1
-                elif miss_item == "dist":
-                    funnel["data_missing_dist"] += 1
-            tf_info = []
-            raw_by_tf = {}
-            for tf in ("3m", "5m", "15m", "1h"):
-                raw = cycle_cache.get_raw(symbol, tf) or []
-                raw_by_tf[tf] = raw
-                bars = len(raw)
-                last_ts = raw[-1][0] if raw else None
-                tf_info.append(f"bars_{tf}={bars}")
-                tf_info.append(f"last_ts_{tf}={last_ts if last_ts is not None else 'N/A'}")
-            series_len_info = "series_len={3m:%d,5m:%d,15m:%d}" % (
-                len(raw_by_tf.get("3m") or []),
-                len(raw_by_tf.get("5m") or []),
-                len(raw_by_tf.get("15m") or []),
-            )
-            rsi_len = rsi_engine.config.rsi_len if rsi_engine else None
-            key_3m = f"{symbol}:3m:rsi_series:{rsi_len}" if rsi_len else "N/A"
-            key_5m = f"{symbol}:5m:rsi_series:{rsi_len}" if rsi_len else "N/A"
-            series_key_info = f"series_key={{rsi3m:'{key_3m}',rsi5m:'{key_5m}'}}"
-            values_info = (
-                "values={rsi3m_last=%s,rsi5m_last=%s,atr=%s,vol_now=%s,vol_avg=%s,vol_ratio=%s,dist=%s}"
-                % (
-                    _fmt_num(rsi_3m_last, 2),
-                    _fmt_num(rsi_5m_last, 2),
-                    _fmt_num(fabio_res.get("atr_now"), 4),
-                    _fmt_num(fabio_res.get("vol_now"), 2),
-                    _fmt_num(fabio_res.get("vol_avg"), 2),
-                    _fmt_num(fabio_res.get("vol_ratio"), 2),
-                    _fmt_num(fabio_res.get("dist_to_ema20"), 4),
-                )
-            )
-            rsi_map_keys = []
-            for (sym_key, tf_key, ind_key) in cycle_cache.IND_CACHE.keys():
-                if sym_key != symbol:
-                    continue
-                if not isinstance(ind_key, tuple) or not ind_key:
-                    continue
-                if ind_key[0] != "rsi_series":
-                    continue
-                if len(ind_key) < 2:
-                    continue
-                rsi_map_keys.append(f"{tf_key}:{ind_key[1]}")
-            rsi_map_keys.sort()
-            requested_keys = "['3m','5m']"
-            resolved_key_3m = f"{symbol}:3m:rsi_series:{rsi_len}" if rsi_len else "N/A"
-            resolved_key_5m = f"{symbol}:5m:rsi_series:{rsi_len}" if rsi_len else "N/A"
-            rsi_map_info = (
-                "rsi_map_keys=%s requested_keys=%s resolved_key_3m=%s resolved_key_5m=%s"
-                % (rsi_map_keys, requested_keys, resolved_key_3m, resolved_key_5m)
-            )
-            miss_line = (
-                "ATLASFABIO_SKIP sym=%s reason=DATA_MISSING missing=%s %s %s %s %s %s"
-                % (
-                    symbol,
-                    "[" + ",".join(missing) + "]",
-                    values_info,
-                    series_len_info,
-                    series_key_info,
-                    rsi_map_info,
-                    " ".join(tf_info),
-                )
-            )
-            print(miss_line)
-            _append_atlasfabio_log(miss_line)
-            continue
-
-        backtest_mode = bool(state.get("_atlasfabio_backtest_mode")) if isinstance(state, dict) else False
-        def _finalize_backtest_live_off(reason: str) -> bool:
-            if not backtest_mode:
-                return False
-            if reason != "live_off":
-                return False
-            funnel["entry_live_off"] += 1
-            funnel["entry_signal"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=BACKTEST")
-            return True
-
-        candidates = []
-        for side, fabio_res in valid_side_results:
-            trigger_ok = bool(fabio_res.get("signal_trigger_ok"))
-            trigger_hard = bool(fabio_res.get("trigger_hard"))
-            trigger_soft = bool(fabio_res.get("trigger_soft"))
-            trigger_mode = fabio_res.get("trigger_mode") or "NONE"
-            strength = float(fabio_res.get("signal_strength") or 0.0)
-            factors = fabio_res.get("signal_factors") or {}
-            weights = fabio_res.get("signal_weights") or {}
-            trigger_factors = fabio_res.get("trigger_factors") or {}
-            signal_side = fabio_res.get("signal_side")
-            atr_now = fabio_res.get("atr_now")
-            if isinstance(atr_now, (int, float)) and abs(atr_now) <= 1e-8:
-                atr_line = "FABIO_ATR_ZERO sym=%s atr=%s ltf=%s" % (
-                    symbol,
-                    _fmt_num(atr_now, 8),
-                    fabio_cfg.timeframe_ltf,
-                )
-                print(atr_line)
-                _append_atlasfabio_log(atr_line)
-
-            if trigger_hard:
-                funnel["trigger_hard"] += 1
-            if trigger_soft:
-                funnel["trigger_soft"] += 1
-            if strength < 0.55:
-                funnel["strength_lt_055"] += 1
-            elif strength < 0.70:
-                funnel["strength_055_070"] += 1
-            elif strength < 0.85:
-                funnel["strength_070_085"] += 1
-            else:
-                funnel["strength_ge_085"] += 1
-
-            if (rsi_3m_last is None) or (rsi_5m_last is None):
-                rsi_map_keys = []
-                for (sym_key, tf_key, ind_key) in cycle_cache.IND_CACHE.keys():
-                    if sym_key != symbol:
-                        continue
-                    if not isinstance(ind_key, tuple) or not ind_key:
-                        continue
-                    if ind_key[0] != "rsi_series":
-                        continue
-                    if len(ind_key) < 2:
-                        continue
-                    rsi_map_keys.append(f"{tf_key}:{ind_key[1]}")
-                rsi_map_keys.sort()
-                bars_3m = len(cycle_cache.get_raw(symbol, "3m") or [])
-                bars_5m = len(cycle_cache.get_raw(symbol, "5m") or [])
-                rsi_len = rsi_engine.config.rsi_len if rsi_engine else None
-                lookup_line = (
-                    "FABIO_RSI_LOOKUP sym=%s rsi3m=%s rsi5m=%s bars_3m=%d bars_5m=%d rsi_len=%s rsi_map_keys=%s"
-                    % (
-                        symbol,
-                        _fmt_num(rsi_3m_last, 2),
-                        _fmt_num(rsi_5m_last, 2),
-                        bars_3m,
-                        bars_5m,
-                        str(rsi_len) if rsi_len is not None else "N/A",
-                        rsi_map_keys,
-                    )
-                )
-                print(lookup_line)
-                _append_atlasfabio_log(lookup_line)
-
-            fabio_signal_line = (
-                "FABIO_SIGNAL sym=%s side=%s trigger_ok=%s strength=%.2f"
-                % (symbol, signal_side or side, "Y" if trigger_ok else "N", strength)
-            )
-            fabio_factors_line = (
-                "FABIO_FACTORS sym=%s ema_align=%s rsi_rev=%s vol=%s retest=%s struct=%s dist=%s weights=%s"
-                % (
-                    symbol,
-                    "Y" if factors.get("ema_align") else "N",
-                    "Y" if factors.get("rsi_reversal") else "N",
-                    "Y" if factors.get("vol") else "N",
-                    "Y" if factors.get("retest") else "N",
-                    "Y" if factors.get("structure") else "N",
-                    "Y" if factors.get("dist") else "N",
-                    weights,
-                )
-            )
-            fabio_trigger_decision = (
-                "FABIO_TRIGGER_DECISION sym=%s hard=%s soft=%s mode=%s soft_min=%.2f"
-                % (
-                    symbol,
-                    "Y" if trigger_hard else "N",
-                    "Y" if trigger_soft else "N",
-                    trigger_mode,
-                    ATLASFABIO_MIN_STRENGTH_SOFT,
-                )
-            )
-            if trigger_ok or strength >= ATLASFABIO_MIN_STRENGTH:
-                print(fabio_signal_line)
-                print(fabio_factors_line)
-                print(fabio_trigger_decision)
-                _append_atlasfabio_log(fabio_signal_line)
-                _append_atlasfabio_log(fabio_factors_line)
-                _append_atlasfabio_log(fabio_trigger_decision)
-
-            if not trigger_ok:
-                trigger_line = (
-                    "FABIO_TRIGGER_FACTORS sym=%s rsi=%s retest=%s vol=%s struct=%s ema=%s "
-                    "rsi3m_prev=%s rsi3m_last=%s rsi5m_prev=%s rsi5m_last=%s "
-                    "rsi_ltf=%s vol_now=%s vol_avg=%s vol_ratio=%s dist=%.4f atr=%s"
-                    % (
-                        symbol,
-                        "Y" if trigger_factors.get("rsi") else "N",
-                        "Y" if trigger_factors.get("retest") else "N",
-                        "Y" if trigger_factors.get("vol") else "N",
-                        "Y" if trigger_factors.get("struct") else "N",
-                        "Y" if trigger_factors.get("ema") else "N",
-                        _fmt_num(rsi_3m_prev, 2),
-                        _fmt_num(rsi_3m_last, 2),
-                        _fmt_num(rsi_5m_prev, 2),
-                        _fmt_num(rsi_5m_last, 2),
-                        _fmt_num(fabio_res.get("rsi"), 2),
-                        _fmt_num(fabio_res.get("vol_now"), 2),
-                        _fmt_num(fabio_res.get("vol_avg"), 2),
-                        _fmt_num(fabio_res.get("vol_ratio"), 2),
-                        float(fabio_res.get("dist_to_ema20") or 0.0),
-                        _fmt_num(fabio_res.get("atr_now"), 6),
-                    )
-                )
-                print(trigger_line)
-                print(fabio_trigger_decision)
-                _append_atlasfabio_log(trigger_line)
-                _append_atlasfabio_log(fabio_trigger_decision)
-
-            if trigger_ok and (signal_side == side):
-                candidates.append((side, fabio_res))
-
-        if candidates:
-            funnel["trigger_seen"] += len(candidates)
-        else:
-            funnel["no_trigger"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=NO_TRIGGER")
-            continue
-
-        def _candidate_key(item):
-            side, fabio_res = item
-            strength = float(fabio_res.get("signal_strength") or 0.0)
-            mode = fabio_res.get("trigger_mode") or "NONE"
-            hard_flag = 1 if mode == "HARD" else 0
-            return (strength, hard_flag)
-
-        best_side, best_res = max(candidates, key=_candidate_key)
-        if len(allowed_sides) > 1:
-            cand_parts = []
-            for side, fabio_res in candidates:
-                cand_parts.append(f"{side}:{float(fabio_res.get('signal_strength') or 0.0):.2f}")
-            _append_atlasfabio_log(
-                "ATLASFABIO_SIDE_SELECT sym=%s candidates=[%s] chosen=%s"
-                % (symbol, ", ".join(cand_parts), best_side)
-            )
-
-        side = best_side
-        _append_atlas_route_log(
-            "ATLASFABIO",
-            symbol,
-            {
-                "side": side,
-                "dir": gate.get("st_dir"),
-                "state": gate.get("state"),
-                "regime": gate.get("regime"),
-                "reason": gate.get("reason"),
-                "trade_allowed": gate.get("trade_allowed"),
-                "allow_long": gate.get("allow_long"),
-                "allow_short": gate.get("allow_short"),
-                "size_mult": size_mult,
-            },
-        )
-        trigger_hard = bool(best_res.get("trigger_hard"))
-        trigger_soft = bool(best_res.get("trigger_soft"))
-        trigger_mode = best_res.get("trigger_mode") or "NONE"
-        strength = float(best_res.get("signal_strength") or 0.0)
-        reasons = best_res.get("signal_reasons") or []
-
-        if "retest" not in reasons:
-            funnel["no_pullback"] += 1
-            _append_atlasfabio_log(
-                "ATLASFABIO_SKIP sym=%s reason=NO_PULLBACK strength=%.2f reasons=%s"
-                % (symbol, strength, reasons)
-            )
-            continue
-
-        if trigger_hard:
-            min_strength = ATLASFABIO_MIN_STRENGTH
-        elif trigger_soft:
-            min_strength = ATLASFABIO_MIN_STRENGTH_SOFT
-        else:
-            min_strength = ATLASFABIO_MIN_STRENGTH
-        if strength < min_strength:
-            funnel["weak_signal"] += 1
-            _append_atlasfabio_log(
-                "ATLASFABIO_SKIP sym=%s reason=WEAK_SIGNAL strength=%.2f < %.2f mode=%s"
-                % (symbol, strength, min_strength, trigger_mode)
-            )
-            continue
-
-        strength_mult = _strength_mult(strength)
-        final_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult * strength_mult)
-        ltf_mode = "5m_or_3m"
-        hit5m, hit3m, ltf_ok = _atlasfabio_ltf_hit(symbol, side, mode=ltf_mode)
-        if not ltf_ok and best_res.get("trend_cont_trigger"):
-            ltf_ok = True
-        if not ltf_ok:
-            funnel["blocked_ltf"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=LTF_BLOCK")
-            continue
-
-        try:
-            refresh_positions_cache(force=True)
-            if side == "LONG":
-                existing_amt = get_long_position_amount(symbol)
-            else:
-                existing_amt = get_short_position_amount(symbol)
-        except Exception:
-            existing_amt = 0.0
-        if isinstance(existing_amt, (int, float)) and existing_amt > 0:
-            _set_in_pos_side(st, side, True)
-            state[symbol] = st
-            funnel["blocked_in_pos"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=IN_POS")
-            continue
-
-        funnel["entry_ready"] += 1
-
-        cur_total = count_open_positions(force=True)
-        if not isinstance(cur_total, int):
-            cur_total = active_positions_total
-        gate_ok, gate_reason = _atlasfabio_entry_gate(
-            symbol,
-            side,
-            st,
-            now_ts,
-            "NA",
-            None,
-            live_ok=LONG_LIVE_TRADING if side == "LONG" else LIVE_TRADING,
-            max_positions=MAX_OPEN_POSITIONS,
-            active_positions=cur_total,
-        )
-        if (not gate_ok) and backtest_mode and gate_reason == "live_off":
-            funnel["entry_live_off"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=BACKTEST")
-            gate_ok = True
-        if not gate_ok:
-            funnel["entry_gate_skip"] += 1
-            if gate_reason == "in_pos":
-                funnel["entry_gate_skip_in_pos"] += 1
-            elif gate_reason == "cooldown":
-                funnel["entry_gate_skip_cooldown"] += 1
-            elif gate_reason == "max_pos":
-                funnel["entry_gate_skip_max_pos"] += 1
-            elif gate_reason == "live_off":
-                funnel["entry_gate_skip_live_off"] += 1
-                if _finalize_backtest_live_off(gate_reason):
-                    continue
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GATE_{gate_reason}")
-            continue
-
-        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="atlasfabio", side=side)
-        if not lock_ok:
-            funnel["entry_lock_skip"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_LOCK")
-            print(f"[ENTRY-LOCK] sym={symbol} owner=atlasfabio ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-            continue
-        if _entry_seen_blocked(state, symbol, side, "atlasfabio"):
-            funnel["entry_lock_skip"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_SEEN")
-            _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
-            continue
-        entry_line = (
-            "ATLASFABIO_ENTRY sym=%s side=%s pass=Y strength=%.2f atlas_mult=%.2f strength_mult=%.2f final_usdt=%.2f reasons=%s"
-            % (symbol, side, strength, size_mult, strength_mult, final_usdt, reasons)
-        )
-        print(entry_line)
-        _append_atlasfabio_log(entry_line)
-        if not backtest_mode:
-            _append_entry_log("fabio/atlasfabio_entries.log", entry_line)
-        if callable(entry_callback):
-            try:
-                entry_callback(
-                    symbol=symbol,
-                    side=side,
-                    strength=strength,
-                    reasons=reasons,
-                    gate=gate,
-                    fabio_res=best_res,
-                )
-            except Exception:
-                pass
-
-        funnel["entry_signal"] += 1
-        if side == "LONG":
-            result["long_hits"] += 1
-        else:
-            result["short_hits"] += 1
-
-        cur_total = count_open_positions(force=True)
-        if not isinstance(cur_total, int):
-            cur_total = active_positions_total
-        if cur_total >= MAX_OPEN_POSITIONS:
-            funnel["entry_gate_skip_max_pos"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=MAX_POS")
-            _append_entry_gate_log(
-                "atlasfabio",
-                symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
-                side=side,
-            )
-            _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
-            continue
-
-        if ATLAS_FABIO_PAPER:
-            funnel["entry_paper_ok"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=PAPER")
-            _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        if side == "LONG":
-            guard_key = _entry_guard_key(state, symbol, "LONG")
-            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
-                funnel["entry_blocked_guard"] += 1
-                _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
-                _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
-            else:
-                try:
-                    req_id = _enqueue_entry_request(
-                        state,
-                        symbol=symbol,
-                        side="LONG",
-                        engine="ATLASFABIO",
-                        reason="atlasfabio_long",
-                        usdt=final_usdt,
-                        live=LONG_LIVE_TRADING,
-                        alert_reason="ATLAS + FABIO",
-                    )
-                    if req_id:
-                        funnel["entry_order_ok"] += 1
-                        active_positions_total += 1
-                except Exception as e:
-                    funnel["entry_gate_skip_exchange"] += 1
-                    _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
-                finally:
-                    _entry_guard_release(state, symbol, key=guard_key)
-                    _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
-        else:
-            guard_key = _entry_guard_key(state, symbol, "SHORT")
-            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
-                funnel["entry_blocked_guard"] += 1
-                _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
-                _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            try:
-                req_id = _enqueue_entry_request(
-                    state,
-                    symbol=symbol,
-                    side="SHORT",
-                    engine="ATLASFABIO",
-                    reason="atlasfabio_short",
-                    usdt=final_usdt,
-                    live=LIVE_TRADING,
-                    alert_reason=reasons,
-                )
-                if req_id:
-                    funnel["entry_order_ok"] += 1
-                    active_positions_total += 1
-            except Exception as e:
-                funnel["entry_gate_skip_exchange"] += 1
-                _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
-            finally:
-                _entry_guard_release(state, symbol, key=guard_key)
-                _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
-            time.sleep(PER_SYMBOL_SLEEP)
-
-    _set_thread_log_buffer(None)
-    funnel_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    funnel_line = (
-        "{ts} [atlasfabio-funnel] total={candidates_total} evaluated={evaluated} precheck={skip_precheck} "
-        "eval_none={skip_eval_none} gate_calls_long={atlas_gate_calls_long} gate_calls_short={atlas_gate_calls_short} "
-        "warmup={skip_warmup} dup={skip_dup_candle} trigger_seen={trigger_seen} "
-        "entry_ready={entry_ready} entry={entry_signal} order_ok={entry_order_ok} "
-        "ltf_block={blocked_ltf} cooldown={blocked_cooldown} in_pos={blocked_in_pos} "
-        "gate_skip={entry_gate_skip} gate_in_pos={entry_gate_skip_in_pos} gate_cooldown={entry_gate_skip_cooldown} "
-        "gate_maxpos={entry_gate_skip_max_pos} gate_live_off={entry_gate_skip_live_off} "
-        "exchange_skip={entry_gate_skip_exchange} atlas_block={atlas_block} d1_block={d1_block} side_block={side_block} "
-        "no_side_allowed={no_side_allowed} no_pullback={no_pullback} "
-        "entry_live_off={entry_live_off} "
-        "trigger_hard={trigger_hard} trigger_soft={trigger_soft} "
-        "strength_lt_055={strength_lt_055} strength_055_070={strength_055_070} "
-        "strength_070_085={strength_070_085} strength_ge_085={strength_ge_085} "
-        "weak_signal={weak_signal} no_trigger={no_trigger} data_missing={data_missing} "
-        "data_missing_rsi={data_missing_rsi} data_missing_atr={data_missing_atr} "
-        "data_missing_vol={data_missing_vol} data_missing_dist={data_missing_dist}".format(ts=funnel_ts, **funnel)
-    )
-    if not state.get("_atlasfabio_backtest_quiet"):
-        print(funnel_line)
-        _append_atlasfabio_log(funnel_line)
-    result["log"] = buf
-    return result
 def _run_dtfx_cycle(
     dtfx_engine,
     dtfx_universe,
@@ -4588,221 +3782,6 @@ def _run_dtfx_cycle(
         time.sleep(PER_SYMBOL_SLEEP)
     _set_thread_log_buffer(None)
     result["log"] = buf
-    return result
-
-def _pumpfade_tf_seconds(tf: str) -> int:
-    try:
-        unit = tf[-1]
-        val = int(tf[:-1])
-    except Exception:
-        return 0
-    if unit == "m":
-        return val * 60
-    if unit == "h":
-        return val * 3600
-    if unit == "d":
-        return val * 86400
-    return 0
-
-def _run_pumpfade_cycle(
-    pumpfade_engine,
-    pumpfade_universe,
-    state: Dict[str, dict],
-    send_alert,
-    pumpfade_cfg,
-):
-    result = {"hits": 0}
-    if not pumpfade_engine or not pumpfade_cfg:
-        return result
-    if not pumpfade_universe:
-        print("[pumpfade] 스캔 대상 없음")
-        return result
-    now_ts = time.time()
-    tf_sec = _pumpfade_tf_seconds(pumpfade_cfg.tf_trigger) or 900
-    bucket = state.setdefault("_pumpfade", {})
-    date_tag = time.strftime("%Y%m%d")
-    _ensure_log_file(f"pumpfade/pumpfade_live_{date_tag}.log")
-    _ensure_log_file(f"pumpfade/pumpfade_entries_{date_tag}.log")
-
-    def _pumpfade_log(msg: str) -> None:
-        _append_entry_log(f"pumpfade/pumpfade_live_{date_tag}.log", msg)
-
-    ctx = EngineContext(exchange=exchange, state=state, now_ts=now_ts, logger=_pumpfade_log, config=pumpfade_cfg)
-
-    for symbol in pumpfade_universe:
-        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        pf = bucket.get(symbol, {})
-        pending_id = pf.get("pending_order_id")
-        pending_deadline = float(pf.get("pending_deadline_ts") or 0.0)
-        pending_prior_hh = pf.get("pending_prior_hh")
-        in_pos = _is_in_pos_side(st, "SHORT")
-
-        try:
-            existing_amt = get_short_position_amount(symbol)
-        except Exception:
-            existing_amt = 0.0
-
-        if pending_id:
-            if existing_amt > 0:
-                _set_in_pos_side(st, "SHORT", True)
-                _set_last_entry_state(st, "SHORT", time.time())
-                state[symbol] = st
-                pf["pending_order_id"] = None
-                pf["pending_deadline_ts"] = None
-                bucket[symbol] = pf
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            if pending_deadline and now_ts >= pending_deadline:
-                cancel_open_orders(symbol)
-                pf["pending_order_id"] = None
-                pf["pending_deadline_ts"] = None
-                pf["last_attempt_ts"] = time.time()
-                bucket[symbol] = pf
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            if isinstance(pending_prior_hh, (int, float)):
-                df15 = cycle_cache.get_df(symbol, pumpfade_cfg.tf_trigger, limit=3)
-                if not df15.empty and len(df15) >= 2:
-                    try:
-                        last_high = float(df15["high"].iloc[-1])
-                        if last_high >= float(pending_prior_hh) * (1 + pumpfade_cfg.failure_eps):
-                            cancel_open_orders(symbol)
-                            pf["pending_order_id"] = None
-                            pf["pending_deadline_ts"] = None
-                            pf["last_attempt_ts"] = time.time()
-                            bucket[symbol] = pf
-                            time.sleep(PER_SYMBOL_SLEEP)
-                            continue
-                    except Exception:
-                        pass
-
-        if in_pos and existing_amt <= 0:
-            _set_in_pos_side(st, "SHORT", False)
-            state[symbol] = st
-            pf["cooldown_until_ts"] = now_ts + tf_sec * int(pumpfade_cfg.cooldown_bars)
-            bucket[symbol] = pf
-
-        if existing_amt > 0:
-            _set_in_pos_side(st, "SHORT", True)
-            state[symbol] = st
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        cooldown_until = float(pf.get("cooldown_until_ts") or 0.0)
-        if cooldown_until and now_ts < cooldown_until:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        if pending_id:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        sig = pumpfade_engine.on_tick(ctx, symbol)
-        if not sig:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        meta = sig.meta or {}
-        hh_n = meta.get("hh_n")
-        atr15 = meta.get("atr15")
-        last_hh = pf.get("last_retest_hh")
-        last_prior_hh = pf.get("last_prior_hh")
-        if isinstance(hh_n, (int, float)) and isinstance(last_hh, (int, float)) and isinstance(atr15, (int, float)):
-            if abs(float(hh_n) - float(last_hh)) <= float(atr15) * 0.2:
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-
-        cur_total = count_open_positions(force=True)
-        if not isinstance(cur_total, int):
-            cur_total = 0
-        if cur_total >= MAX_OPEN_POSITIONS:
-            _append_entry_gate_log(
-                "pumpfade",
-                symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
-                side="SHORT",
-            )
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        if _exit_cooldown_blocked(state, symbol, "pumpfade", "SHORT"):
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        entry_price = float(sig.entry_price or 0.0)
-        if entry_price <= 0:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        order_info = "(알림 전용)"
-        entry_usdt = _resolve_entry_usdt()
-        try:
-            date_tag = time.strftime("%Y%m%d")
-            _append_entry_log(
-                f"pumpfade/pumpfade_entries_{date_tag}.log",
-                "engine=pumpfade side=SHORT symbol=%s state=ENTRY_READY hh=%s prior_hh=%s retest=Y "
-                "failure_high=%s failure_low=%s confirm_close=%s confirm=%s confirm_sub=%s aggr=%s vol_ok=%s vol_rel=%.2f "
-                "rsi=%s rsi_turn=%s macd_inc=%s entry=%.6g reasons=%s"
-                % (
-                    symbol,
-                    f"{meta.get('hh_n'):.6g}" if isinstance(meta.get("hh_n"), (int, float)) else "N/A",
-                    f"{meta.get('prior_hh'):.6g}" if isinstance(meta.get("prior_hh"), (int, float)) else "N/A",
-                    f"{meta.get('failure_high'):.6g}" if isinstance(meta.get("failure_high"), (int, float)) else "N/A",
-                    f"{meta.get('failure_low'):.6g}" if isinstance(meta.get("failure_low"), (int, float)) else "N/A",
-                    f"{meta.get('confirm_close'):.6g}" if isinstance(meta.get("confirm_close"), (int, float)) else "N/A",
-                    f"{meta.get('confirm_type') or 'N/A'}",
-                    f"{meta.get('confirm_subtype') or meta.get('confirm_type') or 'N/A'}",
-                    "1" if meta.get("aggressive_mode") else "0",
-                    "Y" if meta.get("vol_ok") else "N",
-                    (
-                        float(meta.get("vol_failure") or 0.0) / float(meta.get("vol_peak") or 1.0)
-                        if isinstance(meta.get("vol_failure"), (int, float)) and isinstance(meta.get("vol_peak"), (int, float)) and meta.get("vol_peak")
-                        else 0.0
-                    ),
-                    f"{meta.get('rsi'):.2f}" if isinstance(meta.get("rsi"), (int, float)) else "N/A",
-                    "Y" if meta.get("rsi_turn") else "N",
-                    "Y" if meta.get("macd_hist_increasing") else "N",
-                    entry_price,
-                    ",".join(meta.get("reasons") or []),
-                ),
-            )
-        except Exception:
-            pass
-        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="pumpfade", side="SHORT")
-        if not lock_ok:
-            print(f"[ENTRY-LOCK] sym={symbol} owner=pumpfade ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        try:
-            guard_key = _entry_guard_key(state, symbol, "SHORT")
-            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="pumpfade", side="SHORT"):
-                print(f"[pumpfade] 숏 중복 차단 ({symbol})")
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            if _entry_seen_blocked(state, symbol, "SHORT", "pumpfade"):
-                _entry_guard_release(state, symbol, key=guard_key)
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            try:
-                reason = ",".join(meta.get("reasons") or []) or "ENTRY_READY"
-                req_id = _enqueue_entry_request(
-                    state,
-                    symbol=symbol,
-                    side="SHORT",
-                    engine="PUMPFADE",
-                    reason="pumpfade_short",
-                    usdt=entry_usdt,
-                    live=LIVE_TRADING,
-                    alert_reason=reason,
-                    entry_price_hint=entry_price,
-                )
-                if req_id:
-                    result["hits"] += 1
-            finally:
-                _entry_guard_release(state, symbol, key=guard_key)
-        finally:
-            _entry_lock_release(state, symbol, owner="pumpfade", side="SHORT")
-        result["hits"] += 1
-        time.sleep(PER_SYMBOL_SLEEP)
     return result
 
 def _run_atlas_rs_fail_short_cycle(
@@ -6750,14 +5729,6 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             )
             skip_line = f"[long-exit-skip] sym={sym} reason=no_position_detail engine={engine_label}"
             print(skip_line)
-            if engine_label == "ATLASFABIO":
-                try:
-                    os.makedirs(os.path.join("logs", "fabio"), exist_ok=True)
-                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                    with open(os.path.join("logs", "fabio", "atlasfabio_funnel.log"), "a", encoding="utf-8") as f:
-                        f.write(f"{ts} {skip_line}\n")
-                except Exception:
-                    pass
             continue
         entry_px = detail.get("entry")
         mark_px = detail.get("mark")
@@ -6937,7 +5908,7 @@ def _manage_loop_worker(state: dict, exchange, cached_long_ex, send_telegram) ->
 def _reload_runtime_settings_from_disk(state: dict) -> None:
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global ENGINE_EXIT_OVERRIDES
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     try:
@@ -6963,7 +5934,6 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_dca_second_pct",
         "_dca_third_pct",
         "_exit_cooldown_hours",
-        "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
         "_swaggy_atlas_lab_v2_enabled",
         "_swaggy_no_atlas_enabled",
@@ -6971,7 +5941,6 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_swaggy_d1_overext_atr_mult",
         "_rsi_enabled",
         "_dtfx_enabled",
-        "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
         "_chat_id",
         "_manage_ws_mode",
@@ -7014,8 +5983,6 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
             pass
     if isinstance(state.get("_entry_usdt"), (int, float)):
         USDT_PER_TRADE = float(state.get("_entry_usdt"))
-    if isinstance(state.get("_atlas_fabio_enabled"), bool):
-        ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
     if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     if isinstance(state.get("_swaggy_atlas_lab_v2_enabled"), bool):
@@ -7053,8 +6020,6 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
-    if isinstance(state.get("_pumpfade_enabled"), bool):
-        PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
     if isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
         ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
     if state.get("_chat_id"):
@@ -7170,7 +6135,6 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_dca_second_pct",
         "_dca_third_pct",
         "_exit_cooldown_hours",
-        "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
         "_swaggy_atlas_lab_v2_enabled",
         "_swaggy_no_atlas_enabled",
@@ -7178,7 +6142,6 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_swaggy_d1_overext_atr_mult",
         "_rsi_enabled",
         "_dtfx_enabled",
-        "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
         "_tg_offset",
         "_tg_queue_offset",
@@ -7574,7 +6537,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -7849,9 +6812,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"엔진요약: swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
                             f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                             f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
-                            f"atlasfabio={'ON' if ATLAS_FABIO_ENABLED else 'OFF'} "
                             f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
-                            f"pumpfade={'ON' if PUMPFADE_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
                             f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
                             ""
@@ -7859,10 +6820,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                             f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
-                            f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
-                            f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                             f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                             ""
                             "--------------\n"
@@ -7912,9 +6871,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"엔진요약: swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
                         f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                         f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
-                        f"atlasfabio={'ON' if ATLAS_FABIO_ENABLED else 'OFF'} "
                         f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
-                        f"pumpfade={'ON' if PUMPFADE_ENABLED else 'OFF'} "
                         f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
                         f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
                         ""
@@ -7922,10 +6879,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                         f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                         f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
-                        f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
-                        f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                         f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                         ""
                         "--------------\n"
@@ -8221,26 +7176,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] long_live cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
-                if (cmd in ("/atlasfabio", "atlasfabio")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        ATLAS_FABIO_ENABLED = True
-                        state["_atlas_fabio_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ atlasfabio ON (게이트 결합 엔진)"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        ATLAS_FABIO_ENABLED = False
-                        state["_atlas_fabio_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ atlasfabio OFF"
-                    else:
-                        resp = f"ℹ️ atlasfabio 상태: {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n사용법: /atlasfabio on|off|status"
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] atlasfabio cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
                 if (cmd in ("/swaggy_atlas_lab", "swaggy_atlas_lab")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -8396,26 +7331,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] dtfx cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
-                if (cmd in ("/pumpfade", "pumpfade")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        PUMPFADE_ENABLED = True
-                        state["_pumpfade_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ pumpfade ON (PumpFade 엔진)"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        PUMPFADE_ENABLED = False
-                        state["_pumpfade_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ pumpfade OFF"
-                    else:
-                        resp = f"ℹ️ pumpfade 상태: {'ON' if PUMPFADE_ENABLED else 'OFF'}\n사용법: /pumpfade on|off|status"
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] pumpfade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
                 if (cmd in ("/atlas_rs_fail_short", "atlas_rs_fail_short")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -8535,302 +7450,6 @@ def _compute_atlas_swaggy_local(symbol: str, decision, gate: Dict[str, Any], swa
         }
     return atlas_engine.compute_swaggy_local(symbol, decision, gate, cycle_cache, atlas_swaggy_cfg, swaggy_cfg)
 
-def _atlasfabio_gate_long(symbol: str, cfg) -> Optional[Dict[str, Any]]:
-    if atlas_engine:
-        gate = atlas_engine.evaluate_fabio_gate_long(symbol, cfg)
-        if gate is not None:
-            return gate
-    if atlas_fabio_engine:
-        return atlas_fabio_engine.evaluate_gate_long(symbol, cfg)
-    return None
-
-def _atlasfabio_gate_short(symbol: str, cfg) -> Optional[Dict[str, Any]]:
-    if atlas_engine:
-        gate = atlas_engine.evaluate_fabio_gate_short(symbol, cfg)
-        if gate is not None:
-            return gate
-    if atlas_fabio_engine:
-        return atlas_fabio_engine.evaluate_gate_short(symbol, cfg)
-    return None
-
-def _atlasfabio_gate(symbol: str, cfg) -> Optional[Dict[str, Any]]:
-    if atlas_engine:
-        gate = atlas_engine.evaluate_fabio_gate(symbol, cfg)
-        if gate is not None:
-            return gate
-    if atlas_fabio_engine:
-        return atlas_fabio_engine.evaluate_gate(symbol, cfg)
-    return None
-
-def _ema_align_ok(symbol: str, tf: str, limit: int = 120) -> bool:
-    df = cycle_cache.get_df(symbol, tf, limit)
-    if df.empty or len(df) < 70:
-        return False
-    df = df.iloc[:-1]
-    if len(df) < 70:
-        return False
-    ema20 = ema(df["close"], 20).iloc[-1]
-    ema60 = ema(df["close"], 60).iloc[-1]
-    if ema60 == 0:
-        return False
-    dist = abs(ema20 - ema60) / ema60
-    return dist >= EMA_ALIGN_DIST_PCT
-
-exchange = ccxt.binance({
-    "apiKey": os.getenv("BINANCE_API_KEY", ""),
-    "secret": os.getenv("BINANCE_API_SECRET", ""),
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
-    "timeout": 30_000,  # 30초로 증가
-    "rateLimit": 200,   # 요청 간격 증가
-})
-def _fetch_ohlcv_with_stats(symbol: str, tf: str, limit: int) -> Optional[list]:
-    try:
-        data = exchange.fetch_ohlcv(symbol, tf, limit=limit)
-        CURRENT_CYCLE_STATS["rest_calls"] = CURRENT_CYCLE_STATS.get("rest_calls", 0) + 1
-        return data
-    except Exception as e:
-        msg = str(e)
-        CURRENT_CYCLE_STATS["rest_fails"] = CURRENT_CYCLE_STATS.get("rest_fails", 0) + 1
-        if ("429" in msg) or ("-1003" in msg):
-            CURRENT_CYCLE_STATS["rest_429"] = CURRENT_CYCLE_STATS.get("rest_429", 0) + 1
-        print(f"[에러] {symbol} {tf} 데이터 가져오기 실패: {e}")
-        return None
-
-cycle_cache.set_fetcher(_fetch_ohlcv_with_stats)
-
-ATLASFABIO_LTF_RSI_LONG_MIN = 50.0
-ATLASFABIO_MID_RETEST_REASON = "atlas_mid_retest_bypass"
-FABIO_LONG_IMPULSE_ATR_FACTOR = 1.2
-FABIO_LONG_IMPULSE_ATR_PERIOD = 14
-FABIO_LONG_BB_PERIOD = 20
-FABIO_LONG_DIST_MAX = 0.8
-FABIO_RSI_OVERHEAT = 68.0
-
-USDT_PER_TRADE = 30.0  # 사용가능 USDT 대비 퍼센트
-LEVERAGE = 10
-MARGIN_MODE = "cross"
-MAX_OPEN_POSITIONS = 12
-AUTO_EXIT_ENABLED = False  # True이면 TP/SL 기준으로 자동 청산 (기본 OFF)
-AUTO_EXIT_LONG_TP_PCT = 3.0
-AUTO_EXIT_LONG_SL_PCT = 3.0
-AUTO_EXIT_SHORT_TP_PCT = 3.0
-AUTO_EXIT_SHORT_SL_PCT = 3.0
-ENGINE_EXIT_OVERRIDES: Dict[str, Any] = {}
-LIVE_TRADING = True  # True이면 신호 발생 시 실제 주문 실행
-
-SWAGGY_NO_ATLAS_BAR_SEC = 300
-SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = -0.70
-SWAGGY_D1_OVEREXT_ATR_MULT = 1.2
-
-COOLDOWN_SEC = 3600
-PER_SYMBOL_SLEEP = 0.12
-CYCLE_SLEEP = 10.0
-SAME_CYCLE_SLEEP = 10.0
-SHORT_RECONCILE_GRACE_SEC = 45.0
-SHORT_RECONCILE_EPS = 0.0005
-SHORT_RECONCILE_ZERO_STREAK_N = 2
-SHORT_RECONCILE_SEEN_TTL_SEC = 3600  # 최근 숏 포지션 실제 존재 TTL
-
-# 옵션 최적화 설정
-STRUCTURE_TOP_N: Optional[int] = 20  # 구조용 상위 N개 (거래대금 기준)
-EMA_ALIGN_DIST_PCT = 0.003
-FABIO_EARLY_ALERT_COOLDOWN_SEC = 900
-FABIO_UNIVERSE_TOP_N = 30  # 파비오 엔진: top N (조건별 로테이션)
-FABIO_GAIN_TOP_N = 15
-FABIO_LOSS_TOP_N = 15
-ATLASFABIO_DIST_MAX = 0.03
-ATLASFABIO_PULLBACK_VOL_MAX = 1.5
-ATLASFABIO_RETEST_TOUCH_TOL = 0.0020
-ATLASFABIO_STRONG_SCORE = 85
-ATLASFABIO_MID_SCORE = 70
-ATLASFABIO_STRONG_DIST_MAX = 0.045
-ATLASFABIO_MID_DIST_MAX = 0.008
-ATLASFABIO_MID_PULLBACK_VOL_MAX = 1.5
-ATLASFABIO_MID_RETEST_TOUCH_TOL = 0.0035
-ATLASFABIO_MID_VOL_MULT = 1.05
-ATLASFABIO_MIN_STRENGTH = 0.55
-ATLASFABIO_MIN_STRENGTH_SOFT = 0.70
-MANAGE_EVAL_COOLDOWN_SEC: int = 20  # manage 모드 평가 주기 쿨다운(초) → fetch_positions 빈도 완화
-MANAGE_EXIT_COOLDOWN_SEC: int = 5  # auto-exit 전용 최소 평가 주기(초)
-MANAGE_PING_COOLDOWN_SEC: int = 7200  # manage 알림 주기(초) - 2시간
-MANUAL_CLOSE_GRACE_SEC: int = 60  # 진입 직후 포지션 캐시 오차로 인한 오탐 방지
-AUTO_EXIT_GRACE_SEC: int = 30     # 진입 직후 자동청산 금지 구간
-EXIT_COOLDOWN_HOURS: float = 2.0  # 청산 후 재진입 쿨다운(시간)
-EXIT_COOLDOWN_SEC: int = int(EXIT_COOLDOWN_HOURS * 3600)  # 청산 후 재진입 쿨다운(초)
-MANAGE_LOOP_ENABLED: bool = True  # 관리 루프 분리 실행 여부
-MANAGE_LOOP_SLEEP_SEC: float = 2.0  # 관리 루프 주기(초)
-MANAGE_TICKER_TTL_SEC: float = 5.0  # 관리 루프 티커 캐시 TTL(초)
-RUNTIME_CONFIG_RELOAD_SEC: float = 5.0  # 런타임 설정 변경사항 반영 주기
-MANAGE_WS_MODE: bool = False  # WS 관리 모듈 사용 시 메인 리컨실/관리 비활성
-SUPPRESS_RECONCILE_ALERTS: bool = True  # 리컨실 알림 억제용(기본 ON)
-REPORT_API_ONLY: bool = True  # 리포트는 API sync 결과만 사용
-DB_RECONCILE_ENABLED: bool = os.getenv("DB_RECONCILE_ENABLED", "0") == "1"
-DB_RECONCILE_SEC: float = float(os.getenv("DB_RECONCILE_SEC", "30"))
-DB_RECONCILE_LOOKBACK_SEC: float = float(os.getenv("DB_RECONCILE_LOOKBACK_SEC", "3600"))
-DB_RECONCILE_SYMBOLS_RAW = os.getenv("DB_RECONCILE_SYMBOLS", "").strip()
-DB_REPORT_LOOKBACK_SEC: float = float(os.getenv("DB_REPORT_LOOKBACK_SEC", "259200"))
-SHORT_POS_SAMPLE_DIV: int = 20  # 1/N 샘플링
-SHORT_POS_SAMPLE_RECENT_SEC: int = 120  # 최근 진입 심볼은 항상 샘플링
-
-FAST_TF_PREFETCH_TOPN = 30
-MAX_FAST_SYMBOLS = 30
-FAST_LIMIT_CAP = 120
-MID_LIMIT_CAP = 200
-SLOW_LIMIT_CAP = 300
-MID_TF_PREFETCH_EVERY_N = 3
-TTL_4H_SEC = 1800
-TTL_1D_SEC = 86400
-
-# LONG signal control (used by Fabio/AtlasFabio)
-LONG_LIVE_TRADING = True
-ATLAS_FABIO_ENABLED = True
-ATLAS_FABIO_PAPER = False
-SWAGGY_ENABLED = False
-SWAGGY_ATLAS_LAB_ENABLED = False
-SWAGGY_ATLAS_LAB_V2_ENABLED = False
-SWAGGY_NO_ATLAS_ENABLED = False
-DTFX_ENABLED = True
-PUMPFADE_ENABLED = False
-ATLAS_RS_FAIL_SHORT_ENABLED = False
-DIV15M_LONG_ENABLED = False
-DIV15M_SHORT_ENABLED = False
-ONLY_DIV15M_SHORT = False
-RSI_ENABLED = True
-
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-STATE_SAVE_LOCK = threading.Lock()
-
-# 청산 보수성 옵션
-REQUIRE_CLOSE_ABOVE_FOR_EXIT = True  # True이면 wick 터치만으로는 청산하지 않고 종가가 EMA20 이상이어야 함
-
-# 사이클 단위 데이터 캐시 (symbol, timeframe, limit) -> DataFrame
-CURRENT_CYCLE_STATS: Dict[str, dict] = {}
-# funding rate TTL 캐시: symbol -> (ts, rate, interval_hours)
-FUNDING_TTL_CACHE: Dict[str, tuple] = {}
-
-# 영속(사이클 간) OHLCV TTL 캐시: (symbol, tf, limit) -> (ts, df)
-TF_TTL_SECS = {"3m": 60, "5m": 120, "15m": 240, "1h": 300}
-PERSISTENT_OHLCV_CACHE: Dict[tuple, tuple] = {}
-
-# 429/-1003 백오프 제어
-GLOBAL_BACKOFF_UNTIL: float = 0.0
-_BACKOFF_SECS: float = 0.0
-# rate-limit 로그 쿨다운
-RATE_LIMIT_LOG_TS: float = 0.0
-TOTAL_CYCLES: int = 0
-TOTAL_ELAPSED: float = 0.0
-TOTAL_REST_CALLS: int = 0
-TOTAL_429_COUNT: int = 0
-
-FUNDING_INTERVAL_HOURS = 1
-FUNDING_BLOCK_PCT = -0.2
-FUNDING_TTL_SEC = 300
-
-def prune_ohlcv_cache():
-    """TTL 지난 OHLCV 캐시 청소(메모리 보호). 여유 3배를 준다."""
-    try:
-        now = time.time()
-        to_del = []
-        for (sym, tf, limit), (ts, _) in list(PERSISTENT_OHLCV_CACHE.items()):
-            ttl = TF_TTL_SECS.get(tf, 60) * 3
-            if (now - ts) > ttl:
-                to_del.append((sym, tf, limit))
-        for k in to_del:
-            PERSISTENT_OHLCV_CACHE.pop(k, None)
-        if to_del:
-            CURRENT_CYCLE_STATS.setdefault("cache_pruned", 0)
-            CURRENT_CYCLE_STATS["cache_pruned"] += len(to_del)
-    except Exception:
-        pass
-
-def _prefetch_ohlcv_for_cycle(
-    symbols: List[str],
-    ex,
-    plan: Dict[str, int],
-    label: str = "common",
-    ttl_by_tf: Optional[Dict[str, int]] = None,
-) -> Dict[str, Any]:
-    if not symbols or not plan:
-        return {"symbols": len(symbols), "tfs": list(plan.keys()), "fetched": 0, "failed": 0, "fresh_hits": {}}
-    fetched = 0
-    failed = 0
-    failed_429 = 0
-    fresh_hits: Dict[str, int] = {}
-    fetched_by_tf: Dict[str, int] = {}
-    ttl_by_tf = ttl_by_tf or {}
-    t0 = time.time()
-    for sym in symbols:
-        for tf, limit in plan.items():
-            key = (sym, tf)
-            cached_data = cycle_cache.get_raw(sym, tf)
-            if cached_data is not None and len(cached_data) >= limit:
-                continue
-            ttl = ttl_by_tf.get(tf)
-            if ttl and cycle_cache.is_fresh(sym, tf, ttl):
-                fresh_hits[tf] = fresh_hits.get(tf, 0) + 1
-                continue
-            try:
-                data = ex.fetch_ohlcv(sym, tf, limit=limit)
-                cycle_cache.set_raw(sym, tf, data)
-                fetched += 1
-                fetched_by_tf[tf] = fetched_by_tf.get(tf, 0) + 1
-            except Exception as e:
-                failed += 1
-                msg = str(e)
-                if ("429" in msg) or ("-1003" in msg):
-                    failed_429 += 1
-                print(f"[에러] {sym} {tf} 데이터 가져오기 실패: {e}")
-    if fetched > 0:
-        elapsed = time.time() - t0
-        print(f"[prefetch] {label} fetched={fetched} failed={failed} elapsed={elapsed:.2f}s")
-    CURRENT_CYCLE_STATS["rest_calls"] = CURRENT_CYCLE_STATS.get("rest_calls", 0) + fetched
-    CURRENT_CYCLE_STATS["rest_fails"] = CURRENT_CYCLE_STATS.get("rest_fails", 0) + failed
-    CURRENT_CYCLE_STATS["rest_429"] = CURRENT_CYCLE_STATS.get("rest_429", 0) + failed_429
-    return {
-        "symbols": len(symbols),
-        "tfs": list(plan.keys()),
-        "fetched": fetched,
-        "failed": failed,
-        "fresh_hits": fresh_hits,
-        "fetched_by_tf": fetched_by_tf,
-    }
-
-def _atlasfabio_ltf_hit(symbol: str, side: str, mode: str = "5m_or_3m") -> tuple[bool, bool, bool]:
-    if not rsi_engine:
-        return False, False, False
-    cfg = rsi_engine.config
-    side = (side or "").upper()
-    if side == "SHORT":
-        r5 = rsi_engine.fetch_rsi(symbol, "5m")
-        hit5m = (r5 is not None) and (r5 >= cfg.thresholds["5m"])
-        r3, r2, r1 = rsi_engine.fetch_rsi_last3(symbol, "3m")
-        hit3m = False
-        if r2 is not None and r1 is not None and r2 >= cfg.thresholds["3m"] and r2 > r1:
-            hit3m = True
-        if r3 is not None and r2 is not None and r3 >= cfg.thresholds["3m"] and r3 > r2:
-            hit3m = True
-        ltf_ok = hit3m if mode == "3m_only" else (hit5m or hit3m)
-        return hit5m, hit3m, ltf_ok
-
-    r5_prev, r5_last = rsi_engine.fetch_rsi_last2(symbol, "5m")
-    hit5m = False
-    if (
-        r5_prev is not None
-        and r5_last is not None
-        and r5_last >= ATLASFABIO_LTF_RSI_LONG_MIN
-        and r5_last > r5_prev
-    ):
-        hit5m = True
-    r3, r2, r1 = rsi_engine.fetch_rsi_last3(symbol, "3m")
-    hit3m = False
-    if r2 is not None and r1 is not None and r2 >= ATLASFABIO_LTF_RSI_LONG_MIN and r1 > r2:
-        hit3m = True
-    if r3 is not None and r2 is not None and r3 >= ATLASFABIO_LTF_RSI_LONG_MIN and r2 > r3:
-        hit3m = True
-    ltf_ok = hit3m if mode == "3m_only" else (hit5m or hit3m)
-    return hit5m, hit3m, ltf_ok
-
 def _parse_funding_interval_hours(info: dict) -> Optional[float]:
     for key in ("fundingIntervalHours", "fundingInterval", "intervalHours", "interval"):
         if key in info:
@@ -8944,7 +7563,6 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_dca_second_pct",
                 "_dca_third_pct",
                 "_exit_cooldown_hours",
-                "_atlas_fabio_enabled",
                 "_swaggy_enabled",
                 "_swaggy_atlas_lab_enabled",
                 "_swaggy_atlas_lab_v2_enabled",
@@ -8952,7 +7570,6 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_swaggy_no_atlas_overext_min",
                 "_swaggy_d1_overext_atr_mult",
                 "_dtfx_enabled",
-                "_pumpfade_enabled",
                 "_rsi_enabled",
                 "_runtime_cfg_ts",
             ]
@@ -8988,7 +7605,7 @@ def run():
     state = load_state()
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
-    global swaggy_engine, swaggy_atlas_lab_engine, swaggy_atlas_lab_v2_engine, swaggy_no_atlas_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
+    global swaggy_engine, swaggy_atlas_lab_engine, swaggy_atlas_lab_v2_engine, swaggy_no_atlas_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     swaggy_atlas_lab_engine = SwaggyAtlasLabEngine() if SwaggyAtlasLabEngine else None
     swaggy_atlas_lab_v2_engine = SwaggyAtlasLabV2Engine() if SwaggyAtlasLabV2Engine else None
@@ -9005,8 +7622,6 @@ def run():
     div15m_short_engine = Div15mShortEngine() if Div15mShortEngine else None
     dtfx_engine = DTFXEngine() if DTFXEngine else None
     dtfx_cfg = DTFXConfig(tf_ltf="5m") if DTFXConfig else None
-    pumpfade_engine = PumpFadeEngine() if PumpFadeEngine else None
-    pumpfade_cfg = PumpFadeConfig() if PumpFadeConfig else None
     atlas_rs_fail_short_engine = AtlasRsFailShortEngine() if AtlasRsFailShortEngine else None
     atlas_rs_fail_short_cfg = AtlasRsFailShortConfig() if AtlasRsFailShortConfig else None
     if dtfx_engine and dtfx_cfg and EngineContext:
@@ -9018,7 +7633,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
@@ -9078,10 +7693,6 @@ def run():
         RSI_ENABLED = bool(state.get("_rsi_enabled"))
     else:
         state["_rsi_enabled"] = RSI_ENABLED
-    if isinstance(state.get("_atlas_fabio_enabled"), bool):
-        ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
-    else:
-        state["_atlas_fabio_enabled"] = ATLAS_FABIO_ENABLED
     if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     else:
@@ -9106,10 +7717,6 @@ def run():
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
         state["_dtfx_enabled"] = DTFX_ENABLED
-    if isinstance(state.get("_pumpfade_enabled"), bool):
-        PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
-    else:
-        state["_pumpfade_enabled"] = PUMPFADE_ENABLED
     if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
         state["_swaggy_no_atlas_enabled"] = False
     if isinstance(state.get("_swaggy_atlas_lab_v2_enabled"), dict):
@@ -9170,7 +7777,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_d1_overext n, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_d1_overext n, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -9443,25 +8050,6 @@ def run():
         div15m_universe_len = len(div15m_universe)
         div15m_short_universe = list(shared_universe)
         div15m_short_universe_len = len(div15m_short_universe)
-        fabio_universe = []
-        fabio_label = "realtime_only"
-        fabio_dir_hint = {}
-        if heavy_scan and dtfx_cfg and build_universe_from_tickers:
-            fabio_label = "dtfx_universe"
-            anchors = []
-            for s in dtfx_cfg.anchor_symbols or []:
-                anchors.append(s if "/" in s else f"{s}/USDT:USDT")
-            dtfx_min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
-            fabio_universe = build_universe_from_tickers(
-                tickers,
-                symbols=symbols,
-                min_quote_volume_usdt=dtfx_min_qv,
-                top_n=dtfx_cfg.universe_top_n,
-                anchors=tuple(anchors),
-            )
-            state["_fabio_universe"] = fabio_universe
-            state["_fabio_label"] = fabio_label
-            state["_fabio_dir_hint"] = fabio_dir_hint
 
         swaggy_universe = []
         swaggy_cfg = None
@@ -9489,16 +8077,22 @@ def run():
             swaggy_universe = swaggy_engine.build_universe(ctx)
             state["_swaggy_universe"] = swaggy_universe
         elif SWAGGY_ATLAS_LAB_ENABLED or SWAGGY_ATLAS_LAB_V2_ENABLED or SWAGGY_NO_ATLAS_ENABLED:
-            dtfx_cfg = dtfx_cfg if dtfx_cfg else DTFXConfig()
-            dtfx_min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
-            anchors = []
-            for s in dtfx_cfg.anchor_symbols or []:
-                anchors.append(s if "/" in s else f"{s}/USDT:USDT")
+            if DTFXConfig:
+                dtfx_cfg = dtfx_cfg if dtfx_cfg else DTFXConfig()
+                dtfx_min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
+                anchors = []
+                for s in dtfx_cfg.anchor_symbols or []:
+                    anchors.append(s if "/" in s else f"{s}/USDT:USDT")
+                top_n = dtfx_cfg.universe_top_n
+            else:
+                dtfx_min_qv = 8_000_000.0
+                anchors = []
+                top_n = 50
             swaggy_universe = build_universe_from_tickers(
                 tickers,
                 symbols=symbols,
                 min_quote_volume_usdt=dtfx_min_qv,
-                top_n=dtfx_cfg.universe_top_n,
+                top_n=top_n,
                 anchors=tuple(anchors),
             )
             state["_swaggy_universe"] = swaggy_universe
@@ -9518,8 +8112,7 @@ def run():
             swaggy_no_atlas_cfg.d1_overext_atr_mult = SWAGGY_D1_OVEREXT_ATR_MULT
 
             atlas_enabled_any = bool(
-                ATLAS_FABIO_ENABLED
-                or SWAGGY_ATLAS_LAB_ENABLED
+                SWAGGY_ATLAS_LAB_ENABLED
                 or SWAGGY_ATLAS_LAB_V2_ENABLED
                 or ATLAS_RS_FAIL_SHORT_ENABLED
             )
@@ -9550,17 +8143,6 @@ def run():
             dtfx_universe = dtfx_engine.build_universe(ctx)
             state["_dtfx_universe"] = dtfx_universe
 
-        pumpfade_universe = []
-        if PUMPFADE_ENABLED and pumpfade_engine and pumpfade_cfg and EngineContext:
-            ctx = EngineContext(
-                exchange=exchange,
-                state=state,
-                now_ts=time.time(),
-                logger=print,
-                config=pumpfade_cfg,
-            )
-            pumpfade_universe = pumpfade_engine.build_universe(ctx)
-            state["_pumpfade_universe"] = pumpfade_universe
 
         atlas_rs_fail_short_universe = []
         if ATLAS_RS_FAIL_SHORT_ENABLED and atlas_rs_fail_short_engine and atlas_rs_fail_short_cfg and EngineContext:
@@ -9574,86 +8156,30 @@ def run():
             atlas_rs_fail_short_universe = atlas_rs_fail_short_engine.build_universe(ctx)
             state["_atlas_rs_fail_short_universe"] = atlas_rs_fail_short_universe
 
-        if heavy_scan:
-            universe_union = list(
-                set(
-                    universe_momentum
-                    + universe_structure
-                    + fabio_universe
-                    + (swaggy_universe or [])
-                    + (dtfx_universe or [])
-                    + (pumpfade_universe or [])
-                    + (atlas_rs_fail_short_universe or [])
-                )
+        universe_union = list(
+            set(
+                universe_momentum
+                + universe_structure
+                + (swaggy_universe or [])
+                + (dtfx_universe or [])
+                + (atlas_rs_fail_short_universe or [])
             )
-        else:
-            if not fabio_universe:
-                fabio_universe = list(state.get("_fabio_universe") or [])
-                fabio_label = str(state.get("_fabio_label") or "realtime_only")
-                fabio_dir_hint = dict(state.get("_fabio_dir_hint") or {})
-            universe_union = list(
-                set(
-                    universe_momentum
-                    + universe_structure
-                    + fabio_universe
-                    + (swaggy_universe or [])
-                    + (dtfx_universe or [])
-                    + (pumpfade_universe or [])
-                    + (atlas_rs_fail_short_universe or [])
-                )
-            )
-        if heavy_scan:
-            try:
-                os.makedirs("logs", exist_ok=True)
-                atlas_line = (
-                    f"[atlasfabio-universe] total={len(fabio_universe)} label={fabio_label}"
-                )
-                with open(os.path.join("logs", "fabio", "atlasfabio_universe.log"), "a", encoding="utf-8") as f:
-                    f.write(atlas_line + "\n")
-            except Exception:
-                pass
+        )
 
         cached_ex = CachedExchange(exchange)
         cached_long_ex = CachedExchange(exchange)
 
-        atlas_cfg = None
-        if (ATLAS_FABIO_ENABLED or SWAGGY_ATLAS_LAB_ENABLED or SWAGGY_ATLAS_LAB_V2_ENABLED or ATLAS_RS_FAIL_SHORT_ENABLED):
-            if not atlas_engine and AtlasEngine:
-                atlas_engine = AtlasEngine()
-            if not atlas_swaggy_cfg and AtlasSwaggyConfig:
-                atlas_swaggy_cfg = AtlasSwaggyConfig()
-        if ATLAS_FABIO_ENABLED and atlas_fabio_engine and heavy_scan:
-            atlas_cfg = atlas_fabio_engine.Config()
-        fabio_cfg_atlas = None
-        fabio_cfg_atlas_mid = None
-        if atlas_cfg and fabio_entry_engine:
-            fabio_cfg_atlas = fabio_entry_engine.Config()
-            fabio_cfg_atlas.dist_to_ema20_max = ATLASFABIO_STRONG_DIST_MAX
-            fabio_cfg_atlas.long_dist_to_ema20_max = ATLASFABIO_STRONG_DIST_MAX
-            fabio_cfg_atlas.pullback_vol_ratio_max = ATLASFABIO_PULLBACK_VOL_MAX
-            fabio_cfg_atlas.retest_touch_tol = ATLASFABIO_RETEST_TOUCH_TOL
-
-            fabio_cfg_atlas_mid = fabio_entry_engine.Config()
-            fabio_cfg_atlas_mid.timeframe_ltf = "5m"
-            fabio_cfg_atlas_mid.dist_to_ema20_max = ATLASFABIO_MID_DIST_MAX
-            fabio_cfg_atlas_mid.long_dist_to_ema20_max = ATLASFABIO_MID_DIST_MAX
-            fabio_cfg_atlas_mid.pullback_vol_ratio_max = ATLASFABIO_MID_PULLBACK_VOL_MAX
-            fabio_cfg_atlas_mid.retest_touch_tol = ATLASFABIO_MID_RETEST_TOUCH_TOL
-            fabio_cfg_atlas_mid.trigger_vol_ratio_min = 1.05
-        fabio_universe_len = len(fabio_universe)
         swaggy_universe_len = len(swaggy_universe) if swaggy_universe else 0
         swaggy_atlas_lab_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_ENABLED else 0
         swaggy_atlas_lab_v2_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_V2_ENABLED else 0
         swaggy_no_atlas_universe_len = swaggy_universe_len if SWAGGY_NO_ATLAS_ENABLED else 0
         dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
-        pumpfade_universe_len = len(pumpfade_universe) if pumpfade_universe else 0
         atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
         universe_structure_len = len(universe_structure)
         universe_union_len = len(universe_union)
         rsi_ran = bool(run_rsi_short and universe_momentum)
         div15m_long_ran = bool(run_div15m_long and div15m_universe)
         div15m_short_ran = bool(run_div15m_short and div15m_short_universe)
-        atlasfabio_ran = bool(heavy_scan and ATLAS_FABIO_ENABLED and atlas_cfg and fabio_cfg_atlas)
         swaggy_ran = bool(heavy_scan and SWAGGY_ENABLED and swaggy_cfg and swaggy_engine)
         swaggy_atlas_lab_ran = bool(
             heavy_scan
@@ -9679,7 +8205,6 @@ def run():
             and swaggy_universe
         )
         dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
-        pumpfade_ran = bool(PUMPFADE_ENABLED and pumpfade_engine and pumpfade_cfg and pumpfade_universe)
         atlas_rs_fail_short_ran = bool(
             ATLAS_RS_FAIL_SHORT_ENABLED
             and atlas_rs_fail_short_engine
@@ -9713,13 +8238,7 @@ def run():
         for s in universe_structure[:30]:
             if s not in slow_symbols_ordered:
                 slow_symbols_ordered.append(s)
-        for s in fabio_universe:
-            if s not in slow_symbols_ordered:
-                slow_symbols_ordered.append(s)
         for s in swaggy_universe or []:
-            if s not in slow_symbols_ordered:
-                slow_symbols_ordered.append(s)
-        for s in pumpfade_universe or []:
             if s not in slow_symbols_ordered:
                 slow_symbols_ordered.append(s)
         for s in atlas_rs_fail_short_universe or []:
@@ -9739,8 +8258,6 @@ def run():
 
         # MID TF (15m) - 2~3 사이클마다
         mid_plan["15m"] = max(mid_plan.get("15m", 0), 60)
-        if fabio_cfg_atlas:
-            mid_plan["15m"] = max(mid_plan.get("15m", 0), int(fabio_cfg_atlas.limit))
         if swaggy_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_cfg.vp_lookback_1h))
@@ -9753,22 +8270,13 @@ def run():
         if swaggy_no_atlas_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
             mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_no_atlas_cfg.vp_lookback_1h))
-        if pumpfade_cfg:
-            mid_plan["15m"] = max(mid_plan.get("15m", 0), int(max(80, pumpfade_cfg.lookback_hh + 10)))
-            mid_plan["1h"] = max(mid_plan.get("1h", 0), 40)
         if atlas_rs_fail_short_cfg:
             mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
-        if atlas_cfg:
-            mid_plan["1h"] = max(mid_plan.get("1h", 0), int(atlas_cfg.htf_limit))
         mid_plan["15m"] = min(mid_plan.get("15m", 0), MID_LIMIT_CAP)
         if "1h" in mid_plan:
             mid_plan["1h"] = min(mid_plan.get("1h", 0), MID_LIMIT_CAP)
 
         # SLOW TF (4h/1d) - TTL
-        if fabio_cfg_atlas:
-            slow_plan["4h"] = max(slow_plan.get("4h", 0), int(fabio_cfg_atlas.limit))
-        if atlas_cfg:
-            slow_plan["1d"] = max(slow_plan.get("1d", 0), int(getattr(atlas_cfg, "d1_limit", 90)))
         if swaggy_cfg:
             slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
         if swaggy_atlas_lab_cfg:
@@ -9787,8 +8295,7 @@ def run():
         prefetch_enabled = bool(
             heavy_scan
             and (
-                ATLAS_FABIO_ENABLED
-                or SWAGGY_ATLAS_LAB_ENABLED
+                SWAGGY_ATLAS_LAB_ENABLED
                 or SWAGGY_ATLAS_LAB_V2_ENABLED
                 or ATLAS_RS_FAIL_SHORT_ENABLED
             )
@@ -9818,47 +8325,6 @@ def run():
                 label="slow",
                 ttl_by_tf={"4h": TTL_4H_SEC, "1d": TTL_1D_SEC},
             )
-            atlas_pass_symbols = []
-            atlas_fail_count = 0
-            if heavy_scan and ATLAS_FABIO_ENABLED and atlas_fabio_engine:
-                for sym in fabio_universe:
-                    d = fabio_dir_hint.get(sym) if isinstance(fabio_dir_hint, dict) else None
-                    if d == "LONG":
-                        gate = _atlasfabio_gate_long(sym, atlas_cfg)
-                    elif d == "SHORT":
-                        gate = _atlasfabio_gate_short(sym, atlas_cfg)
-                    else:
-                        continue
-                    if gate.get("status") != "ok":
-                        continue
-                    trade_allowed = bool(gate.get("trade_allowed"))
-                    allow_long = bool(gate.get("allow_long"))
-                    allow_short = bool(gate.get("allow_short"))
-                    if not trade_allowed:
-                        atlas_fail_count += 1
-                        continue
-                    if d == "LONG" and not allow_long:
-                        atlas_fail_count += 1
-                        continue
-                    if d == "SHORT" and not allow_short:
-                        atlas_fail_count += 1
-                        continue
-                    atlas_pass_symbols.append(sym)
-                print(
-                    f"[atlas-prefetch] pass={len(atlas_pass_symbols)} fail={atlas_fail_count} total={len(fabio_universe)}"
-                )
-            if atlas_pass_symbols:
-                fast_symbols_ordered = []
-                for s in in_pos_symbols:
-                    if s not in fast_symbols_ordered:
-                        fast_symbols_ordered.append(s)
-                for s in atlas_pass_symbols:
-                    if s not in fast_symbols_ordered:
-                        fast_symbols_ordered.append(s)
-                for s in top_candidates:
-                    if s not in fast_symbols_ordered:
-                        fast_symbols_ordered.append(s)
-                fast_symbols = fast_symbols_ordered[:MAX_FAST_SYMBOLS]
             fast_stats = _prefetch_ohlcv_for_cycle(fast_symbols, exchange, fast_plan, label="fast")
 
             print(
@@ -9979,8 +8445,6 @@ def run():
                 pass
         active_positions = int(active_positions_total)
         pos_limit_logged = False
-        atlasfabio_result = {}
-        atlasfabio_thread = None
         swaggy_result = {}
         swaggy_thread = None
         swaggy_atlas_lab_result = {}
@@ -9991,30 +8455,8 @@ def run():
         swaggy_no_atlas_thread = None
         dtfx_result = {}
         dtfx_thread = None
-        pumpfade_result = {}
-        pumpfade_thread = None
         atlas_rs_fail_short_result = {}
         atlas_rs_fail_short_thread = None
-        if heavy_scan and ATLAS_FABIO_ENABLED and fabio_cfg_atlas and atlas_cfg:
-            atlasfabio_thread = threading.Thread(
-                target=lambda: atlasfabio_result.update(
-                    _run_atlas_fabio_cycle(
-                        fabio_universe,
-                        cached_ex,
-                        state,
-                        fabio_cfg_atlas,
-                        fabio_cfg_atlas_mid,
-                        atlas_cfg,
-                        active_positions,
-                        fabio_dir_hint,
-                        send_telegram,
-                    )
-                ),
-                daemon=True,
-            )
-            atlasfabio_thread.start()
-        elif ATLAS_FABIO_ENABLED and fabio_cfg_atlas:
-            pass
         if SWAGGY_ENABLED and swaggy_cfg and swaggy_engine:
             swaggy_thread = threading.Thread(
                 target=lambda: swaggy_result.update(
@@ -10105,20 +8547,6 @@ def run():
                 daemon=True,
             )
             dtfx_thread.start()
-        if PUMPFADE_ENABLED and pumpfade_cfg and pumpfade_engine:
-            pumpfade_thread = threading.Thread(
-                target=lambda: pumpfade_result.update(
-                    _run_pumpfade_cycle(
-                        pumpfade_engine,
-                        pumpfade_universe,
-                        state,
-                        send_telegram,
-                        pumpfade_cfg,
-                    )
-                ),
-                daemon=True,
-            )
-            pumpfade_thread.start()
         if ATLAS_RS_FAIL_SHORT_ENABLED and atlas_rs_fail_short_cfg and atlas_rs_fail_short_engine:
             atlas_rs_fail_short_thread = threading.Thread(
                 target=lambda: atlas_rs_fail_short_result.update(
@@ -10602,8 +9030,6 @@ def run():
 
             time.sleep(PER_SYMBOL_SLEEP)
 
-        if atlasfabio_thread:
-            atlasfabio_thread.join()
         if swaggy_thread:
             swaggy_thread.join()
         if swaggy_atlas_lab_thread:
@@ -10614,8 +9040,6 @@ def run():
             swaggy_no_atlas_thread.join()
         if dtfx_thread:
             dtfx_thread.join()
-        if pumpfade_thread:
-            pumpfade_thread.join()
         if atlas_rs_fail_short_thread:
             atlas_rs_fail_short_thread.join()
         _set_thread_log_buffer(None)
@@ -10646,16 +9070,14 @@ def run():
             f"[universe] rule=qVol>={int(shared_min_qv):,} sort=abs(pct) topN={shared_top_n} anchors={anchors_disp} "
             f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
             f"dtfx={dtfx_universe_len} "
-            f"pumpfade={pumpfade_universe_len} arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
+            f"arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
         )
         print(
-            "[engines] rsi=%s(%d) atlasfabio=%s(%d) swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) "
-            "swaggy_no_atlas=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
+            "[engines] rsi=%s(%d) swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) "
+            "swaggy_no_atlas=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
             % (
                 "ON" if rsi_ran else "OFF",
                 rsi_universe_len,
-                "ON" if atlasfabio_ran else "OFF",
-                fabio_universe_len,
                 "ON" if swaggy_atlas_lab_ran else "OFF",
                 swaggy_atlas_lab_universe_len,
                 "ON" if swaggy_atlas_lab_v2_ran else "OFF",
@@ -10664,8 +9086,6 @@ def run():
                 swaggy_no_atlas_universe_len,
                 "ON" if dtfx_ran else "OFF",
                 dtfx_universe_len,
-                "ON" if pumpfade_ran else "OFF",
-                pumpfade_universe_len,
                 "ON" if atlas_rs_fail_short_ran else "OFF",
                 atlas_rs_fail_short_universe_len,
             )

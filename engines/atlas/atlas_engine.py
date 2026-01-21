@@ -434,24 +434,3 @@ class AtlasEngine:
                 atlas_local["atlas_long_block_subreason"] = "VOL_LOW"
             elif not self._calc_trigger_strength_ok(trigger, strength):
                 atlas_local["atlas_long_block_subreason"] = "SWAGGY_WEAK"
-
-    def evaluate_fabio_gate_long(self, symbol: str, cfg) -> Optional[Dict[str, Any]]:
-        try:
-            from engines.fabio import atlas_fabio_engine
-        except Exception:
-            return None
-        return atlas_fabio_engine.evaluate_gate_long(symbol, cfg)
-
-    def evaluate_fabio_gate_short(self, symbol: str, cfg) -> Optional[Dict[str, Any]]:
-        try:
-            from engines.fabio import atlas_fabio_engine
-        except Exception:
-            return None
-        return atlas_fabio_engine.evaluate_gate_short(symbol, cfg)
-
-    def evaluate_fabio_gate(self, symbol: str, cfg) -> Optional[Dict[str, Any]]:
-        try:
-            from engines.fabio import atlas_fabio_engine
-        except Exception:
-            return None
-        return atlas_fabio_engine.evaluate_gate(symbol, cfg)
