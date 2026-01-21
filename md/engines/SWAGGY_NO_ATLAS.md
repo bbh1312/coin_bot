@@ -66,18 +66,26 @@ Atlas 게이트 없이 Swaggy 시그널만으로 진입하는 경량 버전이�
 - `level_score`, `touch_count`, `level_age` 등 레벨 품질 지표
 - `d1_dist_atr`: 일봉 EMA7 거리(ATR 배수)로 과열 차단에 사용
 
-## 6) 로그
+## 6) 청산 레이어 v1 (No Atlas 전용)
+
+- TIMEOUT: `hold_bars >= 240` (5m 기준 약 20시간)
+- NO_PROGRESS: `hold_bars >= 120` AND `MFE_pct < 0.5%`
+- TREND_INVALID:
+  - LONG: D1 close < EMA7 AND 1H EMA20 slope(6 bars) < 0
+  - SHORT: D1 close > EMA7 AND 1H EMA20 slope(6 bars) > 0
+
+## 7) 로그
 
 - 엔진 로그: `logs/swaggy_no_atlas/swaggy_no_atlas-YYYY-MM-DD.log`
 - 트레이드 JSONL: `logs/swaggy_trades.jsonl` (engine=SWAGGY_NO_ATLAS)
 - Atlas 지표 필드는 null로 기록됨
 
-## 7) 토글/상태
+## 8) 토글/상태
 
 - 텔레그램: `/swaggy_no_atlas on|off|status`
 - 웹 UI: Engines 섹션의 "Swaggy No Atlas"
 
-## 8) 백테스트 실행
+## 9) 백테스트 실행
 
 ```bash
 python3 -m engines.swaggy_no_atlas.run_backtest \
@@ -87,6 +95,8 @@ python3 -m engines.swaggy_no_atlas.run_backtest \
   --cooldown-min 30 \
   --max-symbols 40 \
   --base-usdt 10 \
+  --exit-layer on \
+  --exit-min-pnl -0.10 \
   --dca on \
   --dca-thresholds "20,30,40"
 ```

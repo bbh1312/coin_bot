@@ -34,6 +34,14 @@ from engines.swaggy_atlas_lab.report import (
 from engines.swaggy_atlas_lab.indicators import atr, ema
 from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine
 
+MAX_HOLD_BARS = 240
+NO_PROGRESS_BARS = 120
+NO_PROGRESS_MFE_PCT = 0.005
+EXIT_MIN_PNL_PCT = -0.10
+TREND_D1_EMA_LEN = 7
+TREND_H1_EMA_LEN = 20
+TREND_H1_SLOPE_BARS = 6
+
 
 def _append_backtest_log(line: str) -> None:
     date_tag = time.strftime("%Y%m%d")
@@ -72,7 +80,9 @@ def parse_args():
     parser.add_argument("--dca-thresholds", default="20,30,40", help="adverse move % thresholds, e.g. 20,30,40")
     parser.add_argument("--fee", type=float, default=0.0)
     parser.add_argument("--slippage", type=float, default=0.0)
-    parser.add_argument("--timeout-bars", type=int, default=0)
+    parser.add_argument("--timeout-bars", type=int, default=MAX_HOLD_BARS)
+    parser.add_argument("--exit-layer", choices=["on", "off"], default="off")
+    parser.add_argument("--exit-min-pnl", type=float, default=EXIT_MIN_PNL_PCT)
     parser.add_argument("--cooldown-min", type=int, default=0)
     parser.add_argument("--last-day-entry", choices=["on", "off"], default="on")
     parser.add_argument("--last-day-entry-days", type=int, default=1)
@@ -117,6 +127,28 @@ def _d1_dist_atr(df, last_price: float, cfg: SwaggyConfig) -> Optional[float]:
     if atr_val <= 0:
         return None
     return abs(last_price - ema_val) / atr_val
+
+
+def _trend_invalid(df_d1, df_1h, side: str) -> bool:
+    if df_d1.empty or df_1h.empty:
+        return False
+    if len(df_d1) < (TREND_D1_EMA_LEN + 2):
+        return False
+    if len(df_1h) < (TREND_H1_EMA_LEN + TREND_H1_SLOPE_BARS + 2):
+        return False
+    d1_ema = ema(df_d1["close"], TREND_D1_EMA_LEN)
+    h1_ema = ema(df_1h["close"], TREND_H1_EMA_LEN)
+    if d1_ema.empty or h1_ema.empty:
+        return False
+    d1_close = float(df_d1["close"].iloc[-1])
+    d1_ema_val = float(d1_ema.iloc[-1])
+    h1_slope = float(h1_ema.iloc[-1] - h1_ema.iloc[-1 - TREND_H1_SLOPE_BARS])
+    side = (side or "").upper()
+    if side == "LONG":
+        return d1_close < d1_ema_val and h1_slope < 0
+    if side == "SHORT":
+        return d1_close > d1_ema_val and h1_slope > 0
+    return False
 
 
 def main() -> None:
@@ -189,6 +221,7 @@ def main() -> None:
 
     data_by_sym: Dict[str, Dict[str, object]] = {}
     tfs = [sw_cfg.tf_ltf, sw_cfg.tf_mtf, sw_cfg.tf_htf, sw_cfg.tf_htf2, sw_cfg.tf_d1, "3m"]
+    exit_pnl_by_reason: Dict[tuple[str, str], float] = {}
     for sym in symbols:
         tf_map: Dict[str, object] = {}
         for tf in tfs:
@@ -228,8 +261,15 @@ def main() -> None:
         dca_thresholds = [20.0, 30.0, 40.0]
     dca_max_adds = len(dca_thresholds)
 
+    exit_layer_enabled = args.exit_layer == "on"
+    exit_min_pnl = float(args.exit_min_pnl)
+    if not exit_layer_enabled:
+        bt_cfg.timeout_bars = 0
     with open(log_path, "a", encoding="utf-8") as log_fp:
-        run_line = f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms}"
+        run_line = (
+            f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms} "
+            f"exit_layer={args.exit_layer} exit_min_pnl={exit_min_pnl}"
+        )
         log_fp.write(run_line + "\n")
         _append_backtest_log(run_line)
         engine = SwaggySignalEngine(sw_cfg)
@@ -301,6 +341,24 @@ def main() -> None:
 
                 if broker.has_position(sym):
                     trade = broker.on_bar(sym, ts_ms, float(cur["high"]), float(cur["low"]), float(cur["close"]), i)
+                    if trade and trade.exit_reason == "TIME":
+                        trade.exit_reason = "TIMEOUT"
+                    if exit_layer_enabled and not trade:
+                        trade_live = broker.positions.get(sym)
+                        if trade_live:
+                            entry_px = float(trade_live.entry_price)
+                            close_px = float(cur["close"])
+                            if trade_live.side == "SHORT":
+                                exit_pnl_pct = (entry_px - close_px) / entry_px
+                            else:
+                                exit_pnl_pct = (close_px - entry_px) / entry_px
+                            if exit_pnl_pct <= exit_min_pnl:
+                                if trade_live.bars >= MAX_HOLD_BARS:
+                                    trade = broker.exit_with_reason(sym, ts_ms, close_px, "TIMEOUT")
+                                elif trade_live.bars >= NO_PROGRESS_BARS and float(trade_live.mfe or 0.0) < NO_PROGRESS_MFE_PCT:
+                                    trade = broker.exit_with_reason(sym, ts_ms, close_px, "NO_PROGRESS")
+                                elif _trend_invalid(d1d, d1h, trade_live.side):
+                                    trade = broker.exit_with_reason(sym, ts_ms, close_px, "TREND_INVALID")
                     if trade:
                         pnl_pct = broker.calc_pnl_pct(trade)
                         pnl_usdt = pnl_pct * trade.size_usdt
@@ -358,6 +416,10 @@ def main() -> None:
                                 "losses": 0,
                                 "tp": 0,
                                 "sl": 0,
+                                "timeout": 0,
+                                "no_progress": 0,
+                                "trend_invalid": 0,
+                                "loss_pnl_sum": 0.0,
                                 "dca_adds": 0,
                                 "mfe_sum": 0.0,
                                 "mae_sum": 0.0,
@@ -370,10 +432,24 @@ def main() -> None:
                             stats["wins"] += 1
                         else:
                             stats["losses"] += 1
+                        stats.setdefault("timeout", 0)
+                        stats.setdefault("no_progress", 0)
+                        stats.setdefault("trend_invalid", 0)
+                        stats.setdefault("loss_pnl_sum", 0.0)
                         if trade.exit_reason == "TP":
                             stats["tp"] += 1
                         elif trade.exit_reason == "SL":
                             stats["sl"] += 1
+                        elif trade.exit_reason == "TIMEOUT":
+                            stats["timeout"] += 1
+                        elif trade.exit_reason == "NO_PROGRESS":
+                            stats["no_progress"] += 1
+                        elif trade.exit_reason == "TREND_INVALID":
+                            stats["trend_invalid"] += 1
+                        if pnl_usdt < 0:
+                            stats["loss_pnl_sum"] += float(pnl_usdt)
+                        reason_key = (mode_name, trade.exit_reason or "UNKNOWN")
+                        exit_pnl_by_reason[reason_key] = exit_pnl_by_reason.get(reason_key, 0.0) + float(pnl_usdt)
                         stats["dca_adds"] += int(trade.dca_adds or 0)
                         stats["mfe_sum"] += trade.mfe
                         stats["mae_sum"] += abs(trade.mae)
@@ -547,10 +623,38 @@ def main() -> None:
             "entry_ts": trade.entry_ts,
             "dca_adds": trade.dca_adds,
             "dca_usdt": trade.dca_usdt,
+            "size_usdt": trade.size_usdt,
         }
 
     write_trades_csv(trades_path, trades)
     summary = build_summary(run_id, trades)
+    open_stats_by_mode: Dict[str, Dict[str, float]] = {}
+    for (mode, sym), rec in open_trades.items():
+        entry_px = rec.get("entry_price")
+        size_usdt = rec.get("size_usdt")
+        last_close = last_close_by_sym.get(sym)
+        if not isinstance(entry_px, (int, float)) or not isinstance(size_usdt, (int, float)):
+            continue
+        if not isinstance(last_close, (int, float)) or last_close <= 0:
+            continue
+        side = (rec.get("side") or "").upper()
+        if side == "SHORT":
+            pnl_pct = (float(entry_px) - float(last_close)) / float(entry_px)
+        else:
+            pnl_pct = (float(last_close) - float(entry_px)) / float(entry_px)
+        pnl_usdt = float(size_usdt) * pnl_pct
+        bucket = open_stats_by_mode.setdefault(mode, {"count": 0.0, "notional": 0.0, "pnl": 0.0})
+        bucket["count"] += 1.0
+        bucket["notional"] += float(size_usdt)
+        bucket["pnl"] += float(pnl_usdt)
+    if open_stats_by_mode:
+        summary["open_positions"] = open_stats_by_mode
+    if exit_pnl_by_reason:
+        per_mode_exit = {}
+        for (mode, reason), pnl in exit_pnl_by_reason.items():
+            bucket = per_mode_exit.setdefault(mode, {})
+            bucket[reason] = float(pnl)
+        summary["exit_pnl_by_reason"] = per_mode_exit
     if overext_by_key:
         by_mode: Dict[str, Dict[str, int]] = {}
         total = {"entry_ready_seen": 0, "overext_block_count": 0, "overext_recover_count": 0}
@@ -708,6 +812,10 @@ def main() -> None:
             "losses": 0,
             "tp": 0,
             "sl": 0,
+            "timeout": 0,
+            "no_progress": 0,
+            "trend_invalid": 0,
+            "loss_pnl_sum": 0.0,
             "dca_adds": 0,
             "mfe_sum": 0.0,
             "mae_sum": 0.0,
@@ -725,6 +833,10 @@ def main() -> None:
             losses = int(stats.get("losses") or 0)
             tp = int(stats.get("tp") or 0)
             sl = int(stats.get("sl") or 0)
+            timeout_count = int(stats.get("timeout") or 0)
+            no_progress_count = int(stats.get("no_progress") or 0)
+            trend_invalid_count = int(stats.get("trend_invalid") or 0)
+            loss_sum_usdt = float(stats.get("loss_pnl_sum") or 0.0)
             win_rate = (wins / trades_count * 100.0) if trades_count else 0.0
             avg_mfe = (stats.get("mfe_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
@@ -736,10 +848,29 @@ def main() -> None:
             sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
             net_sum_usdt = tp_sum_usdt - sl_sum_usdt
             entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
+            dca_usdt_mode = sum(
+                val for (m, _s), val in dca_usdt_by_key.items() if m == mode
+            )
+            open_bucket = open_stats_by_mode.get(mode) or {}
+            open_count = int(open_bucket.get("count") or 0)
+            open_notional = float(open_bucket.get("notional") or 0.0)
+            open_pnl = float(open_bucket.get("pnl") or 0.0)
+            reason_order = ["TP", "SL", "TIMEOUT", "NO_PROGRESS", "TREND_INVALID", "UNKNOWN"]
+            reason_items = []
+            for reason in reason_order:
+                key = (mode, reason)
+                if key in exit_pnl_by_reason:
+                    reason_items.append(f"{reason}={exit_pnl_by_reason.get(key, 0.0):.3f}")
+            for (m_key, reason), pnl in sorted(exit_pnl_by_reason.items()):
+                if m_key != mode or reason in reason_order:
+                    continue
+                reason_items.append(f"{reason}={pnl:.3f}")
+            reason_text = " ".join(reason_items) if reason_items else "none"
             total_lines.append(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f"
+                "timeout=%d no_progress=%d trend_invalid=%d avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f "
+                "open_count=%d open_notional=%.2f open_pnl=%.3f loss_sum=%.3f exit_pnl={%s}"
                 % (
                     label,
                     entries,
@@ -750,6 +881,9 @@ def main() -> None:
                     win_rate,
                     tp,
                     sl,
+                    timeout_count,
+                    no_progress_count,
+                    trend_invalid_count,
                     avg_mfe,
                     avg_mae,
                     avg_hold,
@@ -760,11 +894,17 @@ def main() -> None:
                     net_sum_usdt,
                     entry_sym_count,
                     int(stats.get("dca_adds") or 0),
-                    float(dca_usdt_by_key.get((mode, "*"), sum(dca_usdt_by_key.get((mode, s), 0.0) for s in entry_syms_by_mode.get(mode, set())) if entry_syms_by_mode.get(mode) else 0.0)),
+                    float(dca_usdt_mode),
+                    open_count,
+                    open_notional,
+                    open_pnl,
+                    loss_sum_usdt,
+                    reason_text,
                 )
             )
-            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
+            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits", "timeout", "no_progress", "trend_invalid"):
                 grand_total[key] += int(stats.get(key) or 0)
+            grand_total["loss_pnl_sum"] += float(stats.get("loss_pnl_sum") or 0.0)
             grand_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
             grand_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
             grand_total["hold_sum"] += float(stats.get("hold_sum") or 0.0)
@@ -778,6 +918,10 @@ def main() -> None:
         total_losses = int(grand_total.get("losses") or 0)
         total_tp = int(grand_total.get("tp") or 0)
         total_sl = int(grand_total.get("sl") or 0)
+        total_timeout = int(grand_total.get("timeout") or 0)
+        total_no_progress = int(grand_total.get("no_progress") or 0)
+        total_trend_invalid = int(grand_total.get("trend_invalid") or 0)
+        total_loss_sum = float(grand_total.get("loss_pnl_sum") or 0.0)
         total_win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
         total_avg_mfe = (grand_total.get("mfe_sum", 0.0) / total_trades) if total_trades else 0.0
         total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
@@ -788,10 +932,33 @@ def main() -> None:
             total_sl_sum = total_sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
             total_net_sum = total_tp_sum - total_sl_sum
             total_entry_syms = len(set().union(*entry_syms_by_mode.values())) if entry_syms_by_mode else 0
+            total_open_count = sum(int(v.get("count") or 0) for v in open_stats_by_mode.values())
+            total_open_notional = sum(float(v.get("notional") or 0.0) for v in open_stats_by_mode.values())
+            total_open_pnl = sum(float(v.get("pnl") or 0.0) for v in open_stats_by_mode.values())
+            total_reason_items = []
+            reason_set = {r for (_m, r) in exit_pnl_by_reason.keys()}
+            for reason in ["TP", "SL", "TIMEOUT", "NO_PROGRESS", "TREND_INVALID", "UNKNOWN"]:
+                if reason not in reason_set:
+                    continue
+                pnl_sum = sum(
+                    float(val)
+                    for (m_key, r_key), val in exit_pnl_by_reason.items()
+                    if r_key == reason
+                )
+                total_reason_items.append(f"{reason}={pnl_sum:.3f}")
+            for reason in sorted(r for r in reason_set if r not in ("TP", "SL", "TIMEOUT", "NO_PROGRESS", "TREND_INVALID", "UNKNOWN")):
+                pnl_sum = sum(
+                    float(val)
+                    for (m_key, r_key), val in exit_pnl_by_reason.items()
+                    if r_key == reason
+                )
+                total_reason_items.append(f"{reason}={pnl_sum:.3f}")
+            total_reason_text = " ".join(total_reason_items) if total_reason_items else "none"
             total_lines.append(
                 "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f"
+                "timeout=%d no_progress=%d trend_invalid=%d avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f "
+                "open_count=%d open_notional=%.2f open_pnl=%.3f loss_sum=%.3f exit_pnl={%s}"
                 % (
                     total_entries,
                     total_exits,
@@ -801,6 +968,9 @@ def main() -> None:
                     total_win_rate,
                     total_tp,
                     total_sl,
+                    total_timeout,
+                    total_no_progress,
+                    total_trend_invalid,
                     total_avg_mfe,
                     total_avg_mae,
                     total_avg_hold,
@@ -812,6 +982,11 @@ def main() -> None:
                     total_entry_syms,
                     int(grand_total.get("dca_adds") or 0),
                     float(sum(dca_usdt_by_key.values())),
+                    total_open_count,
+                    total_open_notional,
+                    total_open_pnl,
+                    total_loss_sum,
+                    total_reason_text,
                 )
             )
         if args.verbose and d1_block_by_key:
