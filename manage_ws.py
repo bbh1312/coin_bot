@@ -393,10 +393,6 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "atlasfabio_long" if side == "LONG" else "atlasfabio_short"
     if label == "FABIO":
         return "fabio_long" if side == "LONG" else "fabio_short"
-    if label == "DIV15M_LONG":
-        return "div15m_long"
-    if label == "DIV15M_SHORT":
-        return "div15m_short"
     if label == "PUMPFADE":
         return "pumpfade_short"
     if label == "ATLAS_RS_FAIL_SHORT":
