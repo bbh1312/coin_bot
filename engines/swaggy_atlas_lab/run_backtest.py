@@ -281,6 +281,9 @@ def main() -> None:
     d1_block_by_key: Dict[tuple[str, str], int] = {}
     last_close_by_sym: Dict[str, float] = {}
     last_ts_by_sym: Dict[str, int] = {}
+    entry_syms_by_mode: Dict[str, set] = {}
+    last_day_exits_by_mode: Dict[str, int] = {}
+    last_day_start_ms = end_ms - 24 * 60 * 60 * 1000
 
     with open(log_path, "a", encoding="utf-8") as log_fp:
         for mode in modes:
@@ -470,6 +473,8 @@ def main() -> None:
                             stats["mfe_sum"] += trade.mfe
                             stats["mae_sum"] += abs(trade.mae)
                             stats["hold_sum"] += float(trade.bars) * ltf_minutes
+                            if isinstance(trade.exit_ts, (int, float)) and trade.exit_ts >= last_day_start_ms:
+                                last_day_exits_by_mode[mode.value] = last_day_exits_by_mode.get(mode.value, 0) + 1
                             entry_dt = ""
                             if isinstance(trade.entry_ts, (int, float)) and trade.entry_ts:
                                 entry_dt = datetime.fromtimestamp(trade.entry_ts / 1000.0, tz=timezone.utc).strftime(
@@ -689,6 +694,7 @@ def main() -> None:
                         overext_blocked=overext_blocked,
                         context=trade_context,
                     )
+                    entry_syms_by_mode.setdefault(mode.value, set()).add(sym)
                     stats = stats_by_key.setdefault(
                         key,
                         {
@@ -768,9 +774,16 @@ def main() -> None:
             short_wins = sum(1 for t in sym_trades if t.get("side") == "SHORT" and float(t.get("pnl_pct") or 0.0) > 0)
             short_losses = sum(1 for t in sym_trades if t.get("side") == "SHORT" and float(t.get("pnl_pct") or 0.0) <= 0)
             label = f"{sym}@{mode}" if multi_mode else sym
+            last_day_exits = last_day_exits_by_mode.get(mode, 0)
+            base_usdt = float(bt_cfg.base_usdt or 0.0)
+            tp_sum_usdt = tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
+            sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
+            net_sum_usdt = tp_sum_usdt - sl_sum_usdt
+            entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
             print(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
                 % (
                     label,
                     entries,
@@ -784,6 +797,12 @@ def main() -> None:
                     avg_mfe,
                     avg_mae,
                     avg_hold,
+                    last_day_exits,
+                    base_usdt,
+                    tp_sum_usdt,
+                    sl_sum_usdt,
+                    net_sum_usdt,
+                    entry_sym_count,
                 )
             )
             entries = list(trade_logs.get((mode, sym), []))
@@ -888,9 +907,16 @@ def main() -> None:
             avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
             label = f"TOTAL@{mode}" if multi_mode else "TOTAL"
+            last_day_exits = last_day_exits_by_mode.get(mode, 0)
+            base_usdt = float(bt_cfg.base_usdt or 0.0)
+            tp_sum_usdt = tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
+            sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
+            net_sum_usdt = tp_sum_usdt - sl_sum_usdt
+            entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
             print(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
                 % (
                     label,
                     entries,
@@ -904,6 +930,12 @@ def main() -> None:
                     avg_mfe,
                     avg_mae,
                     avg_hold,
+                    last_day_exits,
+                    base_usdt,
+                    tp_sum_usdt,
+                    sl_sum_usdt,
+                    net_sum_usdt,
+                    entry_sym_count,
                 )
             )
             for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
@@ -925,9 +957,15 @@ def main() -> None:
         total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
         total_avg_hold = (grand_total.get("hold_sum", 0.0) / total_trades) if total_trades else 0.0
         if multi_mode:
+            base_usdt = float(bt_cfg.base_usdt or 0.0)
+            total_tp_sum = total_tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
+            total_sl_sum = total_sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
+            total_net_sum = total_tp_sum - total_sl_sum
+            total_entry_syms = len(set().union(*entry_syms_by_mode.values())) if entry_syms_by_mode else 0
             print(
                 "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
                 % (
                     total_entries,
                     total_exits,
@@ -940,6 +978,12 @@ def main() -> None:
                     total_avg_mfe,
                     total_avg_mae,
                     total_avg_hold,
+                    sum(last_day_exits_by_mode.values()),
+                    base_usdt,
+                    total_tp_sum,
+                    total_sl_sum,
+                    total_net_sum,
+                    total_entry_syms,
                 )
             )
         if d1_block_by_key:
@@ -959,9 +1003,12 @@ def main() -> None:
             print(line)
             _append_backtest_log(line)
     else:
+        base_usdt = float(bt_cfg.base_usdt or 0.0)
         print(
             "[BACKTEST] TOTAL entries=0 exits=0 trades=0 wins=0 losses=0 winrate=0.00%% tp=0 sl=0 "
-            "avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0"
+            "avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0 last_day_exits=0 "
+            "base_usdt=%.2f tp_sum=0.000 sl_sum=0.000 net_sum=0.000 entry_syms=0"
+            % base_usdt
         )
 
 

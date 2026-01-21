@@ -30,6 +30,8 @@ class Trade:
     mfe: float = 0.0
     mae: float = 0.0
     bars: int = 0
+    dca_adds: int = 0
+    dca_usdt: float = 0.0
     context: Optional[Dict[str, Any]] = None
 
 
@@ -132,6 +134,31 @@ class BrokerSim:
             self.positions.pop(sym, None)
             return trade
         return None
+
+    def add_position(self, sym: str, entry_px: float, size_usdt: float, bar_high: float, bar_low: float) -> Optional[Trade]:
+        trade = self.positions.get(sym)
+        if trade is None:
+            return None
+        if trade.size_usdt <= 0 or entry_px <= 0 or size_usdt <= 0:
+            return trade
+        prev_size = float(trade.size_usdt)
+        new_size = prev_size + float(size_usdt)
+        trade.entry_price = (trade.entry_price * prev_size + entry_px * size_usdt) / new_size
+        trade.size_usdt = new_size
+        trade.dca_adds = int(trade.dca_adds or 0) + 1
+        trade.dca_usdt = float(trade.dca_usdt or 0.0) + float(size_usdt)
+        if trade.side == "LONG":
+            trade.sl_price = trade.entry_price * (1 - self.sl_pct)
+            trade.tp_price = trade.entry_price * (1 + self.tp_pct)
+            trade.mfe = max(trade.mfe, (bar_high - trade.entry_price) / trade.entry_price)
+            trade.mae = min(trade.mae, (bar_low - trade.entry_price) / trade.entry_price)
+        else:
+            trade.sl_price = trade.entry_price * (1 + self.sl_pct)
+            trade.tp_price = trade.entry_price * (1 - self.tp_pct)
+            trade.mfe = max(trade.mfe, (trade.entry_price - bar_low) / trade.entry_price)
+            trade.mae = min(trade.mae, (trade.entry_price - bar_high) / trade.entry_price)
+        self.positions[sym] = trade
+        return trade
 
     def calc_pnl_pct(self, trade: Trade) -> float:
         if trade.exit_price is None or trade.entry_price <= 0:

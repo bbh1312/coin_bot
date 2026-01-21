@@ -133,10 +133,7 @@ def evaluate_local(
     metrics: Dict[str, Any] = {"regime": gate.get("regime")}
     if not gate or not gate.get("trade_allowed"):
         return AtlasDecision(False, 0.0, 0.0, ["ATLAS_BLOCK"], metrics)
-    if side == "LONG" and not gate.get("allow_long"):
-        return AtlasDecision(False, 0.0, 0.0, ["ATLAS_SIDE_BLOCK"], metrics)
-    if side == "SHORT" and not gate.get("allow_short"):
-        return AtlasDecision(False, 0.0, 0.0, ["ATLAS_SIDE_BLOCK"], metrics)
+    # NOTE: Direction gate uses symbol RS direction instead of global regime.
 
     btc_fast = _rs_metrics(df_btc_15m, cfg.rs_n, cfg.corr_m)
     alt_fast = _rs_metrics(df_sym_15m, cfg.rs_n, cfg.corr_m)
@@ -177,6 +174,12 @@ def evaluate_local(
         beta_slow = float(np.cov(alt_slow["rets"], btc_slow["rets"])[0, 1] / var_btc_slow) if var_btc_slow > 1e-12 else None
 
     vol_ratio = alt_fast.get("vol_ratio")
+    symbol_direction = "NEUTRAL"
+    if isinstance(rs_fast, (int, float)):
+        if rs_fast > 0:
+            symbol_direction = "BULL"
+        elif rs_fast < 0:
+            symbol_direction = "BEAR"
     metrics.update({
         "rs": rs_fast,
         "rs_z": rs_z_fast,
@@ -187,7 +190,12 @@ def evaluate_local(
         "rs_z_slow": rs_z_slow,
         "corr_slow": corr_slow,
         "beta_slow": beta_slow,
+        "symbol_direction": symbol_direction,
     })
+    if side == "LONG" and symbol_direction != "BULL":
+        return AtlasDecision(False, 0.0, 0.0, ["ATLAS_DIR_BLOCK"], metrics)
+    if side == "SHORT" and symbol_direction != "BEAR":
+        return AtlasDecision(False, 0.0, 0.0, ["ATLAS_DIR_BLOCK"], metrics)
 
     rs_pass_fast = (rs_fast is not None and rs_fast >= cfg.rs_pass) or (rs_z_fast is not None and rs_z_fast >= cfg.rs_z_pass)
     rs_pass_slow = (rs_slow is not None and rs_slow >= cfg.rs_pass) or (rs_z_slow is not None and rs_z_slow >= cfg.rs_z_pass)

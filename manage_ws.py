@@ -569,6 +569,33 @@ def _maybe_update_open_trade_engine(state: dict, symbol: str, side: str, now_ts:
         state[symbol] = st
 
 
+def _backfill_engine_from_recent_event(state: dict, symbol: str, side: str, now_ts: float) -> bool:
+    rec = _get_recent_entry_event(symbol, side, now_ts=now_ts, window_sec=600.0)
+    if not isinstance(rec, dict):
+        return False
+    eng = str(rec.get("engine") or "").upper()
+    if not eng or eng in ("UNKNOWN", "MANUAL"):
+        return False
+    open_tr = er._get_open_trade(state, side, symbol)
+    if not isinstance(open_tr, dict):
+        return False
+    open_tr["engine_label"] = eng
+    meta = open_tr.get("meta") if isinstance(open_tr.get("meta"), dict) else {}
+    reason = _reason_from_engine_label(eng, side)
+    if reason:
+        meta["reason"] = reason
+    meta["engine"] = eng
+    open_tr["meta"] = meta
+    if not open_tr.get("entry_order_id") and rec.get("entry_order_id"):
+        open_tr["entry_order_id"] = rec.get("entry_order_id")
+        st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+        if not isinstance(st, dict):
+            st = {}
+        st[f"entry_order_id_{side.lower()}"] = rec.get("entry_order_id")
+        state[symbol] = st
+    return True
+
+
 def _mark_existing_manual_entries(state: dict, pos_syms: dict, now_ts: float) -> None:
     if not isinstance(pos_syms, dict):
         return
@@ -1221,6 +1248,13 @@ def main():
                 pending_key = "manual_entry_pending_long_ts"
                 alert_key = "manual_entry_alerted_long"
                 if eng_label == "MANUAL" and not st.get(alert_key):
+                    if _backfill_engine_from_recent_event(state, symbol, "LONG", now_ts):
+                        st[alert_key] = True
+                        st[f"{alert_key}_ts"] = now_ts
+                        st[f"{alert_key}_reason"] = "engine_backfill"
+                        st.pop(pending_key, None)
+                        state[symbol] = st
+                        continue
                     if _is_startup_position(state, symbol):
                         _consume_startup_position(state, symbol)
                         st[alert_key] = True
@@ -1261,6 +1295,13 @@ def main():
                 pending_key = "manual_entry_pending_short_ts"
                 alert_key = "manual_entry_alerted_short"
                 if eng_label == "MANUAL" and not st.get(alert_key):
+                    if _backfill_engine_from_recent_event(state, symbol, "SHORT", now_ts):
+                        st[alert_key] = True
+                        st[f"{alert_key}_ts"] = now_ts
+                        st[f"{alert_key}_reason"] = "engine_backfill"
+                        st.pop(pending_key, None)
+                        state[symbol] = st
+                        continue
                     if _is_startup_position(state, symbol):
                         _consume_startup_position(state, symbol)
                         st[alert_key] = True

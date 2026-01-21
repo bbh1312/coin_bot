@@ -68,6 +68,8 @@ def parse_args():
     parser.add_argument("--tp-pct", type=float, default=0.02)
     parser.add_argument("--sl-pct", type=float, default=0.0)
     parser.add_argument("--base-usdt", type=float, default=10.0)
+    parser.add_argument("--dca", choices=["on", "off"], default="off")
+    parser.add_argument("--dca-thresholds", default="20,30,40", help="adverse move % thresholds, e.g. 20,30,40")
     parser.add_argument("--fee", type=float, default=0.0)
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
@@ -202,6 +204,8 @@ def main() -> None:
     overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
     d1_block_by_key: Dict[tuple[str, str], int] = {}
     entry_syms_by_mode: Dict[str, set] = {}
+    dca_adds_by_key: Dict[tuple[str, str], int] = {}
+    dca_usdt_by_key: Dict[tuple[str, str], float] = {}
     last_close_by_sym: Dict[str, float] = {}
     last_ts_by_sym: Dict[str, int] = {}
     last_day_entry_days = int(args.last_day_entry_days or 1)
@@ -210,6 +214,19 @@ def main() -> None:
     last_day_start_ms = end_ms - last_day_entry_days * 24 * 60 * 60 * 1000
     last_day_exits_by_mode: Dict[str, int] = {}
     last_day_entry = str(args.last_day_entry or "on").lower()
+    dca_enabled = str(args.dca or "off").lower() == "on"
+    dca_thresholds: List[float] = []
+    for part in str(args.dca_thresholds or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            dca_thresholds.append(float(part))
+        except Exception:
+            pass
+    if not dca_thresholds:
+        dca_thresholds = [20.0, 30.0, 40.0]
+    dca_max_adds = len(dca_thresholds)
 
     with open(log_path, "a", encoding="utf-8") as log_fp:
         run_line = f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms}"
@@ -301,6 +318,8 @@ def main() -> None:
                                 "exit_reason": trade.exit_reason,
                                 "pnl_usdt": pnl_usdt,
                                 "pnl_pct": pnl_pct,
+                                "dca_adds": trade.dca_adds,
+                                "dca_usdt": trade.dca_usdt,
                                 "policy_action": trade.policy_action,
                                 "overext_dist_at_entry": trade.overext_dist_at_entry,
                                 "overext_blocked": "Y" if trade.overext_blocked else "N",
@@ -321,11 +340,13 @@ def main() -> None:
                             last_day_exits_by_mode[mode_name] = last_day_exits_by_mode.get(mode_name, 0) + 1
                         log_fp.write(
                             f"EXIT ts={trade.exit_ts} sym={sym} pnl_usdt={pnl_usdt:.4f} "
-                            f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars}\n"
+                            f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars} "
+                            f"dca_adds={int(trade.dca_adds or 0)} dca_usdt={float(trade.dca_usdt or 0.0):.2f}\n"
                         )
                         _append_backtest_log(
                             f"EXIT ts={trade.exit_ts} sym={sym} pnl_usdt={pnl_usdt:.4f} "
-                            f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars}"
+                            f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars} "
+                            f"dca_adds={int(trade.dca_adds or 0)} dca_usdt={float(trade.dca_usdt or 0.0):.2f}"
                         )
                         stats = stats_by_key.setdefault(
                             key,
@@ -337,6 +358,7 @@ def main() -> None:
                                 "losses": 0,
                                 "tp": 0,
                                 "sl": 0,
+                                "dca_adds": 0,
                                 "mfe_sum": 0.0,
                                 "mae_sum": 0.0,
                                 "hold_sum": 0.0,
@@ -352,6 +374,7 @@ def main() -> None:
                             stats["tp"] += 1
                         elif trade.exit_reason == "SL":
                             stats["sl"] += 1
+                        stats["dca_adds"] += int(trade.dca_adds or 0)
                         stats["mfe_sum"] += trade.mfe
                         stats["mae_sum"] += abs(trade.mae)
                         stats["hold_sum"] += float(trade.bars) * ltf_minutes
@@ -369,7 +392,7 @@ def main() -> None:
                             {
                                 "entry_ts": trade.entry_ts or 0,
                                 "line": "[BACKTEST][EXIT] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s "
-                                "entry_px=%.6g exit_px=%.6g reason=%s"
+                                "entry_px=%.6g exit_px=%.6g reason=%s dca_adds=%d dca_usdt=%.2f"
                                 % (
                                     sym,
                                     mode_name,
@@ -379,9 +402,64 @@ def main() -> None:
                                     trade.entry_price,
                                     trade.exit_price or 0.0,
                                     trade.exit_reason,
+                                    int(trade.dca_adds or 0),
+                                    float(trade.dca_usdt or 0.0),
                                 ),
                             }
                         )
+                        continue
+                    # DCA (Swaggy No Atlas): apply adverse move thresholds (configurable).
+                    if dca_enabled:
+                        trade_live = broker.positions.get(sym)
+                        if trade_live:
+                            adds_done = int(trade_live.dca_adds or 0)
+                            if adds_done < dca_max_adds:
+                                entry_ref = float(trade_live.entry_price or 0.0)
+                                close_px = float(cur["close"])
+                                adverse_pct = 0.0
+                                if entry_ref > 0:
+                                    if trade_live.side == "LONG":
+                                        adverse_pct = (entry_ref - close_px) / entry_ref * 100.0
+                                    else:
+                                        adverse_pct = (close_px - entry_ref) / entry_ref * 100.0
+                                if adverse_pct >= dca_thresholds[adds_done]:
+                                    dca_usdt = float(bt_cfg.base_usdt or 0.0)
+                                    if dca_usdt > 0:
+                                        broker.add_position(
+                                            sym,
+                                            close_px,
+                                            dca_usdt,
+                                            float(cur["high"]),
+                                            float(cur["low"]),
+                                        )
+                                        log_fp.write(
+                                            "DCA ts=%d sym=%s side=%s adds=%d->%d entry=%.6g mark=%.6g usdt=%.2f\n"
+                                            % (
+                                                ts_ms,
+                                                sym,
+                                                trade_live.side,
+                                                adds_done,
+                                                adds_done + 1,
+                                                entry_ref,
+                                                close_px,
+                                                dca_usdt,
+                                            )
+                                        )
+                                    _append_backtest_log(
+                                        "DCA ts=%d sym=%s side=%s adds=%d->%d entry=%.6g mark=%.6g usdt=%.2f"
+                                            % (
+                                                ts_ms,
+                                                sym,
+                                                trade_live.side,
+                                                adds_done,
+                                                adds_done + 1,
+                                                entry_ref,
+                                                close_px,
+                                                dca_usdt,
+                                        )
+                                    )
+                                    dca_adds_by_key[key] = dca_adds_by_key.get(key, 0) + 1
+                                    dca_usdt_by_key[key] = dca_usdt_by_key.get(key, 0.0) + float(dca_usdt)
                     continue
 
                 if not signal.entry_ok or not side or entry_px is None:
@@ -451,6 +529,7 @@ def main() -> None:
                         "losses": 0,
                         "tp": 0,
                         "sl": 0,
+                        "dca_adds": 0,
                         "mfe_sum": 0.0,
                         "mae_sum": 0.0,
                         "hold_sum": 0.0,
@@ -466,6 +545,8 @@ def main() -> None:
             "side": trade.side,
             "entry_price": trade.entry_price,
             "entry_ts": trade.entry_ts,
+            "dca_adds": trade.dca_adds,
+            "dca_usdt": trade.dca_usdt,
         }
 
     write_trades_csv(trades_path, trades)
@@ -524,7 +605,7 @@ def main() -> None:
             label = f"{sym}@{mode}" if multi_mode else sym
             print(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f dca_adds=%d dca_usdt=%.2f"
                 % (
                     label,
                     entries,
@@ -538,6 +619,8 @@ def main() -> None:
                     avg_mfe,
                     avg_mae,
                     avg_hold,
+                    int(stats.get("dca_adds") or dca_adds_by_key.get((mode, sym), 0)),
+                    float(dca_usdt_by_key.get((mode, sym), 0.0)),
                 )
             )
             entries_list = list(trade_logs.get((mode, sym), []))
@@ -568,7 +651,7 @@ def main() -> None:
                     {
                         "entry_ts": entry_ts or 0,
                         "line": "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s entry_px=%.6g "
-                        "last_px=%s last_dt=%s unrealized_pct=%s"
+                        "last_px=%s last_dt=%s unrealized_pct=%s dca_adds=%s dca_usdt=%s"
                         % (
                             open_trade.get("sym"),
                             open_trade.get("mode"),
@@ -579,6 +662,8 @@ def main() -> None:
                             last_disp,
                             last_dt or "N/A",
                             pnl_disp,
+                            open_trade.get("dca_adds"),
+                            open_trade.get("dca_usdt"),
                         ),
                     }
                 )
@@ -595,6 +680,7 @@ def main() -> None:
                     "losses": 0,
                     "tp": 0,
                     "sl": 0,
+                    "dca_adds": 0,
                     "mfe_sum": 0.0,
                     "mae_sum": 0.0,
                     "hold_sum": 0.0,
@@ -609,6 +695,7 @@ def main() -> None:
             mode_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
             mode_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
             mode_total["hold_sum"] += float(stats.get("hold_sum") or 0.0)
+            mode_total["dca_adds"] += int(stats.get("dca_adds") or 0)
             mode_total["long_wins"] += long_wins
             mode_total["long_losses"] += long_losses
             mode_total["short_wins"] += short_wins
@@ -621,6 +708,7 @@ def main() -> None:
             "losses": 0,
             "tp": 0,
             "sl": 0,
+            "dca_adds": 0,
             "mfe_sum": 0.0,
             "mae_sum": 0.0,
             "hold_sum": 0.0,
@@ -651,7 +739,7 @@ def main() -> None:
             total_lines.append(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
                 "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f"
                 % (
                     label,
                     entries,
@@ -671,6 +759,8 @@ def main() -> None:
                     sl_sum_usdt,
                     net_sum_usdt,
                     entry_sym_count,
+                    int(stats.get("dca_adds") or 0),
+                    float(dca_usdt_by_key.get((mode, "*"), sum(dca_usdt_by_key.get((mode, s), 0.0) for s in entry_syms_by_mode.get(mode, set())) if entry_syms_by_mode.get(mode) else 0.0)),
                 )
             )
             for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
@@ -678,6 +768,7 @@ def main() -> None:
             grand_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
             grand_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
             grand_total["hold_sum"] += float(stats.get("hold_sum") or 0.0)
+            grand_total["dca_adds"] += int(stats.get("dca_adds") or 0)
             for key in ("long_wins", "long_losses", "short_wins", "short_losses"):
                 grand_total[key] += int(stats.get(key) or 0)
         total_trades = int(grand_total.get("trades") or 0)
@@ -700,7 +791,7 @@ def main() -> None:
             total_lines.append(
                 "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
                 "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f"
                 % (
                     total_entries,
                     total_exits,
@@ -719,6 +810,8 @@ def main() -> None:
                     total_sl_sum,
                     total_net_sum,
                     total_entry_syms,
+                    int(grand_total.get("dca_adds") or 0),
+                    float(sum(dca_usdt_by_key.values())),
                 )
             )
         if args.verbose and d1_block_by_key:

@@ -14,6 +14,7 @@ Atlas 게이트 없이 Swaggy 시그널만으로 진입하는 경량 버전이�
 - Atlas 관련 필터/정책 적용 없음 (pass_hard/soft/atlas_mult 무시)
 - Over-extension(추격 방지) 로직은 Swaggy 내부 계산 결과 그대로 사용
 - 최종 통과 시 시장가 진입, TP/SL은 공통 모듈(auto_exit)이 처리
+- 라이브도 확정봉 기준으로만 평가 (미확정봉 제외)
 
 ## 3) 시간프레임
 
@@ -63,6 +64,7 @@ Atlas 게이트 없이 Swaggy 시그널만으로 진입하는 경량 버전이�
 - `trigger_bits`: 트리거 비트 플래그
 - `overext_dist_at_entry`: 과열 거리 (ATR 기준)
 - `level_score`, `touch_count`, `level_age` 등 레벨 품질 지표
+- `d1_dist_atr`: 일봉 EMA7 거리(ATR 배수)로 과열 차단에 사용
 
 ## 6) 로그
 
@@ -83,10 +85,14 @@ python3 -m engines.swaggy_no_atlas.run_backtest \
   --tp-pct 0.03 \
   --sl-pct 0.30 \
   --cooldown-min 30 \
-  --max-symbols 40
+  --max-symbols 40 \
+  --base-usdt 10 \
+  --dca on \
+  --dca-thresholds "20,30,40"
 ```
 
 메모
 - `run_backtest`는 Atlas 관련 `--mode` 옵션을 지원하지 않는다.
 - 로그/리포트 경로는 `logs/swaggy_no_atlas/backtest/`에 생성된다.
 - 콘솔 출력 형식은 `md/engines/BACKTEST_CONSOLE_FORMAT.md` 지침을 따른다.
+- DCA는 옵션으로만 동작하며, 기준/횟수는 `--dca-thresholds` 개수로 결정된다.
