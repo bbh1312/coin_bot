@@ -683,6 +683,11 @@ def main() -> None:
             line = f"[BACKTEST] TOTAL block=D1_EMA7_DIST count={total_blocks}"
             print(line)
             _append_backtest_log(line)
+    else:
+        print(
+            "[BACKTEST] TOTAL entries=0 exits=0 trades=0 wins=0 losses=0 winrate=0.00%% tp=0 sl=0 "
+            "avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0"
+        )
 
 
 if __name__ == "__main__":
