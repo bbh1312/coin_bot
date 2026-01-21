@@ -50,6 +50,12 @@ def _consume_startup_position(state: dict, symbol: str) -> bool:
         return False
     return False
 
+def _entry_alerted_in_state(st: dict, side: str) -> bool:
+    if not isinstance(st, dict):
+        return False
+    suffix = "long" if side == "LONG" else "short"
+    return bool(st.get(f"entry_alerted_{suffix}"))
+
 
 def _coerce_state_int(val) -> int:
     if isinstance(val, (int, float)):
@@ -1103,6 +1109,21 @@ def main():
                 state[sym] = st
         if api_syms:
             state["_startup_pos_syms"] = sorted(api_syms)
+            now_ts = time.time()
+            for sym in pos_syms.get("long") or []:
+                st = state.get(sym, {}) if isinstance(state, dict) else {}
+                if not isinstance(st, dict):
+                    st = {}
+                st["entry_alerted_long"] = True
+                st["entry_alerted_long_ts"] = now_ts
+                state[sym] = st
+            for sym in pos_syms.get("short") or []:
+                st = state.get(sym, {}) if isinstance(state, dict) else {}
+                if not isinstance(st, dict):
+                    st = {}
+                st["entry_alerted_short"] = True
+                st["entry_alerted_short_ts"] = now_ts
+                state[sym] = st
             er._sync_positions_state(state, list(api_syms))
             _force_in_pos_from_api(state, api_syms)
             try:
@@ -1238,6 +1259,13 @@ def main():
                 pending_key = "manual_entry_pending_long_ts"
                 alert_key = "manual_entry_alerted_long"
                 if eng_label == "MANUAL" and not st.get(alert_key):
+                    if _entry_alerted_in_state(st, "LONG"):
+                        st[alert_key] = True
+                        st[f"{alert_key}_ts"] = now_ts
+                        st[f"{alert_key}_reason"] = "entry_alerted"
+                        st.pop(pending_key, None)
+                        state[symbol] = st
+                        continue
                     if _backfill_engine_from_recent_event(state, symbol, "LONG", now_ts):
                         st[alert_key] = True
                         st[f"{alert_key}_ts"] = now_ts
@@ -1272,6 +1300,7 @@ def main():
                                 entry_order_id=open_long.get("entry_order_id"),
                                 sl=sl_price,
                                 tp=None,
+                                state=state,
                             )
                             st[alert_key] = True
                             st[f"{alert_key}_ts"] = now_ts
@@ -1285,6 +1314,13 @@ def main():
                 pending_key = "manual_entry_pending_short_ts"
                 alert_key = "manual_entry_alerted_short"
                 if eng_label == "MANUAL" and not st.get(alert_key):
+                    if _entry_alerted_in_state(st, "SHORT"):
+                        st[alert_key] = True
+                        st[f"{alert_key}_ts"] = now_ts
+                        st[f"{alert_key}_reason"] = "entry_alerted"
+                        st.pop(pending_key, None)
+                        state[symbol] = st
+                        continue
                     if _backfill_engine_from_recent_event(state, symbol, "SHORT", now_ts):
                         st[alert_key] = True
                         st[f"{alert_key}_ts"] = now_ts
@@ -1319,6 +1355,7 @@ def main():
                                 entry_order_id=open_short.get("entry_order_id"),
                                 sl=sl_price,
                                 tp=None,
+                                state=state,
                             )
                             st[alert_key] = True
                             st[f"{alert_key}_ts"] = now_ts
@@ -1361,35 +1398,42 @@ def main():
                     alert_key = "manual_entry_alerted_long"
                     pending_key = "manual_entry_pending_long_ts"
                     if engine_label == "MANUAL" and not st.get(alert_key):
-                        if _consume_startup_position(state, symbol):
+                        if _entry_alerted_in_state(st, "LONG"):
                             st[alert_key] = True
                             st[f"{alert_key}_ts"] = now_ts
-                            st[f"{alert_key}_reason"] = "startup_sync"
+                            st[f"{alert_key}_reason"] = "entry_alerted"
                             st.pop(pending_key, None)
                         else:
-                            pending_ts = st.get(pending_key)
-                            if not isinstance(pending_ts, (int, float)):
-                                st[pending_key] = now_ts
-                            elif (now_ts - float(pending_ts)) >= 10.0:
-                                sl_pct = er.AUTO_EXIT_LONG_SL_PCT
-                                sl_price = er._fmt_price_safe(entry_price, sl_pct, side="LONG")
-                                er._send_entry_alert(
-                                    er.send_telegram,
-                                    side="LONG",
-                                    symbol=symbol,
-                                    engine=engine_label,
-                                    entry_price=entry_price,
-                                    usdt=None,
-                                    reason="manual_entry",
-                                    live=True,
-                                    order_info="(manage-ws)",
-                                    entry_order_id=entry_order_id,
-                                    sl=sl_price,
-                                    tp=None,
-                                )
+                            if _consume_startup_position(state, symbol):
                                 st[alert_key] = True
                                 st[f"{alert_key}_ts"] = now_ts
-                                st[f"{alert_key}_reason"] = "sent"
+                                st[f"{alert_key}_reason"] = "startup_sync"
+                                st.pop(pending_key, None)
+                            else:
+                                pending_ts = st.get(pending_key)
+                                if not isinstance(pending_ts, (int, float)):
+                                    st[pending_key] = now_ts
+                                elif (now_ts - float(pending_ts)) >= 10.0:
+                                    sl_pct = er.AUTO_EXIT_LONG_SL_PCT
+                                    sl_price = er._fmt_price_safe(entry_price, sl_pct, side="LONG")
+                                    er._send_entry_alert(
+                                        er.send_telegram,
+                                        side="LONG",
+                                        symbol=symbol,
+                                        engine=engine_label,
+                                        entry_price=entry_price,
+                                        usdt=None,
+                                        reason="manual_entry",
+                                        live=True,
+                                        order_info="(manage-ws)",
+                                        entry_order_id=entry_order_id,
+                                        sl=sl_price,
+                                        tp=None,
+                                        state=state,
+                                    )
+                                    st[alert_key] = True
+                                    st[f"{alert_key}_ts"] = now_ts
+                                    st[f"{alert_key}_reason"] = "sent"
                     else:
                         st.pop(pending_key, None)
                     state[symbol] = st
@@ -1428,35 +1472,42 @@ def main():
                     alert_key = "manual_entry_alerted_short"
                     pending_key = "manual_entry_pending_short_ts"
                     if engine_label == "MANUAL" and not st.get(alert_key):
-                        if _consume_startup_position(state, symbol):
+                        if _entry_alerted_in_state(st, "SHORT"):
                             st[alert_key] = True
                             st[f"{alert_key}_ts"] = now_ts
-                            st[f"{alert_key}_reason"] = "startup_sync"
+                            st[f"{alert_key}_reason"] = "entry_alerted"
                             st.pop(pending_key, None)
                         else:
-                            pending_ts = st.get(pending_key)
-                            if not isinstance(pending_ts, (int, float)):
-                                st[pending_key] = now_ts
-                            elif (now_ts - float(pending_ts)) >= 10.0:
-                                sl_pct = er.AUTO_EXIT_SHORT_SL_PCT
-                                sl_price = er._fmt_price_safe(entry_price, sl_pct, side="SHORT")
-                                er._send_entry_alert(
-                                    er.send_telegram,
-                                    side="SHORT",
-                                    symbol=symbol,
-                                    engine=engine_label,
-                                    entry_price=entry_price,
-                                    usdt=None,
-                                    reason="manual_entry",
-                                    live=True,
-                                    order_info="(manage-ws)",
-                                    entry_order_id=entry_order_id,
-                                    sl=sl_price,
-                                    tp=None,
-                                )
+                            if _consume_startup_position(state, symbol):
                                 st[alert_key] = True
                                 st[f"{alert_key}_ts"] = now_ts
-                                st[f"{alert_key}_reason"] = "sent"
+                                st[f"{alert_key}_reason"] = "startup_sync"
+                                st.pop(pending_key, None)
+                            else:
+                                pending_ts = st.get(pending_key)
+                                if not isinstance(pending_ts, (int, float)):
+                                    st[pending_key] = now_ts
+                                elif (now_ts - float(pending_ts)) >= 10.0:
+                                    sl_pct = er.AUTO_EXIT_SHORT_SL_PCT
+                                    sl_price = er._fmt_price_safe(entry_price, sl_pct, side="SHORT")
+                                    er._send_entry_alert(
+                                        er.send_telegram,
+                                        side="SHORT",
+                                        symbol=symbol,
+                                        engine=engine_label,
+                                        entry_price=entry_price,
+                                        usdt=None,
+                                        reason="manual_entry",
+                                        live=True,
+                                        order_info="(manage-ws)",
+                                        entry_order_id=entry_order_id,
+                                        sl=sl_price,
+                                        tp=None,
+                                        state=state,
+                                    )
+                                    st[alert_key] = True
+                                    st[f"{alert_key}_ts"] = now_ts
+                                    st[f"{alert_key}_reason"] = "sent"
                     else:
                         st.pop(pending_key, None)
                     state[symbol] = st

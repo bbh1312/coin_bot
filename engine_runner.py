@@ -96,7 +96,7 @@ try:
     from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
     from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
     from engines.swaggy_atlas_lab.indicators import atr
-except Exception:
+except Exception as _import_err:
     SwaggyEngine = None
     SwaggyConfig = None
     EngineContext = None
@@ -118,20 +118,16 @@ except Exception:
     lab_v2_evaluate_local = None
     lab_v2_apply_policy = None
     SwaggyAtlasLabV2Mode = None
+    _IMPORT_ERROR = str(_import_err)
+    try:
+        print(f"[import-error] { _IMPORT_ERROR }")
+    except Exception:
+        pass
 
 if "Div15mLongEngine" not in globals():
     Div15mLongEngine = None
 if "Div15mShortEngine" not in globals():
     Div15mShortEngine = None
-    AtlasEngine = None
-    AtlasSwaggyConfig = None
-    RsiEngine = None
-    build_universe_from_tickers = None
-    DTFXEngine = None
-    DTFXConfig = None
-    write_dtfx_log = None
-    AtlasRsFailShortEngine = None
-    AtlasRsFailShortConfig = None
 
 from executor import (
     get_short_position_amount,
@@ -161,6 +157,7 @@ from executor import (
     get_global_backoff_until,
     refresh_positions_cache,
     get_available_usdt,
+    exchange,
 )
 
 swaggy_engine = None
@@ -187,6 +184,98 @@ EXIT_SL_ICON = os.getenv("EXIT_SL_ICON", "🚨🚨🚨")
 MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "14"))
 MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "600"))
 MANUAL_ALERT_TTL_SEC = float(os.getenv("MANUAL_ALERT_TTL_SEC", "3600"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
+USDT_PER_TRADE = float(os.getenv("ENTRY_USDT_PCT", "8.0"))
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+MARGIN_MODE = os.getenv("MARGIN_MODE", "cross").lower().strip()
+LIVE_TRADING = True
+LONG_LIVE_TRADING = True
+AUTO_EXIT_ENABLED: bool = True
+AUTO_EXIT_LONG_TP_PCT: float = 3.0
+AUTO_EXIT_LONG_SL_PCT: float = 3.0
+AUTO_EXIT_SHORT_TP_PCT: float = 3.0
+AUTO_EXIT_SHORT_SL_PCT: float = 3.0
+ENGINE_EXIT_OVERRIDES: dict = {}
+SWAGGY_ENABLED = False
+SWAGGY_ATLAS_LAB_ENABLED = False
+SWAGGY_ATLAS_LAB_V2_ENABLED = False
+SWAGGY_NO_ATLAS_ENABLED = False
+SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = -0.7
+SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = True
+SWAGGY_D1_OVEREXT_ATR_MULT = 1.2
+DTFX_ENABLED = True
+ATLAS_RS_FAIL_SHORT_ENABLED = False
+DIV15M_LONG_ENABLED = False
+DIV15M_SHORT_ENABLED = False
+ONLY_DIV15M_SHORT = False
+RSI_ENABLED = True
+MANAGE_EXIT_COOLDOWN_SEC: int = 5
+MANAGE_PING_COOLDOWN_SEC: int = 7200
+MANAGE_EVAL_COOLDOWN_SEC: int = 3
+MANUAL_CLOSE_GRACE_SEC: int = 60
+AUTO_EXIT_GRACE_SEC: int = 30
+EXIT_COOLDOWN_HOURS: float = 2.0
+EXIT_COOLDOWN_SEC: int = int(EXIT_COOLDOWN_HOURS * 3600)
+COOLDOWN_SEC: int = int(float(os.getenv("COOLDOWN_SEC", "1800")))
+MANAGE_LOOP_ENABLED: bool = True
+MANAGE_LOOP_SLEEP_SEC: float = 2.0
+MANAGE_TICKER_TTL_SEC: float = 5.0
+RUNTIME_CONFIG_RELOAD_SEC: float = 5.0
+MANAGE_WS_MODE: bool = False
+SUPPRESS_RECONCILE_ALERTS: bool = True
+REPORT_API_ONLY: bool = True
+DB_RECONCILE_ENABLED: bool = os.getenv("DB_RECONCILE_ENABLED", "0") == "1"
+DB_RECONCILE_SEC: float = float(os.getenv("DB_RECONCILE_SEC", "30"))
+DB_RECONCILE_LOOKBACK_SEC: float = float(os.getenv("DB_RECONCILE_LOOKBACK_SEC", "3600"))
+DB_RECONCILE_SYMBOLS_RAW = os.getenv("DB_RECONCILE_SYMBOLS", "").strip()
+DB_REPORT_LOOKBACK_SEC: float = float(os.getenv("DB_REPORT_LOOKBACK_SEC", "259200"))
+SHORT_POS_SAMPLE_DIV: int = 20
+SHORT_POS_SAMPLE_RECENT_SEC: int = 120
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+STATE_SAVE_LOCK = threading.Lock()
+SHORT_RECONCILE_GRACE_SEC: int = 60
+SHORT_RECONCILE_EPS: float = 1e-8
+SHORT_RECONCILE_ZERO_STREAK_N: int = 3
+SHORT_RECONCILE_SEEN_TTL_SEC: int = 180
+FAST_TF_PREFETCH_TOPN = 30
+MAX_FAST_SYMBOLS = 30
+FAST_LIMIT_CAP = 120
+MID_LIMIT_CAP = 200
+SLOW_LIMIT_CAP = 300
+MID_TF_PREFETCH_EVERY_N = 3
+TTL_4H_SEC = 1800
+TTL_1D_SEC = 86400
+FUNDING_INTERVAL_HOURS = 1
+FUNDING_BLOCK_PCT = -0.2
+FUNDING_TTL_SEC = 300
+STRUCTURE_TOP_N = 30
+PER_SYMBOL_SLEEP = 0.05
+CYCLE_SLEEP = float(os.getenv("CYCLE_SLEEP", "1.0"))
+CURRENT_CYCLE_STATS: Dict[str, dict] = {}
+FUNDING_TTL_CACHE: Dict[str, tuple] = {}
+TF_TTL_SECS = {"3m": 60, "5m": 120, "15m": 240, "1h": 300}
+PERSISTENT_OHLCV_CACHE: Dict[tuple, tuple] = {}
+GLOBAL_BACKOFF_UNTIL: float = 0.0
+_BACKOFF_SECS: float = 0.0
+RATE_LIMIT_LOG_TS: float = 0.0
+TOTAL_CYCLES: int = 0
+TOTAL_ELAPSED: float = 0.0
+TOTAL_REST_CALLS: int = 0
+TOTAL_429_COUNT: int = 0
+
+def prune_ohlcv_cache():
+    """TTL 지난 OHLCV 캐시 청소."""
+    try:
+        now = time.time()
+        to_del = []
+        for (sym, tf, limit), (ts, _) in list(PERSISTENT_OHLCV_CACHE.items()):
+            ttl = TF_TTL_SECS.get(tf, 60) * 3
+            if (now - ts) > ttl:
+                to_del.append((sym, tf, limit))
+        for key in to_del:
+            PERSISTENT_OHLCV_CACHE.pop(key, None)
+    except Exception:
+        pass
 
 def print_section(title: str) -> None:
     print(f"[{title}]")
@@ -258,6 +347,47 @@ class CachedExchange:
 
     def __getattr__(self, name):
         return getattr(self._ex, name)
+
+def _prefetch_ohlcv_for_cycle(
+    symbols: list,
+    ex,
+    plan: Dict[str, int],
+    label: str = "prefetch",
+    ttl_by_tf: Optional[dict] = None,
+) -> dict:
+    stats = {"symbols": len(symbols or []), "tfs": list(plan.keys()), "fetched": 0, "failed": 0, "fresh_hits": {}, "fetched_by_tf": {}}
+    if not symbols or not plan:
+        return stats
+    ttl_by_tf = ttl_by_tf or {}
+
+    def _inc_map(key: str, tf: str, amount: int = 1) -> None:
+        bucket = CURRENT_CYCLE_STATS.setdefault(key, {})
+        bucket[tf] = int(bucket.get(tf, 0) or 0) + amount
+
+    for symbol in symbols:
+        for tf, limit in plan.items():
+            if not isinstance(limit, int) or limit <= 0:
+                continue
+            ttl = ttl_by_tf.get(tf)
+            if isinstance(ttl, int) and ttl > 0 and cycle_cache.is_fresh(symbol, tf, ttl):
+                stats["fresh_hits"][tf] = int(stats["fresh_hits"].get(tf, 0) or 0) + 1
+                _inc_map("cache_hits_by_tf", tf)
+                continue
+            try:
+                CURRENT_CYCLE_STATS["rest_calls"] = int(CURRENT_CYCLE_STATS.get("rest_calls", 0) or 0) + 1
+                data = ex.fetch_ohlcv(symbol, tf, limit=limit)
+                if data:
+                    cycle_cache.set_raw(symbol, tf, data)
+                    stats["fetched"] += 1
+                    stats["fetched_by_tf"][tf] = int(stats["fetched_by_tf"].get(tf, 0) or 0) + 1
+                    _inc_map("cache_miss_by_tf", tf)
+                else:
+                    stats["failed"] += 1
+                    CURRENT_CYCLE_STATS["rest_fails"] = int(CURRENT_CYCLE_STATS.get("rest_fails", 0) or 0) + 1
+            except Exception:
+                stats["failed"] += 1
+                CURRENT_CYCLE_STATS["rest_fails"] = int(CURRENT_CYCLE_STATS.get("rest_fails", 0) or 0) + 1
+    return stats
 
 def _kst_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=9)
@@ -336,6 +466,21 @@ def _resolve_entry_usdt(pct: Optional[float] = None) -> float:
             _ENTRY_PCT_WARN_TS = now
         effective_pct = 100.0
     return max(0.0, float(avail) * (effective_pct / 100.0))
+
+
+def _ema_align_ok(symbol: str, tf: str, limit: int) -> bool:
+    df = cycle_cache.get_df(symbol, tf, limit=limit)
+    if df is None or df.empty or len(df) < max(50, int(limit)):
+        return False
+    try:
+        close = df["close"].astype(float).values
+    except Exception:
+        return False
+    if len(close) < 50:
+        return False
+    ema_fast = pd.Series(close).ewm(span=20).mean().iloc[-1]
+    ema_slow = pd.Series(close).ewm(span=50).mean().iloc[-1]
+    return float(ema_fast) >= float(ema_slow)
 
 
 def _get_entry_lock(state: Dict[str, dict]) -> Dict[str, dict]:
@@ -457,6 +602,7 @@ def _send_entry_alert(
     order_info: Optional[str] = None,
     entry_order_id: Optional[str] = None,
     extras: Optional[list] = None,
+    state: Optional[dict] = None,
 ) -> None:
     if not send_alert:
         return
@@ -493,6 +639,18 @@ def _send_entry_alert(
     reason_disp = reason if (reason and str(reason).strip()) else "N/A"
     lines.append(f"사유: {reason_disp}")
     send_alert("\n".join(lines))
+    if isinstance(state, dict):
+        try:
+            _mark_entry_alerted(
+                state,
+                symbol,
+                side_key,
+                engine=engine,
+                reason=reason,
+                entry_order_id=entry_order_id,
+            )
+        except Exception:
+            pass
     if dbrec:
         try:
             dbrec.record_event(
@@ -751,8 +909,9 @@ def _append_swaggy_atlas_lab_v2_log(line: str) -> None:
 
 def _append_swaggy_no_atlas_log(line: str) -> None:
     date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("swaggy_no_atlas", f"swaggy_no_atlas-{date_tag}.log")
-    _append_log_lines(path, [line])
+    _append_log_lines(path, [f"{ts} {line}"])
 
 def _iso_kst(ts: Optional[float] = None) -> str:
     tz = timezone(timedelta(hours=9))
@@ -1401,7 +1560,7 @@ def _run_swaggy_atlas_lab_v2_cycle(
                 except Exception:
                     pass
 
-        if not signal or not signal.allow:
+        if not signal or not signal.entry_ok:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         if signal.side not in ("LONG", "SHORT"):
@@ -1696,7 +1855,11 @@ def _run_swaggy_no_atlas_cycle(
             continue
 
         overext_signed = _swaggy_no_atlas_overext_dist(df_5m, side, swaggy_cfg)
-        if isinstance(overext_signed, (int, float)) and overext_signed < SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:
+        if (
+            SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
+            and isinstance(overext_signed, (int, float))
+            and overext_signed < SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+        ):
             _append_swaggy_no_atlas_log(
                 f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=SKIP_OVEREXT_DEEP overext={overext_signed:.4g}"
             )
@@ -1993,6 +2156,10 @@ def _both_sides_open(st: Optional[dict]) -> bool:
     return False
 
 
+def _has_open_side(st: Optional[dict], side: str) -> bool:
+    return _is_in_pos_side(st, side)
+
+
 def _set_in_pos_side(st: Dict[str, Any], side: str, val: bool) -> None:
     side_key = (side or "").upper()
     if side_key == "LONG":
@@ -2101,6 +2268,65 @@ def _mark_manual_alerted(
 def _clear_manual_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
     cache = _get_manual_alerted(state)
     cache.pop(_manual_alert_key(symbol, side), None)
+
+def _entry_alert_key(symbol: str, side: str) -> str:
+    return f"{symbol}|{side.upper()}"
+
+def _get_entry_alerted(state: Dict[str, dict]) -> Dict[str, dict]:
+    cache = state.get("_entry_alerted")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_entry_alerted"] = cache
+    return cache
+
+def _entry_alert_info(state: Dict[str, dict], symbol: str, side: str) -> Optional[dict]:
+    cache = _get_entry_alerted(state)
+    info = cache.get(_entry_alert_key(symbol, side))
+    return info if isinstance(info, dict) else None
+
+def _mark_entry_alerted(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    engine: Optional[str] = None,
+    reason: Optional[str] = None,
+    entry_order_id: Optional[str] = None,
+) -> None:
+    cache = _get_entry_alerted(state)
+    now_ts = time.time()
+    cache[_entry_alert_key(symbol, side)] = {
+        "ts": now_ts,
+        "engine": engine,
+        "reason": reason,
+        "entry_order_id": entry_order_id,
+    }
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    if not isinstance(st, dict):
+        st = {}
+    suffix = "long" if side.upper() == "LONG" else "short"
+    st[f"entry_alerted_{suffix}"] = True
+    st[f"entry_alerted_{suffix}_ts"] = now_ts
+    if engine:
+        st[f"entry_alerted_{suffix}_engine"] = str(engine)
+    if reason:
+        st[f"entry_alerted_{suffix}_reason"] = str(reason)
+    if entry_order_id:
+        st[f"entry_alerted_{suffix}_order_id"] = entry_order_id
+    state[symbol] = st
+
+def _clear_entry_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
+    cache = _get_entry_alerted(state)
+    cache.pop(_entry_alert_key(symbol, side), None)
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    if not isinstance(st, dict):
+        return
+    suffix = "long" if side.upper() == "LONG" else "short"
+    st.pop(f"entry_alerted_{suffix}", None)
+    st.pop(f"entry_alerted_{suffix}_ts", None)
+    st.pop(f"entry_alerted_{suffix}_engine", None)
+    st.pop(f"entry_alerted_{suffix}_reason", None)
+    st.pop(f"entry_alerted_{suffix}_order_id", None)
+    state[symbol] = st
 
 def _dca_alert_key(symbol: str, side: str, adds_done: int) -> str:
     return f"{symbol}|{side.upper()}|{adds_done}"
@@ -2423,7 +2649,8 @@ def _get_engine_exit_thresholds(engine_label: Optional[str], side: str) -> tuple
     tp = AUTO_EXIT_SHORT_TP_PCT if side_key == "SHORT" else AUTO_EXIT_LONG_TP_PCT
     sl = AUTO_EXIT_SHORT_SL_PCT if side_key == "SHORT" else AUTO_EXIT_LONG_SL_PCT
     label_key = (engine_label or "").upper()
-    overrides = ENGINE_EXIT_OVERRIDES.get(label_key) or ENGINE_EXIT_OVERRIDES.get(label_key.lower())
+    overrides_map = globals().get("ENGINE_EXIT_OVERRIDES") or {}
+    overrides = overrides_map.get(label_key) or overrides_map.get(label_key.lower())
     if isinstance(overrides, dict):
         side_override = overrides.get(side_key) or overrides.get(side_key.lower())
         if isinstance(side_override, dict):
@@ -2471,6 +2698,7 @@ def _close_trade(
     st.pop(f"manual_entry_alerted_{suffix}", None)
     st.pop(f"manual_qty_{suffix}", None)
     st.pop(f"manual_dca_adds_{suffix}", None)
+    _clear_entry_alerted(state, symbol, side)
     state[symbol] = st
     _clear_dca_alerted(state, symbol, side)
     if dbrec:
@@ -4937,6 +5165,22 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             continue
         if req.get("type") != "entry":
             continue
+        engine = str(req.get("engine") or "").upper()
+        allowed_engines = {
+            "SWAGGY_ATLAS_LAB",
+            "SWAGGY_ATLAS_LAB_V2",
+            "SWAGGY_NO_ATLAS",
+            "ATLAS_RS_FAIL_SHORT",
+            "DTFX",
+            "RSI",
+            "MANUAL",
+            "UNKNOWN",
+        }
+        if engine and engine not in allowed_engines:
+            status_key = str(req.get("id") or "").strip() or f"skip:{engine}"
+            status[status_key] = {"status": "failed", "ts": now, "reason": "engine_removed"}
+            print(f"[manage-queue] skip engine={engine} symbol={req.get('symbol')}")
+            continue
         req_id = str(req.get("id") or "").strip()
         if not req_id:
             continue
@@ -5064,6 +5308,7 @@ def _detect_position_events(state: dict, send_telegram) -> None:
                         side=side,
                     ),
                     tp=None,
+                    state=state,
                 )
         elif prev_qty is not None and qty is not None:
             if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > prev_qty * 1.0001:
@@ -5177,6 +5422,7 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                     entry_order_id=None,
                     sl=_fmt_price_safe(entry, AUTO_EXIT_SHORT_SL_PCT if side_label == "SHORT" else AUTO_EXIT_LONG_SL_PCT, side=side_label),
                     tp=None,
+                    state=state,
                 )
                 _mark_manual_alerted(state, sym, side_label, entry_price=entry, qty=qty)
                 try:
@@ -5303,12 +5549,13 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         live=live,
         order_info=None,
         entry_order_id=entry_order_id,
-    sl=_fmt_price_safe(
-        fill_price if isinstance(fill_price, (int, float)) else None,
-        _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
-        side=side,
-    ),
+        sl=_fmt_price_safe(
+            fill_price if isinstance(fill_price, (int, float)) else None,
+            _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
+            side=side,
+        ),
         tp=None,
+        state=state,
     )
     _clear_manage_pending(state, symbol, side)
     return True
@@ -5908,7 +6155,7 @@ def _manage_loop_worker(state: dict, exchange, cached_long_ex, send_telegram) ->
 def _reload_runtime_settings_from_disk(state: dict) -> None:
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global ENGINE_EXIT_OVERRIDES
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     try:
@@ -5938,6 +6185,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_swaggy_atlas_lab_v2_enabled",
         "_swaggy_no_atlas_enabled",
         "_swaggy_no_atlas_overext_min",
+        "_swaggy_no_atlas_overext_min_enabled",
+        "_swaggy_no_atlas_overext_min_enabled",
         "_swaggy_d1_overext_atr_mult",
         "_rsi_enabled",
         "_dtfx_enabled",
@@ -5958,6 +6207,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         state["_swaggy_no_atlas_enabled"] = False
     if isinstance(state.get("_swaggy_no_atlas_overext_min"), dict):
         state["_swaggy_no_atlas_overext_min"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+    if isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), dict):
+        state["_swaggy_no_atlas_overext_min_enabled"] = SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
     if isinstance(state.get("_swaggy_d1_overext_atr_mult"), dict):
         state["_swaggy_d1_overext_atr_mult"] = SWAGGY_D1_OVEREXT_ATR_MULT
     if isinstance(state.get("_auto_exit"), bool):
@@ -5991,6 +6242,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
     if isinstance(state.get("_swaggy_no_atlas_overext_min"), (int, float)):
         SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(state.get("_swaggy_no_atlas_overext_min"))
+    if isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), bool):
+        SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = bool(state.get("_swaggy_no_atlas_overext_min_enabled"))
     if isinstance(state.get("_swaggy_d1_overext_atr_mult"), (int, float)):
         SWAGGY_D1_OVEREXT_ATR_MULT = float(state.get("_swaggy_d1_overext_atr_mult"))
     if isinstance(state.get("_rsi_enabled"), bool):
@@ -6537,7 +6790,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -6803,7 +7056,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                             f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                             f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
-                            f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f}\n"
+                            f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
+                            f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
+                            f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
                             f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
@@ -6862,7 +7117,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                         f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
-                        f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f}\n"
+                        f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
+                        f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
+                        f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
                         f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
@@ -7260,12 +7517,36 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             resp = "⛔ 사용법: /swaggy_no_atlas_overext -0.70"
                     else:
                         resp = (
-                            f"ℹ️ swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f}\n"
+                            f"ℹ️ swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
+                            f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
                             "사용법: /swaggy_no_atlas_overext -0.70"
                         )
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_no_atlas_overext cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_overext_on", "swaggy_no_atlas_overext_on")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = True
+                        state["_swaggy_no_atlas_overext_min_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ swaggy_no_atlas_overext_on: ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = False
+                        state["_swaggy_no_atlas_overext_min_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ swaggy_no_atlas_overext_on: OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_no_atlas_overext_on on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_overext_on cmd 처리 send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/swaggy_d1_overext", "swaggy_d1_overext")) and not responded:
                     parts = lower.split()
@@ -7605,6 +7886,10 @@ def run():
     state = load_state()
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
+    try:
+        cycle_cache.set_fetcher(lambda sym, tf, limit: exchange.fetch_ohlcv(sym, tf, limit=limit))
+    except Exception:
+        pass
     global swaggy_engine, swaggy_atlas_lab_engine, swaggy_atlas_lab_v2_engine, swaggy_no_atlas_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     swaggy_atlas_lab_engine = SwaggyAtlasLabEngine() if SwaggyAtlasLabEngine else None
@@ -7633,7 +7918,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
@@ -7709,6 +7994,10 @@ def run():
         SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(state.get("_swaggy_no_atlas_overext_min"))
     else:
         state["_swaggy_no_atlas_overext_min"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+    if isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), bool):
+        SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = bool(state.get("_swaggy_no_atlas_overext_min_enabled"))
+    else:
+        state["_swaggy_no_atlas_overext_min_enabled"] = SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
     if isinstance(state.get("_swaggy_d1_overext_atr_mult"), (int, float)):
         SWAGGY_D1_OVEREXT_ATR_MULT = float(state.get("_swaggy_d1_overext_atr_mult"))
     else:
@@ -7777,7 +8066,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_d1_overext n, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -7900,8 +8189,13 @@ def run():
         )
         print(f"[CYCLE] cycle_ts={cycle_kst} last_cycle_ts={_fmt_ms_kst(last_cycle_ts)}")
         heavy_scan = bool(cycle_ts and cycle_ts != last_cycle_ts)
+        log_realtime = False
         if not heavy_scan:
-            print(f"[CYCLE] same cycle_ts={cycle_kst} -> realtime only")
+            last_rt = state.get("_last_rt_logged_cycle_ts")
+            if last_rt != cycle_ts:
+                log_realtime = True
+                state["_last_rt_logged_cycle_ts"] = cycle_ts
+                print(f"[CYCLE] same cycle_ts={cycle_kst} -> realtime only")
 
         # 사이클 캐시/통계 초기화
         try:
@@ -7921,6 +8215,7 @@ def run():
         if rsi_engine:
             rsi_engine.set_cycle_stats(CURRENT_CYCLE_STATS)
         if heavy_scan:
+            state["_last_rt_logged_cycle_ts"] = None
             cycle_count += 1
             if cycle_ts and cycle_ts > last_cycle_ts:
                 state["_last_cycle_ts"] = cycle_ts
@@ -7934,7 +8229,8 @@ def run():
             if base_label == "N/A":
                 base_label = str(cycle_count)
             cycle_label = f"{base_label}-RT{realtime_count}"
-            print(f"\n[사이클 {cycle_label}] (동일 캔들) realtime only (heavy_scan=N)")
+            if log_realtime:
+                print(f"\n[사이클 {cycle_label}] (동일 캔들) realtime only (heavy_scan=N)")
         cycle_id = cycle_label
         cycle_start = time.time()
         run_rsi_short = bool(RSI_ENABLED and (not ONLY_DIV15M_SHORT))
@@ -8088,13 +8384,20 @@ def run():
                 dtfx_min_qv = 8_000_000.0
                 anchors = []
                 top_n = 50
-            swaggy_universe = build_universe_from_tickers(
-                tickers,
-                symbols=symbols,
-                min_quote_volume_usdt=dtfx_min_qv,
-                top_n=top_n,
-                anchors=tuple(anchors),
-            )
+            if build_universe_from_tickers:
+                swaggy_universe = build_universe_from_tickers(
+                    tickers,
+                    symbols=symbols,
+                    min_quote_volume_usdt=dtfx_min_qv,
+                    top_n=top_n,
+                    anchors=tuple(anchors),
+                )
+            else:
+                swaggy_universe = [s for s, _ in sorted(pct_all_map.items(), key=lambda x: abs(x[1]), reverse=True)]
+                swaggy_universe = [s for s in swaggy_universe if qv_all_map.get(s, 0) >= dtfx_min_qv]
+                swaggy_universe = [s for s in anchors] + [s for s in swaggy_universe if s not in anchors]
+                if top_n:
+                    swaggy_universe = swaggy_universe[:top_n]
             state["_swaggy_universe"] = swaggy_universe
         if SWAGGY_ATLAS_LAB_ENABLED and SwaggyAtlasLabConfig and SwaggyAtlasLabAtlasConfig:
             swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig()
@@ -8106,30 +8409,30 @@ def run():
             if hasattr(swaggy_atlas_lab_v2_cfg, "d1_overext_atr_mult"):
                 swaggy_atlas_lab_v2_cfg.d1_overext_atr_mult = SWAGGY_D1_OVEREXT_ATR_MULT
             swaggy_atlas_lab_v2_atlas_cfg = SwaggyAtlasLabV2AtlasConfig()
-    if SWAGGY_NO_ATLAS_ENABLED and SwaggyNoAtlasConfig:
-        swaggy_no_atlas_cfg = SwaggyNoAtlasConfig()
-        if hasattr(swaggy_no_atlas_cfg, "d1_overext_atr_mult"):
-            swaggy_no_atlas_cfg.d1_overext_atr_mult = SWAGGY_D1_OVEREXT_ATR_MULT
+        if SWAGGY_NO_ATLAS_ENABLED and SwaggyNoAtlasConfig:
+            swaggy_no_atlas_cfg = SwaggyNoAtlasConfig()
+            if hasattr(swaggy_no_atlas_cfg, "d1_overext_atr_mult"):
+                swaggy_no_atlas_cfg.d1_overext_atr_mult = SWAGGY_D1_OVEREXT_ATR_MULT
 
-            atlas_enabled_any = bool(
-                SWAGGY_ATLAS_LAB_ENABLED
-                or SWAGGY_ATLAS_LAB_V2_ENABLED
-                or ATLAS_RS_FAIL_SHORT_ENABLED
+        atlas_enabled_any = bool(
+            SWAGGY_ATLAS_LAB_ENABLED
+            or SWAGGY_ATLAS_LAB_V2_ENABLED
+            or ATLAS_RS_FAIL_SHORT_ENABLED
+        )
+        if atlas_enabled_any:
+            structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
+            if STRUCTURE_TOP_N:
+                structure_candidates = structure_candidates[:STRUCTURE_TOP_N]
+            _prefetch_ohlcv_for_cycle(
+                structure_candidates,
+                exchange,
+                {"15m": 120, "4h": 120},
+                label="structure-pre",
+                ttl_by_tf={"4h": TTL_4H_SEC},
             )
-            if atlas_enabled_any:
-                structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
-                if STRUCTURE_TOP_N:
-                    structure_candidates = structure_candidates[:STRUCTURE_TOP_N]
-                _prefetch_ohlcv_for_cycle(
-                    structure_candidates,
-                    exchange,
-                    {"15m": 120, "4h": 120},
-                    label="structure-pre",
-                    ttl_by_tf={"4h": TTL_4H_SEC},
-                )
-                for s in structure_candidates:
-                    if _ema_align_ok(s, "15m", 120) or _ema_align_ok(s, "4h", 120):
-                        universe_structure.append(s)
+            for s in structure_candidates:
+                if _ema_align_ok(s, "15m", 120) or _ema_align_ok(s, "4h", 120):
+                    universe_structure.append(s)
 
         dtfx_universe = []
         if DTFX_ENABLED and dtfx_engine and dtfx_cfg and EngineContext:
@@ -8142,7 +8445,6 @@ def run():
             )
             dtfx_universe = dtfx_engine.build_universe(ctx)
             state["_dtfx_universe"] = dtfx_universe
-
 
         atlas_rs_fail_short_universe = []
         if ATLAS_RS_FAIL_SHORT_ENABLED and atlas_rs_fail_short_engine and atlas_rs_fail_short_cfg and EngineContext:
@@ -8198,8 +8500,7 @@ def run():
             and swaggy_universe
         )
         swaggy_no_atlas_ran = bool(
-            heavy_scan
-            and SWAGGY_NO_ATLAS_ENABLED
+            SWAGGY_NO_ATLAS_ENABLED
             and swaggy_no_atlas_cfg
             and swaggy_no_atlas_engine
             and swaggy_universe
@@ -8766,7 +9067,7 @@ def run():
                     _entry_guard_release(state, symbol, key=guard_key)
 
         if not run_div15m_long:
-            print("[모드] DIV15M_LONG 비활성: 롱 다이버전스 스캔 스킵")
+            pass
         for symbol in div15m_universe:
             if not run_div15m_long:
                 break
@@ -8883,7 +9184,7 @@ def run():
                 _entry_guard_release(state, symbol, key=guard_key)
 
         if not run_div15m_short:
-            print("[모드] DIV15M_SHORT 비활성: 숏 다이버전스 스캔 스킵")
+            pass
         div15m_short_bucket = state.setdefault("_div15m_short", {})
         for symbol in div15m_short_universe:
             if not run_div15m_short:
