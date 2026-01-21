@@ -67,6 +67,7 @@ def parse_args():
     parser.add_argument("--anchor", default="BTC,ETH")
     parser.add_argument("--tp-pct", type=float, default=0.02)
     parser.add_argument("--sl-pct", type=float, default=0.0)
+    parser.add_argument("--base-usdt", type=float, default=10.0)
     parser.add_argument("--fee", type=float, default=0.0)
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
@@ -140,6 +141,7 @@ def main() -> None:
         fee_rate=args.fee,
         slippage_pct=args.slippage,
         timeout_bars=args.timeout_bars,
+        base_usdt=args.base_usdt,
     )
     sw_cfg = SwaggyConfig()
     if isinstance(args.cooldown_min, int) and args.cooldown_min > 0:
@@ -199,6 +201,7 @@ def main() -> None:
     open_trades: Dict[tuple[str, str], Dict[str, object]] = {}
     overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
     d1_block_by_key: Dict[tuple[str, str], int] = {}
+    entry_syms_by_mode: Dict[str, set] = {}
     last_close_by_sym: Dict[str, float] = {}
     last_ts_by_sym: Dict[str, int] = {}
     last_day_entry_days = int(args.last_day_entry_days or 1)
@@ -437,6 +440,7 @@ def main() -> None:
                     overext_dist_at_entry=dist_at_entry,
                     overext_blocked=overext_blocked,
                 )
+                entry_syms_by_mode.setdefault(mode_name, set()).add(sym)
                 stats = stats_by_key.setdefault(
                     key,
                     {
@@ -639,9 +643,15 @@ def main() -> None:
             avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
             label = f"TOTAL@{mode}" if multi_mode else "TOTAL"
             last_day_exits = last_day_exits_by_mode.get(mode, 0)
+            base_usdt = float(bt_cfg.base_usdt or 0.0)
+            tp_sum_usdt = tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
+            sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
+            net_sum_usdt = tp_sum_usdt - sl_sum_usdt
+            entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
             total_lines.append(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
                 % (
                     label,
                     entries,
@@ -656,6 +666,11 @@ def main() -> None:
                     avg_mae,
                     avg_hold,
                     last_day_exits,
+                    base_usdt,
+                    tp_sum_usdt,
+                    sl_sum_usdt,
+                    net_sum_usdt,
+                    entry_sym_count,
                 )
             )
             for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
@@ -677,9 +692,15 @@ def main() -> None:
         total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
         total_avg_hold = (grand_total.get("hold_sum", 0.0) / total_trades) if total_trades else 0.0
         if multi_mode:
+            base_usdt = float(bt_cfg.base_usdt or 0.0)
+            total_tp_sum = total_tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
+            total_sl_sum = total_sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
+            total_net_sum = total_tp_sum - total_sl_sum
+            total_entry_syms = len(set().union(*entry_syms_by_mode.values())) if entry_syms_by_mode else 0
             total_lines.append(
                 "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d"
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
                 % (
                     total_entries,
                     total_exits,
@@ -693,6 +714,11 @@ def main() -> None:
                     total_avg_mae,
                     total_avg_hold,
                     sum(last_day_exits_by_mode.values()),
+                    base_usdt,
+                    total_tp_sum,
+                    total_sl_sum,
+                    total_net_sum,
+                    total_entry_syms,
                 )
             )
         if args.verbose and d1_block_by_key:

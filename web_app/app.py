@@ -25,6 +25,7 @@ from engine_runner import (
     ATLAS_FABIO_ENABLED,
     SWAGGY_ATLAS_LAB_ENABLED,
     SWAGGY_NO_ATLAS_ENABLED,
+    SWAGGY_NO_ATLAS_DCA_ENABLED,
     DTFX_ENABLED,
     PUMPFADE_ENABLED,
     DIV15M_LONG_ENABLED,
@@ -52,6 +53,7 @@ COMMAND_DEFS = [
     {"cmd": "/atlasfabio", "key": "_atlas_fabio_enabled", "label": "AtlasFabio", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas", "key": "_swaggy_no_atlas_enabled", "label": "Swaggy No Atlas", "type": "toggle"},
+    {"cmd": "/swaggy_no_atlas_dca", "key": "_swaggy_no_atlas_dca_enabled", "label": "Swaggy No Atlas DCA", "type": "toggle"},
     {"cmd": "/dtfx", "key": "_dtfx_enabled", "label": "DTFX", "type": "toggle"},
     {"cmd": "/pumpfade", "key": "_pumpfade_enabled", "label": "PumpFade", "type": "toggle"},
     {"cmd": "/atlas_rs_fail_short", "key": "_atlas_rs_fail_short_enabled", "label": "Atlas RS Fail Short", "type": "toggle"},
@@ -85,6 +87,7 @@ DEFAULTS = {
     "_atlas_fabio_enabled": ATLAS_FABIO_ENABLED,
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
     "_swaggy_no_atlas_enabled": SWAGGY_NO_ATLAS_ENABLED,
+    "_swaggy_no_atlas_dca_enabled": SWAGGY_NO_ATLAS_DCA_ENABLED,
     "_dtfx_enabled": DTFX_ENABLED,
     "_pumpfade_enabled": PUMPFADE_ENABLED,
     "_div15m_long_enabled": DIV15M_LONG_ENABLED,
@@ -182,6 +185,7 @@ def status():
     payload = {
         "timestamp": datetime.now().isoformat(),
         "positions": positions,
+        "swaggy_no_atlas_dca_rule": "20/30/40 entry_ok<=30s",
     }
     for item in COMMAND_DEFS:
         key = item["key"]

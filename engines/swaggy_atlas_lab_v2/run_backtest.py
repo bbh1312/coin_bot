@@ -10,17 +10,16 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import ccxt
-import pandas as pd
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from engines.swaggy_atlas_lab.atlas_eval import evaluate_global_gate, evaluate_local
-from engines.swaggy_atlas_lab.broker_sim import BrokerSim
-from engines.swaggy_atlas_lab.config import AtlasConfig, BacktestConfig, SwaggyConfig
+from engines.swaggy_atlas_lab_v2.atlas_eval import evaluate_global_gate, evaluate_local
+from engines.swaggy_atlas_lab_v2.broker_sim import BrokerSim
+from engines.swaggy_atlas_lab_v2.config import AtlasConfig, BacktestConfig, SwaggyConfig
 from engines.dtfx.engine import DTFXConfig
-from engines.swaggy_atlas_lab.data import (
+from engines.swaggy_atlas_lab_v2.data import (
     ensure_dir,
     fetch_ohlcv_all,
     slice_df,
@@ -28,20 +27,20 @@ from engines.swaggy_atlas_lab.data import (
     save_universe,
 )
 from engines.universe import build_universe_from_tickers
-from engines.swaggy_atlas_lab.policy import AtlasMode, apply_policy
-from engines.swaggy_atlas_lab.report import (
+from engines.swaggy_atlas_lab_v2.policy import AtlasMode, apply_policy
+from engines.swaggy_atlas_lab_v2.report import (
     build_summary,
     write_shadow_summary_json,
     write_summary_json,
     write_trades_csv,
 )
-from engines.swaggy_atlas_lab.indicators import atr, ema
-from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine
+from engines.swaggy_atlas_lab_v2.indicators import atr, ema
+from engines.swaggy_atlas_lab_v2.swaggy_signal import SwaggySignalEngine
 
 
 def _append_backtest_log(line: str) -> None:
     date_tag = time.strftime("%Y%m%d")
-    path = os.path.join("logs", "swaggy_atlas_lab", "backtest", f"backtest_{date_tag}.log")
+    path = os.path.join("logs", "swaggy_atlas_lab_v2", "backtest", f"backtest_{date_tag}.log")
     ensure_dir(os.path.dirname(path))
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     with open(path, "a", encoding="utf-8") as f:
@@ -50,7 +49,7 @@ def _append_backtest_log(line: str) -> None:
 
 def _append_backtest_entry_log(line: str) -> None:
     date_tag = time.strftime("%Y%m%d")
-    path = os.path.join("logs", "swaggy_atlas_lab", "backtest", f"backtest_entries_{date_tag}.log")
+    path = os.path.join("logs", "swaggy_atlas_lab_v2", "backtest", f"backtest_entries_{date_tag}.log")
     ensure_dir(os.path.dirname(path))
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     with open(path, "a", encoding="utf-8") as f:
@@ -193,8 +192,8 @@ def main() -> None:
         raise SystemExit("end must be after start")
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join("logs", "swaggy_atlas_lab", "backtest")
-    rep_dir = os.path.join("reports", "swaggy_atlas_lab")
+    log_dir = os.path.join("logs", "swaggy_atlas_lab_v2", "backtest")
+    rep_dir = os.path.join("reports", "swaggy_atlas_lab_v2")
     ensure_dir(log_dir)
     ensure_dir(rep_dir)
     log_path = os.path.join(log_dir, f"bt_{run_id}.log")
@@ -277,10 +276,10 @@ def main() -> None:
     stats_by_key: Dict[tuple[str, str], Dict[str, float]] = {}
     trade_logs: Dict[tuple[str, str], List[dict]] = {}
     open_trades: Dict[tuple[str, str], Dict[str, object]] = {}
-    overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
-    d1_block_by_key: Dict[tuple[str, str], int] = {}
     last_close_by_sym: Dict[str, float] = {}
     last_ts_by_sym: Dict[str, int] = {}
+    overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
+    d1_block_by_key: Dict[tuple[str, str], int] = {}
 
     with open(log_path, "a", encoding="utf-8") as log_fp:
         for mode in modes:
@@ -292,16 +291,16 @@ def main() -> None:
             for sym in symbols:
                 sym_state = engine._state.setdefault(sym, {})
                 df_ltf = data_by_sym[sym][sw_cfg.tf_ltf]
-                if isinstance(df_ltf, pd.DataFrame) and not df_ltf.empty:
+                df_mtf = data_by_sym[sym][sw_cfg.tf_mtf]
+                df_htf = data_by_sym[sym][sw_cfg.tf_htf]
+                df_htf2 = data_by_sym[sym][sw_cfg.tf_htf2]
+                df_d1 = data_by_sym[sym][sw_cfg.tf_d1]
+                if df_ltf is not None and not df_ltf.empty:
                     try:
                         last_close_by_sym[sym] = float(df_ltf.iloc[-1]["close"])
                         last_ts_by_sym[sym] = int(df_ltf.iloc[-1]["ts"])
                     except Exception:
                         pass
-                df_mtf = data_by_sym[sym][sw_cfg.tf_mtf]
-                df_htf = data_by_sym[sym][sw_cfg.tf_htf]
-                df_htf2 = data_by_sym[sym][sw_cfg.tf_htf2]
-                df_d1 = data_by_sym[sym][sw_cfg.tf_d1]
                 for i in range(30, len(df_ltf)):
                     cur = df_ltf.iloc[i]
                     ts_ms = int(cur["ts"])
@@ -650,7 +649,7 @@ def main() -> None:
                         "entry_quality_reasons": entry_quality_reasons,
                     }
                     _append_backtest_entry_log(
-                        "engine=swaggy_atlas_lab mode=%s symbol=%s side=%s entry=%.6g "
+                        "engine=swaggy_atlas_lab_v2 mode=%s symbol=%s side=%s entry=%.6g "
                         "final_usdt=%.2f sw_strength=%.3f sw_reasons=%s atlas_pass=%s atlas_mult=%s "
                         "atlas_reasons=%s atlas_shadow_pass=%s atlas_shadow_mult=%s atlas_shadow_reasons=%s policy_action=%s"
                         % (
@@ -786,7 +785,7 @@ def main() -> None:
                     avg_hold,
                 )
             )
-            entries = list(trade_logs.get((mode, sym), []))
+            entries_list = list(trade_logs.get((mode, sym), []))
             open_trade = open_trades.get((mode, sym))
             if isinstance(open_trade, dict):
                 entry_dt = ""
@@ -810,7 +809,7 @@ def main() -> None:
                         unrealized = (float(last_px) - float(entry_px)) / float(entry_px) * 100.0
                 last_disp = f"{float(last_px):.6g}" if isinstance(last_px, (int, float)) else "N/A"
                 pnl_disp = f"{float(unrealized):.2f}%" if isinstance(unrealized, (int, float)) else "N/A"
-                entries.append(
+                entries_list.append(
                     {
                         "entry_ts": entry_ts or 0,
                         "line": "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s entry_px=%.6g "
@@ -828,8 +827,8 @@ def main() -> None:
                         ),
                     }
                 )
-            entries.sort(key=lambda item: item.get("entry_ts") or 0, reverse=True)
-            for entry in entries:
+            entries_list.sort(key=lambda item: item.get("entry_ts") or 0, reverse=True)
+            for entry in entries_list:
                 print(entry.get("line", ""))
             mode_total = total_by_mode.setdefault(
                 mode,

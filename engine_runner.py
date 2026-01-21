@@ -857,7 +857,7 @@ def _run_swaggy_atlas_lab_cycle(
 
     for symbol in swaggy_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
+        if _both_sides_open(st):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         try:
@@ -869,15 +869,18 @@ def _run_swaggy_atlas_lab_cycle(
         except Exception:
             short_amt = 0.0
         if (long_amt > 0) or (short_amt > 0):
-            st["in_pos"] = True
+            st["in_pos_long"] = bool(long_amt > 0)
+            st["in_pos_short"] = bool(short_amt > 0)
+            st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
             now_seen = time.time()
             if long_amt > 0:
                 _set_last_entry_state(st, "LONG", now_seen)
             if short_amt > 0:
                 _set_last_entry_state(st, "SHORT", now_seen)
             state[symbol] = st
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
+            if (long_amt > 0) and (short_amt > 0):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
 
         df_5m = cycle_cache.get_df(symbol, swaggy_cfg.tf_ltf, limit=ltf_limit)
         df_15m = cycle_cache.get_df(symbol, swaggy_cfg.tf_mtf, limit=mtf_limit)
@@ -885,6 +888,18 @@ def _run_swaggy_atlas_lab_cycle(
         df_4h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf2, limit=htf2_limit)
         df_1d = cycle_cache.get_df(symbol, swaggy_cfg.tf_d1, limit=d1_limit)
         df_3m = cycle_cache.get_df(symbol, "3m", limit=30)
+        if not df_5m.empty and len(df_5m) > 1:
+            df_5m = df_5m.iloc[:-1]
+        if not df_15m.empty and len(df_15m) > 1:
+            df_15m = df_15m.iloc[:-1]
+        if not df_1h.empty and len(df_1h) > 1:
+            df_1h = df_1h.iloc[:-1]
+        if not df_4h.empty and len(df_4h) > 1:
+            df_4h = df_4h.iloc[:-1]
+        if not df_1d.empty and len(df_1d) > 1:
+            df_1d = df_1d.iloc[:-1]
+        if not df_3m.empty and len(df_3m) > 1:
+            df_3m = df_3m.iloc[:-1]
         if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty or df_3m.empty:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -1065,7 +1080,7 @@ def _run_swaggy_atlas_lab_cycle(
 
         guard_key = _entry_guard_key(state, symbol, side)
         if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_atlas_lab", side=side):
-            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab", side=side)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
@@ -1155,7 +1170,7 @@ def _run_swaggy_atlas_lab_cycle(
             _append_swaggy_atlas_lab_log(f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
         finally:
             _entry_guard_release(state, symbol, key=guard_key)
-            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab", side=side)
 
         time.sleep(PER_SYMBOL_SLEEP)
     return result
@@ -1194,7 +1209,7 @@ def _run_swaggy_no_atlas_cycle(
 
     for symbol in swaggy_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
+        if _both_sides_open(st):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         try:
@@ -1206,15 +1221,18 @@ def _run_swaggy_no_atlas_cycle(
         except Exception:
             short_amt = 0.0
         if (long_amt > 0) or (short_amt > 0):
-            st["in_pos"] = True
+            st["in_pos_long"] = bool(long_amt > 0)
+            st["in_pos_short"] = bool(short_amt > 0)
+            st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
             now_seen = time.time()
             if long_amt > 0:
                 _set_last_entry_state(st, "LONG", now_seen)
             if short_amt > 0:
                 _set_last_entry_state(st, "SHORT", now_seen)
             state[symbol] = st
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
+            if (long_amt > 0) and (short_amt > 0):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
 
         df_5m = cycle_cache.get_df(symbol, swaggy_cfg.tf_ltf, limit=ltf_limit)
         df_15m = cycle_cache.get_df(symbol, swaggy_cfg.tf_mtf, limit=mtf_limit)
@@ -1364,7 +1382,7 @@ def _run_swaggy_no_atlas_cycle(
 
         guard_key = _entry_guard_key(state, symbol, side)
         if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_no_atlas", side=side):
-            _entry_lock_release(state, symbol, owner="swaggy_no_atlas")
+            _entry_lock_release(state, symbol, owner="swaggy_no_atlas", side=side)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
@@ -1453,7 +1471,7 @@ def _run_swaggy_no_atlas_cycle(
             _append_swaggy_no_atlas_log(f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
         finally:
             _entry_guard_release(state, symbol, key=guard_key)
-            _entry_lock_release(state, symbol, owner="swaggy_no_atlas")
+            _entry_lock_release(state, symbol, owner="swaggy_no_atlas", side=side)
 
         time.sleep(PER_SYMBOL_SLEEP)
     return result
@@ -1543,6 +1561,57 @@ def _set_last_entry_state(st: Dict[str, Any], side: str, ts: float) -> None:
         st["last_entry_ts_short"] = ts_val
 
 
+def _symbol_in_pos_any(st: Optional[dict]) -> bool:
+    if not isinstance(st, dict):
+        return False
+    if ("in_pos_long" in st) or ("in_pos_short" in st):
+        return bool(st.get("in_pos_long")) or bool(st.get("in_pos_short"))
+    return bool(st.get("in_pos"))
+
+
+def _is_in_pos_side(st: Optional[dict], side: str) -> bool:
+    if not isinstance(st, dict):
+        return False
+    side_key = (side or "").upper()
+    if side_key == "LONG":
+        if "in_pos_long" in st:
+            return bool(st.get("in_pos_long"))
+    elif side_key == "SHORT":
+        if "in_pos_short" in st:
+            return bool(st.get("in_pos_short"))
+    return bool(st.get("in_pos"))
+
+
+def _both_sides_open(st: Optional[dict]) -> bool:
+    if not isinstance(st, dict):
+        return False
+    if ("in_pos_long" in st) or ("in_pos_short" in st):
+        return bool(st.get("in_pos_long")) and bool(st.get("in_pos_short"))
+    return False
+
+
+def _set_in_pos_side(st: Dict[str, Any], side: str, val: bool) -> None:
+    side_key = (side or "").upper()
+    if side_key == "LONG":
+        st["in_pos_long"] = bool(val)
+    elif side_key == "SHORT":
+        st["in_pos_short"] = bool(val)
+    st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
+
+
+def _count_open_positions_state(state: Dict[str, dict]) -> int:
+    total = 0
+    for st in state.values():
+        if not isinstance(st, dict):
+            continue
+        if ("in_pos_long" in st) or ("in_pos_short" in st):
+            total += 1 if st.get("in_pos_long") else 0
+            total += 1 if st.get("in_pos_short") else 0
+        elif st.get("in_pos"):
+            total += 1
+    return total
+
+
 def _atlasfabio_entry_gate(
     symbol: str,
     side: str,
@@ -1556,7 +1625,7 @@ def _atlasfabio_entry_gate(
 ) -> tuple[bool, str]:
     if not live_ok:
         return False, "live_off"
-    if st.get("in_pos"):
+    if _is_in_pos_side(st, side):
         return False, "in_pos"
     last_entry = _get_last_entry_ts_by_side(st, side)
     if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
@@ -1798,7 +1867,7 @@ def _enqueue_entry_request(
     except Exception:
         cur_total = None
     if not isinstance(cur_total, int):
-        cur_total = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+        cur_total = _count_open_positions_state(state)
     if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
         _append_entry_gate_log(engine.lower(), symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
         return None
@@ -1836,27 +1905,29 @@ def _entry_lock_acquire(
 ) -> tuple[bool, Optional[str], Optional[float]]:
     lock = _get_entry_lock(state)
     now = time.time()
+    key = f"{symbol}|{(side or '').upper()}" if side else symbol
     with _ENTRY_LOCK_MUTEX:
-        cur = lock.get(symbol)
+        cur = lock.get(key)
         if isinstance(cur, dict):
             expires = float(cur.get("expires", 0.0) or 0.0)
             if now < expires and cur.get("owner"):
                 held_by = str(cur.get("owner"))
                 _append_entry_gate_log(owner, symbol, f"entry_lock_held_by={held_by}", side=side)
                 return False, held_by, expires - now
-        lock[symbol] = {"owner": owner, "expires": now + ttl_sec, "ts": now}
+        lock[key] = {"owner": owner, "expires": now + ttl_sec, "ts": now}
     return True, None, None
 
 
-def _entry_lock_release(state: Dict[str, dict], symbol: str, owner: Optional[str] = None) -> None:
+def _entry_lock_release(state: Dict[str, dict], symbol: str, owner: Optional[str] = None, side: Optional[str] = None) -> None:
     lock = _get_entry_lock(state)
+    key = f"{symbol}|{(side or '').upper()}" if side else symbol
     with _ENTRY_LOCK_MUTEX:
-        cur = lock.get(symbol)
+        cur = lock.get(key)
         if not isinstance(cur, dict):
             return
         if owner and cur.get("owner") != owner:
             return
-        lock.pop(symbol, None)
+        lock.pop(key, None)
 
 def _log_trade_entry(
     state: Dict[str, dict],
@@ -1902,6 +1973,7 @@ def _log_trade_entry(
         if not isinstance(st, dict):
             st = {}
         _set_last_entry_state(st, side, entry_ts)
+        _set_in_pos_side(st, side, True)
         state[symbol] = st
     except Exception:
         pass
@@ -2081,7 +2153,7 @@ def _close_trade(
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     st["last_entry"] = float(exit_ts)
     _set_last_exit_state(st, side, exit_ts, reason)
-    st["in_pos"] = False
+    _set_in_pos_side(st, side, False)
     suffix = "long" if side == "LONG" else "short"
     st.pop(f"manual_entry_alerted_{suffix}", None)
     st.pop(f"manual_qty_{suffix}", None)
@@ -3308,7 +3380,7 @@ def _run_atlas_fabio_cycle(
         result["log"] = buf
         return result
     if not isinstance(active_positions_total, int):
-        active_positions_total = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+        active_positions_total = _count_open_positions_state(state)
     now_ts = now_ts if isinstance(now_ts, (int, float)) else time.time()
 
     funnel = {
@@ -3365,10 +3437,16 @@ def _run_atlas_fabio_cycle(
         if isinstance(dir_hint, dict):
             allowed_dir = dir_hint.get(symbol)
         st = state.get(symbol, {"in_pos": False, "last_ok": False, "last_entry": 0})
-        if st.get("in_pos"):
-            funnel["skip_precheck"] += 1
-            funnel["blocked_in_pos"] += 1
-            continue
+        if allowed_dir in ("LONG", "SHORT"):
+            if _is_in_pos_side(st, allowed_dir):
+                funnel["skip_precheck"] += 1
+                funnel["blocked_in_pos"] += 1
+                continue
+        else:
+            if _both_sides_open(st):
+                funnel["skip_precheck"] += 1
+                funnel["blocked_in_pos"] += 1
+                continue
         if allowed_dir in ("LONG", "SHORT"):
             last_entry = _get_last_entry_ts_by_side(st, allowed_dir)
             if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
@@ -3802,7 +3880,7 @@ def _run_atlas_fabio_cycle(
         except Exception:
             existing_amt = 0.0
         if isinstance(existing_amt, (int, float)) and existing_amt > 0:
-            st["in_pos"] = True
+            _set_in_pos_side(st, side, True)
             state[symbol] = st
             funnel["blocked_in_pos"] += 1
             _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=IN_POS")
@@ -3852,7 +3930,7 @@ def _run_atlas_fabio_cycle(
         if _entry_seen_blocked(state, symbol, side, "atlasfabio"):
             funnel["entry_lock_skip"] += 1
             _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_SEEN")
-            _entry_lock_release(state, symbol, owner="atlasfabio")
+            _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
             continue
         entry_line = (
             "ATLASFABIO_ENTRY sym=%s side=%s pass=Y strength=%.2f atlas_mult=%.2f strength_mult=%.2f final_usdt=%.2f reasons=%s"
@@ -3893,13 +3971,13 @@ def _run_atlas_fabio_cycle(
                 f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
                 side=side,
             )
-            _entry_lock_release(state, symbol, owner="atlasfabio")
+            _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
             continue
 
         if ATLAS_FABIO_PAPER:
             funnel["entry_paper_ok"] += 1
             _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=PAPER")
-            _entry_lock_release(state, symbol, owner="atlasfabio")
+            _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
@@ -3908,7 +3986,7 @@ def _run_atlas_fabio_cycle(
             if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
                 funnel["entry_blocked_guard"] += 1
                 _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
-                _entry_lock_release(state, symbol, owner="atlasfabio")
+                _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
             else:
                 try:
                     req_id = _enqueue_entry_request(
@@ -3929,13 +4007,13 @@ def _run_atlas_fabio_cycle(
                     _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
                 finally:
                     _entry_guard_release(state, symbol, key=guard_key)
-                    _entry_lock_release(state, symbol, owner="atlasfabio")
+                    _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
         else:
             guard_key = _entry_guard_key(state, symbol, "SHORT")
             if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
                 funnel["entry_blocked_guard"] += 1
                 _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
-                _entry_lock_release(state, symbol, owner="atlasfabio")
+                _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             try:
@@ -3957,7 +4035,7 @@ def _run_atlas_fabio_cycle(
                 _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
             finally:
                 _entry_guard_release(state, symbol, key=guard_key)
-                _entry_lock_release(state, symbol, owner="atlasfabio")
+                _entry_lock_release(state, symbol, owner="atlasfabio", side=side)
             time.sleep(PER_SYMBOL_SLEEP)
 
     _set_thread_log_buffer(None)
@@ -4016,7 +4094,7 @@ def _run_dtfx_cycle(
     )
     for symbol in dtfx_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
+        if _both_sides_open(st):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         signals = dtfx_engine.scan_symbol(ctx, symbol)
@@ -4037,6 +4115,7 @@ def _run_dtfx_cycle(
                 except Exception:
                     existing_amt = 0.0
                 if existing_amt > 0:
+                    _set_in_pos_side(st, "LONG", True)
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
             if side == "SHORT":
@@ -4045,7 +4124,7 @@ def _run_dtfx_cycle(
                 except Exception:
                     existing_amt = 0.0
                 if existing_amt > 0:
-                    st["in_pos"] = True
+                    _set_in_pos_side(st, "SHORT", True)
                     state[symbol] = st
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
@@ -4079,12 +4158,12 @@ def _run_dtfx_cycle(
             guard_key = _entry_guard_key(state, symbol, side)
             if not _entry_guard_acquire(state, symbol, key=guard_key, engine="dtfx", side=side):
                 print(f"[dtfx] {side} 중복 차단 ({symbol})")
-                _entry_lock_release(state, symbol, owner="dtfx")
+                _entry_lock_release(state, symbol, owner="dtfx", side=side)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             if _entry_seen_blocked(state, symbol, side, "dtfx"):
                 _entry_guard_release(state, symbol, key=guard_key)
-                _entry_lock_release(state, symbol, owner="dtfx")
+                _entry_lock_release(state, symbol, owner="dtfx", side=side)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             try:
@@ -4120,7 +4199,7 @@ def _run_dtfx_cycle(
                 print(f"[dtfx] queue error {symbol} side={side}: {e}")
             finally:
                 _entry_guard_release(state, symbol, key=guard_key)
-                _entry_lock_release(state, symbol, owner="dtfx")
+                _entry_lock_release(state, symbol, owner="dtfx", side=side)
         time.sleep(PER_SYMBOL_SLEEP)
     _set_thread_log_buffer(None)
     result["log"] = buf
@@ -4171,7 +4250,7 @@ def _run_pumpfade_cycle(
         pending_id = pf.get("pending_order_id")
         pending_deadline = float(pf.get("pending_deadline_ts") or 0.0)
         pending_prior_hh = pf.get("pending_prior_hh")
-        in_pos = bool(st.get("in_pos"))
+        in_pos = _is_in_pos_side(st, "SHORT")
 
         try:
             existing_amt = get_short_position_amount(symbol)
@@ -4180,7 +4259,7 @@ def _run_pumpfade_cycle(
 
         if pending_id:
             if existing_amt > 0:
-                st["in_pos"] = True
+                _set_in_pos_side(st, "SHORT", True)
                 _set_last_entry_state(st, "SHORT", time.time())
                 state[symbol] = st
                 pf["pending_order_id"] = None
@@ -4213,13 +4292,13 @@ def _run_pumpfade_cycle(
                         pass
 
         if in_pos and existing_amt <= 0:
-            st["in_pos"] = False
+            _set_in_pos_side(st, "SHORT", False)
             state[symbol] = st
             pf["cooldown_until_ts"] = now_ts + tf_sec * int(pumpfade_cfg.cooldown_bars)
             bucket[symbol] = pf
 
         if existing_amt > 0:
-            st["in_pos"] = True
+            _set_in_pos_side(st, "SHORT", True)
             state[symbol] = st
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -4336,7 +4415,7 @@ def _run_pumpfade_cycle(
             finally:
                 _entry_guard_release(state, symbol, key=guard_key)
         finally:
-            _entry_lock_release(state, symbol, owner="pumpfade")
+            _entry_lock_release(state, symbol, owner="pumpfade", side="SHORT")
         result["hits"] += 1
         time.sleep(PER_SYMBOL_SLEEP)
     return result
@@ -4381,7 +4460,7 @@ def _run_atlas_rs_fail_short_cycle(
         )
     for symbol in arsf_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
+        if _is_in_pos_side(st, "SHORT"):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         sig = arsf_engine.on_tick(ctx, symbol)
@@ -4500,7 +4579,7 @@ def _run_atlas_rs_fail_short_cycle(
             finally:
                 _entry_guard_release(state, symbol, key=guard_key)
         finally:
-            _entry_lock_release(state, symbol, owner="atlas_rs_fail_short")
+            _entry_lock_release(state, symbol, owner="atlas_rs_fail_short", side="SHORT")
         time.sleep(PER_SYMBOL_SLEEP)
     return result
 
@@ -5342,7 +5421,8 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
                     f"grace_left={grace_left} last_entry_age={last_entry_age}"
                 )
                 st = state.get(symbol, {})
-                st["in_pos"] = True
+                if isinstance(st, dict):
+                    _set_in_pos_side(st, "SHORT", True)
                 state[symbol] = st
                 continue
             print(
@@ -5358,7 +5438,8 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
                 state[symbol] = st
         if amt > SHORT_RECONCILE_EPS:
             st = state.get(symbol, {})
-            st["in_pos"] = True
+            if isinstance(st, dict):
+                _set_in_pos_side(st, "SHORT", True)
             state[symbol] = st
             continue
         age_sec = None
@@ -5683,7 +5764,7 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
             if not isinstance(st, dict):
                 st = {}
             prev_qty = st.get(f"manual_qty_{side_key}")
-            if not st.get("in_pos"):
+            if not _is_in_pos_side(st, side_label):
                 info = _manual_alert_info(state, sym, side_label)
                 if info:
                     prev_entry = info.get("entry")
@@ -5703,7 +5784,7 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                     if isinstance(prev_ts, (int, float)):
                         ttl_ok = (time.time() - float(prev_ts)) <= MANUAL_ALERT_TTL_SEC
                     if same_entry and same_qty and ttl_ok:
-                        st["in_pos"] = True
+                        _set_in_pos_side(st, side_label, True)
                         st[f"manual_qty_{side_key}"] = qty
                         st.setdefault(f"manual_dca_adds_{side_key}", 0)
                         state[sym] = st
@@ -5738,7 +5819,7 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                     save_state(state)
                 except Exception:
                     pass
-                st["in_pos"] = True
+                _set_in_pos_side(st, side_label, True)
                 st[f"manual_qty_{side_key}"] = qty
                 st[f"manual_dca_adds_{side_key}"] = 0
                 _set_last_entry_state(st, side_label, time.time())
@@ -5778,7 +5859,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
     except Exception:
         cur_total = None
     if not isinstance(cur_total, int):
-        cur_total = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+        cur_total = _count_open_positions_state(state)
     if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
         _clear_manage_pending(state, symbol, side)
         _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
@@ -5816,7 +5897,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     if not isinstance(st, dict):
         st = {}
-    st["in_pos"] = True
+    _set_in_pos_side(st, side, True)
     st.setdefault("dca_adds", 0)
     st.setdefault("dca_adds_long", 0)
     st.setdefault("dca_adds_short", 0)
@@ -5913,7 +5994,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
 
     exit_force_refreshed = False
     for sym, st in list(state.items()):
-        if not isinstance(st, dict) or not st.get("in_pos"):
+        if not isinstance(st, dict) or not _symbol_in_pos_any(st):
             continue
         roi = None
         last_ping = float(st.get("manage_ping_ts", 0.0) or 0.0)
@@ -6185,6 +6266,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         )
         use_swaggy_override = engine_label == "SWAGGY_NO_ATLAS"
         if engine_label == "SWAGGY_NO_ATLAS":
+            if not SWAGGY_NO_ATLAS_DCA_ENABLED:
+                continue
             if not _swaggy_no_atlas_entry_ok_for_dca(state, sym, "SHORT", now):
                 continue
         if use_swaggy_override:
@@ -6265,7 +6348,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 )
                 _append_report_line(sym, "LONG", None, None, engine_label)
                 st = state.get(sym, {}) if isinstance(state, dict) else {}
-                st["in_pos"] = False
+                _set_in_pos_side(st, "LONG", False)
                 st["last_ok"] = False
                 st["dca_adds"] = 0
                 st["dca_adds_long"] = 0
@@ -6422,6 +6505,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 )
                 use_swaggy_override = engine_label == "SWAGGY_NO_ATLAS"
                 if engine_label == "SWAGGY_NO_ATLAS":
+                    if not SWAGGY_NO_ATLAS_DCA_ENABLED:
+                        continue
                     if not _swaggy_no_atlas_entry_ok_for_dca(state, sym, "LONG", now):
                         continue
                 if use_swaggy_override:
@@ -6509,6 +6594,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_atlas_fabio_enabled",
         "_swaggy_atlas_lab_enabled",
         "_swaggy_no_atlas_enabled",
+        "_swaggy_no_atlas_dca_enabled",
         "_div15m_long_enabled",
         "_div15m_short_enabled",
         "_rsi_enabled",
@@ -6529,10 +6615,12 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         state["_atlas_rs_fail_short_universe"] = []
     if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
         state["_swaggy_no_atlas_enabled"] = False
+    if isinstance(state.get("_swaggy_no_atlas_dca_enabled"), dict):
+        state["_swaggy_no_atlas_dca_enabled"] = True
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global ENGINE_EXIT_OVERRIDES
     global ENGINE_EXIT_OVERRIDES
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_DCA_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if isinstance(state.get("_auto_exit"), bool):
@@ -6564,6 +6652,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     if isinstance(state.get("_swaggy_no_atlas_enabled"), bool):
         SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
+    if isinstance(state.get("_swaggy_no_atlas_dca_enabled"), bool):
+        SWAGGY_NO_ATLAS_DCA_ENABLED = bool(state.get("_swaggy_no_atlas_dca_enabled"))
     if isinstance(state.get("_div15m_long_enabled"), bool):
         DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
     if isinstance(state.get("_div15m_short_enabled"), bool):
@@ -6926,7 +7016,8 @@ def _sync_short_positions_state(state: dict, symbols: list) -> None:
         except Exception:
             amt = 0
         if amt > 0:
-            st.setdefault("in_pos", True)
+            st["in_pos_short"] = True
+            st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
             st.setdefault("dca_adds", 0)
             st.setdefault("dca_adds_long", 0)
             st.setdefault("dca_adds_short", 0)
@@ -6935,7 +7026,8 @@ def _sync_short_positions_state(state: dict, symbols: list) -> None:
             state[sym] = st
         else:
             if isinstance(st, dict):
-                st["in_pos"] = False
+                st["in_pos_short"] = False
+                st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
                 state[sym] = st
 
 def _sync_positions_state(state: dict, symbols: list) -> None:
@@ -6953,8 +7045,12 @@ def _sync_positions_state(state: dict, symbols: list) -> None:
         except Exception:
             long_amt = 0
         was_in_pos = bool(st.get("in_pos"))
-        if short_amt > 0 or long_amt > 0:
-            st.setdefault("in_pos", True)
+        in_long = bool(long_amt > 0)
+        in_short = bool(short_amt > 0)
+        st["in_pos_long"] = in_long
+        st["in_pos_short"] = in_short
+        st["in_pos"] = bool(in_long or in_short)
+        if in_short or in_long:
             st.setdefault("dca_adds", 0)
             st.setdefault("dca_adds_long", 0)
             st.setdefault("dca_adds_short", 0)
@@ -6963,6 +7059,8 @@ def _sync_positions_state(state: dict, symbols: list) -> None:
             state[sym] = st
         else:
             if isinstance(st, dict):
+                st["in_pos_long"] = False
+                st["in_pos_short"] = False
                 st["in_pos"] = False
                 state[sym] = st
 
@@ -7107,7 +7205,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_DCA_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -7356,7 +7454,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     try:
                         open_pos = count_open_positions(force=True)
                         if not isinstance(open_pos, int):
-                            open_pos = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+                            open_pos = _count_open_positions_state(state)
                     except Exception as e:
                         open_pos = 0
                         print(f"[telegram] status open_pos error: {e}")
@@ -7373,7 +7471,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                             f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                             f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
-                            f"/swaggy_no_atlas dca: 20/30/40 (entry_ok<=30s)\n"
+                            f"/swaggy_no_atlas_dca: {'ON' if SWAGGY_NO_ATLAS_DCA_ENABLED else 'OFF'} (20/30/40, entry_ok&lt;=30s)\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                             f"/engine_exit: {_format_engine_exit_overrides()}\n"
@@ -7419,7 +7517,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     try:
                         open_pos = count_open_positions(force=True)
                         if not isinstance(open_pos, int):
-                            open_pos = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+                            open_pos = _count_open_positions_state(state)
                     except Exception as e:
                         open_pos = 0
                         print(f"[telegram] status open_pos error: {e}")
@@ -7435,7 +7533,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                         f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
-                        f"/swaggy_no_atlas dca: 20/30/40 (entry_ok<=30s)\n"
+                        f"/swaggy_no_atlas_dca: {'ON' if SWAGGY_NO_ATLAS_DCA_ENABLED else 'OFF'} (20/30/40, entry_ok&lt;=30s)\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                         f"/engine_exit: {_format_engine_exit_overrides()}\n"
@@ -7818,6 +7916,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_no_atlas cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/swaggy_no_atlas_dca", "swaggy_no_atlas_dca")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SWAGGY_NO_ATLAS_DCA_ENABLED = True
+                        state["_swaggy_no_atlas_dca_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ swaggy_no_atlas_dca ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SWAGGY_NO_ATLAS_DCA_ENABLED = False
+                        state["_swaggy_no_atlas_dca_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ swaggy_no_atlas_dca OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_dca 상태: {'ON' if SWAGGY_NO_ATLAS_DCA_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_no_atlas_dca on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_dca cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/div15m_long", "div15m_long")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -8187,6 +8308,7 @@ ATLAS_FABIO_PAPER = False
 SWAGGY_ENABLED = False
 SWAGGY_ATLAS_LAB_ENABLED = False
 SWAGGY_NO_ATLAS_ENABLED = False
+SWAGGY_NO_ATLAS_DCA_ENABLED = True
 DTFX_ENABLED = True
 PUMPFADE_ENABLED = False
 ATLAS_RS_FAIL_SHORT_ENABLED = False
@@ -8445,6 +8567,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_swaggy_enabled",
                 "_swaggy_atlas_lab_enabled",
                 "_swaggy_no_atlas_enabled",
+                "_swaggy_no_atlas_dca_enabled",
                 "_dtfx_enabled",
                 "_pumpfade_enabled",
                 "_div15m_long_enabled",
@@ -8513,7 +8636,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_DCA_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
@@ -8593,6 +8716,10 @@ def run():
         SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
     else:
         state["_swaggy_no_atlas_enabled"] = SWAGGY_NO_ATLAS_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_dca_enabled"), bool):
+        SWAGGY_NO_ATLAS_DCA_ENABLED = bool(state.get("_swaggy_no_atlas_dca_enabled"))
+    else:
+        state["_swaggy_no_atlas_dca_enabled"] = SWAGGY_NO_ATLAS_DCA_ENABLED
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
@@ -8603,6 +8730,8 @@ def run():
         state["_pumpfade_enabled"] = PUMPFADE_ENABLED
     if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
         state["_swaggy_no_atlas_enabled"] = False
+    if isinstance(state.get("_swaggy_no_atlas_dca_enabled"), dict):
+        state["_swaggy_no_atlas_dca_enabled"] = True
     if isinstance(state.get("_atlas_rs_fail_short_enabled"), dict):
         state["_atlas_rs_fail_short_enabled"] = False
     if isinstance(state.get("_atlas_rs_fail_short_universe"), dict):
@@ -8680,7 +8809,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /swaggy_no_atlas on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_dca on|off|status, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /swaggy_no_atlas on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None
@@ -8737,9 +8866,7 @@ def run():
                     state["_pos_limit_skip_ts"] = now
                 time.sleep(5)
                 continue
-        active_positions_state = sum(
-            1 for st in state.values() if isinstance(st, dict) and st.get("in_pos")
-        )
+        active_positions_state = _count_open_positions_state(state)
         active_positions_cached = state.get("_active_positions_total")
         if not isinstance(active_positions_cached, int):
             try:
@@ -9172,11 +9299,11 @@ def run():
         watch_symbols = [
             s
             for s, st in state.items()
-            if isinstance(st, dict) and st.get("in_pos")
+            if isinstance(st, dict) and _symbol_in_pos_any(st)
         ]
         prefetch_symbols = list(set(universe_union + watch_symbols))
         top_candidates = list(universe_momentum[:FAST_TF_PREFETCH_TOPN])
-        in_pos_symbols = [s for s, st in state.items() if isinstance(st, dict) and st.get("in_pos")]
+        in_pos_symbols = [s for s, st in state.items() if isinstance(st, dict) and _symbol_in_pos_any(st)]
         fast_symbols_ordered = []
         for s in in_pos_symbols:
             if s not in fast_symbols_ordered:
@@ -9365,9 +9492,7 @@ def run():
             print("[positions] cache refresh failed:", e)
         active_positions_total = count_open_positions(force=True)
         if not isinstance(active_positions_total, int):
-            active_positions_total = sum(
-                1 for st in state.values() if isinstance(st, dict) and st.get("in_pos")
-            )
+            active_positions_total = _count_open_positions_state(state)
         state["_active_positions_total"] = int(active_positions_total)
 
         # --- SYNC from exchange: manage mode baseline (universe 포함) ---
@@ -9376,15 +9501,13 @@ def run():
         # Sync 이후 다시 계산해 max_pos를 정확히 반영
         active_positions_total = count_open_positions(force=True)
         if not isinstance(active_positions_total, int):
-            active_positions_total = sum(
-                1 for st in state.values() if isinstance(st, dict) and st.get("in_pos")
-            )
+            active_positions_total = _count_open_positions_state(state)
         state["_active_positions_total"] = int(active_positions_total)
 
         # 관리 대상(실포지션)만 WebSocket 감시 목록에 반영
         if ws_manager and ws_manager.is_running():
             try:
-                manage_syms = [s for s, st in state.items() if isinstance(st, dict) and st.get("in_pos")]
+                manage_syms = [s for s, st in state.items() if isinstance(st, dict) and _symbol_in_pos_any(st)]
                 ws_manager.set_watch_symbols(manage_syms)
             except Exception as e:
                 print("[WS] set_watch_symbols error:", e)
@@ -9595,7 +9718,7 @@ def run():
             scanned += 1
             # 최소 로그 모드: 진행률 출력 생략
             st = state.get(symbol, {"in_pos": False, "last_ok": False, "last_entry": 0})
-            in_pos = bool(st.get("in_pos", False))
+            in_pos = _is_in_pos_side(st, "SHORT")
             last_ok = bool(st.get("last_ok", False))
             last_entry = _get_last_entry_ts_by_side(st, "SHORT") or 0.0
 
@@ -9606,7 +9729,7 @@ def run():
                 except Exception:
                     existing_amt = 0.0
                 if existing_amt > 0:
-                    st["in_pos"] = True
+                    _set_in_pos_side(st, "SHORT", True)
                     st.setdefault("dca_adds", 0)
                     st.setdefault("dca_adds_long", 0)
                     st.setdefault("dca_adds_short", 0)
@@ -9726,6 +9849,7 @@ def run():
             # update state for edge detection
             state.setdefault(symbol, {})
             state[symbol].setdefault("in_pos", False)
+            state[symbol].setdefault("in_pos_short", False)
             state[symbol].setdefault("last_entry", last_entry)
             # state[symbol]["last_ok"]는 아래에서 ready_entry 기준으로 갱신
 
@@ -9735,7 +9859,7 @@ def run():
             if ready_entry and (not last_ok):
                 # ensure no actual position
                 if get_short_position_amount(symbol) > 0:
-                    state[symbol]["in_pos"] = True
+                    _set_in_pos_side(state[symbol], "SHORT", True)
                     send_telegram(f"⏭️ <b>SKIP</b> (position exists)\n<b>{symbol}</b>")
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
@@ -9797,7 +9921,7 @@ def run():
             if not run_div15m_long:
                 break
             st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-            in_pos = bool(st.get("in_pos", False))
+            in_pos = _is_in_pos_side(st, "LONG")
             last_entry = _get_last_entry_ts_by_side(st, "LONG") or 0.0
 
             if not in_pos:
@@ -9806,7 +9930,7 @@ def run():
                 except Exception:
                     existing_amt = 0.0
                 if existing_amt > 0:
-                    st["in_pos"] = True
+                    _set_in_pos_side(st, "LONG", True)
                     st.setdefault("dca_adds", 0)
                     st.setdefault("dca_adds_long", 0)
                     st.setdefault("dca_adds_short", 0)
@@ -9874,7 +9998,7 @@ def run():
                 continue
 
             if get_long_position_amount(symbol) > 0:
-                st["in_pos"] = True
+                _set_in_pos_side(st, "LONG", True)
                 state[symbol] = st
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
@@ -9916,7 +10040,7 @@ def run():
                 break
 
             st = div15m_short_bucket.get(symbol, {"in_pos": False, "last_entry": 0})
-            in_pos = bool(st.get("in_pos", False))
+            in_pos = _is_in_pos_side(st, "SHORT")
             last_entry = _get_last_entry_ts_by_side(st, "SHORT") or 0.0
 
             if not in_pos:
@@ -9925,7 +10049,7 @@ def run():
                 except Exception:
                     existing_amt = 0.0
                 if existing_amt > 0:
-                    st["in_pos"] = True
+                    _set_in_pos_side(st, "SHORT", True)
                     div15m_short_bucket[symbol] = st
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
@@ -9938,7 +10062,7 @@ def run():
                 if existing_amt > 0:
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
-                st["in_pos"] = False
+                _set_in_pos_side(st, "SHORT", False)
                 div15m_short_bucket[symbol] = st
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue

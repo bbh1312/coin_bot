@@ -265,7 +265,22 @@ def _force_in_pos_from_api(state: dict, api_set: set) -> None:
         st = state.get(sym)
         if not isinstance(st, dict):
             st = {}
-        st["in_pos"] = True
+        try:
+            long_amt = executor_mod.get_long_position_amount(sym)
+        except Exception:
+            long_amt = 0.0
+        try:
+            short_amt = executor_mod.get_short_position_amount(sym)
+        except Exception:
+            short_amt = 0.0
+        if long_amt > 0:
+            er._set_in_pos_side(st, "LONG", True)
+        if short_amt > 0:
+            er._set_in_pos_side(st, "SHORT", True)
+        if long_amt <= 0 and short_amt <= 0:
+            st["in_pos_long"] = False
+            st["in_pos_short"] = False
+            st["in_pos"] = False
         st.setdefault("dca_adds", 0)
         st.setdefault("dca_adds_long", 0)
         st.setdefault("dca_adds_short", 0)
@@ -635,6 +650,12 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
     last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
     last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
     if (
+        isinstance(last_exit_ts, (int, float))
+        and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
+        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
+    ):
+        return
+    if (
         exit_reason == "manual_close"
         and isinstance(last_exit_ts, (int, float))
         and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
@@ -666,7 +687,7 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
     except Exception:
         pass
     st = state.get(symbol, {}) if isinstance(state, dict) else {}
-    st["in_pos"] = False
+    er._set_in_pos_side(st, "LONG", False)
     st["last_ok"] = False
     st["dca_adds"] = 0
     st["dca_adds_long"] = 0
@@ -715,6 +736,12 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
     last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
     last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
     if (
+        isinstance(last_exit_ts, (int, float))
+        and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
+        and last_exit_reason in ("auto_exit_tp", "auto_exit_sl")
+    ):
+        return
+    if (
         exit_reason == "manual_close"
         and isinstance(last_exit_ts, (int, float))
         and (now_ts - float(last_exit_ts)) <= er.MANUAL_CLOSE_GRACE_SEC
@@ -746,7 +773,7 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
     except Exception:
         pass
     st = state.get(symbol, {}) if isinstance(state, dict) else {}
-    st["in_pos"] = False
+    er._set_in_pos_side(st, "SHORT", False)
     st["last_ok"] = False
     st["dca_adds"] = 0
     st["dca_adds_long"] = 0
@@ -1053,6 +1080,8 @@ def main():
             if not isinstance(st, dict):
                 continue
             if st.get("in_pos") and sym not in api_syms:
+                st["in_pos_long"] = False
+                st["in_pos_short"] = False
                 st["in_pos"] = False
                 state[sym] = st
         if api_syms:
@@ -1064,7 +1093,9 @@ def main():
             except Exception:
                 pass
             try:
-                state["_active_positions_total"] = len(api_syms)
+                state["_active_positions_total"] = int(
+                    len(pos_syms.get("long") or []) + len(pos_syms.get("short") or [])
+                )
             except Exception:
                 pass
     except Exception:
@@ -1108,7 +1139,10 @@ def main():
             last_cfg_save_ts = time.time()
         if (time.time() - last_watch_ts) >= 5.0:
             new_watch_syms = _update_watch_symbols()
-            active_count = len(new_watch_syms)
+            try:
+                active_count = int(executor_mod.count_open_positions(force=True))
+            except Exception:
+                active_count = len(new_watch_syms)
             state["_active_positions_total"] = int(active_count)
             state["_pos_limit_reached"] = bool(active_count >= er.MAX_OPEN_POSITIONS)
             try:
@@ -1117,13 +1151,18 @@ def main():
                     if not isinstance(st, dict):
                         continue
                     if st.get("in_pos") and sym not in api_set:
+                        st["in_pos_long"] = False
+                        st["in_pos_short"] = False
                         st["in_pos"] = False
                         state[sym] = st
                 if api_set:
                     er._sync_positions_state(state, list(api_set))
                     _force_in_pos_from_api(state, api_set)
                 if api_set:
-                    missing = sorted(api_set - {s for s, st in state.items() if isinstance(st, dict) and st.get("in_pos")})
+                    missing = sorted(
+                        api_set
+                        - {s for s, st in state.items() if isinstance(st, dict) and er._symbol_in_pos_any(st)}
+                    )
                     if missing:
                         print(f"[manage-ws] api_inpos_missing_in_state={len(missing)} {missing}")
                     else:
@@ -1283,7 +1322,7 @@ def main():
                         entry_order_id=entry_order_id,
                         meta=meta,
                     )
-                    st["in_pos"] = True
+                    er._set_in_pos_side(st, "LONG", True)
                     st["last_entry"] = now_ts
                     engine_label = str(meta.get("engine") or "MANUAL").upper()
                     if engine_label in ("", "UNKNOWN"):
@@ -1339,19 +1378,19 @@ def main():
                                 meta["reason"] = reason
                             meta["engine"] = eng
                             entry_order_id = recent.get("entry_order_id")
-                        er._log_trade_entry(
-                            state,
-                            side="SHORT",
-                            symbol=symbol,
-                            entry_ts=now_ts,
-                            entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
-                            qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=None,
-                            entry_order_id=entry_order_id,
-                            meta=meta,
-                        )
-                        st["in_pos"] = True
-                        st["last_entry"] = now_ts
+                    er._log_trade_entry(
+                        state,
+                        side="SHORT",
+                        symbol=symbol,
+                        entry_ts=now_ts,
+                        entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+                        qty=qty if isinstance(qty, (int, float)) else None,
+                        usdt=None,
+                        entry_order_id=entry_order_id,
+                        meta=meta,
+                    )
+                    er._set_in_pos_side(st, "SHORT", True)
+                    st["last_entry"] = now_ts
                     engine_label = str(meta.get("engine") or "MANUAL").upper()
                     if engine_label in ("", "UNKNOWN"):
                         engine_label = "MANUAL"
