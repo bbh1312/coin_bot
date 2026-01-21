@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
+    parser.add_argument("--d1-overext-atr", type=float, default=None)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -74,6 +75,8 @@ def main() -> None:
         base_cmd.extend(["--max-symbols", str(args.max_symbols)])
     if args.verbose:
         base_cmd.append("--verbose")
+    if isinstance(args.d1_overext_atr, (int, float)):
+        base_cmd.extend(["--d1-overext-atr", str(args.d1_overext_atr)])
 
     for sl in sl_values:
         cmd = base_cmd + ["--sl-pct", str(sl)]

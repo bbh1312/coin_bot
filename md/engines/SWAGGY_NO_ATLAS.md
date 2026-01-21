@@ -76,6 +76,8 @@ Atlas 게이트 없이 Swaggy 시그널만으로 진입하는 경량 버전이�
 
 - 텔레그램: `/swaggy_no_atlas on|off|status`
 - 웹 UI: Engines 섹션의 "Swaggy No Atlas"
+- 일봉 과확장 컷: `/swaggy_d1_overext 1.2`
+- overext 하한: `/swaggy_no_atlas_overext -0.70`
 
 ## 8) 백테스트 실행
 

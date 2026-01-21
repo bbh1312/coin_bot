@@ -153,8 +153,30 @@ def parse_args():
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
+    parser.add_argument("--d1-overext-atr", type=float, default=None)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
+
+
+def _load_runtime_overrides() -> dict:
+    path = os.path.join(ROOT_DIR, "state.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _coerce_float(val) -> Optional[float]:
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(str(val))
+    except Exception:
+        return None
 
 
 def _parse_universe_arg(text: str) -> int:
@@ -185,6 +207,10 @@ def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
 
 def main() -> None:
     args = parse_args()
+    runtime_overrides = _load_runtime_overrides()
+    runtime_d1_overext = _coerce_float(runtime_overrides.get("_swaggy_d1_overext_atr_mult"))
+    if args.d1_overext_atr is None and runtime_d1_overext is not None:
+        args.d1_overext_atr = float(runtime_d1_overext)
     if args.sl_pct <= 0:
         raise SystemExit("--sl-pct is required")
     end_ms = int(time.time() * 1000)
@@ -212,6 +238,8 @@ def main() -> None:
         mode=args.mode,
     )
     sw_cfg = SwaggyConfig()
+    if isinstance(args.d1_overext_atr, (int, float)):
+        sw_cfg.d1_overext_atr_mult = float(args.d1_overext_atr)
     at_cfg = AtlasConfig()
     if isinstance(args.cooldown_min, int) and args.cooldown_min > 0:
         sw_cfg.cooldown_min = int(args.cooldown_min)

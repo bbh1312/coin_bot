@@ -65,7 +65,7 @@ class SwaggyConfig:
     overext_atr_mult: float = 1.5
     d1_ema_len: int = 7
     d1_atr_len: int = 14
-    d1_overext_atr_mult: float = 1.3
+    d1_overext_atr_mult: float = 1.2
     swing_lookback_1h: int = 60
     swing_lookback_mtf: int = 32
     level_recent_secs: int = 14400

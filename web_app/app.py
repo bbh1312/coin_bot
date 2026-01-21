@@ -13,6 +13,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+
 from engine_runner import (
     _build_daily_report,
     load_state,
@@ -24,8 +25,11 @@ from engine_runner import (
     USDT_PER_TRADE,
     ATLAS_FABIO_ENABLED,
     SWAGGY_ATLAS_LAB_ENABLED,
+    SWAGGY_ATLAS_LAB_V2_ENABLED,
     SWAGGY_NO_ATLAS_ENABLED,
     SWAGGY_NO_ATLAS_DCA_ENABLED,
+    SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
+    SWAGGY_D1_OVEREXT_ATR_MULT,
     DTFX_ENABLED,
     PUMPFADE_ENABLED,
     DIV15M_LONG_ENABLED,
@@ -52,9 +56,11 @@ COMMAND_DEFS = [
     {"cmd": "/auto_exit", "key": "_auto_exit", "label": "Auto Exit", "type": "toggle"},
     {"cmd": "/atlasfabio", "key": "_atlas_fabio_enabled", "label": "AtlasFabio", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
+    {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas", "key": "_swaggy_no_atlas_enabled", "label": "Swaggy No Atlas", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas_dca", "key": "_swaggy_no_atlas_dca_enabled", "label": "Swaggy No Atlas DCA", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas_overext", "key": "_swaggy_no_atlas_overext_min", "label": "No Atlas Overext Min", "type": "number", "step": 0.01},
+    {"cmd": "/swaggy_d1_overext", "key": "_swaggy_d1_overext_atr_mult", "label": "Swaggy D1 Overext ATR", "type": "number", "step": 0.1},
     {"cmd": "/dtfx", "key": "_dtfx_enabled", "label": "DTFX", "type": "toggle"},
     {"cmd": "/pumpfade", "key": "_pumpfade_enabled", "label": "PumpFade", "type": "toggle"},
     {"cmd": "/atlas_rs_fail_short", "key": "_atlas_rs_fail_short_enabled", "label": "Atlas RS Fail Short", "type": "toggle"},
@@ -87,9 +93,11 @@ DEFAULTS = {
     "_entry_usdt": USDT_PER_TRADE,
     "_atlas_fabio_enabled": ATLAS_FABIO_ENABLED,
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
+    "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
     "_swaggy_no_atlas_enabled": SWAGGY_NO_ATLAS_ENABLED,
     "_swaggy_no_atlas_dca_enabled": SWAGGY_NO_ATLAS_DCA_ENABLED,
     "_swaggy_no_atlas_overext_min": SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
+    "_swaggy_d1_overext_atr_mult": SWAGGY_D1_OVEREXT_ATR_MULT,
     "_dtfx_enabled": DTFX_ENABLED,
     "_pumpfade_enabled": PUMPFADE_ENABLED,
     "_div15m_long_enabled": DIV15M_LONG_ENABLED,

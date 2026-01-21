@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -77,11 +78,33 @@ def parse_args():
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
-    parser.add_argument("--overext-min", type=float, default=OVEREXT_ENTRY_MIN)
+    parser.add_argument("--overext-min", type=float, default=None)
+    parser.add_argument("--d1-overext-atr", type=float, default=None)
     parser.add_argument("--last-day-entry", choices=["on", "off"], default="on")
     parser.add_argument("--last-day-entry-days", type=int, default=1)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
+
+
+def _load_runtime_overrides() -> dict:
+    path = os.path.join(ROOT_DIR, "state.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _coerce_float(val) -> Optional[float]:
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(str(val))
+    except Exception:
+        return None
 
 
 def _parse_universe_arg(text: str) -> int:
@@ -125,6 +148,15 @@ def _d1_dist_atr(df, last_price: float, cfg: SwaggyConfig) -> Optional[float]:
 
 def main() -> None:
     args = parse_args()
+    runtime_overrides = _load_runtime_overrides()
+    runtime_overext_min = _coerce_float(runtime_overrides.get("_swaggy_no_atlas_overext_min"))
+    runtime_d1_overext = _coerce_float(runtime_overrides.get("_swaggy_d1_overext_atr_mult"))
+    if args.overext_min is None and runtime_overext_min is not None:
+        args.overext_min = float(runtime_overext_min)
+    if args.overext_min is None:
+        args.overext_min = OVEREXT_ENTRY_MIN
+    if args.d1_overext_atr is None and runtime_d1_overext is not None:
+        args.d1_overext_atr = float(runtime_d1_overext)
     if args.sl_pct <= 0:
         raise SystemExit("--sl-pct is required")
     end_ms = int(time.time() * 1000)
@@ -152,6 +184,8 @@ def main() -> None:
     sw_cfg = SwaggyConfig()
     if isinstance(args.cooldown_min, int) and args.cooldown_min > 0:
         sw_cfg.cooldown_min = int(args.cooldown_min)
+    if isinstance(args.d1_overext_atr, (int, float)):
+        sw_cfg.d1_overext_atr_mult = float(args.d1_overext_atr)
 
     ex = _make_exchange()
     ex.load_markets()
@@ -236,7 +270,7 @@ def main() -> None:
     with open(log_path, "a", encoding="utf-8") as log_fp:
         run_line = (
             f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms} "
-            f"overext_min={args.overext_min}"
+            f"overext_min={args.overext_min} d1_overext_atr={sw_cfg.d1_overext_atr_mult}"
         )
         log_fp.write(run_line + "\n")
         _append_backtest_log(run_line)
@@ -776,7 +810,6 @@ def main() -> None:
             losses = int(stats.get("losses") or 0)
             tp = int(stats.get("tp") or 0)
             sl = int(stats.get("sl") or 0)
-            loss_sum_usdt = float(stats.get("loss_pnl_sum") or 0.0)
             win_rate = (wins / trades_count * 100.0) if trades_count else 0.0
             avg_mfe = (stats.get("mfe_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
@@ -788,9 +821,6 @@ def main() -> None:
             sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
             net_sum_usdt = tp_sum_usdt - sl_sum_usdt
             entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
-            dca_usdt_mode = sum(
-                val for (m, _s), val in dca_usdt_by_key.items() if m == mode
-            )
             open_bucket = open_stats_by_mode.get(mode) or {}
             open_count = int(open_bucket.get("count") or 0)
             open_notional = float(open_bucket.get("notional") or 0.0)
@@ -809,8 +839,8 @@ def main() -> None:
             total_lines.append(
                 "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
                 "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f "
-                "open_count=%d open_notional=%.2f open_pnl=%.3f loss_sum=%.3f exit_pnl={%s}"
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d "
+                "open_count=%d open_notional=%.2f open_pnl=%.3f exit_pnl={%s}"
                 % (
                     label,
                     entries,
@@ -830,12 +860,9 @@ def main() -> None:
                     sl_sum_usdt,
                     net_sum_usdt,
                     entry_sym_count,
-                    int(stats.get("dca_adds") or 0),
-                    float(dca_usdt_mode),
                     open_count,
                     open_notional,
                     open_pnl,
-                    loss_sum_usdt,
                     reason_text,
                 )
             )
@@ -855,7 +882,6 @@ def main() -> None:
         total_losses = int(grand_total.get("losses") or 0)
         total_tp = int(grand_total.get("tp") or 0)
         total_sl = int(grand_total.get("sl") or 0)
-        total_loss_sum = float(grand_total.get("loss_pnl_sum") or 0.0)
         total_win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
         total_avg_mfe = (grand_total.get("mfe_sum", 0.0) / total_trades) if total_trades else 0.0
         total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
@@ -891,8 +917,8 @@ def main() -> None:
             total_lines.append(
                 "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
                 "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d dca_adds=%d dca_usdt=%.2f "
-                "open_count=%d open_notional=%.2f open_pnl=%.3f loss_sum=%.3f exit_pnl={%s}"
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d "
+                "open_count=%d open_notional=%.2f open_pnl=%.3f exit_pnl={%s}"
                 % (
                     total_entries,
                     total_exits,
@@ -911,12 +937,9 @@ def main() -> None:
                     total_sl_sum,
                     total_net_sum,
                     total_entry_syms,
-                    int(grand_total.get("dca_adds") or 0),
-                    float(sum(dca_usdt_by_key.values())),
                     total_open_count,
                     total_open_notional,
                     total_open_pnl,
-                    total_loss_sum,
                     total_reason_text,
                 )
             )
