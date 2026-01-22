@@ -202,10 +202,15 @@ SWAGGY_ATLAS_LAB_V2_ENABLED = False
 SWAGGY_NO_ATLAS_ENABLED = False
 SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = -0.7
 SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = True
+SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = False
+SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = "roi"
+SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = 0.0
+SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = 0
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
 SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS", "").strip()
 SWAGGY_NO_ATLAS_OFF_WINDOWS = os.getenv("SWAGGY_NO_ATLAS_OFF_WINDOWS", "").strip()
 SWAGGY_D1_OVEREXT_ATR_MULT = 1.2
+SATURDAY_TRADE_ENABLED = str(os.getenv("SATURDAY_TRADE_ENABLED", "1")).strip().lower() not in ("0", "false", "off", "no")
 DTFX_ENABLED = True
 ATLAS_RS_FAIL_SHORT_ENABLED = False
 DIV15M_LONG_ENABLED = False
@@ -609,13 +614,24 @@ def _send_entry_alert(
     entry_order_id: Optional[str] = None,
     extras: Optional[list] = None,
     state: Optional[dict] = None,
+    label_tag: Optional[str] = None,
 ) -> None:
     if not send_alert:
         return
     side_key = (side or "").upper()
     icon = "🟢" if side_key == "LONG" else "🔴" if side_key == "SHORT" else "⚪"
     side_label = "롱" if side_key == "LONG" else "숏" if side_key == "SHORT" else side_key
-    lines = [f"{icon} <b>{side_label} 시그널</b>", f"<b>{symbol}</b>"]
+    header = f"{icon} <b>{side_label} 시그널</b>"
+    if label_tag:
+        if label_tag.startswith("MULTI_ENTRY:"):
+            try:
+                num = int(label_tag.split(":", 1)[1])
+                header = f"{header} (추가진입 +{num}번째)"
+            except Exception:
+                header = f"{header} (추가진입)"
+        else:
+            header = f"{header} ({label_tag})"
+    lines = [header, f"<b>{symbol}</b>"]
     if entry_order_id:
         lines.append(f"entry_id={entry_order_id}")
     if entry_price is not None or usdt is not None:
@@ -996,6 +1012,16 @@ def _is_in_off_window(text: str, now_ts: Optional[float] = None) -> bool:
                 return True
     return False
 
+
+def _is_saturday_kst(now_ts: Optional[float] = None) -> bool:
+    try:
+        ts_val = time.time() if now_ts is None else float(now_ts)
+        tz = timezone(timedelta(hours=9))
+        dt = datetime.fromtimestamp(ts_val, tz=tz)
+        return dt.weekday() == 5
+    except Exception:
+        return False
+
 def _append_swaggy_trade_json(payload: Dict[str, Any]) -> None:
     try:
         path = os.path.join("logs", "swaggy_trades.jsonl")
@@ -1090,7 +1116,12 @@ def _run_swaggy_atlas_lab_cycle(
 
     now_ts = time.time()
     if _is_in_off_window(SWAGGY_ATLAS_LAB_OFF_WINDOWS, now_ts):
+        print(f"[off-window] SWAGGY_ATLAS_LAB now={_now_kst_str()} windows={SWAGGY_ATLAS_LAB_OFF_WINDOWS}")
         _append_swaggy_atlas_lab_log("SWAGGY_ATLAS_LAB_SKIP reason=OFF_WINDOW")
+        return result
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        print(f"[off-sat] SWAGGY_ATLAS_LAB now={_now_kst_str()} saturday=ON")
+        _append_swaggy_atlas_lab_log("SWAGGY_ATLAS_LAB_SKIP reason=SATURDAY_OFF")
         return result
     hedge_mode = False
     try:
@@ -1514,7 +1545,12 @@ def _run_swaggy_atlas_lab_v2_cycle(
 
     now_ts = time.time()
     if _is_in_off_window(SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, now_ts):
+        print(f"[off-window] SWAGGY_ATLAS_LAB_V2 now={_now_kst_str()} windows={SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS}")
         _append_swaggy_atlas_lab_v2_log("SWAGGY_ATLAS_LAB_V2_SKIP reason=OFF_WINDOW")
+        return result
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        print(f"[off-sat] SWAGGY_ATLAS_LAB_V2 now={_now_kst_str()} saturday=ON")
+        _append_swaggy_atlas_lab_v2_log("SWAGGY_ATLAS_LAB_V2_SKIP reason=SATURDAY_OFF")
         return result
     hedge_mode = False
     try:
@@ -1846,7 +1882,12 @@ def _run_swaggy_no_atlas_cycle(
 
     now_ts = time.time()
     if _is_in_off_window(SWAGGY_NO_ATLAS_OFF_WINDOWS, now_ts):
+        print(f"[off-window] SWAGGY_NO_ATLAS now={_now_kst_str()} windows={SWAGGY_NO_ATLAS_OFF_WINDOWS}")
         _append_swaggy_no_atlas_log("SWAGGY_NO_ATLAS_SKIP reason=OFF_WINDOW")
+        return result
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        print(f"[off-sat] SWAGGY_NO_ATLAS now={_now_kst_str()} saturday=ON")
+        _append_swaggy_no_atlas_log("SWAGGY_NO_ATLAS_SKIP reason=SATURDAY_OFF")
         return result
     hedge_mode = False
     try:
@@ -1950,6 +1991,7 @@ def _run_swaggy_no_atlas_cycle(
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
+        in_pos_same = _is_in_pos_side(st, side)
         overext_signed = _swaggy_no_atlas_overext_dist(df_5m, side, swaggy_cfg)
         if (
             SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
@@ -2024,7 +2066,7 @@ def _run_swaggy_no_atlas_cycle(
         cur_total = count_open_positions(force=True)
         if not isinstance(cur_total, int):
             cur_total = active_positions_total
-        if cur_total >= MAX_OPEN_POSITIONS:
+        if cur_total >= MAX_OPEN_POSITIONS and not in_pos_same:
             _append_entry_gate_log(
                 "swaggy_no_atlas",
                 symbol,
@@ -2033,6 +2075,52 @@ def _run_swaggy_no_atlas_cycle(
             )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
+
+        is_multi_add = False
+        multi_next = 0
+        if in_pos_same:
+            if not SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED:
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=IN_POS side={side}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            open_tr = _get_open_trade(state, side, symbol)
+            if not open_tr:
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_NO_OPEN_TRADE side={side}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            adds_key = f"multi_entry_adds_{side.lower()}"
+            adds_done = int(st.get(adds_key, 0) or 0)
+            if SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX > 0 and adds_done >= SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX:
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_MAX side={side} adds={adds_done}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE == "roi":
+                try:
+                    entry_ref = float(open_tr.get("entry_price") or 0.0)
+                    mark_px = float(df_5m["close"].iloc[-1])
+                except Exception:
+                    entry_ref = 0.0
+                    mark_px = 0.0
+                roi_pct = 0.0
+                if entry_ref > 0 and mark_px > 0:
+                    if side == "LONG":
+                        roi_pct = (mark_px - entry_ref) / entry_ref * 100.0
+                    else:
+                        roi_pct = (entry_ref - mark_px) / entry_ref * 100.0
+                if roi_pct > -abs(SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI):
+                    _append_swaggy_no_atlas_log(
+                        f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_ROI side={side} roi={roi_pct:.2f}%"
+                    )
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+            is_multi_add = True
+            multi_next = adds_done + 1
 
         lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_no_atlas", side=side)
         if not lock_ok:
@@ -2055,12 +2143,23 @@ def _run_swaggy_no_atlas_cycle(
                 symbol=symbol,
                 side=side,
                 engine="SWAGGY_NO_ATLAS",
-                reason="swaggy_no_atlas",
+                reason="swaggy_no_atlas_multi" if is_multi_add else "swaggy_no_atlas",
                 usdt=entry_usdt,
                 live=live,
                 alert_reason="SWAGGY_NO_ATLAS",
+                alert_tag=f"MULTI_ENTRY:{multi_next}" if is_multi_add else None,
             )
             if req_id:
+                if is_multi_add:
+                    adds_key = f"multi_entry_adds_{side.lower()}"
+                    st[adds_key] = int(st.get(adds_key, 0) or 0) + 1
+                    state[symbol] = st
+                    try:
+                        open_tr = _get_open_trade(state, side, symbol)
+                        if open_tr:
+                            open_tr["multi_entry_adds"] = int(open_tr.get("multi_entry_adds", 0)) + 1
+                    except Exception:
+                        pass
                 trade_payload = {
                     "ts": _iso_kst(),
                     "event": "SWAGGY_TRADE",
@@ -2545,6 +2644,7 @@ def _enqueue_entry_request(
     usdt: float,
     live: bool,
     alert_reason: Optional[str] = None,
+    alert_tag: Optional[str] = None,
     entry_price_hint: Optional[float] = None,
     size_mult: Optional[float] = None,
     notify: bool = False,
@@ -2569,6 +2669,7 @@ def _enqueue_entry_request(
         "engine": engine,
         "reason": reason,
         "alert_reason": alert_reason,
+        "alert_tag": alert_tag,
         "usdt": float(usdt),
         "leverage": LEVERAGE,
         "margin_mode": MARGIN_MODE,
@@ -5800,22 +5901,23 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
     except Exception:
         pass
-    _send_entry_alert(
-        (lambda text: send_telegram(text, allow_early=True)),
-        side=side,
-        symbol=symbol,
-        engine=req.get("engine") or "UNKNOWN",
-        entry_price=fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
-        usdt=usdt,
-        reason=req.get("alert_reason") or req.get("reason") or "",
-        live=live,
-        order_info=None,
-        entry_order_id=entry_order_id,
-        sl=_fmt_price_safe(
-            fill_price if isinstance(fill_price, (int, float)) else None,
-            _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
+        _send_entry_alert(
+            (lambda text: send_telegram(text, allow_early=True)),
             side=side,
-        ),
+            symbol=symbol,
+            engine=req.get("engine") or "UNKNOWN",
+            entry_price=fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
+            usdt=usdt,
+            reason=req.get("alert_reason") or req.get("reason") or "",
+            live=live,
+            order_info=None,
+            entry_order_id=entry_order_id,
+            label_tag="추가진입" if req.get("alert_tag") == "MULTI_ENTRY" else None,
+            sl=_fmt_price_safe(
+                fill_price if isinstance(fill_price, (int, float)) else None,
+                _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
+                side=side,
+            ),
         tp=None,
         state=state,
     )
@@ -6405,10 +6507,11 @@ def _manage_loop_worker(state: dict, exchange, cached_long_ex, send_telegram) ->
 def _reload_runtime_settings_from_disk(state: dict) -> None:
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global ENGINE_EXIT_OVERRIDES
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE, SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI, SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
-    global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
+    global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, SATURDAY_TRADE_ENABLED
+    global SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE, SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI, SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     try:
         disk = load_state()
@@ -6433,6 +6536,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_dca_second_pct",
         "_dca_third_pct",
         "_exit_cooldown_hours",
+        "_sat_trade",
         "_swaggy_atlas_lab_enabled",
         "_swaggy_atlas_lab_v2_enabled",
         "_swaggy_no_atlas_enabled",
@@ -6442,6 +6546,10 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         "_swaggy_no_atlas_overext_min",
         "_swaggy_no_atlas_overext_min_enabled",
         "_swaggy_no_atlas_overext_min_enabled",
+        "_swaggy_no_atlas_multi_enabled",
+        "_swaggy_no_atlas_multi_mode",
+        "_swaggy_no_atlas_multi_roi",
+        "_swaggy_no_atlas_multi_max",
         "_swaggy_d1_overext_atr_mult",
         "_rsi_enabled",
         "_dtfx_enabled",
@@ -6529,6 +6637,22 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         DCA_THIRD_PCT = float(state.get("_dca_third_pct"))
         if executor_mod:
             executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
+    if isinstance(state.get("_sat_trade"), bool):
+        SATURDAY_TRADE_ENABLED = bool(state.get("_sat_trade"))
+    if isinstance(state.get("_swaggy_no_atlas_multi_enabled"), bool):
+        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = bool(state.get("_swaggy_no_atlas_multi_enabled"))
+    if isinstance(state.get("_swaggy_no_atlas_multi_mode"), str):
+        SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = str(state.get("_swaggy_no_atlas_multi_mode") or "roi")
+    if isinstance(state.get("_swaggy_no_atlas_multi_roi"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = abs(float(state.get("_swaggy_no_atlas_multi_roi") or 0.0))
+        except Exception:
+            pass
+    if isinstance(state.get("_swaggy_no_atlas_multi_max"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = int(state.get("_swaggy_no_atlas_multi_max") or 0)
+        except Exception:
+            pass
     if isinstance(state.get("_exit_cooldown_hours"), (int, float)):
         EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
         COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
@@ -6650,10 +6774,15 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_dca_second_pct",
         "_dca_third_pct",
         "_exit_cooldown_hours",
+        "_sat_trade",
         "_swaggy_atlas_lab_enabled",
         "_swaggy_atlas_lab_v2_enabled",
         "_swaggy_no_atlas_enabled",
         "_swaggy_no_atlas_overext_min",
+        "_swaggy_no_atlas_multi_enabled",
+        "_swaggy_no_atlas_multi_mode",
+        "_swaggy_no_atlas_multi_roi",
+        "_swaggy_no_atlas_multi_max",
         "_swaggy_d1_overext_atr_mult",
         "_rsi_enabled",
         "_dtfx_enabled",
@@ -7052,7 +7181,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE, SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI, SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -7330,6 +7459,26 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] auto_exit cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/sat_trade", "sat_trade")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SATURDAY_TRADE_ENABLED = True
+                        state["_sat_trade"] = True
+                        state_dirty = True
+                        resp = "✅ saturday trade ON (토요일 진입 허용)"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SATURDAY_TRADE_ENABLED = False
+                        state["_sat_trade"] = False
+                        state_dirty = True
+                        resp = "⛔ saturday trade OFF (토요일 진입 차단)"
+                    else:
+                        resp = f"ℹ️ saturday trade 상태: {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n사용법: /sat_trade on|off|status"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] sat_trade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
 
                 if cmd in ("/engine_exit", "engine_exit") and not responded:
                     parts = lower.split()
@@ -7436,6 +7585,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         status_msg = (
                             "🤖 상태\n"
                             f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
+                            f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
                             f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                             f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                             f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -7447,6 +7597,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
                             f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
                             f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
+                            f"/swaggy_no_atlas_multi: {'ON' if SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED else 'OFF'} "
+                            f"mode={SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE} roi={SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI:.2f}% "
+                            f"max={SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX}\n"
                             f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
                             f"/swaggy_atlas_lab_off: {SWAGGY_ATLAS_LAB_OFF_WINDOWS or 'NONE'}\n"
                             f"/swaggy_atlas_lab_v2_off: {SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS or 'NONE'}\n"
@@ -7500,6 +7653,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     status_msg = (
                         "🤖 상태\n"
                         f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
+                        f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
                         f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                         f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                         f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -7511,6 +7665,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
                         f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
                         f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
+                        f"/swaggy_no_atlas_multi: {'ON' if SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED else 'OFF'} "
+                        f"mode={SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE} roi={SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI:.2f}% "
+                        f"max={SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX}\n"
                         f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
                         f"/swaggy_atlas_lab_off: {SWAGGY_ATLAS_LAB_OFF_WINDOWS or 'NONE'}\n"
                         f"/swaggy_atlas_lab_v2_off: {SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS or 'NONE'}\n"
@@ -7988,6 +8145,93 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_no_atlas_overext_on cmd 처리 send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/swaggy_no_atlas_multi", "swaggy_no_atlas_multi")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = True
+                        state["_swaggy_no_atlas_multi_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ swaggy_no_atlas_multi: ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = False
+                        state["_swaggy_no_atlas_multi_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ swaggy_no_atlas_multi: OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_multi: {'ON' if SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_no_atlas_multi on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_multi cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_multi_mode", "swaggy_no_atlas_multi_mode")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("roi", "always"):
+                        SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = arg
+                        state["_swaggy_no_atlas_multi_mode"] = arg
+                        state_dirty = True
+                        resp = f"✅ swaggy_no_atlas_multi_mode: {arg}"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_multi_mode: {SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE}\n"
+                            "사용법: /swaggy_no_atlas_multi_mode roi|always"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_multi_mode cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_multi_roi", "swaggy_no_atlas_multi_roi")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else ""
+                    resp = None
+                    if arg:
+                        try:
+                            val = abs(float(arg))
+                            SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = val
+                            state["_swaggy_no_atlas_multi_roi"] = val
+                            state_dirty = True
+                            resp = f"✅ swaggy_no_atlas_multi_roi: {val:.2f}%"
+                        except Exception:
+                            resp = "⛔ 사용법: /swaggy_no_atlas_multi_roi 1.5"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_multi_roi: {SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI:.2f}%\n"
+                            "사용법: /swaggy_no_atlas_multi_roi 1.5"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_multi_roi cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_multi_max", "swaggy_no_atlas_multi_max")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else ""
+                    resp = None
+                    if arg:
+                        try:
+                            val = int(float(arg))
+                            if val < 0:
+                                raise ValueError("negative")
+                            SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = val
+                            state["_swaggy_no_atlas_multi_max"] = val
+                            state_dirty = True
+                            resp = f"✅ swaggy_no_atlas_multi_max: {val}"
+                        except Exception:
+                            resp = "⛔ 사용법: /swaggy_no_atlas_multi_max 3"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_multi_max: {SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX}\n"
+                            "사용법: /swaggy_no_atlas_multi_max 3"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_multi_max cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/swaggy_d1_overext", "swaggy_d1_overext")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else ""
@@ -8361,7 +8605,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE, SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI, SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
@@ -8413,6 +8657,10 @@ def run():
             executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
     else:
         state["_dca_third_pct"] = DCA_THIRD_PCT
+    if isinstance(state.get("_sat_trade"), bool):
+        SATURDAY_TRADE_ENABLED = bool(state.get("_sat_trade"))
+    else:
+        state["_sat_trade"] = SATURDAY_TRADE_ENABLED
     if isinstance(state.get("_exit_cooldown_hours"), (int, float)):
         EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
         COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
@@ -8455,6 +8703,28 @@ def run():
         SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = bool(state.get("_swaggy_no_atlas_overext_min_enabled"))
     else:
         state["_swaggy_no_atlas_overext_min_enabled"] = SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_multi_enabled"), bool):
+        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = bool(state.get("_swaggy_no_atlas_multi_enabled"))
+    else:
+        state["_swaggy_no_atlas_multi_enabled"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_multi_mode"), str):
+        SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = str(state.get("_swaggy_no_atlas_multi_mode") or "roi")
+    else:
+        state["_swaggy_no_atlas_multi_mode"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE
+    if isinstance(state.get("_swaggy_no_atlas_multi_roi"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = abs(float(state.get("_swaggy_no_atlas_multi_roi") or 0.0))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_multi_roi"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI
+    if isinstance(state.get("_swaggy_no_atlas_multi_max"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = int(state.get("_swaggy_no_atlas_multi_max") or 0)
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_multi_max"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX
     if isinstance(state.get("_swaggy_d1_overext_atr_mult"), (int, float)):
         SWAGGY_D1_OVEREXT_ATR_MULT = float(state.get("_swaggy_d1_overext_atr_mult"))
     else:
@@ -8523,7 +8793,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_no_atlas_multi on|off|status, /swaggy_no_atlas_multi_mode roi|always, /swaggy_no_atlas_multi_roi n, /swaggy_no_atlas_multi_max n, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     print("[시작] 메인 루프 시작")
     manage_thread = None

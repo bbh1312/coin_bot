@@ -32,6 +32,8 @@ class Trade:
     bars: int = 0
     dca_adds: int = 0
     dca_usdt: float = 0.0
+    multi_entry_adds: int = 0
+    multi_entry_usdt: float = 0.0
     context: Optional[Dict[str, Any]] = None
 
 
@@ -181,6 +183,7 @@ class BrokerSim:
         bar_high: float,
         bar_low: float,
         side: Optional[str] = None,
+        mode: str = "dca",
     ) -> Optional[Trade]:
         trade = self.positions.get(self._key(sym, side)) if side or self.hedge_mode else self.positions.get(sym)
         if trade is None:
@@ -191,8 +194,13 @@ class BrokerSim:
         new_size = prev_size + float(size_usdt)
         trade.entry_price = (trade.entry_price * prev_size + entry_px * size_usdt) / new_size
         trade.size_usdt = new_size
-        trade.dca_adds = int(trade.dca_adds or 0) + 1
-        trade.dca_usdt = float(trade.dca_usdt or 0.0) + float(size_usdt)
+        mode_key = (mode or "").lower().strip()
+        if mode_key == "multi":
+            trade.multi_entry_adds = int(trade.multi_entry_adds or 0) + 1
+            trade.multi_entry_usdt = float(trade.multi_entry_usdt or 0.0) + float(size_usdt)
+        else:
+            trade.dca_adds = int(trade.dca_adds or 0) + 1
+            trade.dca_usdt = float(trade.dca_usdt or 0.0) + float(size_usdt)
         if trade.side == "LONG":
             trade.sl_price = trade.entry_price * (1 - self.sl_pct)
             trade.tp_price = trade.entry_price * (1 + self.tp_pct)

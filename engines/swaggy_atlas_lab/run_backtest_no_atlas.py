@@ -6,7 +6,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import ccxt
@@ -73,6 +73,7 @@ def parse_args():
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
     parser.add_argument("--d1-overext-atr", type=float, default=None)
+    parser.add_argument("--sat-trade", choices=["on", "off"], default="on", help="allow entries on Saturday (KST)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -96,6 +97,15 @@ def _coerce_float(val) -> Optional[float]:
         return float(str(val))
     except Exception:
         return None
+
+
+def _is_saturday_kst_ms(ts_ms: int) -> bool:
+    try:
+        tz = timezone(timedelta(hours=9))
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=tz)
+        return dt.weekday() == 5
+    except Exception:
+        return False
 
 
 def _parse_universe_arg(text: str) -> int:
@@ -126,6 +136,7 @@ def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
 
 def main() -> None:
     args = parse_args()
+    sat_trade_enabled = str(args.sat_trade or "on").lower() == "on"
     runtime_overrides = _load_runtime_overrides()
     runtime_d1_overext = _coerce_float(runtime_overrides.get("_swaggy_d1_overext_atr_mult"))
     if args.d1_overext_atr is None and runtime_d1_overext is not None:
@@ -390,6 +401,11 @@ def main() -> None:
                     continue
 
                 if not signal.entry_ok or not side or entry_px is None:
+                    continue
+                if not sat_trade_enabled and _is_saturday_kst_ms(ts_ms):
+                    _append_backtest_log(
+                        f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=SATURDAY_OFF"
+                    )
                     continue
 
                 entry_line = (

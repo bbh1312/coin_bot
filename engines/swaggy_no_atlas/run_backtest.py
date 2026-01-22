@@ -43,7 +43,7 @@ def _append_backtest_log(line: str) -> None:
     date_tag = time.strftime("%Y%m%d")
     path = os.path.join("logs", "swaggy_no_atlas", "backtest", f"backtest_{date_tag}.log")
     ensure_dir(os.path.dirname(path))
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    ts = datetime.fromtimestamp(time.time(), tz=timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"{ts} {line}\n")
 
@@ -52,7 +52,7 @@ def _append_backtest_entry_log(line: str) -> None:
     date_tag = time.strftime("%Y%m%d")
     path = os.path.join("logs", "swaggy_no_atlas", "backtest", f"backtest_entries_{date_tag}.log")
     ensure_dir(os.path.dirname(path))
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    ts = datetime.fromtimestamp(time.time(), tz=timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"{ts} {line}\n")
 
@@ -84,6 +84,11 @@ def parse_args():
     parser.add_argument("--last-day-entry-days", type=int, default=1)
     parser.add_argument("--entry-windows", default="", help="off windows (HH[:MM]-HH[:MM], comma-separated, UTC by default)")
     parser.add_argument("--entry-tz-offset", type=float, default=0.0, help="hours offset from UTC for entry windows (e.g. 9 for KST)")
+    parser.add_argument("--sat-trade", choices=["on", "off"], default="on", help="allow entries on Saturday (KST)")
+    parser.add_argument("--multi-entry", choices=["on", "off"], default="off", help="allow add when same-side signal repeats")
+    parser.add_argument("--multi-entry-mode", choices=["roi", "always"], default="roi", help="multi-entry condition")
+    parser.add_argument("--multi-entry-roi", type=float, default=0.0, help="roi threshold for multi-entry (use positive number)")
+    parser.add_argument("--multi-entry-max", type=int, default=0, help="max multi-entry adds (0 = unlimited)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -170,6 +175,35 @@ def _in_entry_window(ts_ms: int, windows: List[tuple[int, int]], tz_offset_hours
             if cur_min >= start_min or cur_min < end_min:
                 return True
     return False
+
+
+def _fmt_kst_ms(ts_ms: Optional[float]) -> str:
+    if not isinstance(ts_ms, (int, float)) or ts_ms <= 0:
+        return ""
+    try:
+        tz = timezone(timedelta(hours=9))
+        return datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=tz).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _kst_dt_from_ms(ts_ms: Optional[float]) -> Optional[datetime]:
+    if not isinstance(ts_ms, (int, float)) or ts_ms <= 0:
+        return None
+    try:
+        tz = timezone(timedelta(hours=9))
+        return datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=tz)
+    except Exception:
+        return None
+
+
+def _is_saturday_kst_ms(ts_ms: int) -> bool:
+    try:
+        tz = timezone(timedelta(hours=9))
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=tz)
+        return dt.weekday() == 5
+    except Exception:
+        return False
 
 
 def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
@@ -311,6 +345,11 @@ def main() -> None:
     last_day_entry = str(args.last_day_entry or "on").lower()
     entry_windows = _parse_entry_windows(args.entry_windows)
     entry_tz_offset = float(args.entry_tz_offset or 0.0)
+    sat_trade_enabled = str(args.sat_trade or "on").lower() == "on"
+    multi_entry_enabled = str(args.multi_entry or "off").lower() == "on"
+    multi_entry_mode = str(args.multi_entry_mode or "roi").lower()
+    multi_entry_roi = abs(float(args.multi_entry_roi or 0.0))
+    multi_entry_max = int(args.multi_entry_max or 0)
     dca_enabled = str(args.dca or "off").lower() == "on"
     dca_thresholds: List[float] = []
     for part in str(args.dca_thresholds or "").split(","):
@@ -507,16 +546,8 @@ def main() -> None:
                         stats["mfe_sum"] += trade.mfe
                         stats["mae_sum"] += abs(trade.mae)
                         stats["hold_sum"] += float(trade.bars) * ltf_minutes
-                        entry_dt = ""
-                        if isinstance(trade.entry_ts, (int, float)) and trade.entry_ts:
-                            entry_dt = datetime.fromtimestamp(trade.entry_ts / 1000.0, tz=timezone.utc).strftime(
-                                "%Y-%m-%d %H:%M"
-                            )
-                        exit_dt = ""
-                        if isinstance(trade.exit_ts, (int, float)) and trade.exit_ts:
-                            exit_dt = datetime.fromtimestamp(trade.exit_ts / 1000.0, tz=timezone.utc).strftime(
-                                "%Y-%m-%d %H:%M"
-                            )
+                        entry_dt = _fmt_kst_ms(trade.entry_ts)
+                        exit_dt = _fmt_kst_ms(trade.exit_ts)
                         trade_logs.setdefault(key, []).append(
                             {
                                 "entry_ts": trade.entry_ts or 0,
@@ -557,11 +588,12 @@ def main() -> None:
                                         broker.add_position(
                                             sym,
                                             close_px,
-                                            dca_usdt,
-                                            float(cur["high"]),
-                                            float(cur["low"]),
-                                            side=trade_live.side,
-                                        )
+                                    dca_usdt,
+                                    float(cur["high"]),
+                                    float(cur["low"]),
+                                    side=trade_live.side,
+                                    mode="dca",
+                                )
                                         log_fp.write(
                                             "DCA ts=%d sym=%s side=%s adds=%d->%d entry=%.6g mark=%.6g usdt=%.2f\n"
                                             % (
@@ -595,12 +627,97 @@ def main() -> None:
                     continue
                 if last_day_entry == "off" and ts_ms >= last_day_start_ms:
                     continue
+                if not sat_trade_enabled and _is_saturday_kst_ms(ts_ms):
+                    _append_backtest_log(
+                        f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=SATURDAY_OFF"
+                    )
+                    continue
                 if _in_entry_window(ts_ms, entry_windows, entry_tz_offset):
                     _append_backtest_log(
                         f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=OFF_WINDOW"
                     )
                     continue
                 if (side == "LONG" and had_long) or (side == "SHORT" and had_short):
+                    if not multi_entry_enabled:
+                        continue
+                    trade_live = broker.get_position(sym, side)
+                    if not trade_live:
+                        continue
+                    if multi_entry_max > 0 and int(trade_live.multi_entry_adds or 0) >= multi_entry_max:
+                        _append_backtest_log(
+                            f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=MULTI_MAX_REACHED"
+                        )
+                        continue
+                    if multi_entry_mode == "roi":
+                        entry_ref = float(trade_live.entry_price or 0.0)
+                        close_px = float(cur["close"])
+                        roi_pct = 0.0
+                        if entry_ref > 0:
+                            if side == "LONG":
+                                roi_pct = (close_px - entry_ref) / entry_ref * 100.0
+                            else:
+                                roi_pct = (entry_ref - close_px) / entry_ref * 100.0
+                        if roi_pct > -multi_entry_roi:
+                            _append_backtest_log(
+                                f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=MULTI_ROI roi={roi_pct:.2f}%"
+                            )
+                            continue
+                    add_trade = broker.add_position(
+                        sym,
+                        entry_px,
+                        bt_cfg.base_usdt,
+                        float(cur["high"]),
+                        float(cur["low"]),
+                        side=side,
+                        mode="multi",
+                    )
+                    if add_trade:
+                        line = (
+                            "ENTRY_ADD ts=%d sym=%s side=%s entry_px=%.6g avg_px=%.6g add_usdt=%.2f "
+                            "size_usdt=%.2f multi_adds=%d multi_usdt=%.2f"
+                            % (
+                                ts_ms,
+                                sym,
+                                side,
+                                float(entry_px or 0.0),
+                                float(add_trade.entry_price or 0.0),
+                                float(bt_cfg.base_usdt or 0.0),
+                                float(add_trade.size_usdt or 0.0),
+                                int(add_trade.multi_entry_adds or 0),
+                                float(add_trade.multi_entry_usdt or 0.0),
+                            )
+                        )
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        _append_backtest_entry_log(
+                            "engine=swaggy_no_atlas mode=%s symbol=%s side=%s entry_add=%.6g avg_px=%.6g add_usdt=%.2f"
+                            % (
+                                mode_name,
+                                sym,
+                                side,
+                                float(entry_px or 0.0),
+                                float(add_trade.entry_price or 0.0),
+                                float(bt_cfg.base_usdt or 0.0),
+                            )
+                        )
+                    stats = stats_by_key.setdefault(
+                        key,
+                        {
+                            "entries": 0,
+                            "exits": 0,
+                            "trades": 0,
+                            "wins": 0,
+                            "losses": 0,
+                            "tp": 0,
+                            "sl": 0,
+                            "dca_adds": 0,
+                            "mfe_sum": 0.0,
+                            "mae_sum": 0.0,
+                            "hold_sum": 0.0,
+                        },
+                    )
+                    stats["entries"] += 1
+                    entry_syms_by_mode.setdefault(mode_name, set()).add(sym)
                     continue
 
                 dist_at_entry = _overext_dist(d5, side, sw_cfg)
@@ -690,6 +807,8 @@ def main() -> None:
             "entry_ts": trade.entry_ts,
             "dca_adds": trade.dca_adds,
             "dca_usdt": trade.dca_usdt,
+            "multi_entry_adds": trade.multi_entry_adds,
+            "multi_entry_usdt": trade.multi_entry_usdt,
             "size_usdt": trade.size_usdt,
         }
 
@@ -804,19 +923,13 @@ def main() -> None:
             for open_trade in open_trade_items:
                 if not isinstance(open_trade, dict):
                     continue
-                entry_dt = ""
                 entry_ts = open_trade.get("entry_ts")
-                if isinstance(entry_ts, (int, float)) and entry_ts > 0:
-                    entry_dt = datetime.fromtimestamp(entry_ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                entry_dt = _fmt_kst_ms(entry_ts)
                 entry_px = open_trade.get("entry_price")
                 side = (open_trade.get("side") or "").upper()
                 last_px = last_close_by_sym.get(sym)
                 last_ts = last_ts_by_sym.get(sym)
-                last_dt = ""
-                if isinstance(last_ts, (int, float)) and last_ts > 0:
-                    last_dt = datetime.fromtimestamp(float(last_ts) / 1000.0, tz=timezone.utc).strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
+                last_dt = _fmt_kst_ms(last_ts)
                 unrealized = None
                 if isinstance(entry_px, (int, float)) and isinstance(last_px, (int, float)) and entry_px > 0:
                     if side == "SHORT":
@@ -1056,6 +1169,50 @@ def main() -> None:
     if stats_by_key:
         for line in total_lines:
             print(line)
+        # KST time buckets (entries based on entry_ts)
+        hour_stats: Dict[int, Dict[str, int]] = {h: {"entries": 0, "tp": 0, "sl": 0} for h in range(24)}
+        dow_stats: Dict[int, Dict[str, int]] = {d: {"entries": 0, "tp": 0, "sl": 0} for d in range(7)}
+        for tr in trades:
+            entry_ts = tr.get("entry_ts")
+            dt_kst = _kst_dt_from_ms(entry_ts)
+            if dt_kst is None:
+                continue
+            hour = int(dt_kst.hour)
+            dow = int(dt_kst.weekday())
+            hour_stats[hour]["entries"] += 1
+            dow_stats[dow]["entries"] += 1
+            reason = (tr.get("exit_reason") or "").upper()
+            if reason == "TP":
+                hour_stats[hour]["tp"] += 1
+                dow_stats[dow]["tp"] += 1
+            elif reason == "SL":
+                hour_stats[hour]["sl"] += 1
+                dow_stats[dow]["sl"] += 1
+
+        header = "[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate"
+        print(header)
+        _append_backtest_log(header)
+        for h in range(24):
+            e = hour_stats[h]["entries"]
+            tp = hour_stats[h]["tp"]
+            sl = hour_stats[h]["sl"]
+            sl_rate = (sl / e * 100.0) if e else 0.0
+            line = f"[BACKTEST] HOUR {h:02d} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
+            print(line)
+            _append_backtest_log(line)
+
+        dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        header = "[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate"
+        print(header)
+        _append_backtest_log(header)
+        for d in range(7):
+            e = dow_stats[d]["entries"]
+            tp = dow_stats[d]["tp"]
+            sl = dow_stats[d]["sl"]
+            sl_rate = (sl / e * 100.0) if e else 0.0
+            line = f"[BACKTEST] DOW {dow_labels[d]} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
+            print(line)
+            _append_backtest_log(line)
 
 
 if __name__ == "__main__":

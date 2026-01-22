@@ -65,6 +65,16 @@ def _iso_kst_ms(ts_ms: int) -> str:
         return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
 
 
+def _kst_dt_from_ms(ts_ms: Optional[float]) -> Optional[datetime]:
+    if not isinstance(ts_ms, (int, float)) or ts_ms <= 0:
+        return None
+    try:
+        tz = timezone(timedelta(hours=9))
+        return datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=tz)
+    except Exception:
+        return None
+
+
 def _append_swaggy_trade_json(payload: Dict[str, object]) -> None:
     try:
         path = os.path.join("logs", "swaggy_trades.jsonl")
@@ -153,6 +163,7 @@ def parse_args():
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
     parser.add_argument("--d1-overext-atr", type=float, default=None)
+    parser.add_argument("--sat-trade", choices=["on", "off"], default="on", help="allow entries on Saturday (KST)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -176,6 +187,15 @@ def _coerce_float(val) -> Optional[float]:
         return float(str(val))
     except Exception:
         return None
+
+
+def _is_saturday_kst_ms(ts_ms: int) -> bool:
+    try:
+        tz = timezone(timedelta(hours=9))
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=tz)
+        return dt.weekday() == 5
+    except Exception:
+        return False
 
 
 def _parse_universe_arg(text: str) -> int:
@@ -206,6 +226,7 @@ def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
 
 def main() -> None:
     args = parse_args()
+    sat_trade_enabled = str(args.sat_trade or "on").lower() == "on"
     runtime_overrides = _load_runtime_overrides()
     runtime_d1_overext = _coerce_float(runtime_overrides.get("_swaggy_d1_overext_atr_mult"))
     if args.d1_overext_atr is None and runtime_d1_overext is not None:
@@ -550,6 +571,11 @@ def main() -> None:
                             )
 
                     if not signal.entry_ok or not side or entry_px is None:
+                        continue
+                    if not sat_trade_enabled and _is_saturday_kst_ms(ts_ms):
+                        _append_backtest_log(
+                            f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=SATURDAY_OFF"
+                        )
                         continue
                     if (side == "LONG" and had_long) or (side == "SHORT" and had_short):
                         continue
@@ -1039,6 +1065,50 @@ def main() -> None:
                     total_entry_syms,
                 )
             )
+        # KST time buckets (entries based on entry_ts)
+        hour_stats: Dict[int, Dict[str, int]] = {h: {"entries": 0, "tp": 0, "sl": 0} for h in range(24)}
+        dow_stats: Dict[int, Dict[str, int]] = {d: {"entries": 0, "tp": 0, "sl": 0} for d in range(7)}
+        for tr in trades:
+            entry_ts = tr.get("entry_ts")
+            dt_kst = _kst_dt_from_ms(entry_ts)
+            if dt_kst is None:
+                continue
+            hour = int(dt_kst.hour)
+            dow = int(dt_kst.weekday())
+            hour_stats[hour]["entries"] += 1
+            dow_stats[dow]["entries"] += 1
+            reason = (tr.get("exit_reason") or "").upper()
+            if reason == "TP":
+                hour_stats[hour]["tp"] += 1
+                dow_stats[dow]["tp"] += 1
+            elif reason == "SL":
+                hour_stats[hour]["sl"] += 1
+                dow_stats[dow]["sl"] += 1
+
+        header = "[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate"
+        print(header)
+        _append_backtest_log(header)
+        for h in range(24):
+            e = hour_stats[h]["entries"]
+            tp = hour_stats[h]["tp"]
+            sl = hour_stats[h]["sl"]
+            sl_rate = (sl / e * 100.0) if e else 0.0
+            line = f"[BACKTEST] HOUR {h:02d} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
+            print(line)
+            _append_backtest_log(line)
+
+        dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        header = "[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate"
+        print(header)
+        _append_backtest_log(header)
+        for d in range(7):
+            e = dow_stats[d]["entries"]
+            tp = dow_stats[d]["tp"]
+            sl = dow_stats[d]["sl"]
+            sl_rate = (sl / e * 100.0) if e else 0.0
+            line = f"[BACKTEST] DOW {dow_labels[d]} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
+            print(line)
+            _append_backtest_log(line)
         if d1_block_by_key:
             by_mode: Dict[str, int] = {}
             total_blocks = 0

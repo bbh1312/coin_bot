@@ -85,6 +85,32 @@ ENTRY는 중복 방지를 위해 콘솔에 출력하지 않는다.
 - 멀티 모드에서만 `TOTAL@<MODE>`와 최종 `TOTAL`을 함께 출력한다.
 - 싱글 모드는 `TOTAL@<MODE>`를 출력하지 않는다.
 
+## 시간대/요일 요약 (KST)
+
+TOTAL 아래에 **KST 기준 시간대/요일 요약 표**를 추가한다.
+
+시간대 요약:
+
+```
+[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate
+[BACKTEST] HOUR 00 entries=<N> tp=<N> sl=<N> sl_rate=<PCT>%
+...
+```
+
+요일 요약:
+
+```
+[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate
+[BACKTEST] DOW Mon entries=<N> tp=<N> sl=<N> sl_rate=<PCT>%
+...
+```
+
+정의:
+- `entries`: 해당 시간대/요일 **진입 수**
+- `tp`: TP 종료 수
+- `sl`: SL 종료 수
+- `sl_rate`: `sl / entries * 100` (소수점 2자리)
+
 ## 홀드 시간 규칙
 
 LTF 기준 분 단위로 변환:

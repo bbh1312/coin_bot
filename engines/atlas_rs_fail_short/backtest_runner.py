@@ -133,6 +133,16 @@ def _log_summary(line: str, path: str) -> None:
     _log_file(line, path)
 
 
+def _kst_dt_from_ms(ts_ms: Optional[float]) -> Optional[datetime]:
+    if not isinstance(ts_ms, (int, float)) or ts_ms <= 0:
+        return None
+    try:
+        tz = timezone(timedelta(hours=9))
+        return datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=tz)
+    except Exception:
+        return None
+
+
 def run_backtest(
     symbols: List[str],
     days: int,
@@ -166,6 +176,8 @@ def run_backtest(
     stats_map: Dict[str, Dict[str, float]] = {}
     trade_logs: Dict[str, List[dict]] = {}
     trades: Dict[str, Optional[dict]] = {}
+    entry_times: List[int] = []
+    exit_events: List[dict] = []
     reentry_until: Dict[str, float] = {}
     idx_ref = -1
 
@@ -250,6 +262,7 @@ def run_backtest(
                 trade_logs[symbol].append(
                     {
                         "entry_ts": trade.get("entry_ts") or 0,
+                        "exit_reason": exit_reason,
                         "line": "[BACKTEST][EXIT] symbol=%s entry_dt=%s exit_dt=%s entry_px=%.6g exit_px=%.6g reason=%s"
                         % (
                             symbol,
@@ -261,6 +274,7 @@ def run_backtest(
                         ),
                     }
                 )
+                exit_events.append({"entry_ts": trade.get("entry_ts") or 0, "exit_reason": exit_reason})
                 stats = stats_map[symbol]
                 stats["exits"] += 1
                 stats["trades"] += 1
@@ -450,6 +464,7 @@ def run_backtest(
             "high_minus_ema20": tech.get("high_minus_ema20"),
             "trigger_bits": tech.get("trigger_bits"),
         }
+        entry_times.append(ts)
         stats_map[symbol]["entries"] += 1
         st = state.get(symbol, {})
         if isinstance(st, dict):
@@ -490,6 +505,47 @@ def run_backtest(
             for reason, count in sorted(block_counts[symbol].items(), key=lambda x: x[1], reverse=True):
                 ratio = count / eval_count * 100.0
                 _log_file(f"[BACKTEST] {symbol} block={reason} count={count} ratio={ratio:.2f}%", log_path)
+
+    # KST time buckets (entries based on entry_ts)
+    if entry_times or exit_events:
+        hour_stats: Dict[int, Dict[str, int]] = {h: {"entries": 0, "tp": 0, "sl": 0} for h in range(24)}
+        dow_stats: Dict[int, Dict[str, int]] = {d: {"entries": 0, "tp": 0, "sl": 0} for d in range(7)}
+        for ts in entry_times:
+            dt_kst = _kst_dt_from_ms(ts)
+            if dt_kst is None:
+                continue
+            hour_stats[dt_kst.hour]["entries"] += 1
+            dow_stats[dt_kst.weekday()]["entries"] += 1
+        for ev in exit_events:
+            dt_kst = _kst_dt_from_ms(ev.get("entry_ts"))
+            if dt_kst is None:
+                continue
+            reason = (ev.get("exit_reason") or "").upper()
+            if reason == "TP":
+                hour_stats[dt_kst.hour]["tp"] += 1
+                dow_stats[dt_kst.weekday()]["tp"] += 1
+            elif reason == "SL":
+                hour_stats[dt_kst.hour]["sl"] += 1
+                dow_stats[dt_kst.weekday()]["sl"] += 1
+
+        header = "[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate"
+        _log_summary(header, log_path)
+        for h in range(24):
+            e = hour_stats[h]["entries"]
+            tp = hour_stats[h]["tp"]
+            sl = hour_stats[h]["sl"]
+            sl_rate = (sl / e * 100.0) if e else 0.0
+            _log_summary(f"[BACKTEST] HOUR {h:02d} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%", log_path)
+
+        dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        header = "[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate"
+        _log_summary(header, log_path)
+        for d in range(7):
+            e = dow_stats[d]["entries"]
+            tp = dow_stats[d]["tp"]
+            sl = dow_stats[d]["sl"]
+            sl_rate = (sl / e * 100.0) if e else 0.0
+            _log_summary(f"[BACKTEST] DOW {dow_labels[d]} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%", log_path)
     return stats_map
 
 
