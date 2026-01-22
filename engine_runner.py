@@ -1022,6 +1022,28 @@ def _is_saturday_kst(now_ts: Optional[float] = None) -> bool:
     except Exception:
         return False
 
+
+def _log_off_window_status(state: dict, now_ts: float, tag: str = "skip") -> None:
+    try:
+        last_ts = _coerce_state_float(state.get("_off_window_skip_ts", 0.0))
+    except Exception:
+        last_ts = 0.0
+    if (now_ts - last_ts) < 60:
+        return
+    msgs = []
+    if SWAGGY_ATLAS_LAB_ENABLED and _is_in_off_window(SWAGGY_ATLAS_LAB_OFF_WINDOWS, now_ts):
+        msgs.append(f"SWAGGY_ATLAS_LAB windows={SWAGGY_ATLAS_LAB_OFF_WINDOWS}")
+    if SWAGGY_ATLAS_LAB_V2_ENABLED and _is_in_off_window(SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, now_ts):
+        msgs.append(f"SWAGGY_ATLAS_LAB_V2 windows={SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS}")
+    if SWAGGY_NO_ATLAS_ENABLED and _is_in_off_window(SWAGGY_NO_ATLAS_OFF_WINDOWS, now_ts):
+        msgs.append(f"SWAGGY_NO_ATLAS windows={SWAGGY_NO_ATLAS_OFF_WINDOWS}")
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        msgs.append("SATURDAY_OFF")
+    if not msgs:
+        return
+    print(f"[off-window] {tag} now={_now_kst_str()} " + " | ".join(msgs))
+    state["_off_window_skip_ts"] = now_ts
+
 def _append_swaggy_trade_json(payload: Dict[str, Any]) -> None:
     try:
         path = os.path.join("logs", "swaggy_trades.jsonl")
@@ -2148,6 +2170,7 @@ def _run_swaggy_no_atlas_cycle(
                 live=live,
                 alert_reason="SWAGGY_NO_ATLAS",
                 alert_tag=f"MULTI_ENTRY:{multi_next}" if is_multi_add else None,
+                allow_over_max=is_multi_add,
             )
             if req_id:
                 if is_multi_add:
@@ -2648,6 +2671,7 @@ def _enqueue_entry_request(
     entry_price_hint: Optional[float] = None,
     size_mult: Optional[float] = None,
     notify: bool = False,
+    allow_over_max: bool = False,
 ) -> Optional[str]:
     if _is_manage_pending(state, symbol, side):
         _append_entry_gate_log(engine.lower(), symbol, f"pending_request side={side}", side=side)
@@ -2659,7 +2683,7 @@ def _enqueue_entry_request(
         cur_total = None
     if not isinstance(cur_total, int):
         cur_total = _count_open_positions_state(state)
-    if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+    if not allow_over_max and isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
         _append_entry_gate_log(engine.lower(), symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
         return None
     payload = {
@@ -5551,6 +5575,45 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
         if isinstance(st, dict) and st.get("status") in ("done", "executing"):
             continue
         status[req_id] = {"status": "executing", "ts": now}
+        symbol = str(req.get("symbol") or "")
+        side = str(req.get("side") or "").upper()
+        if engine in ("SWAGGY_NO_ATLAS", "SWAGGY_ATLAS_LAB", "SWAGGY_ATLAS_LAB_V2"):
+            if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now):
+                _append_entry_gate_log(
+                    engine.lower() if engine else "unknown",
+                    symbol,
+                    "off_window=saturday",
+                    side=side,
+                )
+                status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window_saturday"}
+                continue
+            if engine == "SWAGGY_NO_ATLAS" and _is_in_off_window(SWAGGY_NO_ATLAS_OFF_WINDOWS, now):
+                _append_entry_gate_log(
+                    engine.lower() if engine else "unknown",
+                    symbol,
+                    f"off_window={SWAGGY_NO_ATLAS_OFF_WINDOWS}",
+                    side=side,
+                )
+                status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window"}
+                continue
+            if engine == "SWAGGY_ATLAS_LAB" and _is_in_off_window(SWAGGY_ATLAS_LAB_OFF_WINDOWS, now):
+                _append_entry_gate_log(
+                    engine.lower() if engine else "unknown",
+                    symbol,
+                    f"off_window={SWAGGY_ATLAS_LAB_OFF_WINDOWS}",
+                    side=side,
+                )
+                status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window"}
+                continue
+            if engine == "SWAGGY_ATLAS_LAB_V2" and _is_in_off_window(SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, now):
+                _append_entry_gate_log(
+                    engine.lower() if engine else "unknown",
+                    symbol,
+                    f"off_window={SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS}",
+                    side=side,
+                )
+                status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window"}
+                continue
         ok = _execute_manage_entry_request(state, req, send_telegram)
         status[req_id] = {"status": "done" if ok else "failed", "ts": time.time()}
 
@@ -8848,35 +8911,25 @@ def run():
                 if (now - last_warn) >= 60:
                     print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
                     state["_pos_limit_skip_ts"] = now
-                time.sleep(5)
-                continue
+                    _log_off_window_status(state, now, tag="pos_limit")
+                state["_pos_limit_reached"] = True
         active_positions_state = _count_open_positions_state(state)
-        active_positions_cached = state.get("_active_positions_total")
-        if not isinstance(active_positions_cached, int):
-            try:
-                active_positions_cached = int(active_positions_cached)
-            except Exception:
-                active_positions_cached = None
-        active_positions_total_est = (
-            max(active_positions_state, active_positions_cached)
-            if isinstance(active_positions_cached, int)
-            else active_positions_state
-        )
-        if isinstance(active_positions_total_est, int) and active_positions_total_est >= MAX_OPEN_POSITIONS:
+        active_positions_total_est = active_positions_state
+        verified = None
+        try:
+            verified = count_open_positions(force=True)
+        except Exception:
             verified = None
-            try:
-                verified = count_open_positions(force=True)
-            except Exception:
-                verified = None
-            if isinstance(verified, int) and verified < MAX_OPEN_POSITIONS:
-                state["_active_positions_total"] = int(verified)
-            else:
-                last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
-                if (now - last_warn) >= 60:
-                    print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
-                    state["_pos_limit_skip_ts"] = now
-                time.sleep(5)
-                continue
+        if isinstance(verified, int):
+            active_positions_total_est = verified
+            state["_active_positions_total"] = int(verified)
+        if isinstance(active_positions_total_est, int) and active_positions_total_est >= MAX_OPEN_POSITIONS:
+            last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
+            if (now - last_warn) >= 60:
+                print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
+                state["_pos_limit_skip_ts"] = now
+                _log_off_window_status(state, now, tag="pos_limit")
+            state["_pos_limit_reached"] = True
 
         # cycle ts debug (BTC 15m, prev candle only)
         cycle_ts = None
