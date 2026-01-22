@@ -72,6 +72,28 @@
         .grid-2 {
             grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
         }
+        @media (min-width: 980px) {
+            .grid-2 {
+                grid-template-columns: 0.8fr 1.1fr 1.1fr;
+            }
+        }
+        .live-card {
+            padding: 1.15rem;
+        }
+        .live-card .hint {
+            font-size: 0.85rem;
+        }
+        .live-card .toggle {
+            padding: 0.55rem 0;
+        }
+        .engines-card,
+        .risk-card {
+            padding: 1.7rem;
+        }
+        .engines-card h2,
+        .risk-card h2 {
+            font-size: 1.2rem;
+        }
         .card {
             background: linear-gradient(135deg, rgba(18,25,35,0.96), rgba(9,12,17,0.95));
             border: 1px solid var(--line);
@@ -216,17 +238,17 @@
             <div class="status-pill" id="status-pill">Loading status...</div>
         </header>
         <div class="grid grid-2 fade-in">
-            <div class="card">
+            <div class="card live-card">
                 <h2>Live Execution</h2>
                 <div class="hint">실주문 모드와 자동 청산을 빠르게 전환합니다.</div>
                 <div id="live-controls"></div>
             </div>
-            <div class="card">
+            <div class="card engines-card">
                 <h2>Engines</h2>
                 <div class="hint">실행 엔진을 ON/OFF 하고 엔진별 TP/SL을 설정하세요.</div>
                 <div id="engine-controls"></div>
             </div>
-            <div class="card">
+            <div class="card risk-card">
                 <h2>Risk & Size</h2>
                 <div class="hint">진입 비율, 동시 포지션, 롱/숏 TP·SL을 조정합니다.</div>
                 <div id="risk-controls"></div>

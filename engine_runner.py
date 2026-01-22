@@ -217,9 +217,12 @@ MANAGE_PING_COOLDOWN_SEC: int = 7200
 MANAGE_EVAL_COOLDOWN_SEC: int = 3
 MANUAL_CLOSE_GRACE_SEC: int = 60
 AUTO_EXIT_GRACE_SEC: int = 30
-EXIT_COOLDOWN_HOURS: float = 2.0
-EXIT_COOLDOWN_SEC: int = int(EXIT_COOLDOWN_HOURS * 3600)
 COOLDOWN_SEC: int = int(float(os.getenv("COOLDOWN_SEC", "1800")))
+# Re-entry cooldown is managed by COOLDOWN_SEC only.
+EXIT_COOLDOWN_HOURS: float = COOLDOWN_SEC / 3600.0
+EXIT_COOLDOWN_SEC: int = COOLDOWN_SEC
+_DISK_STATE_CACHE = {"ts": 0.0, "data": {}}
+_DB_EXIT_CACHE = {"ts": 0.0, "data": {}}
 MANAGE_LOOP_ENABLED: bool = True
 MANAGE_LOOP_SLEEP_SEC: float = 2.0
 MANAGE_TICKER_TTL_SEC: float = 5.0
@@ -926,6 +929,18 @@ def _iso_kst(ts: Optional[float] = None) -> str:
         return dt.isoformat(timespec="seconds")
     except Exception:
         return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+
+def _fmt_entry_time(tr: Optional[dict]) -> Optional[str]:
+    if not isinstance(tr, dict):
+        return None
+    ts = tr.get("entry_ts")
+    if not isinstance(ts, (int, float)):
+        ts_ms = tr.get("entry_ts_ms")
+        if isinstance(ts_ms, (int, float)) and ts_ms > 0:
+            ts = float(ts_ms) / 1000.0
+    if isinstance(ts, (int, float)) and ts > 0:
+        return _iso_kst(float(ts))
+    return None
 
 def _parse_time_windows(text: str) -> List[tuple[int, int]]:
     windows: List[tuple[int, int]] = []
@@ -1931,7 +1946,7 @@ def _run_swaggy_no_atlas_cycle(
         if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-        if _exit_cooldown_blocked(state, symbol, "swaggy_no_atlas", side):
+        if _exit_cooldown_blocked(state, symbol, "swaggy_no_atlas", side, ttl_sec=COOLDOWN_SEC):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
@@ -2291,9 +2306,65 @@ def _exit_cooldown_blocked(
     ttl_sec: Optional[float] = None,
 ) -> bool:
     if ttl_sec is None:
-        ttl_sec = EXIT_COOLDOWN_SEC
+        ttl_sec = COOLDOWN_SEC
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     last_exit_ts = _get_last_exit_ts_by_side(st, side)
+    if not isinstance(last_exit_ts, (int, float)):
+        last_exit_ts = None
+    if dbrec and dbrec.ENABLED:
+        now_db = time.time()
+        cache = _DB_EXIT_CACHE
+        data = cache.get("data") if isinstance(cache.get("data"), dict) else {}
+        if (now_db - float(cache.get("ts") or 0.0)) > 5.0 or not isinstance(data, dict):
+            try:
+                db_path = getattr(dbrec, "DB_PATH", "") or os.path.join(os.path.dirname(__file__), "logs", "trades.db")
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                rows = cur.execute(
+                    """
+                    SELECT symbol, side, MAX(ts) as last_ts
+                    FROM positions
+                    WHERE qty <= 0
+                    GROUP BY symbol, side
+                    """
+                ).fetchall()
+                data = {}
+                for sym, side_val, ts_val in rows:
+                    if not sym or not side_val or ts_val is None:
+                        continue
+                    data[(sym, str(side_val).upper())] = float(ts_val)
+                conn.close()
+            except Exception:
+                data = {}
+            cache["data"] = data if isinstance(data, dict) else {}
+            cache["ts"] = now_db
+        key = (symbol, side)
+        db_ts = data.get(key) if isinstance(data, dict) else None
+        if isinstance(db_ts, (int, float)) and (last_exit_ts is None or float(db_ts) > float(last_exit_ts)):
+            _set_last_exit_state(st, side, float(db_ts), "db_exit")
+            state[symbol] = st
+            last_exit_ts = float(db_ts)
+    if MANAGE_WS_MODE:
+        now_disk = time.time()
+        cache = _DISK_STATE_CACHE
+        data = cache.get("data") if isinstance(cache.get("data"), dict) else {}
+        if (now_disk - float(cache.get("ts") or 0.0)) > 5.0 or not isinstance(data, dict):
+            try:
+                data = load_state()
+            except Exception:
+                data = {}
+            cache["data"] = data if isinstance(data, dict) else {}
+            cache["ts"] = now_disk
+        disk_st = data.get(symbol) if isinstance(data, dict) else None
+        if isinstance(disk_st, dict):
+            disk_exit_ts = _get_last_exit_ts_by_side(disk_st, side)
+            disk_exit_reason = _get_last_exit_reason_by_side(disk_st, side)
+            if isinstance(disk_exit_ts, (int, float)) and (
+                last_exit_ts is None or float(disk_exit_ts) > float(last_exit_ts)
+            ):
+                _set_last_exit_state(st, side, float(disk_exit_ts), str(disk_exit_reason or ""))
+                state[symbol] = st
+                last_exit_ts = float(disk_exit_ts)
     if not isinstance(last_exit_ts, (int, float)):
         return False
     now = time.time()
@@ -4436,6 +4507,8 @@ def _load_db_entry_events_map(
     report_date: Optional[str] = None,
     since_ts: Optional[float] = None,
     end_ts: Optional[float] = None,
+    include_alerts: bool = False,
+    include_engine_signals: bool = False,
 ) -> tuple[dict, dict]:
     by_id: dict = {}
     by_symbol_side: dict = {}
@@ -4445,7 +4518,10 @@ def _load_db_entry_events_map(
         db_path = getattr(dbrec, "DB_PATH", "") or "logs/trades.db"
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        clauses = ["event_type = 'ENTRY'"]
+        if include_alerts:
+            clauses = ["event_type IN ('ENTRY','ALERT_ENTRY')"]
+        else:
+            clauses = ["event_type = 'ENTRY'"]
         params: list = []
         if report_date:
             clauses.append("date(datetime(ts, 'unixepoch')) = ?")
@@ -4507,9 +4583,65 @@ def _load_db_entry_events_map(
                 "side": side,
                 "engine": engine,
                 "entry_price": entry_price,
+                "record_type": "event",
+                "event_type": "ENTRY",
+                "source": row[3],
+                "meta": meta if isinstance(meta, dict) else None,
             }
+            if entry_order_id:
+                by_id[str(entry_order_id)] = record
             key = (symbol, side)
             by_symbol_side.setdefault(key, []).append(record)
+        if include_engine_signals:
+            try:
+                clauses = []
+                params = []
+                if report_date:
+                    clauses.append("date(datetime(ts, 'unixepoch')) = ?")
+                    params.append(report_date)
+                if since_ts is not None:
+                    clauses.append("ts >= ?")
+                    params.append(float(since_ts))
+                if end_ts is not None:
+                    clauses.append("ts <= ?")
+                    params.append(float(end_ts))
+                where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+                sig_rows = cur.execute(
+                    f"""
+                    SELECT ts, symbol, side, engine, reason
+                    FROM engine_signals
+                    {where_sql}
+                    """,
+                    tuple(params),
+                ).fetchall()
+                for row in sig_rows:
+                    try:
+                        ts_val = float(row[0]) if row[0] is not None else None
+                    except Exception:
+                        ts_val = None
+                    if ts_val is None:
+                        continue
+                    symbol = row[1] or ""
+                    side = (row[2] or "").upper()
+                    if not symbol or side not in ("LONG", "SHORT"):
+                        continue
+                    engine = row[3] or "unknown"
+                    record = {
+                        "entry_ts": ts_val,
+                        "entry_order_id": None,
+                        "symbol": symbol,
+                        "side": side,
+                        "engine": engine,
+                        "entry_price": None,
+                        "record_type": "engine_signal",
+                        "event_type": None,
+                        "source": row[4],
+                        "meta": None,
+                    }
+                    key = (symbol, side)
+                    by_symbol_side.setdefault(key, []).append(record)
+            except Exception:
+                pass
         return by_id, by_symbol_side
     except Exception:
         return by_id, by_symbol_side
@@ -4518,19 +4650,24 @@ def _load_entry_events_map(
     report_date: Optional[str] = None,
     since_ts: Optional[float] = None,
     end_ts: Optional[float] = None,
+    include_alerts: bool = False,
+    include_engine_signals: bool = False,
 ) -> tuple[dict, dict]:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     if dbrec and dbrec.ENABLED:
         by_id, by_symbol_side = _load_db_entry_events_map(
             report_date=report_date,
             since_ts=since_ts,
             end_ts=end_ts,
+            include_alerts=include_alerts,
+            include_engine_signals=include_engine_signals,
         )
         if by_id or by_symbol_side:
             return by_id, by_symbol_side
     by_id = {}
     by_symbol_side = {}
     paths: list[str] = []
-    entry_dir = os.path.join("logs", "entry")
+    entry_dir = os.path.join(base_dir, "logs", "entry")
     if os.path.isdir(entry_dir):
         try:
             for name in sorted(os.listdir(entry_dir)):
@@ -4538,11 +4675,11 @@ def _load_entry_events_map(
                     paths.append(os.path.join(entry_dir, name))
         except Exception:
             pass
-    legacy_path = os.path.join("logs", "entry_events.log")
+    legacy_path = os.path.join(base_dir, "logs", "entry_events.log")
     if os.path.exists(legacy_path):
         paths.append(legacy_path)
     if report_date:
-        dated_path = os.path.join("logs", "entry", f"entry_events-{report_date}.log")
+        dated_path = os.path.join(base_dir, "logs", "entry", f"entry_events-{report_date}.log")
         if os.path.exists(dated_path) and dated_path not in paths:
             paths.append(dated_path)
     if not paths:
@@ -4591,6 +4728,50 @@ def _load_entry_events_map(
     except Exception:
         return by_id, by_symbol_side
     return by_id, by_symbol_side
+
+def _load_swaggy_trade_engine_map(needed: set) -> dict:
+    if not needed:
+        return {}
+    out = {}
+    path = os.path.join("logs", "swaggy_trades.jsonl")
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("event") != "SWAGGY_TRADE":
+                    continue
+                sym = rec.get("symbol")
+                side = (rec.get("side") or "").upper()
+                if not sym or side not in ("LONG", "SHORT"):
+                    continue
+                key = (sym, side)
+                if key not in needed:
+                    continue
+                ts_val = None
+                ts = rec.get("entry_ts") or rec.get("ts")
+                if isinstance(ts, (int, float)):
+                    ts_val = float(ts)
+                elif isinstance(ts, str):
+                    try:
+                        ts_val = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        ts_val = None
+                if ts_val is None:
+                    continue
+                cur = out.get(key)
+                if not cur or ts_val > float(cur.get("ts") or 0.0):
+                    out[key] = {"engine": rec.get("engine"), "ts": ts_val}
+    except Exception:
+        return out
+    return out
 
 def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
     if executor_mod is None or not hasattr(executor_mod, "exchange"):
@@ -5003,13 +5184,13 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
         ):
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
-            order_block = _format_order_id_block(tr.get("entry_order_id"), tr.get("exit_order_id"))
-            order_line = f"{order_block}\n" if order_block else ""
+            entry_time = _fmt_entry_time(tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
             send_telegram(
                 f"{EXIT_ICON} <b>롱 청산</b>\n"
                 f"<b>{symbol}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
-                f"{order_line}"
+                f"{entry_line}"
                 f"청산가={price_str}\n"
                 f"손익={pnl_str}"
             )
@@ -5196,15 +5377,15 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
             exit_tag = "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
-            order_block = _format_order_id_block(tr.get("entry_order_id"), tr.get("exit_order_id"))
-            order_line = f"{order_block}\n" if order_block else ""
+            entry_time = _fmt_entry_time(tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
             icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
             send_telegram(
                 f"{icon} <b>숏 청산</b>\n"
                 f"<b>{symbol}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
-                f"{order_line}"
+                f"{entry_line}"
                 f"청산가={price_str}\n"
                 f"손익={pnl_str}"
             )
@@ -5751,15 +5932,15 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 and _trade_has_entry(open_tr)
                 and not _recent_auto_exit(state, sym, now)
             ):
-                order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
-                order_line = f"{order_block}\n" if order_block else ""
+                entry_time = _fmt_entry_time(open_tr)
+                entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                 icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
                 send_telegram(
                     f"{icon} <b>숏 청산</b>\n"
                     f"<b>{sym}</b>\n"
                     f"엔진: {_display_engine_label(engine_label)}\n"
                     f"사유: {exit_tag}\n"
-                    f"{order_line}".rstrip()
+                    f"{entry_line}".rstrip()
                 )
             time.sleep(0.1)
             continue
@@ -5873,18 +6054,15 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         _set_last_exit_state(st, "SHORT", now, "auto_exit_tp")
                         state[sym] = st
                     _append_report_line(sym, "SHORT", profit_unlev, pnl_usdt, engine_label)
-                    order_block = _format_order_id_block(
-                        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-                        exit_order_id,
-                    )
-                    order_line = f"{order_block}\n" if order_block else ""
+                    entry_time = _fmt_entry_time(open_tr)
+                    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                     icon = EXIT_ICON if exit_tag == "TP" else EXIT_SL_ICON
                     send_telegram(
                         f"{icon} <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
-                        f"{order_line}"
+                        f"{entry_line}"
                         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                         f"{'' if pnl_usdt is None else f' 손익={pnl_usdt:+.3f} USDT'}"
@@ -5933,18 +6111,15 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         _set_last_exit_state(st, "SHORT", now, "auto_exit_sl")
                         state[sym] = st
                     _append_report_line(sym, "SHORT", profit_unlev, pnl_usdt, engine_label)
-                    order_block = _format_order_id_block(
-                        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-                        exit_order_id,
-                    )
-                    order_line = f"{order_block}\n" if order_block else ""
+                    entry_time = _fmt_entry_time(open_tr)
+                    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                     icon = EXIT_ICON if exit_tag == "TP" else EXIT_SL_ICON
                     send_telegram(
                         f"{icon} <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
-                        f"{order_line}"
+                        f"{entry_line}"
                         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                         f"{'' if pnl_usdt is None else f' 손익={pnl_usdt:+.3f} USDT'}"
@@ -6040,14 +6215,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 st["dca_adds_short"] = 0
                 state[sym] = st
                 if engine_label != "UNKNOWN" and _trade_has_entry(open_tr) and not _recent_auto_exit(state, sym, now):
-                    order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
-                    order_line = f"{order_block}\n" if order_block else ""
+                    entry_time = _fmt_entry_time(open_tr)
+                    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                     send_telegram(
                         f"{EXIT_ICON} <b>롱 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: MANUAL\n"
-                        f"{order_line}".rstrip()
+                        f"{entry_line}".rstrip()
                     )
                 time.sleep(0.1)
                 continue
@@ -6103,17 +6278,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 _set_last_exit_state(st, "LONG", now, "auto_exit_tp")
                 state[sym] = st
             _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
-            order_block = _format_order_id_block(
-                open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-                exit_order_id,
-            )
-            order_line = f"{order_block}\n" if order_block else ""
+            entry_time = _fmt_entry_time(open_tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
             send_telegram(
                 f"{EXIT_ICON} <b>롱 청산</b>\n"
                 f"<b>{sym}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
-                f"{order_line}"
+                f"{entry_line}"
                 f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                 f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                 f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
@@ -6155,17 +6327,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 _set_last_exit_state(st, "LONG", now, "auto_exit_sl")
                 state[sym] = st
             _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
-            order_block = _format_order_id_block(
-                open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-                exit_order_id,
-            )
-            order_line = f"{order_block}\n" if order_block else ""
+            entry_time = _fmt_entry_time(open_tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
             send_telegram(
                 f"{EXIT_SL_ICON} <b>롱 청산</b>\n"
                 f"<b>{sym}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
-                f"{order_line}"
+                f"{entry_line}"
                 f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                 f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                 f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
@@ -6240,7 +6409,7 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
-    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     try:
         disk = load_state()
     except Exception:
@@ -6362,7 +6531,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
             executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
     if isinstance(state.get("_exit_cooldown_hours"), (int, float)):
         EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
-        EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+        COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+        EXIT_COOLDOWN_SEC = COOLDOWN_SEC
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     if isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
@@ -6884,7 +7054,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
     global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
-    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
         return
     last_update_id = _coerce_state_int(state.get("_tg_offset", 0))
@@ -6952,10 +7122,80 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         refresh_positions_cache(force=True)
                     except Exception:
                         pass
+                    print("[positions] build message start", flush=True)
                     pos_map = executor_mod._POS_ALL_CACHE.get("positions_by_symbol") if executor_mod else None
                     pos_map = pos_map or {}
                     open_trades = [tr for tr in (_get_trade_log(state) or []) if tr.get("status") == "open"]
                     engine_by_key = {}
+                    entry_by_id, entry_by_symbol = _load_entry_events_map(
+                        None, include_alerts=True, include_engine_signals=True
+                    )
+                    position_keys = set()
+                    for sym, positions in pos_map.items():
+                        if not positions:
+                            continue
+                        for p in positions:
+                            try:
+                                size = executor_mod._position_size_abs(p)
+                            except Exception:
+                                size = 0.0
+                            if not size:
+                                continue
+                            side = "LONG" if executor_mod._is_long_position(p) else "SHORT" if executor_mod._is_short_position(p) else "UNKNOWN"
+                            if side in ("LONG", "SHORT"):
+                                position_keys.add((sym, side))
+                    swaggy_trade_map = _load_swaggy_trade_engine_map(position_keys)
+                    try:
+                        print(f"[positions] entry_by_id={len(entry_by_id)} entry_by_symbol={len(entry_by_symbol)}", flush=True)
+                    except Exception:
+                        pass
+                    entry_by_symbol_norm = {}
+                    entry_by_symbol_flat = {}
+                    def _pick_entry_record(recs: list) -> Optional[dict]:
+                        if not recs:
+                            return None
+                        def _is_event(rec: dict) -> bool:
+                            return (rec.get("record_type") or "") == "event" or rec.get("event_type") in ("ENTRY", "ALERT_ENTRY")
+                        def _ts_val(rec: dict) -> float:
+                            try:
+                                return float(rec.get("entry_ts") or 0.0)
+                            except Exception:
+                                return 0.0
+                        def _is_manual_pos_snapshot(rec: dict) -> bool:
+                            eng = str(rec.get("engine") or "").strip().upper()
+                            if eng not in ("MANUAL", "MANUAL_ENTRY"):
+                                return False
+                            meta = rec.get("meta") or {}
+                            src = (rec.get("source") or "").strip().lower()
+                            meta_src = str(meta.get("source") or "").strip().lower()
+                            return src == "pos_snapshot" or meta_src == "pos_snapshot"
+                        def _rank(rec: dict) -> tuple:
+                            # Prefer non-pos_snapshot records even if older; then by ts; then event vs signal.
+                            return (
+                                0 if _is_manual_pos_snapshot(rec) else 1,
+                                _ts_val(rec),
+                                1 if _is_event(rec) else 0,
+                            )
+                        try:
+                            return max(recs, key=_rank)
+                        except Exception:
+                            return recs[-1]
+                    if isinstance(entry_by_symbol, dict):
+                        for (sym_key, side_key), recs in entry_by_symbol.items():
+                            if not sym_key or not side_key or not recs:
+                                continue
+                            sym_norm = str(sym_key).replace("/USDT:USDT", "").replace("/USDT", "")
+                            rec = _pick_entry_record(recs)
+                            if rec is None:
+                                continue
+                            entry_by_symbol_norm[(sym_norm, str(side_key).upper())] = rec
+                            entry_by_symbol_flat.setdefault(sym_norm, []).append(rec)
+                    if entry_by_symbol_flat:
+                        for sym_norm, recs in list(entry_by_symbol_flat.items()):
+                            rec = _pick_entry_record(recs)
+                            if rec is None:
+                                continue
+                            entry_by_symbol_flat[sym_norm] = rec
                     for tr in open_trades:
                         sym = tr.get("symbol")
                         side = (tr.get("side") or "").upper()
@@ -6963,7 +7203,12 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             continue
                         engine = tr.get("engine_label") or (tr.get("meta") or {}).get("engine") or (tr.get("meta") or {}).get("reason")
                         if engine:
-                            engine_by_key[(sym, side)] = engine
+                            eng_norm = str(engine).strip()
+                            eng_upper = eng_norm.upper()
+                            if eng_upper not in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                                engine_by_key[(sym, side)] = eng_norm
+                                sym_norm = str(sym).replace("/USDT:USDT", "").replace("/USDT", "")
+                                engine_by_key[(sym_norm, side)] = eng_norm
                     rows = []
                     sym_col = 0
                     eng_col = 0
@@ -6978,13 +7223,64 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             if not size:
                                 continue
                             side = "LONG" if executor_mod._is_long_position(p) else "SHORT" if executor_mod._is_short_position(p) else "UNKNOWN"
-                            engine = engine_by_key.get((sym, side), "UNKNOWN")
+                            sym_norm = (sym or "").replace("/USDT:USDT", "").replace("/USDT", "")
+                            engine = engine_by_key.get((sym, side)) or engine_by_key.get((sym_norm, side))
+                            if isinstance(engine, str) and engine.strip().upper() in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                                engine = None
+                            if not engine:
+                                st = state.get(sym, {}) if isinstance(state, dict) else {}
+                                entry_order_id = None
+                                if isinstance(st, dict):
+                                    entry_order_id = st.get(f"entry_order_id_{side.lower()}")
+                                debug_info = {
+                                    "sym": sym,
+                                    "side": side,
+                                    "sym_norm": sym_norm,
+                                    "state_entry_id": entry_order_id,
+                                    "engine_by_key": engine_by_key.get((sym, side)) or engine_by_key.get((sym_norm, side)),
+                                }
+                                if entry_order_id and isinstance(entry_by_id, dict):
+                                    rec = entry_by_id.get(str(entry_order_id))
+                                    engine = rec.get("engine") if isinstance(rec, dict) else None
+                                    if engine:
+                                        debug_info["engine_by_id"] = engine
+                                if not engine and isinstance(entry_by_symbol, dict):
+                                    recs = entry_by_symbol.get((sym, side)) or []
+                                    rec = _pick_entry_record(recs)
+                                    if isinstance(rec, dict):
+                                        engine = rec.get("engine")
+                                        if engine:
+                                            debug_info["engine_by_sym"] = engine
+                                if not engine and entry_by_symbol_norm:
+                                    rec = entry_by_symbol_norm.get((sym_norm, side))
+                                    if isinstance(rec, dict):
+                                        engine = rec.get("engine")
+                                        if engine:
+                                            debug_info["engine_by_sym_norm"] = engine
+                                if not engine and entry_by_symbol_flat:
+                                    rec = entry_by_symbol_flat.get(sym_norm)
+                                    if isinstance(rec, dict):
+                                        engine = rec.get("engine")
+                                        if engine:
+                                            debug_info["engine_by_sym_flat"] = engine
+                                if not engine:
+                                    print(f"[positions-map] unresolved {debug_info}")
+                            if not engine:
+                                print(f"[positions-map] unresolved {debug_info}", flush=True)
+                            print(f"[positions-map] sym={sym} side={side} engine={engine}", flush=True)
+                            if not engine or str(engine).strip().upper() in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                                rec = swaggy_trade_map.get((sym, side))
+                                if isinstance(rec, dict):
+                                    swaggy_engine = rec.get("engine")
+                                    if swaggy_engine:
+                                        engine = swaggy_engine
+                            engine = engine or "UNKNOWN"
                             base = (sym or "").replace("/USDT:USDT", "")
                             sym_col = max(sym_col, len(base))
                             eng_col = max(eng_col, len(str(engine)))
                             tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
                             rows.append((base, side, engine, tp_pct, sl_pct))
-                    lines = [f"ℹ️ positions total={len(rows)}"]
+                    lines = [f"ℹ️ positions total={len(rows)} pid={os.getpid()}"]
                     if not rows:
                         lines.append("none")
                     else:
@@ -7501,7 +7797,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             if val <= 0:
                                 raise ValueError("non-positive")
                             EXIT_COOLDOWN_HOURS = float(val)
-                            EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+                            COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+                            EXIT_COOLDOWN_SEC = COOLDOWN_SEC
                             state["_exit_cooldown_hours"] = EXIT_COOLDOWN_HOURS
                             state_dirty = True
                             resp = f"✅ exit_cd_h set to {EXIT_COOLDOWN_HOURS:.2f}h"
@@ -7991,6 +8288,9 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_swaggy_atlas_lab_enabled",
                 "_swaggy_atlas_lab_v2_enabled",
                 "_swaggy_no_atlas_enabled",
+                "_swaggy_atlas_lab_off_windows",
+                "_swaggy_atlas_lab_v2_off_windows",
+                "_swaggy_no_atlas_off_windows",
                 "_swaggy_no_atlas_overext_min",
                 "_swaggy_d1_overext_atr_mult",
                 "_dtfx_enabled",
@@ -8064,7 +8364,7 @@ def run():
     global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
-    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
     state["_auto_exit"] = AUTO_EXIT_ENABLED
@@ -8115,7 +8415,8 @@ def run():
         state["_dca_third_pct"] = DCA_THIRD_PCT
     if isinstance(state.get("_exit_cooldown_hours"), (int, float)):
         EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
-        EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+        COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+        EXIT_COOLDOWN_SEC = COOLDOWN_SEC
     else:
         state["_exit_cooldown_hours"] = EXIT_COOLDOWN_HOURS
     if isinstance(state.get("_rsi_enabled"), bool):

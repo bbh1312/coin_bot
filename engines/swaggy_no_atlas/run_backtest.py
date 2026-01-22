@@ -325,6 +325,7 @@ def main() -> None:
         dca_thresholds = [20.0, 30.0, 40.0]
     dca_max_adds = len(dca_thresholds)
 
+    ensure_dir(os.path.dirname(log_path))
     with open(log_path, "a", encoding="utf-8") as log_fp:
         run_line = (
             f"[run] mode={mode_name} days={args.days} start_ms={start_ms} end_ms={end_ms} "

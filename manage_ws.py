@@ -75,10 +75,11 @@ def _coerce_state_int(val) -> int:
 def _get_entry_event_engine(entry_order_id: Optional[str]) -> Optional[str]:
     if not entry_order_id:
         return None
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     date_tag = time.strftime("%Y-%m-%d")
-    path = os.path.join("logs", "entry", f"entry_events-{date_tag}.log")
+    path = os.path.join(base_dir, "logs", "entry", f"entry_events-{date_tag}.log")
     if not os.path.exists(path):
-        path = os.path.join("logs", "entry_events.log")
+        path = os.path.join(base_dir, "logs", "entry_events.log")
     try:
         mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
     except Exception:
@@ -268,6 +269,8 @@ def _force_in_pos_from_api(state: dict, api_set: set) -> None:
         return
     now = time.time()
     for sym in api_set:
+        if not isinstance(sym, str) or "/" not in sym:
+            continue
         st = state.get(sym)
         if not isinstance(st, dict):
             st = {}
@@ -725,8 +728,8 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
     if report_ok:
         er._update_report_csv(open_tr)
     print(f"[manage-ws] long_manual_close sym={symbol} engine={engine_label}")
-    order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
-    order_line = f"{order_block}\n" if order_block else ""
+    entry_time = er._fmt_entry_time(open_tr)
+    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
     reason_label = "TP" if exit_reason == "auto_exit_tp" else "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
     icon = er.EXIT_SL_ICON if reason_label == "SL" else er.EXIT_ICON
     er.send_telegram(
@@ -734,7 +737,7 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: {reason_label}\n"
-        f"{order_line}".rstrip()
+        f"{entry_line}".rstrip()
     )
 
 
@@ -811,8 +814,8 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
     if report_ok:
         er._update_report_csv(open_tr)
     print(f"[manage-ws] short_manual_close sym={symbol} engine={engine_label}")
-    order_block = er._format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
-    order_line = f"{order_block}\n" if order_block else ""
+    entry_time = er._fmt_entry_time(open_tr)
+    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
     reason_label = "TP" if exit_reason == "auto_exit_tp" else "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
     icon = er.EXIT_SL_ICON if reason_label == "SL" else er.EXIT_ICON
     er.send_telegram(
@@ -820,7 +823,7 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: {reason_label}\n"
-        f"{order_line}".rstrip()
+        f"{entry_line}".rstrip()
     )
 
 
@@ -870,17 +873,14 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
         state[symbol] = st
     er._append_report_line(symbol, "LONG", profit_unlev, pnl_long, engine_label)
     print(f"[manage-ws] long_tp_exit sym={symbol} roi={profit_unlev:.2f}% pnl={pnl_long}")
-    order_block = er._format_order_id_block(
-        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-        exit_order_id,
-    )
-    order_line = f"{order_block}\n" if order_block else ""
+    entry_time = er._fmt_entry_time(open_tr)
+    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
     er.send_telegram(
         f"{er.EXIT_ICON} <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: TP\n"
-        f"{order_line}"
+        f"{entry_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
         f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
@@ -934,17 +934,14 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts) -> bool:
         state[symbol] = st
     er._append_report_line(symbol, "SHORT", profit_unlev, pnl_short, engine_label)
     print(f"[manage-ws] short_tp_exit sym={symbol} roi={profit_unlev:.2f}% pnl={pnl_short}")
-    order_block = er._format_order_id_block(
-        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-        exit_order_id,
-    )
-    order_line = f"{order_block}\n" if order_block else ""
+    entry_time = er._fmt_entry_time(open_tr)
+    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
     er.send_telegram(
         f"{er.EXIT_ICON} <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: TP\n"
-        f"{order_line}"
+        f"{entry_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
         f"{'' if pnl_short is None else f' 손익={pnl_short:+.3f} USDT'}"
@@ -996,17 +993,14 @@ def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
         st["last_exit_ts"] = now_ts
         st["last_exit_reason"] = "auto_exit_sl"
         state[symbol] = st
-    order_block = er._format_order_id_block(
-        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-        exit_order_id,
-    )
-    order_line = f"{order_block}\n" if order_block else ""
+    entry_time = er._fmt_entry_time(open_tr)
+    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
     er.send_telegram(
         f"{er.EXIT_SL_ICON} <b>롱 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: SL\n"
-        f"{order_line}"
+        f"{entry_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
         f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
@@ -1058,17 +1052,14 @@ def _handle_short_sl(state, symbol, detail, mark_px, now_ts) -> bool:
         st["last_exit_ts"] = now_ts
         st["last_exit_reason"] = "auto_exit_sl"
         state[symbol] = st
-    order_block = er._format_order_id_block(
-        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-        exit_order_id,
-    )
-    order_line = f"{order_block}\n" if order_block else ""
+    entry_time = er._fmt_entry_time(open_tr)
+    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
     er.send_telegram(
         f"{er.EXIT_SL_ICON} <b>숏 청산</b>\n"
         f"<b>{symbol}</b>\n"
         f"엔진: {er._display_engine_label(engine_label)}\n"
         f"사유: SL\n"
-        f"{order_line}"
+        f"{entry_line}"
         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
         f"{'' if pnl_short is None else f' 손익={pnl_short:+.3f} USDT'}"
@@ -1246,6 +1237,8 @@ def main():
             er._reconcile_short_trades(state, tickers)
             last_reconcile_ts = now_ts
         for symbol in watch_syms:
+            if not isinstance(symbol, str) or "/" not in symbol:
+                continue
             long_amt = executor_mod.get_long_position_amount(symbol)
             short_amt = executor_mod.get_short_position_amount(symbol)
             st = state.get(symbol, {}) if isinstance(state, dict) else {}
@@ -1437,22 +1430,24 @@ def main():
                     else:
                         st.pop(pending_key, None)
                     state[symbol] = st
-                if short_amt > 0:
-                    open_tr = er._get_open_trade(state, "SHORT", symbol)
-                    if not open_tr:
-                        detail = executor_mod.get_short_position_detail(symbol) or {}
-                        entry_price = detail.get("entry") if isinstance(detail, dict) else None
-                        qty = detail.get("qty") if isinstance(detail, dict) else None
-                        meta = {"reason": "manual_entry"}
-                        entry_order_id = None
-                        recent = _get_recent_entry_event(symbol, "SHORT", now_ts=now_ts)
-                        if isinstance(recent, dict):
-                            eng = str(recent.get("engine") or "").upper()
-                            reason = _reason_from_engine_label(eng, "SHORT")
-                            if reason:
-                                meta["reason"] = reason
-                            meta["engine"] = eng
-                            entry_order_id = recent.get("entry_order_id")
+            if short_amt > 0:
+                open_tr = er._get_open_trade(state, "SHORT", symbol)
+                entry_price = None
+                qty = None
+                meta = {"reason": "manual_entry"}
+                entry_order_id = None
+                if not open_tr:
+                    detail = executor_mod.get_short_position_detail(symbol) or {}
+                    entry_price = detail.get("entry") if isinstance(detail, dict) else None
+                    qty = detail.get("qty") if isinstance(detail, dict) else None
+                    recent = _get_recent_entry_event(symbol, "SHORT", now_ts=now_ts)
+                    if isinstance(recent, dict):
+                        eng = str(recent.get("engine") or "").upper()
+                        reason = _reason_from_engine_label(eng, "SHORT")
+                        if reason:
+                            meta["reason"] = reason
+                        meta["engine"] = eng
+                        entry_order_id = recent.get("entry_order_id")
                     er._log_trade_entry(
                         state,
                         side="SHORT",

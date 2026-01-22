@@ -526,10 +526,7 @@ def get_short_position_amount(symbol: str) -> float:
     if not _is_short_position(p):
         return 0.0
     amt = _position_size_abs(p)
-    if random.random() < 0.05:
-        info = p.get("info") or {}
-        raw_amt = info.get("positionAmt") or p.get("positionAmt") or p.get("contracts")
-        print(f"[pos-sample] sym={symbol} raw_amt={raw_amt} parsed={amt:.6f}")
+    # noisy sampling log disabled
     return amt
 
 def get_long_position_amount(symbol: str) -> float:
