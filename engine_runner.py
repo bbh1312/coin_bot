@@ -208,6 +208,8 @@ SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = False
 SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = "roi"
 SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = 0.0
 SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = 0
+SWAGGY_NO_ATLAS_MULTI_ADD_COOLDOWN_SEC = int(os.getenv("SWAGGY_NO_ATLAS_MULTI_ADD_COOLDOWN_SEC", "60"))
+SWAGGY_NO_ATLAS_MULTI_STARTUP_BLOCK_SEC = int(os.getenv("SWAGGY_NO_ATLAS_MULTI_STARTUP_BLOCK_SEC", "300"))
 SWAGGY_NO_ATLAS_DEBUG_SYMBOLS = os.getenv("SWAGGY_NO_ATLAS_DEBUG_SYMBOLS", "").strip()
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
 SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS", "").strip()
@@ -2326,6 +2328,24 @@ def _run_swaggy_no_atlas_cycle(
                 continue
             adds_key = f"multi_entry_adds_{side.lower()}"
             adds_done = int(st.get(adds_key, 0) or 0)
+            db_adds = _count_db_multi_entries(symbol, side)
+            if db_adds > adds_done:
+                adds_done = int(db_adds)
+                st[adds_key] = adds_done
+                last_db_ts = _get_db_last_multi_entry_ts(symbol, side)
+                if isinstance(last_db_ts, (int, float)):
+                    st[f"multi_entry_last_ts_{side.lower()}"] = float(last_db_ts)
+                state[symbol] = st
+            if db_adds > 0 and SWAGGY_NO_ATLAS_MULTI_STARTUP_BLOCK_SEC > 0:
+                startup_ts = state.get("_startup_ts")
+                if isinstance(startup_ts, (int, float)):
+                    if (now_ts - float(startup_ts)) < SWAGGY_NO_ATLAS_MULTI_STARTUP_BLOCK_SEC:
+                        _append_swaggy_no_atlas_log(
+                            f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_STARTUP_BLOCK side={side} "
+                            f"since_start={int(now_ts - float(startup_ts))}s"
+                        )
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
             if SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX > 0 and adds_done >= SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX:
                 _append_swaggy_no_atlas_log(
                     f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_MAX side={side} adds={adds_done}"
@@ -2351,6 +2371,18 @@ def _run_swaggy_no_atlas_cycle(
                     )
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
+            if SWAGGY_NO_ATLAS_MULTI_ADD_COOLDOWN_SEC > 0:
+                last_add_ts = st.get(f"multi_entry_last_ts_{side.lower()}")
+                if isinstance(last_add_ts, (int, float)):
+                    if (now_ts - float(last_add_ts)) < SWAGGY_NO_ATLAS_MULTI_ADD_COOLDOWN_SEC:
+                        _append_swaggy_no_atlas_log(
+                            f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_COOLDOWN side={side} "
+                            f"last_add={_iso_kst(float(last_add_ts))}"
+                        )
+                        time.sleep(PER_SYMBOL_SLEEP)
+                        continue
+            st[adds_key] = int(st.get(adds_key, 0) or 0)
+            state[symbol] = st
             is_multi_add = True
             multi_next = adds_done + 1
 
@@ -2404,6 +2436,7 @@ def _run_swaggy_no_atlas_cycle(
                 if is_multi_add:
                     adds_key = f"multi_entry_adds_{side.lower()}"
                     st[adds_key] = int(st.get(adds_key, 0) or 0) + 1
+                    st[f"multi_entry_last_ts_{side.lower()}"] = float(now_ts)
                     state[symbol] = st
                     try:
                         open_tr = _get_open_trade(state, side, symbol)
@@ -3028,6 +3061,169 @@ def _log_trade_entry(
             st = {}
         st[f"entry_order_id_{side.lower()}"] = entry_order_id
         state[symbol] = st
+
+def _append_trade_log_only(
+    state: Dict[str, dict],
+    side: str,
+    symbol: str,
+    entry_ts: float,
+    entry_price: Optional[float],
+    qty: Optional[float],
+    usdt: Optional[float],
+    entry_order_id: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> None:
+    log = _get_trade_log(state)
+    tr = {
+        "side": side,
+        "symbol": symbol,
+        "entry_ts": float(entry_ts),
+        "entry_ts_ms": int(entry_ts * 1000),
+        "entry_price": entry_price,
+        "qty": qty,
+        "usdt": usdt,
+        "entry_order_id": entry_order_id,
+        "status": "open",
+        "meta": meta or {},
+    }
+    tr["engine_label"] = _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
+    log.append(tr)
+    try:
+        st = state.get(symbol) if isinstance(state, dict) else {}
+        if not isinstance(st, dict):
+            st = {}
+        _set_last_entry_state(st, side, float(entry_ts))
+        _set_in_pos_side(st, side, True)
+        if entry_order_id:
+            st[f"entry_order_id_{side.lower()}"] = entry_order_id
+        state[symbol] = st
+    except Exception:
+        pass
+
+def _sync_trade_log_from_db(state: Dict[str, dict], symbol: str, side: str) -> None:
+    if _get_open_trade(state, side, symbol):
+        return
+    if not dbrec:
+        return
+    try:
+        dbrec._get_conn()
+    except Exception:
+        pass
+    if not dbrec.ENABLED:
+        return
+    try:
+        db_path = getattr(dbrec, "DB_PATH", "") or os.path.join(os.path.dirname(__file__), "logs", "trades.db")
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            """
+            SELECT ts, source, qty, avg_entry, meta_json
+            FROM events
+            WHERE symbol = ? AND side = ? AND event_type = 'ENTRY'
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (symbol, side),
+        ).fetchone()
+        conn.close()
+    except Exception:
+        row = None
+    if not row:
+        return
+    try:
+        ts_val = float(row[0]) if row[0] is not None else None
+    except Exception:
+        ts_val = None
+    if ts_val is None:
+        return
+    source = row[1] or ""
+    qty = row[2]
+    avg_entry = row[3]
+    meta = None
+    entry_order_id = None
+    if row[4]:
+        try:
+            meta = json.loads(row[4])
+        except Exception:
+            meta = None
+    if isinstance(meta, dict):
+        entry_order_id = meta.get("entry_order_id")
+        if not meta.get("reason") and meta.get("engine"):
+            meta["reason"] = _reason_from_engine_label(meta.get("engine"), side)
+    if not meta:
+        meta = {"reason": source} if source else {}
+    _append_trade_log_only(
+        state,
+        side=side,
+        symbol=symbol,
+        entry_ts=ts_val,
+        entry_price=avg_entry if isinstance(avg_entry, (int, float)) else None,
+        qty=qty if isinstance(qty, (int, float)) else None,
+        usdt=None,
+        entry_order_id=entry_order_id,
+        meta=meta,
+    )
+
+def _count_db_multi_entries(symbol: str, side: str, window_sec: float = 7 * 86400) -> int:
+    if not dbrec:
+        return 0
+    try:
+        dbrec._get_conn()
+    except Exception:
+        pass
+    if not dbrec.ENABLED:
+        return 0
+    now = time.time()
+    since_ts = now - float(window_sec)
+    try:
+        db_path = getattr(dbrec, "DB_PATH", "") or os.path.join(os.path.dirname(__file__), "logs", "trades.db")
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            """
+            SELECT COUNT(1)
+            FROM events
+            WHERE symbol = ? AND side = ? AND event_type = 'ENTRY'
+              AND ts >= ? AND meta_json LIKE ?
+            """,
+            (symbol, side, since_ts, "%swaggy_no_atlas_multi%"),
+        ).fetchone()
+        conn.close()
+        if row and row[0] is not None:
+            return int(row[0])
+    except Exception:
+        return 0
+    return 0
+
+def _get_db_last_multi_entry_ts(symbol: str, side: str, window_sec: float = 7 * 86400) -> Optional[float]:
+    if not dbrec:
+        return None
+    try:
+        dbrec._get_conn()
+    except Exception:
+        pass
+    if not dbrec.ENABLED:
+        return None
+    now = time.time()
+    since_ts = now - float(window_sec)
+    try:
+        db_path = getattr(dbrec, "DB_PATH", "") or os.path.join(os.path.dirname(__file__), "logs", "trades.db")
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            """
+            SELECT ts
+            FROM events
+            WHERE symbol = ? AND side = ? AND event_type = 'ENTRY'
+              AND ts >= ? AND meta_json LIKE ?
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (symbol, side, since_ts, "%swaggy_no_atlas_multi%"),
+        ).fetchone()
+        conn.close()
+        if row and row[0] is not None:
+            return float(row[0])
+    except Exception:
+        return None
+    return None
 
 def _get_open_trade(state: Dict[str, dict], side: str, symbol: str) -> Optional[dict]:
     log = _get_trade_log(state)
@@ -6176,68 +6372,67 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
             if not isinstance(st, dict):
                 st = {}
             prev_qty = st.get(f"manual_qty_{side_key}")
-            if not _is_in_pos_side(st, side_label):
-                info = _manual_alert_info(state, sym, side_label)
-                if info:
-                    prev_entry = info.get("entry")
-                    prev_qty = info.get("qty")
-                    prev_ts = info.get("ts")
-                    same_entry = False
-                    if isinstance(prev_entry, (int, float)) and isinstance(entry, (int, float)) and entry > 0:
-                        same_entry = abs(float(prev_entry) - float(entry)) / float(entry) <= 0.001
-                    elif prev_entry is None or entry is None:
-                        same_entry = True
-                    same_qty = False
-                    if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > 0:
-                        same_qty = abs(float(prev_qty) - float(qty)) / float(qty) <= 0.01
-                    elif prev_qty is None or qty is None:
-                        same_qty = True
-                    ttl_ok = False
-                    if isinstance(prev_ts, (int, float)):
-                        ttl_ok = (time.time() - float(prev_ts)) <= MANUAL_ALERT_TTL_SEC
-                    if same_entry and same_qty and ttl_ok:
-                        _set_in_pos_side(st, side_label, True)
-                        st[f"manual_qty_{side_key}"] = qty
-                        st.setdefault(f"manual_dca_adds_{side_key}", 0)
-                        state[sym] = st
-                        continue
-                _log_trade_entry(
-                    state,
-                    side=side_label,
-                    symbol=sym,
-                    entry_ts=time.time(),
-                    entry_price=entry if isinstance(entry, (int, float)) else None,
-                    qty=qty if isinstance(qty, (int, float)) else None,
-                    usdt=None,
-                    entry_order_id=None,
-                    meta={"reason": "manual_entry"},
-                )
-                _send_entry_alert(
-                    send_telegram,
-                    side=side_label,
-                    symbol=sym,
-                    engine="MANUAL",
-                    entry_price=entry if isinstance(entry, (int, float)) else None,
-                    usdt=None,
-                    reason="manual_entry",
-                    live=True,
-                    order_info="(manual)",
-                    entry_order_id=None,
-                    sl=_fmt_price_safe(entry, AUTO_EXIT_SHORT_SL_PCT if side_label == "SHORT" else AUTO_EXIT_LONG_SL_PCT, side=side_label),
-                    tp=None,
-                    state=state,
-                )
-                _mark_manual_alerted(state, sym, side_label, entry_price=entry, qty=qty)
-                try:
-                    save_state(state)
-                except Exception:
-                    pass
-                _set_in_pos_side(st, side_label, True)
-                st[f"manual_qty_{side_key}"] = qty
-                st[f"manual_dca_adds_{side_key}"] = 0
-                _set_last_entry_state(st, side_label, time.time())
-                state[sym] = st
-                continue
+            info = _manual_alert_info(state, sym, side_label)
+            if info:
+                prev_entry = info.get("entry")
+                prev_qty = info.get("qty")
+                prev_ts = info.get("ts")
+                same_entry = False
+                if isinstance(prev_entry, (int, float)) and isinstance(entry, (int, float)) and entry > 0:
+                    same_entry = abs(float(prev_entry) - float(entry)) / float(entry) <= 0.001
+                elif prev_entry is None or entry is None:
+                    same_entry = True
+                same_qty = False
+                if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > 0:
+                    same_qty = abs(float(prev_qty) - float(qty)) / float(qty) <= 0.01
+                elif prev_qty is None or qty is None:
+                    same_qty = True
+                ttl_ok = False
+                if isinstance(prev_ts, (int, float)):
+                    ttl_ok = (time.time() - float(prev_ts)) <= MANUAL_ALERT_TTL_SEC
+                if same_entry and same_qty and ttl_ok:
+                    _set_in_pos_side(st, side_label, True)
+                    st[f"manual_qty_{side_key}"] = qty
+                    st.setdefault(f"manual_dca_adds_{side_key}", 0)
+                    state[sym] = st
+                    continue
+            _log_trade_entry(
+                state,
+                side=side_label,
+                symbol=sym,
+                entry_ts=time.time(),
+                entry_price=entry if isinstance(entry, (int, float)) else None,
+                qty=qty if isinstance(qty, (int, float)) else None,
+                usdt=None,
+                entry_order_id=None,
+                meta={"reason": "manual_entry"},
+            )
+            _send_entry_alert(
+                send_telegram,
+                side=side_label,
+                symbol=sym,
+                engine="MANUAL",
+                entry_price=entry if isinstance(entry, (int, float)) else None,
+                usdt=None,
+                reason="manual_entry",
+                live=True,
+                order_info="(manual)",
+                entry_order_id=None,
+                sl=_fmt_price_safe(entry, AUTO_EXIT_SHORT_SL_PCT if side_label == "SHORT" else AUTO_EXIT_LONG_SL_PCT, side=side_label),
+                tp=None,
+                state=state,
+            )
+            _mark_manual_alerted(state, sym, side_label, entry_price=entry, qty=qty)
+            try:
+                save_state(state)
+            except Exception:
+                pass
+            _set_in_pos_side(st, side_label, True)
+            st[f"manual_qty_{side_key}"] = qty
+            st[f"manual_dca_adds_{side_key}"] = 0
+            _set_last_entry_state(st, side_label, time.time())
+            state[sym] = st
+            continue
             if isinstance(qty, (int, float)) and isinstance(prev_qty, (int, float)) and qty > prev_qty * 1.0001:
                 adds_key = f"manual_dca_adds_{side_key}"
                 adds_done = int(st.get(adds_key, 0) or 0)
@@ -6358,6 +6553,10 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         {"source": "manage_queue", "reason": req.get("reason")},
     )
     try:
+        _sync_trade_log_from_db(state, symbol, side)
+    except Exception:
+        pass
+    try:
         _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
     except Exception:
         pass
@@ -6388,7 +6587,10 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
 def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> None:
     now = time.time()
     if DB_RECONCILE_ENABLED and dbrecon and dbrec and dbrec.ENABLED:
-        last_recon = float(state.get("_db_recon_ts", 0.0) or 0.0)
+        last_recon = _coerce_state_float(state.get("_db_recon_ts", 0.0))
+        if not isinstance(last_recon, (int, float)):
+            last_recon = 0.0
+            state["_db_recon_ts"] = 0.0
         if (now - last_recon) >= DB_RECONCILE_SEC:
             try:
                 symbols = None
@@ -9037,6 +9239,7 @@ def run():
     state = load_state()
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
+    state["_startup_ts"] = time.time()
     try:
         cycle_cache.set_fetcher(lambda sym, tf, limit: _fetch_ohlcv_with_retry(exchange, sym, tf, limit))
     except Exception:
