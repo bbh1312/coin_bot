@@ -1744,8 +1744,13 @@ def _run_swaggy_atlas_lab_v2_cycle(
         trigger_parts = debug.get("trigger_parts") if isinstance(debug.get("trigger_parts"), dict) else {}
         strength_total = float(debug.get("strength_total") or 0.0)
         strength_min_req = float(debug.get("strength_min_req") or 0.0)
+        atlas_pass_hard = False
+        if isinstance(atlas, dict):
+            atlas_pass_hard = bool(atlas.get("pass_hard"))
+        else:
+            atlas_pass_hard = bool(getattr(atlas, "pass_hard", False))
         entry_quality, entry_quality_reasons = _entry_quality_bucket(
-            bool((atlas or {}).get("pass_hard")),
+            atlas_pass_hard,
             int(debug.get("confirm_pass") or 0),
             debug.get("overext_dist_at_entry"),
             trigger_combo,
@@ -2005,15 +2010,53 @@ def _run_swaggy_no_atlas_cycle(
             continue
         side = signal.side.upper()
         entry_px = signal.entry_px
-        last_entry = _get_last_entry_ts_by_side(st, side)
-        if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        if _exit_cooldown_blocked(state, symbol, "swaggy_no_atlas", side, ttl_sec=COOLDOWN_SEC):
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
         in_pos_same = _is_in_pos_side(st, side)
+        if not in_pos_same:
+            try:
+                open_tr = _get_open_trade(state, side, symbol)
+                if isinstance(open_tr, dict):
+                    in_pos_same = True
+            except Exception:
+                pass
+        live_amt_same = None
+        if not in_pos_same:
+            try:
+                live_amt = (
+                    executor_mod.get_long_position_amount(symbol)
+                    if side == "LONG"
+                    else executor_mod.get_short_position_amount(symbol)
+                )
+                live_amt_same = live_amt
+                if isinstance(live_amt, (int, float)) and live_amt > 0:
+                    in_pos_same = True
+                    if side == "LONG":
+                        st["in_pos_long"] = True
+                    else:
+                        st["in_pos_short"] = True
+                    st["in_pos"] = True
+                    state[symbol] = st
+            except Exception:
+                pass
+        last_entry = _get_last_entry_ts_by_side(st, side)
+        if not in_pos_same:
+            if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if _exit_cooldown_blocked(state, symbol, "swaggy_no_atlas", side, ttl_sec=COOLDOWN_SEC):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+        _append_swaggy_no_atlas_log(
+            f"SWAGGY_NO_ATLAS_MULTI_CHECK sym={symbol} side={side} in_pos_same={int(bool(in_pos_same))} "
+            f"multi_on={int(bool(SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED))} "
+            f"cooldown={int(_exit_cooldown_blocked(state, symbol, 'swaggy_no_atlas', side, ttl_sec=COOLDOWN_SEC))} "
+            f"live_amt={_fmt(live_amt_same) if live_amt_same is not None else 'N/A'}"
+        )
+        if in_pos_same and _exit_cooldown_blocked(state, symbol, "swaggy_no_atlas", side, ttl_sec=COOLDOWN_SEC):
+            _append_swaggy_no_atlas_log(
+                f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_EXIT_COOLDOWN side={side}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
         overext_signed = _swaggy_no_atlas_overext_dist(df_5m, side, swaggy_cfg)
         if (
             SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
@@ -2092,7 +2135,7 @@ def _run_swaggy_no_atlas_cycle(
             _append_entry_gate_log(
                 "swaggy_no_atlas",
                 symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side} in_pos_same={in_pos_same} live_amt={live_amt_same}",
                 side=side,
             )
             time.sleep(PER_SYMBOL_SLEEP)
@@ -2108,6 +2151,8 @@ def _run_swaggy_no_atlas_cycle(
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             open_tr = _get_open_trade(state, side, symbol)
+            if not open_tr:
+                open_tr = _backfill_open_trade_from_db(state, symbol, side, now_ts=now_ts)
             if not open_tr:
                 _append_swaggy_no_atlas_log(
                     f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_NO_OPEN_TRADE side={side}"
@@ -2806,6 +2851,132 @@ def _get_open_trade(state: Dict[str, dict], side: str, symbol: str) -> Optional[
         if tr.get("status") == "open" and tr.get("side") == side and tr.get("symbol") == symbol:
             return tr
     return None
+
+def _db_latest_position_snapshot(symbol: str, side: str) -> Optional[dict]:
+    if not dbrec or not dbrec.ENABLED:
+        return None
+    try:
+        db_path = getattr(dbrec, "DB_PATH", "") or os.path.join(os.path.dirname(__file__), "logs", "trades.db")
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            """
+            SELECT ts, side, qty, avg_entry
+            FROM positions
+            WHERE symbol = ?
+            ORDER BY ts DESC
+            LIMIT 20
+            """,
+            (symbol,),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return None
+    want_side = (side or "").upper()
+    for row in rows or []:
+        try:
+            ts_val = float(row[0]) if row[0] is not None else None
+        except Exception:
+            ts_val = None
+        row_side = str(row[1] or "").upper()
+        try:
+            qty_val = float(row[2]) if row[2] is not None else None
+        except Exception:
+            qty_val = None
+        try:
+            avg_entry = float(row[3]) if row[3] is not None else None
+        except Exception:
+            avg_entry = None
+        if ts_val is None or qty_val is None or qty_val == 0:
+            continue
+        if want_side == "LONG":
+            if row_side != "LONG":
+                continue
+            if qty_val <= 0:
+                continue
+            return {"ts": ts_val, "qty": float(qty_val), "avg_entry": avg_entry}
+        if want_side == "SHORT":
+            if row_side != "SHORT":
+                continue
+            if qty_val >= 0 and row_side not in ("SHORT", "BOTH", ""):
+                continue
+            return {"ts": ts_val, "qty": float(abs(qty_val)), "avg_entry": avg_entry}
+    return None
+
+def _find_entry_event_for_backfill(
+    symbol: str,
+    side: str,
+    ref_ts: Optional[float] = None,
+    now_ts: Optional[float] = None,
+    window_sec: float = 7 * 24 * 3600,
+) -> Optional[dict]:
+    now_ts = float(now_ts if isinstance(now_ts, (int, float)) else time.time())
+    since_ts = now_ts - float(window_sec)
+    _, by_symbol = _load_entry_events_map(since_ts=since_ts)
+    recs = by_symbol.get((symbol, (side or "").upper())) if isinstance(by_symbol, dict) else None
+    if not recs:
+        return None
+    if isinstance(ref_ts, (int, float)):
+        best = None
+        best_gap = None
+        for rec in recs:
+            ts_val = rec.get("entry_ts")
+            if not isinstance(ts_val, (int, float)):
+                continue
+            gap = abs(float(ts_val) - float(ref_ts))
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best = rec
+        return best
+    return max(recs, key=lambda r: float(r.get("entry_ts") or 0.0))
+
+def _backfill_open_trade_from_db(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    now_ts: Optional[float] = None,
+) -> Optional[dict]:
+    if _get_open_trade(state, side, symbol):
+        return _get_open_trade(state, side, symbol)
+    pos = _db_latest_position_snapshot(symbol, side)
+    if not isinstance(pos, dict):
+        return None
+    ref_ts = pos.get("ts")
+    rec = _find_entry_event_for_backfill(symbol, side, ref_ts=ref_ts, now_ts=now_ts)
+    entry_ts = None
+    entry_order_id = None
+    engine_label = None
+    entry_price = pos.get("avg_entry")
+    if isinstance(rec, dict):
+        entry_ts = rec.get("entry_ts")
+        entry_order_id = rec.get("entry_order_id")
+        engine_label = str(rec.get("engine") or "").upper() or None
+        if isinstance(rec.get("entry_price"), (int, float)):
+            entry_price = float(rec.get("entry_price"))
+    if not isinstance(entry_ts, (int, float)):
+        entry_ts = float(ref_ts) if isinstance(ref_ts, (int, float)) else time.time()
+    qty = pos.get("qty")
+    try:
+        qty = float(qty) if qty is not None else None
+    except Exception:
+        qty = None
+    reason = _reason_from_engine_label(engine_label, side) if engine_label else None
+    if not reason:
+        reason = "manual_entry"
+    meta = {"reason": reason}
+    if engine_label:
+        meta["engine"] = engine_label
+    _log_trade_entry(
+        state,
+        side=side,
+        symbol=symbol,
+        entry_ts=float(entry_ts),
+        entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+        qty=qty if isinstance(qty, (int, float)) else None,
+        usdt=None,
+        entry_order_id=entry_order_id,
+        meta=meta,
+    )
+    return _get_open_trade(state, side, symbol)
 
 def _trade_has_entry(tr: Optional[dict]) -> bool:
     if not isinstance(tr, dict):
@@ -5741,8 +5912,9 @@ def _detect_position_events(state: dict, send_telegram) -> None:
                 if not managed:
                     _record_position_event(symbol, side, "DCA", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
                     changed = True
+                    label = "DCA" if DCA_ENABLED else "ADD"
                     send_telegram(
-                        f"➕ <b>DCA</b> {symbol} {side} adds mark={mark} entry={avg_entry} qty={qty}"
+                        f"➕ <b>{label}</b> {symbol} {side} adds mark={mark} entry={avg_entry} qty={qty}"
                     )
         elif prev_qty is not None and qty is None:
             source = managed_engine or ("AUTO" if managed else "MANUAL")
@@ -5896,18 +6068,38 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         cur_total = None
     if not isinstance(cur_total, int):
         cur_total = _count_open_positions_state(state)
-    if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+    alert_tag = req.get("alert_tag")
+    reason = str(req.get("reason") or "").lower()
+    is_multi_req = False
+    if isinstance(alert_tag, str) and alert_tag.startswith("MULTI_ENTRY"):
+        is_multi_req = True
+    if "multi" in reason:
+        is_multi_req = True
+    if engine == "SWAGGY_NO_ATLAS" or is_multi_req:
+        _append_swaggy_no_atlas_log(
+            f"SWAGGY_NO_ATLAS_MANAGE_REQ sym={symbol} side={side} "
+            f"multi={int(is_multi_req)} reason={req.get('reason')} tag={alert_tag or ''}"
+        )
+    if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS and not is_multi_req:
         _clear_manage_pending(state, symbol, side)
         _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
         return False
     try:
-        if side == "SHORT" and get_short_position_amount(symbol) > 0:
+        if side == "SHORT" and get_short_position_amount(symbol) > 0 and not is_multi_req:
             _clear_manage_pending(state, symbol, side)
             _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, "already_in_position", side=side)
+            if engine == "SWAGGY_NO_ATLAS":
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_MANAGE_SKIP sym={symbol} side={side} reason=ALREADY_IN_POSITION"
+                )
             return True
-        if side == "LONG" and get_long_position_amount(symbol) > 0:
+        if side == "LONG" and get_long_position_amount(symbol) > 0 and not is_multi_req:
             _clear_manage_pending(state, symbol, side)
             _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, "already_in_position", side=side)
+            if engine == "SWAGGY_NO_ATLAS":
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_MANAGE_SKIP sym={symbol} side={side} reason=ALREADY_IN_POSITION"
+                )
             return True
     except Exception:
         pass
@@ -5964,23 +6156,23 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
     except Exception:
         pass
-        _send_entry_alert(
-            (lambda text: send_telegram(text, allow_early=True)),
+    _send_entry_alert(
+        (lambda text: send_telegram(text, allow_early=True)),
+        side=side,
+        symbol=symbol,
+        engine=req.get("engine") or "UNKNOWN",
+        entry_price=fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
+        usdt=usdt,
+        reason=req.get("alert_reason") or req.get("reason") or "",
+        live=live,
+        order_info=None,
+        entry_order_id=entry_order_id,
+        label_tag=str(alert_tag) if isinstance(alert_tag, str) and alert_tag.startswith("MULTI_ENTRY") else None,
+        sl=_fmt_price_safe(
+            fill_price if isinstance(fill_price, (int, float)) else None,
+            _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
             side=side,
-            symbol=symbol,
-            engine=req.get("engine") or "UNKNOWN",
-            entry_price=fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
-            usdt=usdt,
-            reason=req.get("alert_reason") or req.get("reason") or "",
-            live=live,
-            order_info=None,
-            entry_order_id=entry_order_id,
-            label_tag="추가진입" if req.get("alert_tag") == "MULTI_ENTRY" else None,
-            sl=_fmt_price_safe(
-                fill_price if isinstance(fill_price, (int, float)) else None,
-                _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
-                side=side,
-            ),
+        ),
         tp=None,
         state=state,
     )

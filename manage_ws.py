@@ -116,7 +116,7 @@ def _get_entry_events_by_symbol(now_ts: Optional[float] = None) -> dict:
         and float(cached.get("mtime", 0.0) or 0.0) == float(mtime or 0.0)
     ):
         return cached["map"]
-    _, by_symbol = er._load_entry_events_map(None)
+    _, by_symbol = er._load_entry_events_map(None, include_alerts=True, include_engine_signals=True)
     _ENTRY_EVENTS_BY_SYMBOL_CACHE["ts"] = now
     _ENTRY_EVENTS_BY_SYMBOL_CACHE["mtime"] = float(mtime or 0.0)
     _ENTRY_EVENTS_BY_SYMBOL_CACHE["map"] = by_symbol
@@ -1195,7 +1195,14 @@ def main():
                     if missing:
                         print(f"[manage-ws] api_inpos_missing_in_state={len(missing)} {missing}")
                     else:
-                        print(f"[manage-ws] api_inpos_sync_ok count={len(api_set)}")
+                        longs = set((symbols.get("long") or set()))
+                        shorts = set((symbols.get("short") or set()))
+                        both = longs & shorts
+                        total = len(longs) + len(shorts)
+                        print(
+                            "[manage-ws] api_inpos_sync_ok "
+                            f"total={total} unique={len(api_set)} long={len(longs)} short={len(shorts)} both={len(both)}"
+                        )
             except Exception:
                 pass
             if new_watch_syms != watch_syms:
@@ -1244,6 +1251,10 @@ def main():
             st = state.get(symbol, {}) if isinstance(state, dict) else {}
             prev_long_amt = float(last_amt.get((symbol, "long"), 0.0) or 0.0)
             prev_short_amt = float(last_amt.get((symbol, "short"), 0.0) or 0.0)
+            if long_amt > 0:
+                st["zero_long_count_ws"] = 0
+            if short_amt > 0:
+                st["zero_short_count_ws"] = 0
             _maybe_update_open_trade_engine(state, symbol, "LONG", now_ts)
             _maybe_update_open_trade_engine(state, symbol, "SHORT", now_ts)
             open_long = er._get_open_trade(state, "LONG", symbol)
@@ -1372,6 +1383,16 @@ def main():
                             meta["reason"] = reason
                         meta["engine"] = eng
                         entry_order_id = recent.get("entry_order_id")
+                    if "engine" not in meta:
+                        alerted_eng = str(st.get("entry_alerted_long_engine") or "").upper()
+                        alerted_ts = st.get("entry_alerted_long_ts")
+                        if alerted_eng and alerted_eng not in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                            if isinstance(alerted_ts, (int, float)) and (now_ts - float(alerted_ts)) <= 600.0:
+                                meta["engine"] = alerted_eng
+                                reason = _reason_from_engine_label(alerted_eng, "LONG")
+                                if reason:
+                                    meta["reason"] = reason
+                                entry_order_id = st.get("entry_alerted_long_order_id") or entry_order_id
                     er._log_trade_entry(
                         state,
                         side="LONG",
@@ -1448,6 +1469,16 @@ def main():
                             meta["reason"] = reason
                         meta["engine"] = eng
                         entry_order_id = recent.get("entry_order_id")
+                    if "engine" not in meta:
+                        alerted_eng = str(st.get("entry_alerted_short_engine") or "").upper()
+                        alerted_ts = st.get("entry_alerted_short_ts")
+                        if alerted_eng and alerted_eng not in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                            if isinstance(alerted_ts, (int, float)) and (now_ts - float(alerted_ts)) <= 600.0:
+                                meta["engine"] = alerted_eng
+                                reason = _reason_from_engine_label(alerted_eng, "SHORT")
+                                if reason:
+                                    meta["reason"] = reason
+                                entry_order_id = st.get("entry_alerted_short_order_id") or entry_order_id
                     er._log_trade_entry(
                         state,
                         side="SHORT",
@@ -1518,7 +1549,10 @@ def main():
                 except Exception:
                     pass
                 if long_amt <= 0:
-                    _manual_close_long(state, symbol, now_ts, report_ok=True, mark_px=_last_ws_close(symbol))
+                    zero_cnt = int(st.get("zero_long_count_ws", 0)) + 1
+                    st["zero_long_count_ws"] = zero_cnt
+                    if zero_cnt >= 2:
+                        _manual_close_long(state, symbol, now_ts, report_ok=True, mark_px=_last_ws_close(symbol))
             if prev_short_amt > 0 and short_amt <= 0:
                 try:
                     executor_mod.refresh_positions_cache(force=True)
@@ -1527,7 +1561,10 @@ def main():
                 except Exception:
                     pass
                 if short_amt <= 0:
-                    _manual_close_short(state, symbol, now_ts, report_ok=True, mark_px=_last_ws_close(symbol))
+                    zero_cnt = int(st.get("zero_short_count_ws", 0)) + 1
+                    st["zero_short_count_ws"] = zero_cnt
+                    if zero_cnt >= 2:
+                        _manual_close_short(state, symbol, now_ts, report_ok=True, mark_px=_last_ws_close(symbol))
             state[symbol] = st
             last_amt[(symbol, "long")] = float(long_amt or 0.0)
             last_amt[(symbol, "short")] = float(short_amt or 0.0)

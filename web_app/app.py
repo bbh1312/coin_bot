@@ -184,11 +184,22 @@ def _notify_change(item: dict, value: object) -> None:
         pass
 
 
+def _trade_log_entries(state: dict) -> list[dict]:
+    raw = state.get("_trade_log", [])
+    if isinstance(raw, dict):
+        items = raw.values()
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        return []
+    return [tr for tr in items if isinstance(tr, dict)]
+
+
 @app.route("/")
 def index():
     state = load_state()
     totals = {"LONG": 0, "SHORT": 0}
-    for tr in state.get("_trade_log", []):
+    for tr in _trade_log_entries(state):
         if tr.get("status") == "open":
             side = tr.get("side")
             if side in totals:
@@ -205,7 +216,7 @@ def index():
 @app.route("/status")
 def status():
     state = load_state()
-    positions = sum(1 for tr in state.get("_trade_log", []) if tr.get("status") == "open")
+    positions = sum(1 for tr in _trade_log_entries(state) if tr.get("status") == "open")
     payload = {
         "timestamp": datetime.now().isoformat(),
         "positions": positions,

@@ -32,8 +32,14 @@ def fetch_ohlcv_all(
     timeframe: str,
     start_ms: int,
     end_ms: int,
-    limit: int = 1000,
+    limit: Optional[int] = None,
 ) -> List[list]:
+    if limit is None:
+        try:
+            limit = int(os.getenv("BACKTEST_OHLCV_LIMIT", "500"))
+        except Exception:
+            limit = 500
+    limit = max(50, min(int(limit), 1000))
     out: List[list] = []
     since = start_ms
     tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)

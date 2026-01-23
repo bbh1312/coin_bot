@@ -55,7 +55,14 @@ def _append_backtest_entry_log(line: str) -> None:
 
 
 def _make_exchange() -> ccxt.Exchange:
-    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    return ccxt.binance(
+        {
+            "apiKey": os.getenv("BACKTEST_BINANCE_API_KEY", ""),
+            "secret": os.getenv("BACKTEST_BINANCE_API_SECRET", ""),
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap"},
+        }
+    )
 
 
 def parse_args():

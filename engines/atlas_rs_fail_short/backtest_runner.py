@@ -551,7 +551,14 @@ def run_backtest(
 
 def main():
     args = parse_args()
-    exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    exchange = ccxt.binance(
+        {
+            "apiKey": os.getenv("BACKTEST_BINANCE_API_KEY", ""),
+            "secret": os.getenv("BACKTEST_BINANCE_API_SECRET", ""),
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap"},
+        }
+    )
     exchange.load_markets()
 
     base_dir = os.path.join("logs", "atlas_rs_fail_short", "backtest")
