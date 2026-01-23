@@ -188,6 +188,8 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 USDT_PER_TRADE = float(os.getenv("ENTRY_USDT_PCT", "8.0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "cross").lower().strip()
+ENGINE_WRITE_STATE = os.getenv("ENGINE_WRITE_STATE", "1") == "1"
+LOG_LONG_EXIT = os.getenv("LOG_LONG_EXIT", "0") == "1"
 LIVE_TRADING = True
 LONG_LIVE_TRADING = True
 AUTO_EXIT_ENABLED: bool = True
@@ -206,6 +208,7 @@ SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = False
 SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = "roi"
 SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = 0.0
 SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = 0
+SWAGGY_NO_ATLAS_DEBUG_SYMBOLS = os.getenv("SWAGGY_NO_ATLAS_DEBUG_SYMBOLS", "").strip()
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
 SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS", "").strip()
 SWAGGY_NO_ATLAS_OFF_WINDOWS = os.getenv("SWAGGY_NO_ATLAS_OFF_WINDOWS", "").strip()
@@ -477,6 +480,68 @@ def _resolve_entry_usdt(pct: Optional[float] = None) -> float:
             _ENTRY_PCT_WARN_TS = now
         effective_pct = 100.0
     return max(0.0, float(avail) * (effective_pct / 100.0))
+
+
+def _log_entry_usdt_debug(symbol: str, engine: str, usdt: float) -> None:
+    try:
+        avail = get_available_usdt()
+    except Exception:
+        avail = None
+    entry_pct = None
+    try:
+        entry_pct = float(USDT_PER_TRADE)
+    except Exception:
+        entry_pct = None
+    if not isinstance(avail, (int, float)):
+        avail = None
+    if not isinstance(entry_pct, (int, float)):
+        entry_pct = None
+    try:
+        usdt_val = float(usdt) if usdt is not None else None
+    except Exception:
+        usdt_val = None
+    print(
+        "[entry_usdt] "
+        f"symbol={symbol} engine={engine} "
+        f"available={avail} pct={entry_pct} calc_usdt={usdt_val}"
+    )
+
+
+def _fetch_ohlcv_with_retry(exchange, symbol: str, tf: str, limit: int):
+    global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, TOTAL_429_COUNT, RATE_LIMIT_LOG_TS
+    max_retries = 5
+    base_wait = max(1.0, (getattr(exchange, "rateLimit", 0) or 0) / 1000.0)
+    for attempt in range(max_retries):
+        try:
+            return exchange.fetch_ohlcv(symbol, tf, limit=limit)
+        except (ccxt.DDoSProtection, ccxt.RateLimitExceeded) as e:
+            _BACKOFF_SECS = 5.0 if _BACKOFF_SECS <= 0 else min(_BACKOFF_SECS * 1.5, 30.0)
+            GLOBAL_BACKOFF_UNTIL = time.time() + _BACKOFF_SECS
+            try:
+                TOTAL_429_COUNT += 1
+            except Exception:
+                pass
+            wait_s = min(base_wait * (2 ** attempt), 60.0)
+            now = time.time()
+            if now - RATE_LIMIT_LOG_TS > 5.0:
+                print(f"[rate-limit] ohlcv {symbol} {tf} retry={attempt+1}/{max_retries} wait={wait_s:.1f}s err={e}")
+                RATE_LIMIT_LOG_TS = now
+            time.sleep(wait_s)
+        except Exception as e:
+            msg = str(e)
+            if ("429" in msg) or ("-1003" in msg):
+                _BACKOFF_SECS = 5.0 if _BACKOFF_SECS <= 0 else min(_BACKOFF_SECS * 1.5, 30.0)
+                GLOBAL_BACKOFF_UNTIL = time.time() + _BACKOFF_SECS
+                wait_s = min(base_wait * (2 ** attempt), 60.0)
+                now = time.time()
+                if now - RATE_LIMIT_LOG_TS > 5.0:
+                    print(f"[rate-limit] ohlcv {symbol} {tf} retry={attempt+1}/{max_retries} wait={wait_s:.1f}s err={msg}")
+                    RATE_LIMIT_LOG_TS = now
+                time.sleep(wait_s)
+                continue
+            print(f"[ohlcv] fetch error sym={symbol} tf={tf} err={e}")
+            return []
+    return []
 
 
 def _ema_align_ok(symbol: str, tf: str, limit: int) -> bool:
@@ -1906,8 +1971,17 @@ def _run_swaggy_no_atlas_cycle(
         return result
     if not swaggy_universe:
         return result
+    try:
+        refresh_positions_cache(force=True)
+    except Exception:
+        pass
 
     now_ts = time.time()
+    debug_syms = {
+        s.strip()
+        for s in (SWAGGY_NO_ATLAS_DEBUG_SYMBOLS or "").split(",")
+        if s.strip()
+    }
     if _is_in_off_window(SWAGGY_NO_ATLAS_OFF_WINDOWS, now_ts):
         print(f"[off-window] SWAGGY_NO_ATLAS now={_now_kst_str()} windows={SWAGGY_NO_ATLAS_OFF_WINDOWS}")
         _append_swaggy_no_atlas_log("SWAGGY_NO_ATLAS_SKIP reason=OFF_WINDOW")
@@ -2006,10 +2080,72 @@ def _run_swaggy_no_atlas_cycle(
                 _append_swaggy_trade_json(payload)
 
         if not signal.entry_ok or not signal.side or signal.entry_px is None:
+            if symbol in debug_syms or _symbol_in_pos_any(st):
+                phase_info = None
+                if isinstance(swaggy_no_atlas_engine, object):
+                    try:
+                        phase_info = (swaggy_no_atlas_engine._state or {}).get(symbol)
+                    except Exception:
+                        phase_info = None
+                cooldown_until = None
+                last_signal_ts = None
+                if isinstance(phase_info, dict):
+                    cooldown_until = phase_info.get("cooldown_until")
+                    last_signal_ts = phase_info.get("last_signal_ts")
+                cooldown_until_fmt = None
+                last_signal_fmt = None
+                try:
+                    if isinstance(cooldown_until, (int, float)):
+                        cooldown_until_fmt = _iso_kst(float(cooldown_until))
+                except Exception:
+                    cooldown_until_fmt = None
+                try:
+                    if isinstance(last_signal_ts, (int, float)):
+                        last_signal_fmt = _iso_kst(float(last_signal_ts))
+                except Exception:
+                    last_signal_fmt = None
+                _append_swaggy_no_atlas_log(
+                    "SWAGGY_NO_ATLAS_SKIP sym=%s reason=ENTRY_NOT_READY entry_ok=%s side=%s entry_px=%s "
+                    "phase=%s reasons=%s confirm_pass=%s confirm_fail=%s cooldown_until=%s last_signal=%s"
+                    % (
+                        symbol,
+                        int(bool(signal.entry_ok)),
+                        signal.side,
+                        _fmt(debug.get("entry_px") or signal.entry_px),
+                        new_phase or prev_phase,
+                        ",".join(signal.reasons or []),
+                        _fmt(debug.get("confirm_pass")),
+                        _fmt(debug.get("confirm_fail")),
+                        cooldown_until_fmt or "N/A",
+                        last_signal_fmt or "N/A",
+                    )
+                )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         side = signal.side.upper()
         entry_px = signal.entry_px
+        if symbol in debug_syms or _symbol_in_pos_any(st):
+            try:
+                live_amt_dbg = (
+                    executor_mod.get_long_position_amount(symbol)
+                    if side == "LONG"
+                    else executor_mod.get_short_position_amount(symbol)
+                ) if executor_mod else None
+            except Exception:
+                live_amt_dbg = None
+            if _is_in_pos_side(st, side) and not _get_open_trade(state, side, symbol):
+                _get_open_trade_or_backfill(state, symbol, side, now_ts=now_ts)
+            _append_swaggy_no_atlas_log(
+                "SWAGGY_NO_ATLAS_ENTRY_READY sym=%s side=%s entry_px=%s in_pos_flag=%s live_amt=%s open_tr=%s"
+                % (
+                    symbol,
+                    side,
+                    _fmt(entry_px),
+                    int(bool(_is_in_pos_side(st, side))),
+                    _fmt(live_amt_dbg) if live_amt_dbg is not None else "N/A",
+                    int(bool(_get_open_trade(state, side, symbol))),
+                )
+            )
         in_pos_same = _is_in_pos_side(st, side)
         if not in_pos_same:
             try:
@@ -2152,8 +2288,37 @@ def _run_swaggy_no_atlas_cycle(
                 continue
             open_tr = _get_open_trade(state, side, symbol)
             if not open_tr:
-                open_tr = _backfill_open_trade_from_db(state, symbol, side, now_ts=now_ts)
+                open_tr = _get_open_trade_or_backfill(state, symbol, side, now_ts=now_ts)
             if not open_tr:
+                if symbol in debug_syms:
+                    try:
+                        db_snap = _db_latest_position_snapshot(symbol, side)
+                    except Exception:
+                        db_snap = None
+                    try:
+                        _, by_symbol = _load_entry_events_map(since_ts=now_ts - 7 * 24 * 3600)
+                        evs = by_symbol.get((symbol, side)) if isinstance(by_symbol, dict) else None
+                        evs_cnt = len(evs) if isinstance(evs, list) else 0
+                    except Exception:
+                        evs_cnt = 0
+                        evs = None
+                    _append_swaggy_no_atlas_log(
+                        "SWAGGY_NO_ATLAS_DEBUG_OPEN_TRADE sym=%s side=%s in_pos_flag=%s live_amt=%s db_snap=%s evs=%s"
+                        % (
+                            symbol,
+                            side,
+                            int(bool(_is_in_pos_side(st, side))),
+                            _fmt(
+                                executor_mod.get_long_position_amount(symbol)
+                                if side == "LONG"
+                                else executor_mod.get_short_position_amount(symbol)
+                            )
+                            if executor_mod
+                            else "N/A",
+                            _fmt(db_snap) if db_snap else "N/A",
+                            evs_cnt,
+                        )
+                    )
                 _append_swaggy_no_atlas_log(
                     f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_NO_OPEN_TRADE side={side}"
                 )
@@ -2205,6 +2370,24 @@ def _run_swaggy_no_atlas_cycle(
 
         try:
             live = LONG_LIVE_TRADING if side == "LONG" else LIVE_TRADING
+            _append_swaggy_no_atlas_log(
+                "SWAGGY_NO_ATLAS_ENQUEUE sym=%s side=%s in_pos_same=%s in_pos_flag=%s live_amt=%s open_tr=%s reason=%s"
+                % (
+                    symbol,
+                    side,
+                    int(bool(in_pos_same)),
+                    int(bool(_is_in_pos_side(st, side))),
+                    _fmt(
+                        executor_mod.get_long_position_amount(symbol)
+                        if side == "LONG"
+                        else executor_mod.get_short_position_amount(symbol)
+                    )
+                    if executor_mod
+                    else "N/A",
+                    int(bool(_get_open_trade(state, side, symbol))),
+                    "swaggy_no_atlas_multi" if is_multi_add else "swaggy_no_atlas",
+                )
+            )
             req_id = _enqueue_entry_request(
                 state,
                 symbol=symbol,
@@ -2731,6 +2914,7 @@ def _enqueue_entry_request(
     if not allow_over_max and isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
         _append_entry_gate_log(engine.lower(), symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
         return None
+    _log_entry_usdt_debug(symbol, engine, usdt)
     payload = {
         "type": "entry",
         "symbol": symbol,
@@ -2852,8 +3036,26 @@ def _get_open_trade(state: Dict[str, dict], side: str, symbol: str) -> Optional[
             return tr
     return None
 
+def _get_open_trade_or_backfill(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    now_ts: Optional[float] = None,
+) -> Optional[dict]:
+    tr = _get_open_trade(state, side, symbol)
+    if tr:
+        return tr
+    return _backfill_open_trade_from_db(state, symbol, side, now_ts=now_ts)
+
 def _db_latest_position_snapshot(symbol: str, side: str) -> Optional[dict]:
-    if not dbrec or not dbrec.ENABLED:
+    if not dbrec:
+        return None
+    try:
+        # ensure .env has been loaded and dbrec.ENABLED refreshed
+        dbrec._get_conn()
+    except Exception:
+        pass
+    if not dbrec.ENABLED:
         return None
     try:
         db_path = getattr(dbrec, "DB_PATH", "") or os.path.join(os.path.dirname(__file__), "logs", "trades.db")
@@ -5428,16 +5630,19 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
             continue
         if still_open:
             continue
-        print(f"[long-exit] {symbol} position closed detected, canceling open orders")
+        if LOG_LONG_EXIT:
+            print(f"[long-exit] {symbol} position closed detected, canceling open orders")
         meta = tr.get("meta") or {}
         try:
             cancel_conditional_by_side(symbol, "LONG")
         except Exception as e:
-            print(f"[long-exit] {symbol} cancel_conditional_by_side failed: {e}")
+            if LOG_LONG_EXIT:
+                print(f"[long-exit] {symbol} cancel_conditional_by_side failed: {e}")
         try:
             cancel_stop_orders(symbol)
         except Exception as e:
-            print(f"[long-exit] {symbol} cancel_stop_orders failed: {e}")
+            if LOG_LONG_EXIT:
+                print(f"[long-exit] {symbol} cancel_stop_orders failed: {e}")
         exit_ts = time.time()
         entry_ts_ms = tr.get("entry_ts_ms")
         realized_pnl = None
@@ -6896,6 +7101,8 @@ def _reload_runtime_settings_from_disk(state: dict) -> None:
         SATURDAY_TRADE_ENABLED = bool(state.get("_sat_trade"))
     if isinstance(state.get("_swaggy_no_atlas_multi_enabled"), bool):
         SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = bool(state.get("_swaggy_no_atlas_multi_enabled"))
+    if isinstance(state.get("_swaggy_no_atlas_multi_enabled"), dict):
+        state["_swaggy_no_atlas_multi_enabled"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED
     if isinstance(state.get("_swaggy_no_atlas_multi_mode"), str):
         SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = str(state.get("_swaggy_no_atlas_multi_mode") or "roi")
     if isinstance(state.get("_swaggy_no_atlas_multi_roi"), (int, float)):
@@ -8756,6 +8963,8 @@ def load_state() -> Dict[str, dict]:
         return {}
 
 def save_state(state: Dict[str, dict]) -> None:
+    if not ENGINE_WRITE_STATE:
+        return
     disk = None
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -8829,7 +9038,7 @@ def run():
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
     try:
-        cycle_cache.set_fetcher(lambda sym, tf, limit: exchange.fetch_ohlcv(sym, tf, limit=limit))
+        cycle_cache.set_fetcher(lambda sym, tf, limit: _fetch_ohlcv_with_retry(exchange, sym, tf, limit))
     except Exception:
         pass
     global swaggy_engine, swaggy_atlas_lab_engine, swaggy_atlas_lab_v2_engine, swaggy_no_atlas_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
@@ -9089,6 +9298,7 @@ def run():
             set_dry_run(not LIVE_TRADING)
         except Exception:
             pass
+        multi_entry_on = bool(SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED)
         if state.get("_pos_limit_reached") is True:
             verified = None
             try:
@@ -9099,12 +9309,15 @@ def run():
                 state["_pos_limit_reached"] = False
                 state["_active_positions_total"] = int(verified)
             else:
-                last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
-                if (now - last_warn) >= 60:
-                    print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
-                    state["_pos_limit_skip_ts"] = now
-                    _log_off_window_status(state, now, tag="pos_limit")
                 state["_pos_limit_reached"] = True
+                if not multi_entry_on:
+                    last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
+                    if (now - last_warn) >= 60:
+                        print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
+                        state["_pos_limit_skip_ts"] = now
+                        _log_off_window_status(state, now, tag="pos_limit")
+                    time.sleep(1)
+                    continue
         active_positions_state = _count_open_positions_state(state)
         active_positions_total_est = active_positions_state
         verified = None
@@ -9116,12 +9329,15 @@ def run():
             active_positions_total_est = verified
             state["_active_positions_total"] = int(verified)
         if isinstance(active_positions_total_est, int) and active_positions_total_est >= MAX_OPEN_POSITIONS:
-            last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
-            if (now - last_warn) >= 60:
-                print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
-                state["_pos_limit_skip_ts"] = now
-                _log_off_window_status(state, now, tag="pos_limit")
             state["_pos_limit_reached"] = True
+            if not multi_entry_on:
+                last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
+                if (now - last_warn) >= 60:
+                    print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
+                    state["_pos_limit_skip_ts"] = now
+                    _log_off_window_status(state, now, tag="pos_limit")
+                time.sleep(1)
+                continue
 
         # cycle ts debug (BTC 15m, prev candle only)
         cycle_ts = None

@@ -14,9 +14,23 @@ _ENV_PATH = os.getenv("DB_PATH", "").strip()
 ENABLED = _ENV_ENABLED or bool(_ENV_PATH)
 DB_PATH = _ENV_PATH or ("logs/trades.db" if ENABLED else "")
 
+def _refresh_config() -> None:
+    """Refresh config from environment in case .env was loaded after import."""
+    global _ENV_ENABLED, _ENV_PATH, ENABLED, DB_PATH
+    try:
+        from env_loader import load_env
+        load_env()
+    except Exception:
+        pass
+    _ENV_ENABLED = str(os.getenv("DB_RECORDING", "")).lower() in ("1", "true", "yes")
+    _ENV_PATH = os.getenv("DB_PATH", "").strip()
+    ENABLED = _ENV_ENABLED or bool(_ENV_PATH)
+    DB_PATH = _ENV_PATH or ("logs/trades.db" if ENABLED else "")
+
 
 def _get_conn() -> Optional[sqlite3.Connection]:
     global _CONN
+    _refresh_config()
     if not ENABLED or not DB_PATH:
         return None
     with _LOCK:

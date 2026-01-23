@@ -19,6 +19,9 @@ import executor as executor_mod
 import engine_runner as er
 import db_reconcile as dbrecon
 
+MANAGE_WS_WRITE_STATE = os.getenv("MANAGE_WS_WRITE_STATE", "0") == "1"
+MANAGE_WS_SAVE_RUNTIME = os.getenv("MANAGE_WS_SAVE_RUNTIME", "0") == "1"
+
 _ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_BY_SYMBOL_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_TTL_SEC = 5.0
@@ -1138,7 +1141,8 @@ def main():
         er._detect_position_events(state, lambda *args, **kwargs: None)
         _backfill_engine_labels_from_entry_events(state)
         _mark_existing_manual_entries(state, pos_syms, time.time())
-        er.save_state(state)
+        if MANAGE_WS_WRITE_STATE:
+            er.save_state(state)
         print("[manage-ws] startup sync complete")
     except Exception as e:
         print(f"[manage-ws] startup sync failed: {e}")
@@ -1150,6 +1154,7 @@ def main():
     watch_syms = []
     first_watch = True
     last_amt = {}
+    last_pos_log_ts = 0.0
     tickers_cache = {"ts": 0.0, "tickers": {}}
     cached_long_ex = er.CachedExchange(executor_mod.exchange)
     while True:
@@ -1162,7 +1167,8 @@ def main():
         if (time.time() - last_cfg_save_ts) >= 2.0:
             try:
                 er._reload_runtime_settings_from_disk(state)
-                er._save_runtime_settings_only(state)
+                if MANAGE_WS_SAVE_RUNTIME:
+                    er._save_runtime_settings_only(state)
             except Exception:
                 pass
             last_cfg_save_ts = time.time()
@@ -1225,9 +1231,26 @@ def main():
                                 _manual_close_short(state, sym, now_ts, report_ok=True, mark_px=_last_ws_close(sym))
                 watch_syms = new_watch_syms
             last_watch_ts = time.time()
+            now_ts = last_watch_ts
+            if (now_ts - last_pos_log_ts) >= 30.0:
+                try:
+                    pos_syms = executor_mod.list_open_position_symbols(force=True)
+                except Exception:
+                    pos_syms = {"long": set(), "short": set()}
+                longs = set(pos_syms.get("long") or set())
+                shorts = set(pos_syms.get("short") or set())
+                both = longs & shorts
+                total = len(longs) + len(shorts)
+                unique = len(longs | shorts)
+                print(
+                    f"[manage-ws] pos_summary total={total} unique={unique} "
+                    f"long={len(longs)} short={len(shorts)} both={len(both)}"
+                )
+                last_pos_log_ts = now_ts
         if (time.time() - last_state_save_ts) >= 5.0:
             try:
-                er.save_state(state)
+                if MANAGE_WS_WRITE_STATE:
+                    er.save_state(state)
             except Exception:
                 pass
             last_state_save_ts = time.time()

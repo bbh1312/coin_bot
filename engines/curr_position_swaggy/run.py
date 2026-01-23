@@ -194,12 +194,12 @@ def main() -> None:
                 df_1d,
                 time.time(),
             )
-            if signal.entry_ok and signal.side:
+            if signal and signal.entry_ok:
                 entries.append(
                     {
                         "symbol": sym,
                         "pos_side": pos_side,
-                        "side": signal.side.upper(),
+                        "side": (signal.side or "").upper() if signal.side else "N/A",
                         "entry_px": signal.entry_px,
                         "candle_ts": candle_ts,
                     }
