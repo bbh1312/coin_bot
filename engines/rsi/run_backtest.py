@@ -209,6 +209,7 @@ def parse_args():
     parser.add_argument("--out-trades", type=str, default="rsi_trades.csv")
     parser.add_argument("--log-path", type=str, default="backtest.log")
     parser.add_argument("--entry-mode", type=str, default="NEXT_OPEN", choices=["NEXT_OPEN", "SIGNAL_CLOSE"])
+    parser.add_argument("--reentry-minutes", type=int, default=60)
     parser.add_argument("--sl-pct", type=float, default=0.02)
     parser.add_argument("--tp-pct", type=float, default=0.02)
     parser.add_argument("--timeout-bars", type=int, default=40)
@@ -328,6 +329,7 @@ def main() -> None:
         i1h = i15m = i5m = -1
         pending: Optional[PendingEntry] = None
         trade: Optional[TradeState] = None
+        reentry_until = 0.0
         trade_stats: Dict[str, float] = {
             "trades": 0,
             "wins": 0,
@@ -419,6 +421,8 @@ def main() -> None:
                         if exit_reason == "SL":
                             trade_stats["sl"] += 1
                     trade = None
+                    if args.reentry_minutes and args.reentry_minutes > 0:
+                        reentry_until = (ts / 1000.0) + (args.reentry_minutes * 60)
 
             if pending is not None and i == pending.entry_idx:
                 entry_px = o if args.entry_mode == "NEXT_OPEN" else c
@@ -477,6 +481,9 @@ def main() -> None:
             ready_entry = spike_ready or struct_ready
 
             if ready_entry and trade is None and pending is None:
+                if args.reentry_minutes and args.reentry_minutes > 0:
+                    if (ts / 1000.0) < reentry_until:
+                        continue
                 reason = "spike_ready" if spike_ready else "struct_ready"
                 if out_signals:
                     _append_csv(

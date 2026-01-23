@@ -26,10 +26,11 @@ pip install ccxt pandas requests websocket-client
   - 백테스트
     ```
      python3 engines/rsi/run_backtest.py \
-    --days 3 \
+    --days 7 \
     --sl-pct 0.30 \
     --tp-pct 0.03 \
-    --max-symbols 7
+    --reentry-minutes 60 \
+    --max-symbols 40
 
     ```
   - 예시
@@ -45,34 +46,6 @@ pip install ccxt pandas requests websocket-client
 
     ```
 
-- PumpFade 엔진
-  - 백테스트
-    ```
-    python3 engines/pumpfade/backtest_runner.py \
-    --days 7 \
-    --sl-pct 0.05 \
-    --tp-pct 0.05 \
-    --max-symbols 15
-    ```
-  - 예시
-    ```
-    [BACKTEST] NOT/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0537 avg_mae=0.0023 avg_hold=3210.0
-    [BACKTEST] MOODENG/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] 币安人生/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] GRT/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] ZEC/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] SPX/USDT:USDT trades=1 wins=1 losses=0 winrate=100.00% tp=1 sl=0 avg_mfe=0.0514 avg_mae=0.0044 avg_hold=720.0
-    [BACKTEST] MORPHO/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] SNT/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] USELESS/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] MEW/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] DEEP/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] 1000SATS/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] KAITO/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] OGN/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] LSK/USDT:USDT trades=0 wins=0 losses=0 winrate=0.00% tp=0 sl=0 avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0
-    [BACKTEST] TOTAL trades=2 wins=2 losses=0 winrate=100.00% tp=2 sl=0 avg_mfe=0.0526 avg_mae=0.0034 avg_hold=1965.0
-    ```
 - DTFX     
   - 백테스트 (sl 크게)
     ```

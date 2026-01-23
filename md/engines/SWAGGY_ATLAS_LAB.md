@@ -76,6 +76,7 @@
       - EMA 길이: overext_ema_len = 20
 
   CHASE 상태에서 dist가 다시 낮아지면 WAIT_TRIGGER로 복귀.
+  - 로그 기록 시 overext_dist_at_touch/entry는 **절대값(항상 양수)** 기준으로 저장
 
   ———
 
@@ -101,4 +102,4 @@
   - 신호 확정봉 기준 시장가 진입
   - 엔진명: SWAGGY_ATLAS_LAB
   - 엔트리 금액: policy.final_usdt → _resolve_entry_usdt()로 계산
-  - TP/SL은 **공통 모듈(auto_exit)**이 처리
+  - TP/SL은 **공통 모듈(auto_exit)**이 처리 (엔진별 override 설정 가능)

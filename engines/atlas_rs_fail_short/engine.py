@@ -160,7 +160,13 @@ class AtlasRsFailShortEngine(BaseEngine):
             )
             logger(line)
 
-        def _blocked(reason: str, atlas_data: Optional[dict] = None, htf_ok: Optional[bool] = None) -> AtlasRsFailShortSignal:
+        def _blocked(
+            reason: str,
+            atlas_data: Optional[dict] = None,
+            htf_ok: Optional[bool] = None,
+            risk_tags: Optional[list] = None,
+            tech: Optional[dict] = None,
+        ) -> AtlasRsFailShortSignal:
             _emit_log(
                 entry_ready=0,
                 block_reason=reason,
@@ -176,6 +182,8 @@ class AtlasRsFailShortEngine(BaseEngine):
                 "atlas": atlas_data or {},
                 "state_transition": state_transition,
                 "pullback_id": rec.get("pullback_id"),
+                "risk_tags": risk_tags or [],
+                "tech": tech or {},
             }
             return AtlasRsFailShortSignal(
                 symbol=symbol,
@@ -365,6 +373,25 @@ class AtlasRsFailShortEngine(BaseEngine):
         macd_decay = hist_now < hist_prev
         bearish_body = close_now < open_now
         wick_ok = wick_ratio >= cfg.wick_ratio_min
+        trigger_bits = "WICK={w};RSI={r};MACD={m};BEAR={b}".format(
+            w=int(wick_ok),
+            r=int(rsi_down),
+            m=int(macd_decay),
+            b=int(bearish_body),
+        )
+        if wick_ok and macd_decay and (not rsi_down) and (not bearish_body):
+            return _blocked(
+                "TRIGGER_BLOCK_WICK_MACD_ONLY",
+                atlas_data,
+                risk_tags=["WICK_MACD_ONLY"],
+                tech={
+                    "close": close_now,
+                    "ema20": ema20_now,
+                    "atr": atr_now,
+                    "rsi": rsi_now,
+                    "trigger_bits": trigger_bits,
+                },
+            )
         trigger_hits = sum(1 for v in (wick_ok, rsi_down, macd_decay, bearish_body) if v)
         if trigger_hits < cfg.trigger_min:
             return _blocked("TRIGGER_NOT_MET", atlas_data)
@@ -403,13 +430,6 @@ class AtlasRsFailShortEngine(BaseEngine):
         if bearish_body:
             triggers.append("BEAR_BODY")
         confirm_type = "+".join(triggers)
-        trigger_bits = "WICK={w};RSI={r};MACD={m};BEAR={b}".format(
-            w=int(wick_ok),
-            r=int(rsi_down),
-            m=int(macd_decay),
-            b=int(bearish_body),
-        )
-
         meta = {
             "engine": "atlas_rs_fail_short",
             "symbol": symbol,

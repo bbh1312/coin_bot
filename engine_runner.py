@@ -39,6 +39,7 @@ import cycle_cache
 import accounts_db
 from account_context import AccountContext, AccountSettings
 from telegram_client import TelegramClient
+import manage_queue
 
 try:
     import ws_manager
@@ -63,12 +64,6 @@ except Exception:
 from executor import AccountExecutor
 from env_loader import load_env
 try:
-    from engines.fabio import fabio_entry_engine
-    from engines.fabio import atlas_fabio_engine
-except Exception:
-    fabio_entry_engine = None
-    atlas_fabio_engine = None
-try:
     from engines.base import EngineContext
     try:
         from engines.swaggy.swaggy_engine import SwaggyEngine, SwaggyConfig
@@ -81,24 +76,32 @@ try:
     from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine as SwaggyAtlasLabEngine
     from engines.swaggy_atlas_lab.config import SwaggyConfig as SwaggyAtlasLabConfig
     from engines.swaggy_atlas_lab.config import AtlasConfig as SwaggyAtlasLabAtlasConfig
+    from engines.swaggy_atlas_lab_v2.swaggy_signal import SwaggySignalEngine as SwaggyAtlasLabV2Engine
+    from engines.swaggy_atlas_lab_v2.config import SwaggyConfig as SwaggyAtlasLabV2Config
+    from engines.swaggy_atlas_lab_v2.config import AtlasConfig as SwaggyAtlasLabV2AtlasConfig
+    from engines.swaggy_no_atlas.engine import SwaggyNoAtlasEngine
+    from engines.swaggy_no_atlas.config import SwaggyNoAtlasConfig
     from engines.swaggy_atlas_lab.atlas_eval import (
         evaluate_global_gate as lab_evaluate_global_gate,
         evaluate_local as lab_evaluate_local,
     )
+    from engines.swaggy_atlas_lab_v2.atlas_eval import (
+        evaluate_global_gate as lab_v2_evaluate_global_gate,
+        evaluate_local as lab_v2_evaluate_local,
+    )
     from engines.swaggy_atlas_lab.policy import apply_policy as lab_apply_policy
     from engines.swaggy_atlas_lab.policy import AtlasMode as SwaggyAtlasLabMode
+    from engines.swaggy_atlas_lab_v2.policy import apply_policy as lab_v2_apply_policy
+    from engines.swaggy_atlas_lab_v2.policy import AtlasMode as SwaggyAtlasLabV2Mode
     from engines.atlas.atlas_engine import AtlasEngine, AtlasSwaggyConfig
     from engines.rsi.engine import RsiEngine
-    from engines.div15m_long.engine import Div15mLongEngine
-    from engines.div15m_short.engine import Div15mShortEngine
     from engines.universe import build_universe_from_tickers
     from engines.dtfx.engine import DTFXEngine, DTFXConfig
     from engines.dtfx.core.logger import write_dtfx_log
-    from engines.pumpfade.engine import PumpFadeEngine
-    from engines.pumpfade.config import PumpFadeConfig
     from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
     from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
-except Exception:
+    from engines.swaggy_atlas_lab.indicators import atr
+except Exception as _import_err:
     SwaggyEngine = None
     SwaggyConfig = None
     EngineContext = None
@@ -107,23 +110,29 @@ except Exception:
     SwaggyAtlasLabEngine = None
     SwaggyAtlasLabConfig = None
     SwaggyAtlasLabAtlasConfig = None
+    SwaggyAtlasLabV2Engine = None
+    SwaggyAtlasLabV2Config = None
+    SwaggyAtlasLabV2AtlasConfig = None
+    SwaggyNoAtlasEngine = None
+    SwaggyNoAtlasConfig = None
     lab_evaluate_global_gate = None
     lab_evaluate_local = None
     lab_apply_policy = None
     SwaggyAtlasLabMode = None
-    AtlasEngine = None
-    AtlasSwaggyConfig = None
-    RsiEngine = None
+    lab_v2_evaluate_global_gate = None
+    lab_v2_evaluate_local = None
+    lab_v2_apply_policy = None
+    SwaggyAtlasLabV2Mode = None
+    _IMPORT_ERROR = str(_import_err)
+    try:
+        print(f"[import-error] { _IMPORT_ERROR }")
+    except Exception:
+        pass
+
+if "Div15mLongEngine" not in globals():
     Div15mLongEngine = None
+if "Div15mShortEngine" not in globals():
     Div15mShortEngine = None
-    build_universe_from_tickers = None
-    DTFXEngine = None
-    DTFXConfig = None
-    write_dtfx_log = None
-    PumpFadeEngine = None
-    PumpFadeConfig = None
-    AtlasRsFailShortEngine = None
-    AtlasRsFailShortConfig = None
 
 from executor import (
     get_short_position_amount,
@@ -154,18 +163,20 @@ from executor import (
     get_global_backoff_until,
     refresh_positions_cache,
     get_available_usdt,
+    exchange,
 )
 
 swaggy_engine = None
 swaggy_atlas_lab_engine = None
+swaggy_atlas_lab_v2_engine = None
+swaggy_no_atlas_engine = None
 atlas_engine = None
 atlas_swaggy_cfg = None
 rsi_engine = None
+dtfx_engine = None
+atlas_rs_fail_short_engine = None
 div15m_engine = None
 div15m_short_engine = None
-dtfx_engine = None
-pumpfade_engine = None
-atlas_rs_fail_short_engine = None
 
 load_env()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -174,7 +185,117 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CHAT_ID_RUNTIME = CHAT_ID
 START_TIME = time.time()
 TELEGRAM_STARTUP_GRACE_SEC = 15.0
-EXIT_ICON = os.getenv("EXIT_ICON", "✅")
+EXIT_ICON = os.getenv("EXIT_ICON", "😄😄😄")
+EXIT_SL_ICON = os.getenv("EXIT_SL_ICON", "🚨🚨🚨")
+MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "14"))
+MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "600"))
+MANUAL_ALERT_TTL_SEC = float(os.getenv("MANUAL_ALERT_TTL_SEC", "3600"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
+USDT_PER_TRADE = float(os.getenv("ENTRY_USDT_PCT", "8.0"))
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+MARGIN_MODE = os.getenv("MARGIN_MODE", "cross").lower().strip()
+ENGINE_WRITE_STATE = os.getenv("ENGINE_WRITE_STATE", "1") == "1"
+LOG_LONG_EXIT = os.getenv("LOG_LONG_EXIT", "0") == "1"
+LIVE_TRADING = True
+LONG_LIVE_TRADING = True
+AUTO_EXIT_ENABLED: bool = True
+AUTO_EXIT_LONG_TP_PCT: float = 3.0
+AUTO_EXIT_LONG_SL_PCT: float = 3.0
+AUTO_EXIT_SHORT_TP_PCT: float = 3.0
+AUTO_EXIT_SHORT_SL_PCT: float = 3.0
+ENGINE_EXIT_OVERRIDES: dict = {}
+SWAGGY_ENABLED = False
+SWAGGY_ATLAS_LAB_ENABLED = False
+SWAGGY_ATLAS_LAB_V2_ENABLED = False
+SWAGGY_NO_ATLAS_ENABLED = False
+SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = -0.7
+SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = True
+SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = False
+SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = "roi"
+SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = 0.0
+SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = 0
+SWAGGY_NO_ATLAS_DEBUG_SYMBOLS = os.getenv("SWAGGY_NO_ATLAS_DEBUG_SYMBOLS", "").strip()
+SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
+SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS", "").strip()
+SWAGGY_NO_ATLAS_OFF_WINDOWS = os.getenv("SWAGGY_NO_ATLAS_OFF_WINDOWS", "").strip()
+SWAGGY_D1_OVEREXT_ATR_MULT = 1.2
+SATURDAY_TRADE_ENABLED = str(os.getenv("SATURDAY_TRADE_ENABLED", "1")).strip().lower() not in ("0", "false", "off", "no")
+DTFX_ENABLED = True
+ATLAS_RS_FAIL_SHORT_ENABLED = False
+DIV15M_LONG_ENABLED = False
+DIV15M_SHORT_ENABLED = False
+ONLY_DIV15M_SHORT = False
+RSI_ENABLED = True
+MANAGE_EXIT_COOLDOWN_SEC: int = 5
+MANAGE_PING_COOLDOWN_SEC: int = 7200
+MANAGE_EVAL_COOLDOWN_SEC: int = 3
+MANUAL_CLOSE_GRACE_SEC: int = 60
+AUTO_EXIT_GRACE_SEC: int = 30
+COOLDOWN_SEC: int = int(float(os.getenv("COOLDOWN_SEC", "1800")))
+# Re-entry cooldown is managed by COOLDOWN_SEC only.
+EXIT_COOLDOWN_HOURS: float = COOLDOWN_SEC / 3600.0
+EXIT_COOLDOWN_SEC: int = COOLDOWN_SEC
+_DISK_STATE_CACHE = {"ts": 0.0, "data": {}}
+_DB_EXIT_CACHE = {"ts": 0.0, "data": {}}
+MANAGE_LOOP_ENABLED: bool = True
+MANAGE_LOOP_SLEEP_SEC: float = 2.0
+MANAGE_TICKER_TTL_SEC: float = 5.0
+RUNTIME_CONFIG_RELOAD_SEC: float = 5.0
+MANAGE_WS_MODE: bool = False
+SUPPRESS_RECONCILE_ALERTS: bool = True
+REPORT_API_ONLY: bool = True
+DB_RECONCILE_ENABLED: bool = os.getenv("DB_RECONCILE_ENABLED", "0") == "1"
+DB_RECONCILE_SEC: float = float(os.getenv("DB_RECONCILE_SEC", "30"))
+DB_RECONCILE_LOOKBACK_SEC: float = float(os.getenv("DB_RECONCILE_LOOKBACK_SEC", "3600"))
+DB_RECONCILE_SYMBOLS_RAW = os.getenv("DB_RECONCILE_SYMBOLS", "").strip()
+DB_REPORT_LOOKBACK_SEC: float = float(os.getenv("DB_REPORT_LOOKBACK_SEC", "259200"))
+SHORT_POS_SAMPLE_DIV: int = 20
+SHORT_POS_SAMPLE_RECENT_SEC: int = 120
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+STATE_SAVE_LOCK = threading.Lock()
+SHORT_RECONCILE_GRACE_SEC: int = 60
+SHORT_RECONCILE_EPS: float = 1e-8
+SHORT_RECONCILE_ZERO_STREAK_N: int = 3
+SHORT_RECONCILE_SEEN_TTL_SEC: int = 180
+FAST_TF_PREFETCH_TOPN = 30
+MAX_FAST_SYMBOLS = 30
+FAST_LIMIT_CAP = 120
+MID_LIMIT_CAP = 200
+SLOW_LIMIT_CAP = 300
+MID_TF_PREFETCH_EVERY_N = 3
+TTL_4H_SEC = 1800
+TTL_1D_SEC = 86400
+FUNDING_INTERVAL_HOURS = 1
+FUNDING_BLOCK_PCT = -0.2
+FUNDING_TTL_SEC = 300
+STRUCTURE_TOP_N = 30
+PER_SYMBOL_SLEEP = 0.05
+CYCLE_SLEEP = float(os.getenv("CYCLE_SLEEP", "1.0"))
+CURRENT_CYCLE_STATS: Dict[str, dict] = {}
+FUNDING_TTL_CACHE: Dict[str, tuple] = {}
+TF_TTL_SECS = {"3m": 60, "5m": 120, "15m": 240, "1h": 300}
+PERSISTENT_OHLCV_CACHE: Dict[tuple, tuple] = {}
+GLOBAL_BACKOFF_UNTIL: float = 0.0
+_BACKOFF_SECS: float = 0.0
+RATE_LIMIT_LOG_TS: float = 0.0
+TOTAL_CYCLES: int = 0
+TOTAL_ELAPSED: float = 0.0
+TOTAL_REST_CALLS: int = 0
+TOTAL_429_COUNT: int = 0
+
+def prune_ohlcv_cache():
+    """TTL 지난 OHLCV 캐시 청소."""
+    try:
+        now = time.time()
+        to_del = []
+        for (sym, tf, limit), (ts, _) in list(PERSISTENT_OHLCV_CACHE.items()):
+            ttl = TF_TTL_SECS.get(tf, 60) * 3
+            if (now - ts) > ttl:
+                to_del.append((sym, tf, limit))
+        for key in to_del:
+            PERSISTENT_OHLCV_CACHE.pop(key, None)
+    except Exception:
+        pass
 
 def print_section(title: str) -> None:
     print(f"[{title}]")
@@ -248,6 +369,47 @@ class CachedExchange:
 
     def __getattr__(self, name):
         return getattr(self._ex, name)
+
+def _prefetch_ohlcv_for_cycle(
+    symbols: list,
+    ex,
+    plan: Dict[str, int],
+    label: str = "prefetch",
+    ttl_by_tf: Optional[dict] = None,
+) -> dict:
+    stats = {"symbols": len(symbols or []), "tfs": list(plan.keys()), "fetched": 0, "failed": 0, "fresh_hits": {}, "fetched_by_tf": {}}
+    if not symbols or not plan:
+        return stats
+    ttl_by_tf = ttl_by_tf or {}
+
+    def _inc_map(key: str, tf: str, amount: int = 1) -> None:
+        bucket = CURRENT_CYCLE_STATS.setdefault(key, {})
+        bucket[tf] = int(bucket.get(tf, 0) or 0) + amount
+
+    for symbol in symbols:
+        for tf, limit in plan.items():
+            if not isinstance(limit, int) or limit <= 0:
+                continue
+            ttl = ttl_by_tf.get(tf)
+            if isinstance(ttl, int) and ttl > 0 and cycle_cache.is_fresh(symbol, tf, ttl):
+                stats["fresh_hits"][tf] = int(stats["fresh_hits"].get(tf, 0) or 0) + 1
+                _inc_map("cache_hits_by_tf", tf)
+                continue
+            try:
+                CURRENT_CYCLE_STATS["rest_calls"] = int(CURRENT_CYCLE_STATS.get("rest_calls", 0) or 0) + 1
+                data = ex.fetch_ohlcv(symbol, tf, limit=limit)
+                if data:
+                    cycle_cache.set_raw(symbol, tf, data)
+                    stats["fetched"] += 1
+                    stats["fetched_by_tf"][tf] = int(stats["fetched_by_tf"].get(tf, 0) or 0) + 1
+                    _inc_map("cache_miss_by_tf", tf)
+                else:
+                    stats["failed"] += 1
+                    CURRENT_CYCLE_STATS["rest_fails"] = int(CURRENT_CYCLE_STATS.get("rest_fails", 0) or 0) + 1
+            except Exception:
+                stats["failed"] += 1
+                CURRENT_CYCLE_STATS["rest_fails"] = int(CURRENT_CYCLE_STATS.get("rest_fails", 0) or 0) + 1
+    return stats
 
 def _kst_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=9)
@@ -328,6 +490,83 @@ def _resolve_entry_usdt(pct: Optional[float] = None) -> float:
     return max(0.0, float(avail) * (effective_pct / 100.0))
 
 
+def _log_entry_usdt_debug(symbol: str, engine: str, usdt: float) -> None:
+    try:
+        avail = get_available_usdt()
+    except Exception:
+        avail = None
+    entry_pct = None
+    try:
+        entry_pct = float(USDT_PER_TRADE)
+    except Exception:
+        entry_pct = None
+    if not isinstance(avail, (int, float)):
+        avail = None
+    if not isinstance(entry_pct, (int, float)):
+        entry_pct = None
+    try:
+        usdt_val = float(usdt) if usdt is not None else None
+    except Exception:
+        usdt_val = None
+    print(
+        "[entry_usdt] "
+        f"symbol={symbol} engine={engine} "
+        f"available={avail} pct={entry_pct} calc_usdt={usdt_val}"
+    )
+
+
+def _fetch_ohlcv_with_retry(exchange, symbol: str, tf: str, limit: int):
+    global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, TOTAL_429_COUNT, RATE_LIMIT_LOG_TS
+    max_retries = 5
+    base_wait = max(1.0, (getattr(exchange, "rateLimit", 0) or 0) / 1000.0)
+    for attempt in range(max_retries):
+        try:
+            return exchange.fetch_ohlcv(symbol, tf, limit=limit)
+        except (ccxt.DDoSProtection, ccxt.RateLimitExceeded) as e:
+            _BACKOFF_SECS = 5.0 if _BACKOFF_SECS <= 0 else min(_BACKOFF_SECS * 1.5, 30.0)
+            GLOBAL_BACKOFF_UNTIL = time.time() + _BACKOFF_SECS
+            try:
+                TOTAL_429_COUNT += 1
+            except Exception:
+                pass
+            wait_s = min(base_wait * (2 ** attempt), 60.0)
+            now = time.time()
+            if now - RATE_LIMIT_LOG_TS > 5.0:
+                print(f"[rate-limit] ohlcv {symbol} {tf} retry={attempt+1}/{max_retries} wait={wait_s:.1f}s err={e}")
+                RATE_LIMIT_LOG_TS = now
+            time.sleep(wait_s)
+        except Exception as e:
+            msg = str(e)
+            if ("429" in msg) or ("-1003" in msg):
+                _BACKOFF_SECS = 5.0 if _BACKOFF_SECS <= 0 else min(_BACKOFF_SECS * 1.5, 30.0)
+                GLOBAL_BACKOFF_UNTIL = time.time() + _BACKOFF_SECS
+                wait_s = min(base_wait * (2 ** attempt), 60.0)
+                now = time.time()
+                if now - RATE_LIMIT_LOG_TS > 5.0:
+                    print(f"[rate-limit] ohlcv {symbol} {tf} retry={attempt+1}/{max_retries} wait={wait_s:.1f}s err={msg}")
+                    RATE_LIMIT_LOG_TS = now
+                time.sleep(wait_s)
+                continue
+            print(f"[ohlcv] fetch error sym={symbol} tf={tf} err={e}")
+            return []
+    return []
+
+
+def _ema_align_ok(symbol: str, tf: str, limit: int) -> bool:
+    df = cycle_cache.get_df(symbol, tf, limit=limit)
+    if df is None or df.empty or len(df) < max(50, int(limit)):
+        return False
+    try:
+        close = df["close"].astype(float).values
+    except Exception:
+        return False
+    if len(close) < 50:
+        return False
+    ema_fast = pd.Series(close).ewm(span=20).mean().iloc[-1]
+    ema_slow = pd.Series(close).ewm(span=50).mean().iloc[-1]
+    return float(ema_fast) >= float(ema_slow)
+
+
 def _get_entry_lock(state: Dict[str, dict]) -> Dict[str, dict]:
     lock = state.get("_entry_lock")
     if not isinstance(lock, dict):
@@ -405,6 +644,20 @@ def _fmt_price_safe(entry_price: Any, sl_pct: Any, side: str = "LONG") -> str:
     except Exception:
         return "N/A"
 
+def _fmt_tp_price_safe(entry_price: Any, tp_pct: Any, side: str = "LONG") -> str:
+    try:
+        entry = float(entry_price)
+        pct = float(tp_pct) / 100.0
+        if entry <= 0 or pct <= 0:
+            return "N/A"
+        if side.upper() == "SHORT":
+            price = entry * (1.0 - pct)
+        else:
+            price = entry * (1.0 + pct)
+        return f"{price:.6g}"
+    except Exception:
+        return "N/A"
+
 def _fmt_entry_price(val: Any) -> str:
     try:
         return f"{float(val):.6g}"
@@ -433,13 +686,25 @@ def _send_entry_alert(
     order_info: Optional[str] = None,
     entry_order_id: Optional[str] = None,
     extras: Optional[list] = None,
+    state: Optional[dict] = None,
+    label_tag: Optional[str] = None,
 ) -> None:
     if not send_alert:
         return
     side_key = (side or "").upper()
     icon = "🟢" if side_key == "LONG" else "🔴" if side_key == "SHORT" else "⚪"
     side_label = "롱" if side_key == "LONG" else "숏" if side_key == "SHORT" else side_key
-    lines = [f"{icon} <b>{side_label} 시그널</b>", f"<b>{symbol}</b>"]
+    header = f"{icon} <b>{side_label} 시그널</b>"
+    if label_tag:
+        if label_tag.startswith("MULTI_ENTRY:"):
+            try:
+                num = int(label_tag.split(":", 1)[1])
+                header = f"{header} (추가진입 +{num}번째)"
+            except Exception:
+                header = f"{header} (추가진입)"
+        else:
+            header = f"{header} ({label_tag})"
+    lines = [header, f"<b>{symbol}</b>"]
     if entry_order_id:
         lines.append(f"entry_id={entry_order_id}")
     if entry_price is not None or usdt is not None:
@@ -452,13 +717,59 @@ def _send_entry_alert(
             lines.append(f"진입가≈{entry_disp} (USDT {usdt_disp})")
         else:
             lines.append(f"진입가≈{entry_disp}")
-    sl_disp = sl if sl else "N/A"
-    tp_disp = tp if tp else "N/A"
+    sl_disp = sl if sl else None
+    tp_disp = tp if tp else None
+    if (sl_disp is None or tp_disp is None) and entry_price is not None:
+        tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side_key)
+        if sl_disp is None:
+            sl_disp = _fmt_price_safe(entry_price, sl_pct, side=side_key)
+        if tp_disp is None:
+            tp_disp = _fmt_tp_price_safe(entry_price, tp_pct, side=side_key)
+    if not sl_disp:
+        sl_disp = "N/A"
+    if not tp_disp:
+        tp_disp = "N/A"
     lines.append(f"손절가={sl_disp} 익절가={tp_disp}")
     lines.append(f"엔진: {_display_engine_label(engine)}")
     reason_disp = reason if (reason and str(reason).strip()) else "N/A"
     lines.append(f"사유: {reason_disp}")
     send_alert("\n".join(lines))
+    if isinstance(state, dict):
+        try:
+            _mark_entry_alerted(
+                state,
+                symbol,
+                side_key,
+                engine=engine,
+                reason=reason,
+                entry_order_id=entry_order_id,
+            )
+        except Exception:
+            pass
+    if dbrec:
+        try:
+            dbrec.record_event(
+                symbol=symbol,
+                side=side_key,
+                event_type="ALERT_ENTRY",
+                source="engine_runner",
+                qty=None,
+                avg_entry=entry_price,
+                price=None,
+                meta={
+                    "engine": engine,
+                    "reason": reason_disp,
+                    "entry_price": entry_price,
+                    "entry_usdt": usdt,
+                    "entry_order_id": entry_order_id,
+                    "sl": sl_disp,
+                    "tp": tp_disp,
+                    "live": live,
+                    "order_info": order_info,
+                },
+            )
+        except Exception:
+            pass
 
 
 def _compute_impulse_metrics(symbol: str) -> Optional[dict]:
@@ -686,6 +997,135 @@ def _append_swaggy_atlas_lab_log(line: str) -> None:
     path = os.path.join("swaggy_atlas_lab", f"swaggy_atlas_lab-{date_tag}.log")
     _append_log_lines(path, [line])
 
+def _append_swaggy_atlas_lab_v2_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    path = os.path.join("swaggy_atlas_lab_v2", f"swaggy_atlas_lab_v2-{date_tag}.log")
+    _append_log_lines(path, [line])
+
+def _append_swaggy_no_atlas_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("swaggy_no_atlas", f"swaggy_no_atlas-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
+def _iso_kst(ts: Optional[float] = None) -> str:
+    tz = timezone(timedelta(hours=9))
+    try:
+        if ts is None:
+            dt = datetime.now(tz=tz)
+        else:
+            dt = datetime.fromtimestamp(float(ts), tz=tz)
+        return dt.isoformat(timespec="seconds")
+    except Exception:
+        return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+
+def _fmt_entry_time(tr: Optional[dict]) -> Optional[str]:
+    if not isinstance(tr, dict):
+        return None
+    ts = tr.get("entry_ts")
+    if not isinstance(ts, (int, float)):
+        ts_ms = tr.get("entry_ts_ms")
+        if isinstance(ts_ms, (int, float)) and ts_ms > 0:
+            ts = float(ts_ms) / 1000.0
+    if isinstance(ts, (int, float)) and ts > 0:
+        return _iso_kst(float(ts))
+    return None
+
+def _parse_time_windows(text: str) -> List[tuple[int, int]]:
+    windows: List[tuple[int, int]] = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        start_raw, end_raw = part.split("-", 1)
+        start_raw = start_raw.strip()
+        end_raw = end_raw.strip()
+        try:
+            if ":" in start_raw:
+                sh, sm = start_raw.split(":", 1)
+            else:
+                sh, sm = start_raw, "0"
+            if ":" in end_raw:
+                eh, em = end_raw.split(":", 1)
+            else:
+                eh, em = end_raw, "0"
+            sh_i = int(sh)
+            sm_i = int(sm)
+            eh_i = int(eh)
+            em_i = int(em)
+        except Exception:
+            continue
+        if not (0 <= sh_i <= 23 and 0 <= eh_i <= 23 and 0 <= sm_i <= 59 and 0 <= em_i <= 59):
+            continue
+        windows.append((sh_i * 60 + sm_i, eh_i * 60 + em_i))
+    return windows
+
+
+def _is_in_off_window(text: str, now_ts: Optional[float] = None) -> bool:
+    if not text:
+        return False
+    windows = _parse_time_windows(text)
+    if not windows:
+        return False
+    try:
+        tz = timezone(timedelta(hours=9))
+        ts_val = time.time() if now_ts is None else float(now_ts)
+        dt = datetime.fromtimestamp(ts_val, tz=tz)
+    except Exception:
+        return False
+    cur_min = dt.hour * 60 + dt.minute
+    for start_min, end_min in windows:
+        if start_min == end_min:
+            continue
+        if start_min < end_min:
+            if start_min <= cur_min < end_min:
+                return True
+        else:
+            if cur_min >= start_min or cur_min < end_min:
+                return True
+    return False
+
+
+def _is_saturday_kst(now_ts: Optional[float] = None) -> bool:
+    try:
+        ts_val = time.time() if now_ts is None else float(now_ts)
+        tz = timezone(timedelta(hours=9))
+        dt = datetime.fromtimestamp(ts_val, tz=tz)
+        return dt.weekday() == 5
+    except Exception:
+        return False
+
+
+def _log_off_window_status(state: dict, now_ts: float, tag: str = "skip") -> None:
+    try:
+        last_ts = _coerce_state_float(state.get("_off_window_skip_ts", 0.0))
+    except Exception:
+        last_ts = 0.0
+    if (now_ts - last_ts) < 60:
+        return
+    msgs = []
+    if SWAGGY_ATLAS_LAB_ENABLED and _is_in_off_window(SWAGGY_ATLAS_LAB_OFF_WINDOWS, now_ts):
+        msgs.append(f"SWAGGY_ATLAS_LAB windows={SWAGGY_ATLAS_LAB_OFF_WINDOWS}")
+    if SWAGGY_ATLAS_LAB_V2_ENABLED and _is_in_off_window(SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, now_ts):
+        msgs.append(f"SWAGGY_ATLAS_LAB_V2 windows={SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS}")
+    if SWAGGY_NO_ATLAS_ENABLED and _is_in_off_window(SWAGGY_NO_ATLAS_OFF_WINDOWS, now_ts):
+        msgs.append(f"SWAGGY_NO_ATLAS windows={SWAGGY_NO_ATLAS_OFF_WINDOWS}")
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        msgs.append("SATURDAY_OFF")
+    if not msgs:
+        return
+    print(f"[off-window] {tag} now={_now_kst_str()} " + " | ".join(msgs))
+    state["_off_window_skip_ts"] = now_ts
+
+def _append_swaggy_trade_json(payload: Dict[str, Any]) -> None:
+    try:
+        path = os.path.join("logs", "swaggy_trades.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
 def _run_swaggy_atlas_lab_cycle(
     swaggy_atlas_lab_engine,
     swaggy_universe,
@@ -695,7 +1135,74 @@ def _run_swaggy_atlas_lab_cycle(
     atlas_cfg,
     active_positions_total,
     send_alert,
+    cycle_id: Optional[int] = None,
 ):
+    def _fmt(v: Any) -> str:
+        if v is None or v == "":
+            return "N/A"
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v)
+
+    def _entry_quality_bucket(
+        atlas_pass_hard: Optional[bool],
+        confirm_pass: Optional[int],
+        overext_dist_at_entry: Optional[float],
+        trigger_combo: str,
+        trigger_parts: Dict[str, float],
+        strength_total: float,
+        strength_min_req: float,
+    ) -> tuple[str, List[str]]:
+        reasons: List[str] = []
+        if atlas_pass_hard:
+            reasons.append("ATLAS_HARD_OK")
+        if confirm_pass:
+            reasons.append("CONFIRM_OK")
+        if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry <= 1.0:
+            reasons.append("LOW_OVEREXT")
+        strong_combo = False
+        combo_set = {c.strip().upper() for c in (trigger_combo or "").split("+") if c.strip()}
+        if combo_set == {"SWEEP", "RECLAIM"}:
+            strong_combo = True
+        rej_strength = trigger_parts.get("REJECTION")
+        if rej_strength is not None and rej_strength >= 0.56:
+            strong_combo = True
+        if strong_combo:
+            reasons.append("TRIGGER_COMBO_STRONG")
+        if strength_total >= (strength_min_req + 0.08):
+            reasons.append("STRENGTH_ABOVE_MIN")
+
+        if (
+            atlas_pass_hard
+            and confirm_pass
+            and isinstance(overext_dist_at_entry, (int, float))
+            and overext_dist_at_entry <= 1.0
+            and strong_combo
+            and strength_total >= (strength_min_req + 0.08)
+        ):
+            return "A", reasons
+        if (
+            atlas_pass_hard
+            and confirm_pass
+            and isinstance(overext_dist_at_entry, (int, float))
+            and overext_dist_at_entry <= 1.35
+        ):
+            return "B", reasons
+        fail_reasons = []
+        if not atlas_pass_hard:
+            fail_reasons.append("ATLAS_HARD_FAIL")
+        if not confirm_pass:
+            fail_reasons.append("CONFIRM_FAIL")
+        if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry > 1.35:
+            fail_reasons.append("HIGH_OVEREXT")
+        if not strong_combo:
+            fail_reasons.append("WEAK_TRIGGER")
+        if strength_total < (strength_min_req + 0.08):
+            fail_reasons.append("LOW_STRENGTH")
+        return "C", reasons + fail_reasons
+
     result = {"long_hits": 0, "short_hits": 0}
     if (not SWAGGY_ATLAS_LAB_ENABLED) or (not swaggy_atlas_lab_engine) or (not swaggy_cfg) or (not atlas_cfg):
         return result
@@ -703,6 +1210,19 @@ def _run_swaggy_atlas_lab_cycle(
         return result
 
     now_ts = time.time()
+    if _is_in_off_window(SWAGGY_ATLAS_LAB_OFF_WINDOWS, now_ts):
+        print(f"[off-window] SWAGGY_ATLAS_LAB now={_now_kst_str()} windows={SWAGGY_ATLAS_LAB_OFF_WINDOWS}")
+        _append_swaggy_atlas_lab_log("SWAGGY_ATLAS_LAB_SKIP reason=OFF_WINDOW")
+        return result
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        print(f"[off-sat] SWAGGY_ATLAS_LAB now={_now_kst_str()} saturday=ON")
+        _append_swaggy_atlas_lab_log("SWAGGY_ATLAS_LAB_SKIP reason=SATURDAY_OFF")
+        return result
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
     btc_df = cycle_cache.get_df(atlas_cfg.ref_symbol, swaggy_cfg.tf_mtf, limit=200)
     if btc_df is None:
         btc_df = pd.DataFrame()
@@ -715,7 +1235,7 @@ def _run_swaggy_atlas_lab_cycle(
 
     for symbol in swaggy_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
+        if _both_sides_open(st) and not hedge_mode:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         try:
@@ -727,15 +1247,18 @@ def _run_swaggy_atlas_lab_cycle(
         except Exception:
             short_amt = 0.0
         if (long_amt > 0) or (short_amt > 0):
-            st["in_pos"] = True
+            st["in_pos_long"] = bool(long_amt > 0)
+            st["in_pos_short"] = bool(short_amt > 0)
+            st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
             now_seen = time.time()
             if long_amt > 0:
                 _set_last_entry_state(st, "LONG", now_seen)
             if short_amt > 0:
                 _set_last_entry_state(st, "SHORT", now_seen)
             state[symbol] = st
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
+            if (long_amt > 0) and (short_amt > 0):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
 
         df_5m = cycle_cache.get_df(symbol, swaggy_cfg.tf_ltf, limit=ltf_limit)
         df_15m = cycle_cache.get_df(symbol, swaggy_cfg.tf_mtf, limit=mtf_limit)
@@ -743,9 +1266,23 @@ def _run_swaggy_atlas_lab_cycle(
         df_4h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf2, limit=htf2_limit)
         df_1d = cycle_cache.get_df(symbol, swaggy_cfg.tf_d1, limit=d1_limit)
         df_3m = cycle_cache.get_df(symbol, "3m", limit=30)
+        if not df_5m.empty and len(df_5m) > 1:
+            df_5m = df_5m.iloc[:-1]
+        if not df_15m.empty and len(df_15m) > 1:
+            df_15m = df_15m.iloc[:-1]
+        if not df_1h.empty and len(df_1h) > 1:
+            df_1h = df_1h.iloc[:-1]
+        if not df_4h.empty and len(df_4h) > 1:
+            df_4h = df_4h.iloc[:-1]
+        if not df_1d.empty and len(df_1d) > 1:
+            df_1d = df_1d.iloc[:-1]
+        if not df_3m.empty and len(df_3m) > 1:
+            df_3m = df_3m.iloc[:-1]
         if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty or df_3m.empty:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
+
+        last_close = float(df_5m.iloc[-1]["close"])
 
         prev_phase = swaggy_atlas_lab_engine._state.get(symbol, {}).get("phase")
         signal = swaggy_atlas_lab_engine.evaluate_symbol(
@@ -764,6 +1301,29 @@ def _run_swaggy_atlas_lab_cycle(
                 "SWAGGY_ATLAS_LAB_PHASE sym=%s prev=%s now=%s reasons=%s"
                 % (symbol, prev_phase, new_phase, ",".join(signal.reasons or []))
             )
+
+        debug = signal.debug if isinstance(signal.debug, dict) else {}
+        event_list = debug.get("events") if isinstance(debug.get("events"), list) else []
+        if event_list:
+            for event in event_list:
+                if not isinstance(event, dict):
+                    continue
+                payload = {
+                    "ts": _iso_kst(),
+                    "event": event.get("event") or "SWAGGY_EVENT",
+                    "engine": "SWAGGY_ATLAS_LAB",
+                    "mode": "live" if LIVE_TRADING or LONG_LIVE_TRADING else "paper",
+                    "symbol": symbol,
+                    "side": event.get("side") or signal.side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": event.get("range_id") or debug.get("touch_key"),
+                }
+                payload.update(event)
+                _append_swaggy_trade_json(payload)
 
         if not signal.entry_ok or not signal.side or signal.entry_px is None:
             time.sleep(PER_SYMBOL_SLEEP)
@@ -788,9 +1348,23 @@ def _run_swaggy_atlas_lab_cycle(
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
+        atlas_metrics = atlas.metrics if atlas and isinstance(atlas.metrics, dict) else {}
+        entry_quality, entry_quality_reasons = _entry_quality_bucket(
+            bool(atlas.pass_hard) if atlas and atlas.pass_hard is not None else False,
+            int(debug.get("confirm_pass") or 0),
+            debug.get("overext_dist_at_entry"),
+            str(debug.get("trigger_combo") or ""),
+            debug.get("trigger_parts") if isinstance(debug.get("trigger_parts"), dict) else {},
+            float(debug.get("strength_total") or 0.0),
+            float(debug.get("strength_min_req") or 0.0),
+        )
         entry_line = (
             "SWAGGY_ATLAS_LAB_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
-            "final_usdt=%.2f atlas_pass=%s atlas_mult=%s atlas_reasons=%s policy_action=%s"
+            "final_usdt=%.2f atlas_pass=%s atlas_mult=%s atlas_reasons=%s policy_action=%s "
+            "level_score=%s touch_count=%s level_age=%s trigger_combo=%s confirm_pass=%s confirm_fail=%s "
+            "overext_dist_at_touch=%s overext_dist_at_entry=%s "
+            "atlas_rs_z=%s atlas_corr=%s atlas_beta=%s atlas_vol_ratio=%s atlas_pass_soft=%s atlas_pass_hard=%s "
+            "entry_quality=%s"
             % (
                 symbol,
                 side,
@@ -801,12 +1375,67 @@ def _run_swaggy_atlas_lab_cycle(
                 policy.atlas_mult if policy.atlas_mult is not None else "N/A",
                 ",".join(policy.atlas_reasons or []),
                 policy.policy_action or "N/A",
+                _fmt(debug.get("level_score")),
+                _fmt(debug.get("touch_count")),
+                _fmt(debug.get("level_age_sec")),
+                _fmt(debug.get("trigger_combo")),
+                _fmt(debug.get("confirm_pass")),
+                _fmt(debug.get("confirm_fail")),
+                _fmt(debug.get("overext_dist_at_touch")),
+                _fmt(debug.get("overext_dist_at_entry")),
+                _fmt(atlas_metrics.get("rs_z")),
+                _fmt(atlas_metrics.get("corr")),
+                _fmt(atlas_metrics.get("beta")),
+                _fmt(atlas_metrics.get("vol_ratio")),
+                _fmt(atlas_metrics.get("pass_soft")),
+                _fmt(atlas_metrics.get("pass_hard")),
+                _fmt(entry_quality),
             )
         )
         _append_swaggy_atlas_lab_log(entry_line)
         if not policy.allow:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
+
+        if swaggy_cfg:
+            beta_val = atlas_metrics.get("beta")
+            if (
+                swaggy_cfg.skip_beta_mid
+                and isinstance(beta_val, (int, float))
+                and 1.0 <= float(beta_val) < 1.5
+            ):
+                _append_swaggy_atlas_lab_log(
+                    f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=SKIP_BETA_MID beta={beta_val:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            overext_val = debug.get("overext_dist_at_entry")
+            if isinstance(overext_val, (int, float)):
+                overext_val = abs(float(overext_val))
+            if (
+                swaggy_cfg.skip_overext_mid
+                and isinstance(overext_val, (int, float))
+                and 1.1 <= overext_val < 1.4
+            ):
+                _append_swaggy_atlas_lab_log(
+                    f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=SKIP_OVEREXT_MID overext={overext_val:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            body_ratio = None
+            confirm_metrics = debug.get("confirm_metrics")
+            if isinstance(confirm_metrics, dict):
+                body_ratio = confirm_metrics.get("body_ratio")
+            if (
+                swaggy_cfg.skip_confirm_body
+                and isinstance(body_ratio, (int, float))
+                and float(body_ratio) < 0.60
+            ):
+                _append_swaggy_atlas_lab_log(
+                    f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=SKIP_CONFIRM_BODY body_ratio={body_ratio:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
 
         cur_total = count_open_positions(force=True)
         if not isinstance(cur_total, int):
@@ -831,104 +1460,1038 @@ def _run_swaggy_atlas_lab_cycle(
 
         guard_key = _entry_guard_key(state, symbol, side)
         if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_atlas_lab", side=side):
-            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab", side=side)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
         entry_usdt = _resolve_entry_usdt(policy.final_usdt)
-        entry_order_id = None
-        fill_price = None
-        qty = None
         try:
-            if side == "LONG":
-                if LONG_LIVE_TRADING:
-                    res = long_market(
-                        symbol,
-                        usdt_amount=entry_usdt,
-                        leverage=LEVERAGE,
-                        margin_mode=MARGIN_MODE,
-                    )
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    st["in_pos"] = True
-                    _set_last_entry_state(st, "LONG", time.time())
-                    state[symbol] = st
-                    _log_trade_entry(
-                        state,
-                        side="LONG",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=entry_usdt,
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "swaggy_atlas_lab"},
-                    )
+            live = LONG_LIVE_TRADING if side == "LONG" else LIVE_TRADING
+            req_id = _enqueue_entry_request(
+                state,
+                symbol=symbol,
+                side=side,
+                engine="SWAGGY_ATLAS_LAB",
+                reason="swaggy_atlas_lab",
+                usdt=entry_usdt,
+                live=live,
+                alert_reason="SWAGGY_ATLAS_LAB",
+            )
+            if req_id:
+                trade_payload = {
+                    "ts": _iso_kst(),
+                    "event": "SWAGGY_TRADE",
+                    "engine": "SWAGGY_ATLAS_LAB",
+                    "mode": "live" if live else "paper",
+                    "symbol": symbol,
+                    "side": side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": debug.get("touch_key"),
+                    "entry_ts": _iso_kst(),
+                    "entry_price": entry_px,
+                    "atr14_ltf": debug.get("atr14_ltf"),
+                    "atr14_htf": debug.get("atr14_htf"),
+                    "ema20_ltf": debug.get("ema20_ltf"),
+                    "ema20_htf": debug.get("ema20_htf"),
+                    "level_type": debug.get("level_type"),
+                    "level_price": debug.get("level_price"),
+                    "level_score": debug.get("level_score"),
+                    "touch_count": debug.get("touch_count"),
+                    "level_age_bars": debug.get("level_age_bars"),
+                    "touch_pct": debug.get("touch_pct"),
+                    "touch_atr_mult": debug.get("touch_atr_mult"),
+                    "touch_pass": int(debug.get("touch_pass") or 0),
+                    "touch_fail_reason": debug.get("touch_fail_reason"),
+                    "trigger_combo": debug.get("trigger_combo"),
+                    "trigger_strength_best": debug.get("trigger_strength_best"),
+                    "trigger_strength_min": debug.get("trigger_strength_min"),
+                    "trigger_strength_avg": debug.get("trigger_strength_avg"),
+                    "trigger_strength_used": debug.get("trigger_strength_used"),
+                    "trigger_parts": debug.get("trigger_parts"),
+                    "strength_total": debug.get("strength_total"),
+                    "strength_min_req": debug.get("strength_min_req"),
+                    "trigger_threshold_used": debug.get("trigger_threshold_used"),
+                    "use_trigger_min": debug.get("use_trigger_min"),
+                    "confirm_pass": int(debug.get("confirm_pass") or 0),
+                    "confirm_fail_reason": debug.get("confirm_fail"),
+                "confirm_metrics": debug.get("confirm_metrics"),
+                "confirm_body_ratio": (debug.get("confirm_metrics") or {}).get("body_ratio")
+                if isinstance(debug.get("confirm_metrics"), dict)
+                else None,
+                    "overext_ema_len": debug.get("overext_ema_len"),
+                    "overext_atr_mult": debug.get("overext_atr_mult"),
+                    "overext_dist_at_touch": debug.get("overext_dist_at_touch"),
+                    "overext_dist_at_entry": debug.get("overext_dist_at_entry"),
+                    "overext_blocked": 0,
+                    "overext_state": "OK",
+                    "atlas_pass_soft": atlas_metrics.get("pass_soft"),
+                    "atlas_pass_hard": atlas_metrics.get("pass_hard"),
+                    "atlas_state": gate.get("reason") if isinstance(gate, dict) else None,
+                    "atlas_regime": atlas_metrics.get("regime") or (gate.get("regime") if isinstance(gate, dict) else None),
+                    "atlas_rs": atlas_metrics.get("rs"),
+                    "atlas_rs_z": atlas_metrics.get("rs_z"),
+                    "atlas_corr": atlas_metrics.get("corr"),
+                    "atlas_beta": atlas_metrics.get("beta"),
+                    "atlas_vol_ratio": atlas_metrics.get("vol_ratio"),
+                    "atlas_block_reason": policy.policy_action if policy and not policy.allow else None,
+                    "entry_quality_bucket": entry_quality,
+                    "entry_quality_reasons": entry_quality_reasons,
+                }
+                _append_swaggy_trade_json(trade_payload)
+                if side == "LONG":
                     result["long_hits"] += 1
                 else:
-                    result["long_hits"] += 1
-                if send_alert:
-                    _send_entry_alert(
-                        send_alert,
-                        side="LONG",
-                        symbol=symbol,
-                        engine="SWAGGY_ATLAS_LAB",
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        usdt=entry_usdt,
-                        reason="SWAGGY_ATLAS_LAB",
-                        live=LONG_LIVE_TRADING,
-                        entry_order_id=entry_order_id,
-                        sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                        tp=None,
-                    )
-            else:
-                if LIVE_TRADING:
-                    res = short_market(
-                        symbol,
-                        usdt_amount=entry_usdt,
-                        leverage=LEVERAGE,
-                        margin_mode=MARGIN_MODE,
-                    )
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    st["in_pos"] = True
-                    _set_last_entry_state(st, "SHORT", time.time())
-                    state[symbol] = st
-                    _log_trade_entry(
-                        state,
-                        side="SHORT",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=entry_usdt,
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "swaggy_atlas_lab"},
-                    )
                     result["short_hits"] += 1
-                else:
-                    result["short_hits"] += 1
-                if send_alert:
-                    _send_entry_alert(
-                        send_alert,
-                        side="SHORT",
-                        symbol=symbol,
-                        engine="SWAGGY_ATLAS_LAB",
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        usdt=entry_usdt,
-                        reason="SWAGGY_ATLAS_LAB",
-                        live=LIVE_TRADING,
-                        entry_order_id=entry_order_id,
-                        sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                        tp=None,
-                    )
         except Exception as e:
-            _append_swaggy_atlas_lab_log(f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=EXCHANGE_ERROR {e}")
+            _append_swaggy_atlas_lab_log(f"SWAGGY_ATLAS_LAB_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
         finally:
             _entry_guard_release(state, symbol, key=guard_key)
-            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab")
+            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab", side=side)
+
+        time.sleep(PER_SYMBOL_SLEEP)
+    return result
+
+def _run_swaggy_atlas_lab_v2_cycle(
+    swaggy_atlas_lab_engine,
+    swaggy_universe,
+    cached_ex,
+    state,
+    swaggy_cfg,
+    atlas_cfg,
+    active_positions_total,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    def _fmt(v: Any) -> str:
+        if v is None or v == "":
+            return "N/A"
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v)
+
+    def _entry_quality_bucket(
+        atlas_pass_hard: Optional[bool],
+        confirm_pass: Optional[int],
+        overext_dist_at_entry: Optional[float],
+        trigger_combo: str,
+        trigger_parts: Dict[str, float],
+        strength_total: float,
+        strength_min_req: float,
+    ) -> tuple[str, List[str]]:
+        reasons: List[str] = []
+        if atlas_pass_hard:
+            reasons.append("ATLAS_HARD_OK")
+        if confirm_pass:
+            reasons.append("CONFIRM_OK")
+        if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry <= 1.0:
+            reasons.append("LOW_OVEREXT")
+        strong_combo = False
+        combo_set = {c.strip().upper() for c in (trigger_combo or "").split("+") if c.strip()}
+        if combo_set == {"SWEEP", "RECLAIM"}:
+            strong_combo = True
+        rej_strength = trigger_parts.get("REJECTION")
+        if rej_strength is not None and rej_strength >= 0.56:
+            strong_combo = True
+        if strong_combo:
+            reasons.append("TRIGGER_COMBO_STRONG")
+        if strength_total >= (strength_min_req + 0.08):
+            reasons.append("STRENGTH_ABOVE_MIN")
+
+        if (
+            atlas_pass_hard
+            and confirm_pass
+            and isinstance(overext_dist_at_entry, (int, float))
+            and overext_dist_at_entry <= 1.0
+            and strong_combo
+            and strength_total >= (strength_min_req + 0.08)
+        ):
+            return "A", reasons
+        if (
+            atlas_pass_hard
+            and confirm_pass
+            and isinstance(overext_dist_at_entry, (int, float))
+            and overext_dist_at_entry <= 1.35
+        ):
+            return "B", reasons
+        fail_reasons = []
+        if not atlas_pass_hard:
+            fail_reasons.append("ATLAS_HARD_FAIL")
+        if not confirm_pass:
+            fail_reasons.append("CONFIRM_FAIL")
+        if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry > 1.35:
+            fail_reasons.append("HIGH_OVEREXT")
+        if not strong_combo:
+            fail_reasons.append("WEAK_TRIGGER")
+        if strength_total < (strength_min_req + 0.08):
+            fail_reasons.append("LOW_STRENGTH")
+        return "C", reasons + fail_reasons
+
+    result = {"long_hits": 0, "short_hits": 0}
+    if (not SWAGGY_ATLAS_LAB_V2_ENABLED) or (not swaggy_atlas_lab_engine) or (not swaggy_cfg) or (not atlas_cfg):
+        return result
+    if not swaggy_universe:
+        return result
+
+    now_ts = time.time()
+    if _is_in_off_window(SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, now_ts):
+        print(f"[off-window] SWAGGY_ATLAS_LAB_V2 now={_now_kst_str()} windows={SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS}")
+        _append_swaggy_atlas_lab_v2_log("SWAGGY_ATLAS_LAB_V2_SKIP reason=OFF_WINDOW")
+        return result
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        print(f"[off-sat] SWAGGY_ATLAS_LAB_V2 now={_now_kst_str()} saturday=ON")
+        _append_swaggy_atlas_lab_v2_log("SWAGGY_ATLAS_LAB_V2_SKIP reason=SATURDAY_OFF")
+        return result
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
+    btc_df = cycle_cache.get_df(atlas_cfg.ref_symbol, swaggy_cfg.tf_mtf, limit=200)
+    if btc_df is None:
+        btc_df = pd.DataFrame()
+
+    ltf_limit = max(int(swaggy_cfg.ltf_limit), 120)
+    mtf_limit = 200
+    htf_limit = max(int(swaggy_cfg.vp_lookback_1h), 120)
+    htf2_limit = 200
+    d1_limit = 120
+
+    for symbol in swaggy_universe:
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if _both_sides_open(st) and not hedge_mode:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            long_amt = get_long_position_amount(symbol)
+        except Exception:
+            long_amt = 0.0
+        try:
+            short_amt = get_short_position_amount(symbol)
+        except Exception:
+            short_amt = 0.0
+        if (long_amt > 0) or (short_amt > 0):
+            st["in_pos_long"] = bool(long_amt > 0)
+            st["in_pos_short"] = bool(short_amt > 0)
+            st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
+            now_seen = time.time()
+            if long_amt > 0:
+                _set_last_entry_state(st, "LONG", now_seen)
+            if short_amt > 0:
+                _set_last_entry_state(st, "SHORT", now_seen)
+            state[symbol] = st
+            if (long_amt > 0) and (short_amt > 0):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+        df_5m = cycle_cache.get_df(symbol, swaggy_cfg.tf_ltf, limit=ltf_limit)
+        df_15m = cycle_cache.get_df(symbol, swaggy_cfg.tf_mtf, limit=mtf_limit)
+        df_1h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf, limit=htf_limit)
+        df_4h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf2, limit=htf2_limit)
+        df_1d = cycle_cache.get_df(symbol, swaggy_cfg.tf_d1, limit=d1_limit)
+        df_3m = cycle_cache.get_df(symbol, "3m", limit=30)
+        if not df_5m.empty and len(df_5m) > 1:
+            df_5m = df_5m.iloc[:-1]
+        if not df_15m.empty and len(df_15m) > 1:
+            df_15m = df_15m.iloc[:-1]
+        if not df_1h.empty and len(df_1h) > 1:
+            df_1h = df_1h.iloc[:-1]
+        if not df_4h.empty and len(df_4h) > 1:
+            df_4h = df_4h.iloc[:-1]
+        if not df_1d.empty and len(df_1d) > 1:
+            df_1d = df_1d.iloc[:-1]
+        if not df_3m.empty and len(df_3m) > 1:
+            df_3m = df_3m.iloc[:-1]
+        if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty or df_3m.empty:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        last_close = float(df_5m.iloc[-1]["close"])
+
+        prev_phase = swaggy_atlas_lab_engine._state.get(symbol, {}).get("phase")
+        signal = swaggy_atlas_lab_engine.evaluate_symbol(
+            symbol,
+            df_4h,
+            df_1h,
+            df_15m,
+            df_5m,
+            df_3m,
+            df_1d if isinstance(df_1d, pd.DataFrame) else pd.DataFrame(),
+            now_ts,
+        )
+        new_phase = swaggy_atlas_lab_engine._state.get(symbol, {}).get("phase")
+        if prev_phase != new_phase and new_phase:
+            _append_swaggy_atlas_lab_v2_log(
+                "SWAGGY_ATLAS_LAB_V2_PHASE sym=%s prev=%s now=%s reasons=%s"
+                % (symbol, prev_phase, new_phase, ",".join(signal.reasons or []))
+            )
+
+        debug = signal.debug if isinstance(signal.debug, dict) else {}
+        event_list = debug.get("events") if isinstance(debug.get("events"), list) else []
+        if event_list:
+            for ev in event_list:
+                if not isinstance(ev, dict):
+                    continue
+                evt_name = ev.get("event")
+                if not evt_name:
+                    continue
+                try:
+                    payload = {
+                        "ts": _iso_kst(),
+                        "event": evt_name,
+                        "engine": "SWAGGY_ATLAS_LAB_V2",
+                        "mode": "live",
+                        "symbol": symbol,
+                        "side": signal.side,
+                        "ltf": swaggy_cfg.tf_ltf,
+                        "mtf": swaggy_cfg.tf_mtf,
+                        "htf": swaggy_cfg.tf_htf,
+                        "htf2": swaggy_cfg.tf_htf2,
+                        "cycle_id": cycle_id,
+                        "range_id": ev.get("range_id"),
+                        "level_score": ev.get("level_score"),
+                        "touch_count": ev.get("touch_count"),
+                        "level_age_bars": ev.get("level_age_bars"),
+                        "trigger_combo": ev.get("trigger_combo"),
+                        "trigger_parts": ev.get("trigger_parts"),
+                        "trigger_strength_best": ev.get("trigger_strength_best"),
+                        "trigger_strength_min": ev.get("trigger_strength_min"),
+                        "trigger_strength_avg": ev.get("trigger_strength_avg"),
+                        "trigger_strength_used": ev.get("trigger_strength_used"),
+                        "strength_total": ev.get("strength_total"),
+                        "strength_min_req": ev.get("strength_min_req"),
+                        "trigger_threshold_used": ev.get("trigger_threshold_used"),
+                        "use_trigger_min": ev.get("use_trigger_min"),
+                        "confirm_pass": int(ev.get("confirm_pass") or 0),
+                        "confirm_fail_reason": ev.get("confirm_fail"),
+                        "confirm_metrics": ev.get("confirm_metrics"),
+                        "overext_ema_len": ev.get("overext_ema_len"),
+                        "overext_atr_mult": ev.get("overext_atr_mult"),
+                        "overext_dist_at_touch": ev.get("overext_dist_at_touch"),
+                        "overext_dist_at_entry": ev.get("overext_dist_at_entry"),
+                    }
+                    _append_swaggy_trade_json(payload)
+                except Exception:
+                    pass
+
+        if not signal or not signal.entry_ok:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if signal.side not in ("LONG", "SHORT"):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        side = signal.side
+        if _exit_cooldown_blocked(state, symbol, "swaggy_atlas_lab_v2", side):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        if side == "LONG" and _has_open_side(st, "LONG"):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if side == "SHORT" and _has_open_side(st, "SHORT"):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        entry_usdt = _resolve_entry_usdt()
+        entry_px = last_close
+
+        atlas = {}
+        gate = {}
+        if lab_v2_evaluate_global_gate and lab_v2_evaluate_local and not btc_df.empty:
+            gate = lab_v2_evaluate_global_gate(btc_df, atlas_cfg)
+            atlas = lab_v2_evaluate_local(symbol, side, df_15m, btc_df, gate, atlas_cfg)
+        policy = lab_v2_apply_policy(SwaggyAtlasLabV2Mode.HARD, USDT_PER_TRADE, atlas) if lab_v2_apply_policy else None
+        if policy and not policy.allow:
+            _append_swaggy_atlas_lab_v2_log(
+                f"SWAGGY_ATLAS_LAB_V2_SKIP sym={symbol} reason=ATLAS_POLICY block={policy.policy_action}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        trigger_combo = _fmt(debug.get("trigger_combo"))
+        trigger_parts = debug.get("trigger_parts") if isinstance(debug.get("trigger_parts"), dict) else {}
+        strength_total = float(debug.get("strength_total") or 0.0)
+        strength_min_req = float(debug.get("strength_min_req") or 0.0)
+        atlas_pass_hard = False
+        if isinstance(atlas, dict):
+            atlas_pass_hard = bool(atlas.get("pass_hard"))
+        else:
+            atlas_pass_hard = bool(getattr(atlas, "pass_hard", False))
+        entry_quality, entry_quality_reasons = _entry_quality_bucket(
+            atlas_pass_hard,
+            int(debug.get("confirm_pass") or 0),
+            debug.get("overext_dist_at_entry"),
+            trigger_combo,
+            trigger_parts,
+            strength_total,
+            strength_min_req,
+        )
+
+        guard_key = f"swaggy_atlas_lab_v2|{symbol}|{side}"
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_atlas_lab_v2", side=side)
+        if not lock_ok:
+            _append_swaggy_atlas_lab_v2_log(
+                f"SWAGGY_ATLAS_LAB_V2_SKIP sym={symbol} reason=ENTRY_LOCK owner={lock_owner} age_s={lock_age:.1f}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_atlas_lab_v2", side=side):
+            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab_v2", side=side)
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            req_id = _enqueue_entry_request(
+                state,
+                symbol=symbol,
+                side=side,
+                engine="SWAGGY_ATLAS_LAB_V2",
+                reason="swaggy_atlas_lab_v2",
+                usdt=entry_usdt,
+                live=LIVE_TRADING,
+                alert_reason="SWAGGY_ATLAS_LAB_V2",
+                entry_price_hint=entry_px,
+            )
+            if req_id:
+                _append_swaggy_atlas_lab_v2_log(
+                    "SWAGGY_ATLAS_LAB_V2_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
+                    "final_usdt=%.2f level_score=%s touch_count=%s level_age=%s trigger_combo=%s confirm_pass=%s confirm_fail=%s "
+                    "overext_dist_at_touch=%s overext_dist_at_entry=%s entry_quality=%s"
+                    % (
+                        symbol,
+                        side,
+                        float(signal.strength or 0.0),
+                        ",".join(signal.reasons or []),
+                        float(entry_usdt or 0.0),
+                        _fmt(debug.get("level_score")),
+                        _fmt(debug.get("touch_count")),
+                        _fmt(debug.get("level_age_sec")),
+                        _fmt(debug.get("trigger_combo")),
+                        _fmt(debug.get("confirm_pass")),
+                        _fmt(debug.get("confirm_fail")),
+                        _fmt(debug.get("overext_dist_at_touch")),
+                        _fmt(debug.get("overext_dist_at_entry")),
+                        _fmt(entry_quality),
+                    )
+                )
+                trade_payload = {
+                    "ts": _iso_kst(),
+                    "event": "SWAGGY_TRADE",
+                    "engine": "SWAGGY_ATLAS_LAB_V2",
+                    "mode": "live",
+                    "symbol": symbol,
+                    "side": side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": debug.get("range_id"),
+                    "entry_ts": _iso_kst(),
+                    "entry_price": entry_px,
+                    "atr14_ltf": debug.get("atr14_ltf"),
+                    "atr14_htf": debug.get("atr14_htf"),
+                    "ema20_ltf": debug.get("ema20_ltf"),
+                    "ema20_htf": debug.get("ema20_htf"),
+                    "level_type": debug.get("level_type"),
+                    "level_price": debug.get("level_price"),
+                    "level_score": debug.get("level_score"),
+                    "touch_count": debug.get("touch_count"),
+                    "level_age_bars": debug.get("level_age_bars"),
+                    "touch_pct": debug.get("touch_pct"),
+                    "touch_atr_mult": debug.get("touch_atr_mult"),
+                    "touch_pass": int(debug.get("touch_pass") or 0),
+                    "touch_fail_reason": debug.get("touch_fail_reason"),
+                    "trigger_combo": debug.get("trigger_combo"),
+                    "trigger_strength_best": debug.get("trigger_strength_best"),
+                    "trigger_strength_min": debug.get("trigger_strength_min"),
+                    "trigger_strength_avg": debug.get("trigger_strength_avg"),
+                    "trigger_strength_used": debug.get("trigger_strength_used"),
+                    "trigger_parts": debug.get("trigger_parts"),
+                    "strength_total": debug.get("strength_total"),
+                    "strength_min_req": debug.get("strength_min_req"),
+                    "trigger_threshold_used": debug.get("trigger_threshold_used"),
+                    "use_trigger_min": debug.get("use_trigger_min"),
+                    "confirm_pass": int(debug.get("confirm_pass") or 0),
+                    "confirm_fail_reason": debug.get("confirm_fail"),
+                    "confirm_metrics": debug.get("confirm_metrics"),
+                    "confirm_body_ratio": (debug.get("confirm_metrics") or {}).get("body_ratio")
+                    if isinstance(debug.get("confirm_metrics"), dict)
+                    else None,
+                    "overext_ema_len": debug.get("overext_ema_len"),
+                    "overext_atr_mult": debug.get("overext_atr_mult"),
+                    "overext_dist_at_touch": debug.get("overext_dist_at_touch"),
+                    "overext_dist_at_entry": debug.get("overext_dist_at_entry"),
+                    "overext_blocked": 0,
+                    "overext_state": "OK",
+                    "atlas_pass_soft": atlas.get("pass_soft"),
+                    "atlas_pass_hard": atlas.get("pass_hard"),
+                    "atlas_state": gate.get("reason") if isinstance(gate, dict) else None,
+                    "atlas_regime": atlas.get("regime") or (gate.get("regime") if isinstance(gate, dict) else None),
+                    "atlas_rs": atlas.get("rs"),
+                    "atlas_rs_z": atlas.get("rs_z"),
+                    "atlas_corr": atlas.get("corr"),
+                    "atlas_beta": atlas.get("beta"),
+                    "atlas_vol_ratio": atlas.get("vol_ratio"),
+                    "atlas_block_reason": policy.policy_action if policy and not policy.allow else None,
+                    "entry_quality_bucket": entry_quality,
+                    "entry_quality_reasons": entry_quality_reasons,
+                }
+                _append_swaggy_trade_json(trade_payload)
+                if side == "LONG":
+                    result["long_hits"] += 1
+                else:
+                    result["short_hits"] += 1
+        except Exception as e:
+            _append_swaggy_atlas_lab_v2_log(f"SWAGGY_ATLAS_LAB_V2_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
+        finally:
+            _entry_guard_release(state, symbol, key=guard_key)
+            _entry_lock_release(state, symbol, owner="swaggy_atlas_lab_v2", side=side)
+
+        time.sleep(PER_SYMBOL_SLEEP)
+    return result
+
+def _run_swaggy_no_atlas_cycle(
+    swaggy_no_atlas_engine,
+    swaggy_universe,
+    cached_ex,
+    state,
+    swaggy_cfg,
+    active_positions_total,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    def _fmt(v: Any) -> str:
+        if v is None or v == "":
+            return "N/A"
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return str(v)
+
+    result = {"long_hits": 0, "short_hits": 0}
+    if (not SWAGGY_NO_ATLAS_ENABLED) or (not swaggy_no_atlas_engine) or (not swaggy_cfg):
+        return result
+    if not swaggy_universe:
+        return result
+    try:
+        refresh_positions_cache(force=True)
+    except Exception:
+        pass
+
+    now_ts = time.time()
+    debug_syms = {
+        s.strip()
+        for s in (SWAGGY_NO_ATLAS_DEBUG_SYMBOLS or "").split(",")
+        if s.strip()
+    }
+    if _is_in_off_window(SWAGGY_NO_ATLAS_OFF_WINDOWS, now_ts):
+        print(f"[off-window] SWAGGY_NO_ATLAS now={_now_kst_str()} windows={SWAGGY_NO_ATLAS_OFF_WINDOWS}")
+        _append_swaggy_no_atlas_log("SWAGGY_NO_ATLAS_SKIP reason=OFF_WINDOW")
+        return result
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        print(f"[off-sat] SWAGGY_NO_ATLAS now={_now_kst_str()} saturday=ON")
+        _append_swaggy_no_atlas_log("SWAGGY_NO_ATLAS_SKIP reason=SATURDAY_OFF")
+        return result
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
+    ltf_limit = max(int(swaggy_cfg.ltf_limit), 120)
+    mtf_limit = 200
+    htf_limit = max(int(swaggy_cfg.vp_lookback_1h), 120)
+    htf2_limit = 200
+    d1_limit = 120
+
+    for symbol in swaggy_universe:
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if _both_sides_open(st) and not hedge_mode:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            long_amt = get_long_position_amount(symbol)
+        except Exception:
+            long_amt = 0.0
+        try:
+            short_amt = get_short_position_amount(symbol)
+        except Exception:
+            short_amt = 0.0
+        if (long_amt > 0) or (short_amt > 0):
+            st["in_pos_long"] = bool(long_amt > 0)
+            st["in_pos_short"] = bool(short_amt > 0)
+            st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
+            now_seen = time.time()
+            if long_amt > 0:
+                _set_last_entry_state(st, "LONG", now_seen)
+            if short_amt > 0:
+                _set_last_entry_state(st, "SHORT", now_seen)
+            state[symbol] = st
+            if (long_amt > 0) and (short_amt > 0):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+        df_5m = cycle_cache.get_df(symbol, swaggy_cfg.tf_ltf, limit=ltf_limit)
+        df_15m = cycle_cache.get_df(symbol, swaggy_cfg.tf_mtf, limit=mtf_limit)
+        df_1h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf, limit=htf_limit)
+        df_4h = cycle_cache.get_df(symbol, swaggy_cfg.tf_htf2, limit=htf2_limit)
+        df_1d = cycle_cache.get_df(symbol, swaggy_cfg.tf_d1, limit=d1_limit)
+        df_3m = cycle_cache.get_df(symbol, "3m", limit=30)
+        if df_5m.empty or df_15m.empty or df_1h.empty or df_4h.empty or df_3m.empty:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        prev_phase = swaggy_no_atlas_engine._state.get(symbol, {}).get("phase")
+        signal = swaggy_no_atlas_engine.evaluate_symbol(
+            symbol,
+            df_4h,
+            df_1h,
+            df_15m,
+            df_5m,
+            df_3m,
+            df_1d if isinstance(df_1d, pd.DataFrame) else pd.DataFrame(),
+            now_ts,
+        )
+        new_phase = swaggy_no_atlas_engine._state.get(symbol, {}).get("phase")
+        if prev_phase != new_phase and new_phase:
+            _append_swaggy_no_atlas_log(
+                "SWAGGY_NO_ATLAS_PHASE sym=%s prev=%s now=%s reasons=%s"
+                % (symbol, prev_phase, new_phase, ",".join(signal.reasons or []))
+            )
+
+        debug = signal.debug if isinstance(signal.debug, dict) else {}
+        event_list = debug.get("events") if isinstance(debug.get("events"), list) else []
+        if event_list:
+            for event in event_list:
+                if not isinstance(event, dict):
+                    continue
+                payload = {
+                    "ts": _iso_kst(),
+                    "event": event.get("event") or "SWAGGY_EVENT",
+                    "engine": "SWAGGY_NO_ATLAS",
+                    "mode": "live" if LIVE_TRADING or LONG_LIVE_TRADING else "paper",
+                    "symbol": symbol,
+                    "side": event.get("side") or signal.side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": event.get("range_id") or debug.get("touch_key"),
+                }
+                payload.update(event)
+                _append_swaggy_trade_json(payload)
+
+        if not signal.entry_ok or not signal.side or signal.entry_px is None:
+            if symbol in debug_syms or _symbol_in_pos_any(st):
+                phase_info = None
+                if isinstance(swaggy_no_atlas_engine, object):
+                    try:
+                        phase_info = (swaggy_no_atlas_engine._state or {}).get(symbol)
+                    except Exception:
+                        phase_info = None
+                cooldown_until = None
+                last_signal_ts = None
+                if isinstance(phase_info, dict):
+                    cooldown_until = phase_info.get("cooldown_until")
+                    last_signal_ts = phase_info.get("last_signal_ts")
+                cooldown_until_fmt = None
+                last_signal_fmt = None
+                try:
+                    if isinstance(cooldown_until, (int, float)):
+                        cooldown_until_fmt = _iso_kst(float(cooldown_until))
+                except Exception:
+                    cooldown_until_fmt = None
+                try:
+                    if isinstance(last_signal_ts, (int, float)):
+                        last_signal_fmt = _iso_kst(float(last_signal_ts))
+                except Exception:
+                    last_signal_fmt = None
+                _append_swaggy_no_atlas_log(
+                    "SWAGGY_NO_ATLAS_SKIP sym=%s reason=ENTRY_NOT_READY entry_ok=%s side=%s entry_px=%s "
+                    "phase=%s reasons=%s confirm_pass=%s confirm_fail=%s cooldown_until=%s last_signal=%s"
+                    % (
+                        symbol,
+                        int(bool(signal.entry_ok)),
+                        signal.side,
+                        _fmt(debug.get("entry_px") or signal.entry_px),
+                        new_phase or prev_phase,
+                        ",".join(signal.reasons or []),
+                        _fmt(debug.get("confirm_pass")),
+                        _fmt(debug.get("confirm_fail")),
+                        cooldown_until_fmt or "N/A",
+                        last_signal_fmt or "N/A",
+                    )
+                )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        side = signal.side.upper()
+        entry_px = signal.entry_px
+        if symbol in debug_syms or _symbol_in_pos_any(st):
+            try:
+                live_amt_dbg = (
+                    executor_mod.get_long_position_amount(symbol)
+                    if side == "LONG"
+                    else executor_mod.get_short_position_amount(symbol)
+                ) if executor_mod else None
+            except Exception:
+                live_amt_dbg = None
+            if _is_in_pos_side(st, side) and not _get_open_trade(state, side, symbol):
+                _get_open_trade_or_backfill(state, symbol, side, now_ts=now_ts)
+            _append_swaggy_no_atlas_log(
+                "SWAGGY_NO_ATLAS_ENTRY_READY sym=%s side=%s entry_px=%s in_pos_flag=%s live_amt=%s open_tr=%s"
+                % (
+                    symbol,
+                    side,
+                    _fmt(entry_px),
+                    int(bool(_is_in_pos_side(st, side))),
+                    _fmt(live_amt_dbg) if live_amt_dbg is not None else "N/A",
+                    int(bool(_get_open_trade(state, side, symbol))),
+                )
+            )
+        in_pos_same = _is_in_pos_side(st, side)
+        if not in_pos_same:
+            try:
+                open_tr = _get_open_trade(state, side, symbol)
+                if isinstance(open_tr, dict):
+                    in_pos_same = True
+            except Exception:
+                pass
+        live_amt_same = None
+        if not in_pos_same:
+            try:
+                live_amt = (
+                    executor_mod.get_long_position_amount(symbol)
+                    if side == "LONG"
+                    else executor_mod.get_short_position_amount(symbol)
+                )
+                live_amt_same = live_amt
+                if isinstance(live_amt, (int, float)) and live_amt > 0:
+                    in_pos_same = True
+                    if side == "LONG":
+                        st["in_pos_long"] = True
+                    else:
+                        st["in_pos_short"] = True
+                    st["in_pos"] = True
+                    state[symbol] = st
+            except Exception:
+                pass
+        last_entry = _get_last_entry_ts_by_side(st, side)
+        if not in_pos_same:
+            if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if _exit_cooldown_blocked(state, symbol, "swaggy_no_atlas", side, ttl_sec=COOLDOWN_SEC):
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+        _append_swaggy_no_atlas_log(
+            f"SWAGGY_NO_ATLAS_MULTI_CHECK sym={symbol} side={side} in_pos_same={int(bool(in_pos_same))} "
+            f"multi_on={int(bool(SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED))} "
+            f"cooldown={int(_exit_cooldown_blocked(state, symbol, 'swaggy_no_atlas', side, ttl_sec=COOLDOWN_SEC))} "
+            f"live_amt={_fmt(live_amt_same) if live_amt_same is not None else 'N/A'}"
+        )
+        if in_pos_same and _exit_cooldown_blocked(state, symbol, "swaggy_no_atlas", side, ttl_sec=COOLDOWN_SEC):
+            _append_swaggy_no_atlas_log(
+                f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_EXIT_COOLDOWN side={side}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        overext_signed = _swaggy_no_atlas_overext_dist(df_5m, side, swaggy_cfg)
+        if (
+            SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
+            and isinstance(overext_signed, (int, float))
+            and overext_signed < SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+        ):
+            _append_swaggy_no_atlas_log(
+                f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=SKIP_OVEREXT_DEEP overext={overext_signed:.4g}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+
+        if swaggy_cfg:
+            overext_val = debug.get("overext_dist_at_entry")
+            if isinstance(overext_val, (int, float)):
+                overext_val = abs(float(overext_val))
+            if (
+                swaggy_cfg.skip_overext_mid
+                and isinstance(overext_val, (int, float))
+                and 1.1 <= overext_val < 1.4
+            ):
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=SKIP_OVEREXT_MID overext={overext_val:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+        entry_quality = "NA"
+        entry_quality_reasons = ["NO_ATLAS"]
+        entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE)
+        strength_val = float(signal.strength or 0.0)
+        reasons_val = signal.reasons
+        entry_line = (
+            "SWAGGY_NO_ATLAS_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
+            "final_usdt=%.2f "
+            "level_score=%s touch_count=%s level_age=%s trigger_combo=%s confirm_pass=%s confirm_fail=%s "
+            "overext_dist_at_touch=%s overext_dist_at_entry=%s entry_quality=%s"
+            % (
+                symbol,
+                side,
+                float(strength_val),
+                ",".join(reasons_val or []),
+                float(entry_usdt or 0.0),
+                _fmt(debug.get("level_score")),
+                _fmt(debug.get("touch_count")),
+                _fmt(debug.get("level_age_sec")),
+                _fmt(debug.get("trigger_combo")),
+                _fmt(debug.get("confirm_pass")),
+                _fmt(debug.get("confirm_fail")),
+                _fmt(debug.get("overext_dist_at_touch")),
+                _fmt(debug.get("overext_dist_at_entry")),
+                _fmt(entry_quality),
+            )
+        )
+        _append_swaggy_no_atlas_log(entry_line)
+        body_ratio = None
+        confirm_metrics = debug.get("confirm_metrics")
+        if isinstance(confirm_metrics, dict):
+            body_ratio = confirm_metrics.get("body_ratio")
+        if (
+            swaggy_cfg.skip_confirm_body
+            and isinstance(body_ratio, (int, float))
+            and float(body_ratio) < 0.60
+        ):
+            _append_swaggy_no_atlas_log(
+                f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=SKIP_CONFIRM_BODY body_ratio={body_ratio:.4g}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        cur_total = count_open_positions(force=True)
+        if not isinstance(cur_total, int):
+            cur_total = active_positions_total
+        if cur_total >= MAX_OPEN_POSITIONS and not in_pos_same:
+            _append_entry_gate_log(
+                "swaggy_no_atlas",
+                symbol,
+                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side} in_pos_same={in_pos_same} live_amt={live_amt_same}",
+                side=side,
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        is_multi_add = False
+        multi_next = 0
+        if in_pos_same:
+            if not SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED:
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=IN_POS side={side}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            open_tr = _get_open_trade(state, side, symbol)
+            if not open_tr:
+                open_tr = _get_open_trade_or_backfill(state, symbol, side, now_ts=now_ts)
+            if not open_tr:
+                if symbol in debug_syms:
+                    try:
+                        db_snap = _db_latest_position_snapshot(symbol, side)
+                    except Exception:
+                        db_snap = None
+                    try:
+                        _, by_symbol = _load_entry_events_map(since_ts=now_ts - 7 * 24 * 3600)
+                        evs = by_symbol.get((symbol, side)) if isinstance(by_symbol, dict) else None
+                        evs_cnt = len(evs) if isinstance(evs, list) else 0
+                    except Exception:
+                        evs_cnt = 0
+                        evs = None
+                    _append_swaggy_no_atlas_log(
+                        "SWAGGY_NO_ATLAS_DEBUG_OPEN_TRADE sym=%s side=%s in_pos_flag=%s live_amt=%s db_snap=%s evs=%s"
+                        % (
+                            symbol,
+                            side,
+                            int(bool(_is_in_pos_side(st, side))),
+                            _fmt(
+                                executor_mod.get_long_position_amount(symbol)
+                                if side == "LONG"
+                                else executor_mod.get_short_position_amount(symbol)
+                            )
+                            if executor_mod
+                            else "N/A",
+                            _fmt(db_snap) if db_snap else "N/A",
+                            evs_cnt,
+                        )
+                    )
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_NO_OPEN_TRADE side={side}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            adds_key = f"multi_entry_adds_{side.lower()}"
+            adds_done = int(st.get(adds_key, 0) or 0)
+            if SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX > 0 and adds_done >= SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX:
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_MAX side={side} adds={adds_done}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE == "roi":
+                try:
+                    entry_ref = float(open_tr.get("entry_price") or 0.0)
+                    mark_px = float(df_5m["close"].iloc[-1])
+                except Exception:
+                    entry_ref = 0.0
+                    mark_px = 0.0
+                roi_pct = 0.0
+                if entry_ref > 0 and mark_px > 0:
+                    if side == "LONG":
+                        roi_pct = (mark_px - entry_ref) / entry_ref * 100.0
+                    else:
+                        roi_pct = (entry_ref - mark_px) / entry_ref * 100.0
+                if roi_pct > -abs(SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI):
+                    _append_swaggy_no_atlas_log(
+                        f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=MULTI_ROI side={side} roi={roi_pct:.2f}%"
+                    )
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+            is_multi_add = True
+            multi_next = adds_done + 1
+
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="swaggy_no_atlas", side=side)
+        if not lock_ok:
+            _append_swaggy_no_atlas_log(
+                f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=ENTRY_LOCK owner={lock_owner} age_s={lock_age:.1f}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        guard_key = _entry_guard_key(state, symbol, side)
+        if not _entry_guard_acquire(state, symbol, key=guard_key, engine="swaggy_no_atlas", side=side):
+            _entry_lock_release(state, symbol, owner="swaggy_no_atlas", side=side)
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        try:
+            live = LONG_LIVE_TRADING if side == "LONG" else LIVE_TRADING
+            _append_swaggy_no_atlas_log(
+                "SWAGGY_NO_ATLAS_ENQUEUE sym=%s side=%s in_pos_same=%s in_pos_flag=%s live_amt=%s open_tr=%s reason=%s"
+                % (
+                    symbol,
+                    side,
+                    int(bool(in_pos_same)),
+                    int(bool(_is_in_pos_side(st, side))),
+                    _fmt(
+                        executor_mod.get_long_position_amount(symbol)
+                        if side == "LONG"
+                        else executor_mod.get_short_position_amount(symbol)
+                    )
+                    if executor_mod
+                    else "N/A",
+                    int(bool(_get_open_trade(state, side, symbol))),
+                    "swaggy_no_atlas_multi" if is_multi_add else "swaggy_no_atlas",
+                )
+            )
+            req_id = _enqueue_entry_request(
+                state,
+                symbol=symbol,
+                side=side,
+                engine="SWAGGY_NO_ATLAS",
+                reason="swaggy_no_atlas_multi" if is_multi_add else "swaggy_no_atlas",
+                usdt=entry_usdt,
+                live=live,
+                alert_reason="SWAGGY_NO_ATLAS",
+                alert_tag=f"MULTI_ENTRY:{multi_next}" if is_multi_add else None,
+                allow_over_max=is_multi_add,
+            )
+            if req_id:
+                if is_multi_add:
+                    adds_key = f"multi_entry_adds_{side.lower()}"
+                    st[adds_key] = int(st.get(adds_key, 0) or 0) + 1
+                    state[symbol] = st
+                    try:
+                        open_tr = _get_open_trade(state, side, symbol)
+                        if open_tr:
+                            open_tr["multi_entry_adds"] = int(open_tr.get("multi_entry_adds", 0)) + 1
+                    except Exception:
+                        pass
+                trade_payload = {
+                    "ts": _iso_kst(),
+                    "event": "SWAGGY_TRADE",
+                    "engine": "SWAGGY_NO_ATLAS",
+                    "mode": "live" if live else "paper",
+                    "symbol": symbol,
+                    "side": side,
+                    "ltf": swaggy_cfg.tf_ltf,
+                    "mtf": swaggy_cfg.tf_mtf,
+                    "htf": swaggy_cfg.tf_htf,
+                    "htf2": swaggy_cfg.tf_htf2,
+                    "cycle_id": cycle_id,
+                    "range_id": debug.get("touch_key"),
+                    "entry_ts": _iso_kst(),
+                    "entry_price": signal.entry_px,
+                    "atr14_ltf": debug.get("atr14_ltf"),
+                    "atr14_htf": debug.get("atr14_htf"),
+                    "ema20_ltf": debug.get("ema20_ltf"),
+                    "ema20_htf": debug.get("ema20_htf"),
+                    "level_type": debug.get("level_type"),
+                    "level_price": debug.get("level_price"),
+                    "level_score": debug.get("level_score"),
+                    "touch_count": debug.get("touch_count"),
+                    "level_age_bars": debug.get("level_age_bars"),
+                    "touch_pct": debug.get("touch_pct"),
+                    "touch_atr_mult": debug.get("touch_atr_mult"),
+                    "touch_pass": int(debug.get("touch_pass") or 0),
+                    "touch_fail_reason": debug.get("touch_fail_reason"),
+                    "trigger_combo": debug.get("trigger_combo"),
+                    "trigger_strength_best": debug.get("trigger_strength_best"),
+                    "trigger_strength_min": debug.get("trigger_strength_min"),
+                    "trigger_strength_avg": debug.get("trigger_strength_avg"),
+                    "trigger_strength_used": debug.get("trigger_strength_used"),
+                    "trigger_parts": debug.get("trigger_parts"),
+                    "strength_total": debug.get("strength_total"),
+                    "strength_min_req": debug.get("strength_min_req"),
+                    "trigger_threshold_used": debug.get("trigger_threshold_used"),
+                    "use_trigger_min": debug.get("use_trigger_min"),
+                    "confirm_pass": int(debug.get("confirm_pass") or 0),
+                    "confirm_fail_reason": debug.get("confirm_fail"),
+                    "confirm_metrics": debug.get("confirm_metrics"),
+                    "confirm_body_ratio": (debug.get("confirm_metrics") or {}).get("body_ratio")
+                    if isinstance(debug.get("confirm_metrics"), dict)
+                    else None,
+                    "overext_ema_len": debug.get("overext_ema_len"),
+                    "overext_atr_mult": debug.get("overext_atr_mult"),
+                    "overext_dist_at_touch": debug.get("overext_dist_at_touch"),
+                    "overext_dist_at_entry": debug.get("overext_dist_at_entry"),
+                    "overext_blocked": 0,
+                    "overext_state": "OK",
+                    "atlas_pass_soft": None,
+                    "atlas_pass_hard": None,
+                    "atlas_state": None,
+                    "atlas_regime": None,
+                    "atlas_rs": None,
+                    "atlas_rs_z": None,
+                    "atlas_corr": None,
+                    "atlas_beta": None,
+                    "atlas_vol_ratio": None,
+                    "atlas_block_reason": None,
+                    "entry_quality_bucket": entry_quality,
+                    "entry_quality_reasons": entry_quality_reasons,
+                }
+                _append_swaggy_trade_json(trade_payload)
+                if side == "LONG":
+                    result["long_hits"] += 1
+                else:
+                    result["short_hits"] += 1
+        except Exception as e:
+            _append_swaggy_no_atlas_log(f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=QUEUE_ERROR {e}")
+        finally:
+            _entry_guard_release(state, symbol, key=guard_key)
+            _entry_lock_release(state, symbol, owner="swaggy_no_atlas", side=side)
 
         time.sleep(PER_SYMBOL_SLEEP)
     return result
@@ -1018,51 +2581,60 @@ def _set_last_entry_state(st: Dict[str, Any], side: str, ts: float) -> None:
         st["last_entry_ts_short"] = ts_val
 
 
-def _atlasfabio_entry_gate(
-    symbol: str,
-    side: str,
-    st: dict,
-    now_ts: float,
-    gate_tier: str,
-    gate_score: Optional[float],
-    live_ok: bool,
-    max_positions: Optional[int] = None,
-    active_positions: Optional[int] = None,
-) -> tuple[bool, str]:
-    if not live_ok:
-        return False, "live_off"
-    if st.get("in_pos"):
-        return False, "in_pos"
-    last_entry = _get_last_entry_ts_by_side(st, side)
-    if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
-        return False, "cooldown"
-    last_exit_ts = _get_last_exit_ts_by_side(st, side)
-    if isinstance(last_exit_ts, (int, float)) and (now_ts - float(last_exit_ts)) < EXIT_COOLDOWN_SEC:
-        _append_entry_gate_log(
-            "atlasfabio",
-            symbol,
-            f"청산쿨다운={int(EXIT_COOLDOWN_SEC)}s side={side}",
-        )
-        return False, "exit_cooldown"
-    if isinstance(max_positions, int) and isinstance(active_positions, int):
-        if active_positions >= max_positions:
-            _append_entry_gate_log(
-                "atlasfabio",
-                symbol,
-                f"포지션제한={active_positions}/{max_positions} side={side}",
-                side=side,
-            )
-            return False, "max_pos"
-    return True, "ok"
+def _symbol_in_pos_any(st: Optional[dict]) -> bool:
+    if not isinstance(st, dict):
+        return False
+    if ("in_pos_long" in st) or ("in_pos_short" in st):
+        return bool(st.get("in_pos_long")) or bool(st.get("in_pos_short"))
+    return bool(st.get("in_pos"))
 
 
-def _atlas_tier_from_score(score: Optional[float]) -> str:
-    if isinstance(score, (int, float)):
-        if score >= ATLASFABIO_STRONG_SCORE:
-            return "STRONG"
-        if score >= ATLASFABIO_MID_SCORE:
-            return "MID"
-    return "NO"
+def _is_in_pos_side(st: Optional[dict], side: str) -> bool:
+    if not isinstance(st, dict):
+        return False
+    side_key = (side or "").upper()
+    if side_key == "LONG":
+        if "in_pos_long" in st:
+            return bool(st.get("in_pos_long"))
+    elif side_key == "SHORT":
+        if "in_pos_short" in st:
+            return bool(st.get("in_pos_short"))
+    return bool(st.get("in_pos"))
+
+
+def _both_sides_open(st: Optional[dict]) -> bool:
+    if not isinstance(st, dict):
+        return False
+    if ("in_pos_long" in st) or ("in_pos_short" in st):
+        return bool(st.get("in_pos_long")) and bool(st.get("in_pos_short"))
+    return False
+
+
+def _has_open_side(st: Optional[dict], side: str) -> bool:
+    return _is_in_pos_side(st, side)
+
+
+def _set_in_pos_side(st: Dict[str, Any], side: str, val: bool) -> None:
+    side_key = (side or "").upper()
+    if side_key == "LONG":
+        st["in_pos_long"] = bool(val)
+    elif side_key == "SHORT":
+        st["in_pos_short"] = bool(val)
+    st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
+
+
+def _count_open_positions_state(state: Dict[str, dict]) -> int:
+    total = 0
+    for st in state.values():
+        if not isinstance(st, dict):
+            continue
+        if ("in_pos_long" in st) or ("in_pos_short" in st):
+            total += 1 if st.get("in_pos_long") else 0
+            total += 1 if st.get("in_pos_short") else 0
+        elif st.get("in_pos"):
+            total += 1
+    return total
+
 
 
 def _entry_guard_acquire(
@@ -1092,9 +2664,65 @@ def _exit_cooldown_blocked(
     ttl_sec: Optional[float] = None,
 ) -> bool:
     if ttl_sec is None:
-        ttl_sec = EXIT_COOLDOWN_SEC
+        ttl_sec = COOLDOWN_SEC
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     last_exit_ts = _get_last_exit_ts_by_side(st, side)
+    if not isinstance(last_exit_ts, (int, float)):
+        last_exit_ts = None
+    if dbrec and dbrec.ENABLED:
+        now_db = time.time()
+        cache = _DB_EXIT_CACHE
+        data = cache.get("data") if isinstance(cache.get("data"), dict) else {}
+        if (now_db - float(cache.get("ts") or 0.0)) > 5.0 or not isinstance(data, dict):
+            try:
+                db_path = getattr(dbrec, "DB_PATH", "") or os.path.join(os.path.dirname(__file__), "logs", "trades.db")
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                rows = cur.execute(
+                    """
+                    SELECT symbol, side, MAX(ts) as last_ts
+                    FROM positions
+                    WHERE qty <= 0
+                    GROUP BY symbol, side
+                    """
+                ).fetchall()
+                data = {}
+                for sym, side_val, ts_val in rows:
+                    if not sym or not side_val or ts_val is None:
+                        continue
+                    data[(sym, str(side_val).upper())] = float(ts_val)
+                conn.close()
+            except Exception:
+                data = {}
+            cache["data"] = data if isinstance(data, dict) else {}
+            cache["ts"] = now_db
+        key = (symbol, side)
+        db_ts = data.get(key) if isinstance(data, dict) else None
+        if isinstance(db_ts, (int, float)) and (last_exit_ts is None or float(db_ts) > float(last_exit_ts)):
+            _set_last_exit_state(st, side, float(db_ts), "db_exit")
+            state[symbol] = st
+            last_exit_ts = float(db_ts)
+    if MANAGE_WS_MODE:
+        now_disk = time.time()
+        cache = _DISK_STATE_CACHE
+        data = cache.get("data") if isinstance(cache.get("data"), dict) else {}
+        if (now_disk - float(cache.get("ts") or 0.0)) > 5.0 or not isinstance(data, dict):
+            try:
+                data = load_state()
+            except Exception:
+                data = {}
+            cache["data"] = data if isinstance(data, dict) else {}
+            cache["ts"] = now_disk
+        disk_st = data.get(symbol) if isinstance(data, dict) else None
+        if isinstance(disk_st, dict):
+            disk_exit_ts = _get_last_exit_ts_by_side(disk_st, side)
+            disk_exit_reason = _get_last_exit_reason_by_side(disk_st, side)
+            if isinstance(disk_exit_ts, (int, float)) and (
+                last_exit_ts is None or float(disk_exit_ts) > float(last_exit_ts)
+            ):
+                _set_last_exit_state(st, side, float(disk_exit_ts), str(disk_exit_reason or ""))
+                state[symbol] = st
+                last_exit_ts = float(disk_exit_ts)
     if not isinstance(last_exit_ts, (int, float)):
         return False
     now = time.time()
@@ -1118,6 +2746,208 @@ def _entry_guard_release(state: Dict[str, dict], symbol: str, key: Optional[str]
     for k in keys:
         guard.pop(k, None)
 
+def _manual_alert_key(symbol: str, side: str) -> str:
+    return f"{symbol}|{side.upper()}"
+
+def _get_manual_alerted(state: Dict[str, dict]) -> Dict[str, float]:
+    cache = state.get("_manual_alerted")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_manual_alerted"] = cache
+    return cache
+
+def _manual_alert_info(state: Dict[str, dict], symbol: str, side: str) -> Optional[dict]:
+    cache = _get_manual_alerted(state)
+    info = cache.get(_manual_alert_key(symbol, side))
+    return info if isinstance(info, dict) else None
+
+def _mark_manual_alerted(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    entry_price: Optional[float] = None,
+    qty: Optional[float] = None,
+) -> None:
+    cache = _get_manual_alerted(state)
+    cache[_manual_alert_key(symbol, side)] = {
+        "ts": time.time(),
+        "entry": entry_price,
+        "qty": qty,
+    }
+
+def _clear_manual_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
+    cache = _get_manual_alerted(state)
+    cache.pop(_manual_alert_key(symbol, side), None)
+
+def _entry_alert_key(symbol: str, side: str) -> str:
+    return f"{symbol}|{side.upper()}"
+
+def _get_entry_alerted(state: Dict[str, dict]) -> Dict[str, dict]:
+    cache = state.get("_entry_alerted")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_entry_alerted"] = cache
+    return cache
+
+def _entry_alert_info(state: Dict[str, dict], symbol: str, side: str) -> Optional[dict]:
+    cache = _get_entry_alerted(state)
+    info = cache.get(_entry_alert_key(symbol, side))
+    return info if isinstance(info, dict) else None
+
+def _mark_entry_alerted(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    engine: Optional[str] = None,
+    reason: Optional[str] = None,
+    entry_order_id: Optional[str] = None,
+) -> None:
+    cache = _get_entry_alerted(state)
+    now_ts = time.time()
+    cache[_entry_alert_key(symbol, side)] = {
+        "ts": now_ts,
+        "engine": engine,
+        "reason": reason,
+        "entry_order_id": entry_order_id,
+    }
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    if not isinstance(st, dict):
+        st = {}
+    suffix = "long" if side.upper() == "LONG" else "short"
+    st[f"entry_alerted_{suffix}"] = True
+    st[f"entry_alerted_{suffix}_ts"] = now_ts
+    if engine:
+        st[f"entry_alerted_{suffix}_engine"] = str(engine)
+    if reason:
+        st[f"entry_alerted_{suffix}_reason"] = str(reason)
+    if entry_order_id:
+        st[f"entry_alerted_{suffix}_order_id"] = entry_order_id
+    state[symbol] = st
+
+def _clear_entry_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
+    cache = _get_entry_alerted(state)
+    cache.pop(_entry_alert_key(symbol, side), None)
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    if not isinstance(st, dict):
+        return
+    suffix = "long" if side.upper() == "LONG" else "short"
+    st.pop(f"entry_alerted_{suffix}", None)
+    st.pop(f"entry_alerted_{suffix}_ts", None)
+    st.pop(f"entry_alerted_{suffix}_engine", None)
+    st.pop(f"entry_alerted_{suffix}_reason", None)
+    st.pop(f"entry_alerted_{suffix}_order_id", None)
+    state[symbol] = st
+
+def _dca_alert_key(symbol: str, side: str, adds_done: int) -> str:
+    return f"{symbol}|{side.upper()}|{adds_done}"
+
+def _get_dca_alerted(state: Dict[str, dict]) -> Dict[str, float]:
+    cache = state.get("_dca_alerted")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_dca_alerted"] = cache
+    return cache
+
+def _dca_alerted(state: Dict[str, dict], symbol: str, side: str, adds_done: int) -> bool:
+    cache = _get_dca_alerted(state)
+    return _dca_alert_key(symbol, side, adds_done) in cache
+
+def _mark_dca_alerted(state: Dict[str, dict], symbol: str, side: str, adds_done: int) -> None:
+    cache = _get_dca_alerted(state)
+    cache[_dca_alert_key(symbol, side, adds_done)] = time.time()
+
+def _clear_dca_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
+    cache = _get_dca_alerted(state)
+    prefix = f"{symbol}|{side.upper()}|"
+    for key in list(cache.keys()):
+        if str(key).startswith(prefix):
+            cache.pop(key, None)
+
+
+def _manage_pending_key(symbol: str, side: str) -> str:
+    return f"{symbol}|{side.upper()}"
+
+def _get_manage_pending(state: Dict[str, dict]) -> Dict[str, dict]:
+    pending = state.get("_manage_pending")
+    if not isinstance(pending, dict):
+        pending = {}
+        state["_manage_pending"] = pending
+    return pending
+
+def _mark_manage_pending(state: Dict[str, dict], symbol: str, side: str, req_id: str) -> None:
+    pending = _get_manage_pending(state)
+    pending[_manage_pending_key(symbol, side)] = {"id": req_id, "ts": time.time()}
+
+def _clear_manage_pending(state: Dict[str, dict], symbol: str, side: str) -> None:
+    pending = _get_manage_pending(state)
+    pending.pop(_manage_pending_key(symbol, side), None)
+
+def _is_manage_pending(state: Dict[str, dict], symbol: str, side: str) -> bool:
+    pending = _get_manage_pending(state)
+    key = _manage_pending_key(symbol, side)
+    item = pending.get(key)
+    if not isinstance(item, dict):
+        return False
+    ts = item.get("ts")
+    if isinstance(ts, (int, float)) and (time.time() - float(ts)) <= MANAGE_QUEUE_PENDING_TTL_SEC:
+        return True
+    pending.pop(key, None)
+    return False
+
+def _enqueue_entry_request(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    engine: str,
+    reason: str,
+    usdt: float,
+    live: bool,
+    alert_reason: Optional[str] = None,
+    alert_tag: Optional[str] = None,
+    entry_price_hint: Optional[float] = None,
+    size_mult: Optional[float] = None,
+    notify: bool = False,
+    allow_over_max: bool = False,
+) -> Optional[str]:
+    if _is_manage_pending(state, symbol, side):
+        _append_entry_gate_log(engine.lower(), symbol, f"pending_request side={side}", side=side)
+        return None
+    cur_total = None
+    try:
+        cur_total = count_open_positions(force=True)
+    except Exception:
+        cur_total = None
+    if not isinstance(cur_total, int):
+        cur_total = _count_open_positions_state(state)
+    if not allow_over_max and isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+        _append_entry_gate_log(engine.lower(), symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
+        return None
+    _log_entry_usdt_debug(symbol, engine, usdt)
+    payload = {
+        "type": "entry",
+        "symbol": symbol,
+        "side": side.upper(),
+        "engine": engine,
+        "reason": reason,
+        "alert_reason": alert_reason,
+        "alert_tag": alert_tag,
+        "usdt": float(usdt),
+        "leverage": LEVERAGE,
+        "margin_mode": MARGIN_MODE,
+        "live": bool(live),
+        "entry_price_hint": entry_price_hint,
+        "size_mult": size_mult,
+    }
+    req_id = manage_queue.enqueue_request(payload)
+    _mark_manage_pending(state, symbol, side, req_id)
+    if notify:
+        price_text = _fmt_float(entry_price_hint, 6) if isinstance(entry_price_hint, (int, float)) else "N/A"
+        send_telegram(
+            f"📝 <b>QUEUE</b>\n"
+            f"<b>{symbol}</b>\n"
+            f"{side} entry={price_text}"
+        )
+    return req_id
 
 def _entry_lock_acquire(
     state: Dict[str, dict],
@@ -1128,27 +2958,29 @@ def _entry_lock_acquire(
 ) -> tuple[bool, Optional[str], Optional[float]]:
     lock = _get_entry_lock(state)
     now = time.time()
+    key = f"{symbol}|{(side or '').upper()}" if side else symbol
     with _ENTRY_LOCK_MUTEX:
-        cur = lock.get(symbol)
+        cur = lock.get(key)
         if isinstance(cur, dict):
             expires = float(cur.get("expires", 0.0) or 0.0)
             if now < expires and cur.get("owner"):
                 held_by = str(cur.get("owner"))
                 _append_entry_gate_log(owner, symbol, f"entry_lock_held_by={held_by}", side=side)
                 return False, held_by, expires - now
-        lock[symbol] = {"owner": owner, "expires": now + ttl_sec, "ts": now}
+        lock[key] = {"owner": owner, "expires": now + ttl_sec, "ts": now}
     return True, None, None
 
 
-def _entry_lock_release(state: Dict[str, dict], symbol: str, owner: Optional[str] = None) -> None:
+def _entry_lock_release(state: Dict[str, dict], symbol: str, owner: Optional[str] = None, side: Optional[str] = None) -> None:
     lock = _get_entry_lock(state)
+    key = f"{symbol}|{(side or '').upper()}" if side else symbol
     with _ENTRY_LOCK_MUTEX:
-        cur = lock.get(symbol)
+        cur = lock.get(key)
         if not isinstance(cur, dict):
             return
         if owner and cur.get("owner") != owner:
             return
-        lock.pop(symbol, None)
+        lock.pop(key, None)
 
 def _log_trade_entry(
     state: Dict[str, dict],
@@ -1194,6 +3026,7 @@ def _log_trade_entry(
         if not isinstance(st, dict):
             st = {}
         _set_last_entry_state(st, side, entry_ts)
+        _set_in_pos_side(st, side, True)
         state[symbol] = st
     except Exception:
         pass
@@ -1210,6 +3043,150 @@ def _get_open_trade(state: Dict[str, dict], side: str, symbol: str) -> Optional[
         if tr.get("status") == "open" and tr.get("side") == side and tr.get("symbol") == symbol:
             return tr
     return None
+
+def _get_open_trade_or_backfill(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    now_ts: Optional[float] = None,
+) -> Optional[dict]:
+    tr = _get_open_trade(state, side, symbol)
+    if tr:
+        return tr
+    return _backfill_open_trade_from_db(state, symbol, side, now_ts=now_ts)
+
+def _db_latest_position_snapshot(symbol: str, side: str) -> Optional[dict]:
+    if not dbrec:
+        return None
+    try:
+        # ensure .env has been loaded and dbrec.ENABLED refreshed
+        dbrec._get_conn()
+    except Exception:
+        pass
+    if not dbrec.ENABLED:
+        return None
+    try:
+        db_path = getattr(dbrec, "DB_PATH", "") or os.path.join(os.path.dirname(__file__), "logs", "trades.db")
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            """
+            SELECT ts, side, qty, avg_entry
+            FROM positions
+            WHERE symbol = ?
+            ORDER BY ts DESC
+            LIMIT 20
+            """,
+            (symbol,),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return None
+    want_side = (side or "").upper()
+    for row in rows or []:
+        try:
+            ts_val = float(row[0]) if row[0] is not None else None
+        except Exception:
+            ts_val = None
+        row_side = str(row[1] or "").upper()
+        try:
+            qty_val = float(row[2]) if row[2] is not None else None
+        except Exception:
+            qty_val = None
+        try:
+            avg_entry = float(row[3]) if row[3] is not None else None
+        except Exception:
+            avg_entry = None
+        if ts_val is None or qty_val is None or qty_val == 0:
+            continue
+        if want_side == "LONG":
+            if row_side != "LONG":
+                continue
+            if qty_val <= 0:
+                continue
+            return {"ts": ts_val, "qty": float(qty_val), "avg_entry": avg_entry}
+        if want_side == "SHORT":
+            if row_side != "SHORT":
+                continue
+            if qty_val >= 0 and row_side not in ("SHORT", "BOTH", ""):
+                continue
+            return {"ts": ts_val, "qty": float(abs(qty_val)), "avg_entry": avg_entry}
+    return None
+
+def _find_entry_event_for_backfill(
+    symbol: str,
+    side: str,
+    ref_ts: Optional[float] = None,
+    now_ts: Optional[float] = None,
+    window_sec: float = 7 * 24 * 3600,
+) -> Optional[dict]:
+    now_ts = float(now_ts if isinstance(now_ts, (int, float)) else time.time())
+    since_ts = now_ts - float(window_sec)
+    _, by_symbol = _load_entry_events_map(since_ts=since_ts)
+    recs = by_symbol.get((symbol, (side or "").upper())) if isinstance(by_symbol, dict) else None
+    if not recs:
+        return None
+    if isinstance(ref_ts, (int, float)):
+        best = None
+        best_gap = None
+        for rec in recs:
+            ts_val = rec.get("entry_ts")
+            if not isinstance(ts_val, (int, float)):
+                continue
+            gap = abs(float(ts_val) - float(ref_ts))
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best = rec
+        return best
+    return max(recs, key=lambda r: float(r.get("entry_ts") or 0.0))
+
+def _backfill_open_trade_from_db(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    now_ts: Optional[float] = None,
+) -> Optional[dict]:
+    if _get_open_trade(state, side, symbol):
+        return _get_open_trade(state, side, symbol)
+    pos = _db_latest_position_snapshot(symbol, side)
+    if not isinstance(pos, dict):
+        return None
+    ref_ts = pos.get("ts")
+    rec = _find_entry_event_for_backfill(symbol, side, ref_ts=ref_ts, now_ts=now_ts)
+    entry_ts = None
+    entry_order_id = None
+    engine_label = None
+    entry_price = pos.get("avg_entry")
+    if isinstance(rec, dict):
+        entry_ts = rec.get("entry_ts")
+        entry_order_id = rec.get("entry_order_id")
+        engine_label = str(rec.get("engine") or "").upper() or None
+        if isinstance(rec.get("entry_price"), (int, float)):
+            entry_price = float(rec.get("entry_price"))
+    if not isinstance(entry_ts, (int, float)):
+        entry_ts = float(ref_ts) if isinstance(ref_ts, (int, float)) else time.time()
+    qty = pos.get("qty")
+    try:
+        qty = float(qty) if qty is not None else None
+    except Exception:
+        qty = None
+    reason = _reason_from_engine_label(engine_label, side) if engine_label else None
+    if not reason:
+        reason = "manual_entry"
+    meta = {"reason": reason}
+    if engine_label:
+        meta["engine"] = engine_label
+    _log_trade_entry(
+        state,
+        side=side,
+        symbol=symbol,
+        entry_ts=float(entry_ts),
+        entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+        qty=qty if isinstance(qty, (int, float)) else None,
+        usdt=None,
+        entry_order_id=entry_order_id,
+        meta=meta,
+    )
+    return _get_open_trade(state, side, symbol)
 
 def _trade_has_entry(tr: Optional[dict]) -> bool:
     if not isinstance(tr, dict):
@@ -1235,20 +3212,16 @@ def _get_open_symbols(state: Dict[str, dict], side: str) -> List[str]:
 
 def _engine_label_from_reason(reason: Optional[str]) -> str:
     key = (reason or "").lower()
-    if key in ("atlasfabio_long", "atlasfabio_short"):
-        return "ATLASFABIO"
     if key in ("swaggy_long", "swaggy_short"):
         return "SWAGGY"
     if key == "swaggy_atlas_lab":
         return "SWAGGY_ATLAS_LAB"
+    if key == "swaggy_atlas_lab_v2":
+        return "SWAGGY_ATLAS_LAB_V2"
+    if key == "swaggy_no_atlas":
+        return "SWAGGY_NO_ATLAS"
     if key in ("dtfx_long", "dtfx_short"):
         return "DTFX"
-    if key == "div15m_long":
-        return "DIV15M_LONG"
-    if key == "div15m_short":
-        return "DIV15M_SHORT"
-    if key == "pumpfade_short":
-        return "PUMPFADE"
     if key == "atlas_rs_fail_short":
         return "ATLAS_RS_FAIL_SHORT"
     if key == "short_entry":
@@ -1261,14 +3234,111 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "MANUAL_ADMIN"
     return "UNKNOWN"
 
+def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
+    label = (engine_label or "").upper()
+    if label == "SWAGGY_ATLAS_LAB":
+        return "swaggy_atlas_lab"
+    if label == "SWAGGY_ATLAS_LAB_V2":
+        return "swaggy_atlas_lab_v2"
+    if label == "SWAGGY_NO_ATLAS":
+        return "swaggy_no_atlas"
+    if label == "SWAGGY":
+        return "swaggy_long" if side == "LONG" else "swaggy_short"
+    if label == "ATLAS_RS_FAIL_SHORT":
+        return "atlas_rs_fail_short"
+    if label == "DTFX":
+        return "dtfx_long" if side == "LONG" else "dtfx_short"
+    if label == "RSI":
+        return "short_entry"
+    if label == "SCALP":
+        return "long_entry"
+    if label == "MANUAL":
+        return "manual_entry"
+    return None
+
 def _display_engine_label(label: Optional[str]) -> str:
     name = (label or "").strip() or "UNKNOWN"
     overrides = {
         "ATLAS_RS_FAIL_SHORT": "아틀라스 숏",
         "SWAGGY_ATLAS_LAB": "스웨기랩",
-        "ATLASFABIO": "파비오",
+        "SWAGGY_ATLAS_LAB_V2": "스웨기랩v2",
+        "SWAGGY_NO_ATLAS": "스웨기 단독",
     }
     return overrides.get(name, name)
+
+def _is_engine_enabled(engine: str) -> bool:
+    key = (engine or "").upper()
+    if key in ("SWAGGY_ATLAS_LAB", "SWAGGY_ATLAS_LAB_V2", "SWAGGY", "SWAGGY_NO_ATLAS"):
+        if key == "SWAGGY_ATLAS_LAB":
+            return SWAGGY_ATLAS_LAB_ENABLED
+        if key == "SWAGGY_ATLAS_LAB_V2":
+            return SWAGGY_ATLAS_LAB_V2_ENABLED
+        if key == "SWAGGY_NO_ATLAS":
+            return SWAGGY_NO_ATLAS_ENABLED
+        return SWAGGY_ENABLED
+    if key == "DTFX":
+        return DTFX_ENABLED
+    if key == "ATLAS_RS_FAIL_SHORT":
+        return ATLAS_RS_FAIL_SHORT_ENABLED
+    if key in ("RSI", "SCALP"):
+        return RSI_ENABLED
+    if key in ("MANUAL", "UNKNOWN", ""):
+        return True
+    return True
+
+def _normalize_engine_key(engine: str) -> str:
+    return (engine or "").strip().upper()
+
+def _format_engine_exit_overrides() -> str:
+    if not ENGINE_EXIT_OVERRIDES:
+        return "none"
+    parts = []
+    for eng, val in ENGINE_EXIT_OVERRIDES.items():
+        if not isinstance(val, dict):
+            continue
+        for side, cfg in val.items():
+            if not isinstance(cfg, dict):
+                continue
+            tp = cfg.get("tp")
+            sl = cfg.get("sl")
+            parts.append(f"{eng}:{side} tp={_fmt_pct_safe(tp)} sl={_fmt_pct_safe(sl)}")
+    return ", ".join(parts) if parts else "none"
+
+def _get_engine_exit_thresholds(engine_label: Optional[str], side: str) -> tuple[float, float]:
+    side_key = (side or "").upper()
+    tp = AUTO_EXIT_SHORT_TP_PCT if side_key == "SHORT" else AUTO_EXIT_LONG_TP_PCT
+    sl = AUTO_EXIT_SHORT_SL_PCT if side_key == "SHORT" else AUTO_EXIT_LONG_SL_PCT
+    label_key = (engine_label or "").upper()
+    overrides_map = globals().get("ENGINE_EXIT_OVERRIDES") or {}
+    overrides = overrides_map.get(label_key) or overrides_map.get(label_key.lower())
+    if isinstance(overrides, dict):
+        side_override = overrides.get(side_key) or overrides.get(side_key.lower())
+        if isinstance(side_override, dict):
+            if isinstance(side_override.get("tp"), (int, float)):
+                tp = float(side_override.get("tp"))
+            if isinstance(side_override.get("sl"), (int, float)):
+                sl = float(side_override.get("sl"))
+    return float(tp), float(sl)
+
+
+def _swaggy_no_atlas_overext_dist(df_ltf: pd.DataFrame, side: str, cfg) -> Optional[float]:
+    if df_ltf.empty or len(df_ltf) < int(getattr(cfg, "overext_ema_len", 20)) + 2:
+        return None
+    ema_len = int(getattr(cfg, "overext_ema_len", 20))
+    atr_len = int(getattr(cfg, "touch_atr_len", 14))
+    ema_series = ema(df_ltf["close"], ema_len)
+    if ema_series.empty:
+        return None
+    ema_val = float(ema_series.iloc[-1])
+    last_price = float(df_ltf["close"].iloc[-1])
+    atr_val = atr(df_ltf, atr_len)
+    if atr_val <= 0:
+        return None
+    side = (side or "").upper()
+    if side == "SHORT":
+        return (ema_val - last_price) / atr_val
+    return (last_price - ema_val) / atr_val
+
 
 def _close_trade(
     state: Dict[str, dict],
@@ -1283,8 +3353,14 @@ def _close_trade(
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     st["last_entry"] = float(exit_ts)
     _set_last_exit_state(st, side, exit_ts, reason)
-    st["in_pos"] = False
+    _set_in_pos_side(st, side, False)
+    suffix = "long" if side == "LONG" else "short"
+    st.pop(f"manual_entry_alerted_{suffix}", None)
+    st.pop(f"manual_qty_{suffix}", None)
+    st.pop(f"manual_dca_adds_{suffix}", None)
+    _clear_entry_alerted(state, symbol, side)
     state[symbol] = st
+    _clear_dca_alerted(state, symbol, side)
     if dbrec:
         try:
             dbrec.record_position_snapshot(
@@ -1862,9 +3938,40 @@ def _format_report_output(
     lines.append("</pre>")
     return "\n".join(lines)
 
+def _count_unique_entries(entry_by_symbol: dict) -> int:
+    seen = set()
+    total = 0
+    for (sym, side), entries in (entry_by_symbol or {}).items():
+        if not entries:
+            continue
+        for rec in entries:
+            order_id = rec.get("entry_order_id")
+            if order_id:
+                key = ("order", str(order_id))
+            else:
+                price = rec.get("entry_price")
+                ts = rec.get("entry_ts")
+                bucket = int(float(ts) // 1800) if isinstance(ts, (int, float)) else 0
+                if isinstance(price, (int, float)):
+                    key = ("price", sym, side, round(float(price), 8), bucket)
+                else:
+                    key = ("ts", sym, side, bucket)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += 1
+    return total
+
 def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool = False) -> str:
     db_rows = _load_db_daily_rows(report_date)
     records = None if db_rows else _read_report_csv_records(report_date)
+    try:
+        report_start_ts = calendar.timegm(datetime.strptime(report_date, "%Y-%m-%d").timetuple())
+    except Exception:
+        report_start_ts = None
+    report_end_ts = report_start_ts + 86400.0 if isinstance(report_start_ts, (int, float)) else None
+    lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
+    since_ts = (float(report_start_ts) - lookback) if isinstance(report_start_ts, (int, float)) else None
     totals = {
         "LONG": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
         "SHORT": {"count": 0, "pnl": 0.0, "pnl_valid": 0, "notional": 0.0, "wins": 0, "losses": 0},
@@ -1876,12 +3983,12 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
     use_trade_rows = False
     entry_by_symbol = {}
     try:
-        _, entry_by_symbol = _load_entry_events_map(report_date)
+        _, entry_by_symbol = _load_entry_events_map(report_date, since_ts=report_start_ts, end_ts=report_end_ts)
     except Exception:
         entry_by_symbol = {}
     entry_by_symbol_all = {}
     try:
-        _, entry_by_symbol_all = _load_entry_events_map(None)
+        _, entry_by_symbol_all = _load_entry_events_map(None, since_ts=since_ts, end_ts=report_end_ts)
     except Exception:
         entry_by_symbol_all = {}
 
@@ -2172,8 +4279,6 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
                     pnl_pct = (entry_price - exit_price) / entry_price * 100.0
             raw_reason = (tr.get("meta") or {}).get("reason") or tr.get("exit_reason") or "unknown"
             reason_map = {
-                "atlasfabio_long": "atlas-fabio",
-                "atlasfabio_short": "atlas-fabio",
                 "swaggy_long": "atlas-swaggy",
                 "swaggy_short": "atlas-swaggy",
                 "dtfx_long": "dtfx",
@@ -2226,7 +4331,7 @@ def _build_daily_report(state: Dict[str, dict], report_date: str, compact: bool 
             exec_ts = tr.get("exit_ts") if isinstance(tr.get("exit_ts"), (int, float)) else None
             _update_symbol_row(side, symbol, reason, pnl, win_flag, exec_ts)
 
-    entry_count = sum(len(v) for v in entry_by_symbol.values()) if entry_by_symbol else 0
+    entry_count = _count_unique_entries(entry_by_symbol) if entry_by_symbol else 0
     rows_out = symbol_trade_rows if use_trade_rows else symbol_rows
     return _format_report_output(totals, engine_totals, rows_out, report_date, compact, entry_count)
 
@@ -2234,13 +4339,24 @@ def _build_range_report(state: Dict[str, dict], start_date: str, end_date: str, 
     db_rows = _load_db_daily_rows_range(start_date, end_date)
     if not db_rows:
         return _build_daily_report(state, start_date, compact=compact)
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except Exception:
+        return _build_daily_report(state, start_date, compact=compact)
+    if end_dt < start_dt:
+        start_dt, end_dt = end_dt, start_dt
+    range_start_ts = calendar.timegm(start_dt.timetuple())
+    range_end_ts = calendar.timegm((end_dt + timedelta(days=1)).timetuple())
+    lookback = max(86400.0, float(DB_REPORT_LOOKBACK_SEC or 0.0))
+    since_ts = float(range_start_ts) - lookback
     entry_by_symbol: dict = {}
     entry_count = 0
     entry_engine_map: Dict[Tuple[str, str], Tuple[float, str]] = {}
     entry_event_index: Dict[Tuple[str, str], List[Tuple[float, str]]] = {}
     entry_by_symbol_all = {}
     try:
-        _, entry_by_symbol_all = _load_entry_events_map(None)
+        _, entry_by_symbol_all = _load_entry_events_map(None, since_ts=since_ts, end_ts=range_end_ts)
     except Exception:
         entry_by_symbol_all = {}
     totals = {
@@ -2253,8 +4369,8 @@ def _build_range_report(state: Dict[str, dict], start_date: str, end_date: str, 
         cur = start_dt
         while cur <= end_dt:
             day = cur.strftime("%Y-%m-%d")
-            _, entry_by_symbol = _load_entry_events_map(day)
-            entry_count += sum(len(v) for v in entry_by_symbol.values())
+            _, entry_by_symbol = _load_entry_events_map(day, since_ts=range_start_ts, end_ts=range_end_ts)
+            entry_count += _count_unique_entries(entry_by_symbol)
             cur += timedelta(days=1)
     except Exception:
         entry_count = 0
@@ -2414,831 +4530,6 @@ def _build_range_report(state: Dict[str, dict], start_date: str, end_date: str, 
     rows_out = symbol_trade_rows if use_trade_rows else symbol_rows
     return _format_report_output(totals, engine_totals, rows_out, label, compact, entry_count)
 
-def _run_atlas_fabio_cycle(
-    universe_structure,
-    cached_ex,
-    state,
-    fabio_cfg,
-    fabio_cfg_mid,
-    atlas_cfg,
-    active_positions_total,
-    dir_hint,
-    send_alert,
-    entry_callback=None,
-    now_ts: Optional[float] = None,
-):
-    result = {"long_hits": 0, "short_hits": 0}
-    buf = []
-    _set_thread_log_buffer(buf)
-
-    def _atlasfabio_log_path() -> str:
-        path = state.get("_atlasfabio_funnel_log_path") if isinstance(state, dict) else None
-        if isinstance(path, str) and path:
-            return path
-        return os.path.join("logs", "fabio", "atlasfabio_funnel.log")
-
-    def _append_atlasfabio_log(line: str) -> None:
-        try:
-            os.makedirs(os.path.dirname(_atlasfabio_log_path()), exist_ok=True)
-            with open(_atlasfabio_log_path(), "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-
-    def _strength_mult(strength: float) -> float:
-        if strength >= 0.85:
-            return 1.2
-        if strength >= 0.70:
-            return 1.0
-        if strength >= 0.55:
-            return 0.7
-        return 0.0
-
-    if not ATLAS_FABIO_ENABLED:
-        _set_thread_log_buffer(None)
-        result["log"] = buf
-        return result
-    if not (fabio_cfg and atlas_cfg and fabio_entry_engine and atlas_fabio_engine):
-        _set_thread_log_buffer(None)
-        result["log"] = buf
-        return result
-    if not isinstance(active_positions_total, int):
-        active_positions_total = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
-    now_ts = now_ts if isinstance(now_ts, (int, float)) else time.time()
-
-    funnel = {
-        "candidates_total": 0,
-        "evaluated": 0,
-        "skip_precheck": 0,
-        "skip_eval_none": 0,
-        "skip_warmup": 0,
-        "skip_dup_candle": 0,
-        "trigger_seen": 0,
-        "entry_ready": 0,
-        "blocked_ltf": 0,
-        "blocked_cooldown": 0,
-        "blocked_in_pos": 0,
-        "no_signal": 0,
-        "entry_signal": 0,
-        "entry_order_ok": 0,
-        "entry_blocked_guard": 0,
-        "entry_lock_skip": 0,
-        "entry_paper_ok": 0,
-        "entry_gate_skip": 0,
-        "entry_gate_skip_in_pos": 0,
-        "entry_gate_skip_cooldown": 0,
-        "entry_gate_skip_lock": 0,
-        "entry_gate_skip_max_pos": 0,
-        "entry_gate_skip_live_off": 0,
-        "entry_gate_skip_exchange": 0,
-        "atlas_gate_calls_long": 0,
-        "atlas_gate_calls_short": 0,
-        "atlas_block": 0,
-        "d1_block": 0,
-        "side_block": 0,
-        "no_side_allowed": 0,
-        "no_pullback": 0,
-        "weak_signal": 0,
-        "no_trigger": 0,
-        "entry_live_off": 0,
-        "trigger_hard": 0,
-        "trigger_soft": 0,
-        "strength_lt_055": 0,
-        "strength_055_070": 0,
-        "strength_070_085": 0,
-        "strength_ge_085": 0,
-        "data_missing": 0,
-        "data_missing_rsi": 0,
-        "data_missing_atr": 0,
-        "data_missing_vol": 0,
-        "data_missing_dist": 0,
-    }
-
-    for symbol in universe_structure:
-        funnel["candidates_total"] += 1
-        allowed_dir = None
-        if isinstance(dir_hint, dict):
-            allowed_dir = dir_hint.get(symbol)
-        st = state.get(symbol, {"in_pos": False, "last_ok": False, "last_entry": 0})
-        if st.get("in_pos"):
-            funnel["skip_precheck"] += 1
-            funnel["blocked_in_pos"] += 1
-            continue
-        if allowed_dir in ("LONG", "SHORT"):
-            last_entry = _get_last_entry_ts_by_side(st, allowed_dir)
-            if isinstance(last_entry, (int, float)) and (now_ts - float(last_entry)) < COOLDOWN_SEC:
-                funnel["skip_precheck"] += 1
-                funnel["blocked_cooldown"] += 1
-                continue
-
-        if allowed_dir == "LONG":
-            funnel["atlas_gate_calls_long"] += 1
-            gate = _atlasfabio_gate_long(symbol, atlas_cfg)
-        elif allowed_dir == "SHORT":
-            funnel["atlas_gate_calls_short"] += 1
-            gate = _atlasfabio_gate_short(symbol, atlas_cfg)
-        else:
-            gate = _atlasfabio_gate(symbol, atlas_cfg) if atlas_cfg else {"status": "skip"}
-        if gate.get("status") != "ok":
-            funnel["skip_warmup"] += 1
-            continue
-
-        trade_allowed = bool(gate.get("trade_allowed"))
-        allow_long = bool(gate.get("allow_long"))
-        allow_short = bool(gate.get("allow_short"))
-        size_mult = float(gate.get("size_mult") or 1.0)
-        gate_line = (
-            "ATLASFABIO_GATE sym=%s trade_allowed=%s allow_long=%s allow_short=%s size_mult=%.2f"
-            % (
-                symbol,
-                "Y" if trade_allowed else "N",
-                "Y" if allow_long else "N",
-                "Y" if allow_short else "N",
-                size_mult,
-            )
-        )
-        print(gate_line)
-        _append_atlasfabio_log(gate_line)
-
-        if not trade_allowed:
-            funnel["atlas_block"] += 1
-            block_reason = gate.get("block_reason") or "ATLAS_BLOCK"
-            if block_reason == "D1_EMA7_DIST":
-                funnel["d1_block"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason={block_reason}")
-            continue
-
-        allowed_sides = []
-        if allow_long:
-            allowed_sides.append("LONG")
-        if allow_short:
-            allowed_sides.append("SHORT")
-        if not allowed_sides:
-            funnel["no_side_allowed"] += 1
-            _append_atlasfabio_log(
-                "ATLASFABIO_SKIP sym=%s reason=NO_SIDE_ALLOWED gate_allow_long=%s gate_allow_short=%s"
-                % (symbol, "Y" if allow_long else "N", "Y" if allow_short else "N")
-            )
-            continue
-
-        side_results = []
-        had_eval_none = False
-        had_warmup = False
-        had_dup = False
-        for side in allowed_sides:
-            bucket_key = f"_fabio_atlas_{side.lower()}"
-            fabio_res = fabio_entry_engine.evaluate_symbol(
-                symbol,
-                cached_ex,
-                state,
-                fabio_cfg,
-                bucket_key=bucket_key,
-                side_hint=side,
-            )
-            if not isinstance(fabio_res, dict) or not fabio_res:
-                had_eval_none = True
-                continue
-            if fabio_res.get("status") == "warmup":
-                had_warmup = True
-                continue
-            if fabio_res.get("block_reason") == "dup_candle":
-                had_dup = True
-                continue
-            side_results.append((side, fabio_res))
-
-        if not side_results:
-            if had_eval_none:
-                funnel["skip_eval_none"] += 1
-            if had_warmup:
-                funnel["skip_warmup"] += 1
-            if had_dup:
-                funnel["skip_dup_candle"] += 1
-            continue
-
-        funnel["evaluated"] += 1
-
-        def _fmt_num(val: Optional[float], digits: int = 4) -> str:
-            if isinstance(val, (int, float)):
-                return f"{val:.{digits}f}"
-            return "N/A"
-
-        rsi_3m_prev = None
-        rsi_3m_last = None
-        rsi_5m_prev = None
-        rsi_5m_last = None
-        if rsi_engine:
-            rsi_3m_prev, rsi_3m_last = rsi_engine.fetch_rsi_last2(symbol, "3m")
-            rsi_5m_prev, rsi_5m_last = rsi_engine.fetch_rsi_last2(symbol, "5m")
-
-        missing_side_results = []
-        valid_side_results = []
-        for side, fabio_res in side_results:
-            missing = []
-            if fabio_res.get("rsi") is None:
-                missing.append("rsi")
-            if fabio_res.get("atr_now") is None:
-                missing.append("atr")
-            if fabio_res.get("vol_avg") is None:
-                missing.append("vol_avg")
-            if fabio_res.get("vol_ratio") is None:
-                missing.append("vol_ratio")
-            if fabio_res.get("dist_to_ema20") is None:
-                missing.append("dist")
-            if missing:
-                missing_side_results.append((side, fabio_res, missing))
-            else:
-                valid_side_results.append((side, fabio_res))
-
-        if not valid_side_results:
-            funnel["data_missing"] += 1
-            side, fabio_res, missing = missing_side_results[0]
-            for miss_item in missing:
-                if miss_item == "rsi":
-                    funnel["data_missing_rsi"] += 1
-                elif miss_item == "atr":
-                    funnel["data_missing_atr"] += 1
-                elif miss_item in ("vol_avg", "vol_ratio"):
-                    funnel["data_missing_vol"] += 1
-                elif miss_item == "dist":
-                    funnel["data_missing_dist"] += 1
-            tf_info = []
-            raw_by_tf = {}
-            for tf in ("3m", "5m", "15m", "1h"):
-                raw = cycle_cache.get_raw(symbol, tf) or []
-                raw_by_tf[tf] = raw
-                bars = len(raw)
-                last_ts = raw[-1][0] if raw else None
-                tf_info.append(f"bars_{tf}={bars}")
-                tf_info.append(f"last_ts_{tf}={last_ts if last_ts is not None else 'N/A'}")
-            series_len_info = "series_len={3m:%d,5m:%d,15m:%d}" % (
-                len(raw_by_tf.get("3m") or []),
-                len(raw_by_tf.get("5m") or []),
-                len(raw_by_tf.get("15m") or []),
-            )
-            rsi_len = rsi_engine.config.rsi_len if rsi_engine else None
-            key_3m = f"{symbol}:3m:rsi_series:{rsi_len}" if rsi_len else "N/A"
-            key_5m = f"{symbol}:5m:rsi_series:{rsi_len}" if rsi_len else "N/A"
-            series_key_info = f"series_key={{rsi3m:'{key_3m}',rsi5m:'{key_5m}'}}"
-            values_info = (
-                "values={rsi3m_last=%s,rsi5m_last=%s,atr=%s,vol_now=%s,vol_avg=%s,vol_ratio=%s,dist=%s}"
-                % (
-                    _fmt_num(rsi_3m_last, 2),
-                    _fmt_num(rsi_5m_last, 2),
-                    _fmt_num(fabio_res.get("atr_now"), 4),
-                    _fmt_num(fabio_res.get("vol_now"), 2),
-                    _fmt_num(fabio_res.get("vol_avg"), 2),
-                    _fmt_num(fabio_res.get("vol_ratio"), 2),
-                    _fmt_num(fabio_res.get("dist_to_ema20"), 4),
-                )
-            )
-            rsi_map_keys = []
-            for (sym_key, tf_key, ind_key) in cycle_cache.IND_CACHE.keys():
-                if sym_key != symbol:
-                    continue
-                if not isinstance(ind_key, tuple) or not ind_key:
-                    continue
-                if ind_key[0] != "rsi_series":
-                    continue
-                if len(ind_key) < 2:
-                    continue
-                rsi_map_keys.append(f"{tf_key}:{ind_key[1]}")
-            rsi_map_keys.sort()
-            requested_keys = "['3m','5m']"
-            resolved_key_3m = f"{symbol}:3m:rsi_series:{rsi_len}" if rsi_len else "N/A"
-            resolved_key_5m = f"{symbol}:5m:rsi_series:{rsi_len}" if rsi_len else "N/A"
-            rsi_map_info = (
-                "rsi_map_keys=%s requested_keys=%s resolved_key_3m=%s resolved_key_5m=%s"
-                % (rsi_map_keys, requested_keys, resolved_key_3m, resolved_key_5m)
-            )
-            miss_line = (
-                "ATLASFABIO_SKIP sym=%s reason=DATA_MISSING missing=%s %s %s %s %s %s"
-                % (
-                    symbol,
-                    "[" + ",".join(missing) + "]",
-                    values_info,
-                    series_len_info,
-                    series_key_info,
-                    rsi_map_info,
-                    " ".join(tf_info),
-                )
-            )
-            print(miss_line)
-            _append_atlasfabio_log(miss_line)
-            continue
-
-        backtest_mode = bool(state.get("_atlasfabio_backtest_mode")) if isinstance(state, dict) else False
-        def _finalize_backtest_live_off(reason: str) -> bool:
-            if not backtest_mode:
-                return False
-            if reason != "live_off":
-                return False
-            funnel["entry_live_off"] += 1
-            funnel["entry_signal"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=BACKTEST")
-            return True
-
-        candidates = []
-        for side, fabio_res in valid_side_results:
-            trigger_ok = bool(fabio_res.get("signal_trigger_ok"))
-            trigger_hard = bool(fabio_res.get("trigger_hard"))
-            trigger_soft = bool(fabio_res.get("trigger_soft"))
-            trigger_mode = fabio_res.get("trigger_mode") or "NONE"
-            strength = float(fabio_res.get("signal_strength") or 0.0)
-            factors = fabio_res.get("signal_factors") or {}
-            weights = fabio_res.get("signal_weights") or {}
-            trigger_factors = fabio_res.get("trigger_factors") or {}
-            signal_side = fabio_res.get("signal_side")
-            atr_now = fabio_res.get("atr_now")
-            if isinstance(atr_now, (int, float)) and abs(atr_now) <= 1e-8:
-                atr_line = "FABIO_ATR_ZERO sym=%s atr=%s ltf=%s" % (
-                    symbol,
-                    _fmt_num(atr_now, 8),
-                    fabio_cfg.timeframe_ltf,
-                )
-                print(atr_line)
-                _append_atlasfabio_log(atr_line)
-
-            if trigger_hard:
-                funnel["trigger_hard"] += 1
-            if trigger_soft:
-                funnel["trigger_soft"] += 1
-            if strength < 0.55:
-                funnel["strength_lt_055"] += 1
-            elif strength < 0.70:
-                funnel["strength_055_070"] += 1
-            elif strength < 0.85:
-                funnel["strength_070_085"] += 1
-            else:
-                funnel["strength_ge_085"] += 1
-
-            if (rsi_3m_last is None) or (rsi_5m_last is None):
-                rsi_map_keys = []
-                for (sym_key, tf_key, ind_key) in cycle_cache.IND_CACHE.keys():
-                    if sym_key != symbol:
-                        continue
-                    if not isinstance(ind_key, tuple) or not ind_key:
-                        continue
-                    if ind_key[0] != "rsi_series":
-                        continue
-                    if len(ind_key) < 2:
-                        continue
-                    rsi_map_keys.append(f"{tf_key}:{ind_key[1]}")
-                rsi_map_keys.sort()
-                bars_3m = len(cycle_cache.get_raw(symbol, "3m") or [])
-                bars_5m = len(cycle_cache.get_raw(symbol, "5m") or [])
-                rsi_len = rsi_engine.config.rsi_len if rsi_engine else None
-                lookup_line = (
-                    "FABIO_RSI_LOOKUP sym=%s rsi3m=%s rsi5m=%s bars_3m=%d bars_5m=%d rsi_len=%s rsi_map_keys=%s"
-                    % (
-                        symbol,
-                        _fmt_num(rsi_3m_last, 2),
-                        _fmt_num(rsi_5m_last, 2),
-                        bars_3m,
-                        bars_5m,
-                        str(rsi_len) if rsi_len is not None else "N/A",
-                        rsi_map_keys,
-                    )
-                )
-                print(lookup_line)
-                _append_atlasfabio_log(lookup_line)
-
-            fabio_signal_line = (
-                "FABIO_SIGNAL sym=%s side=%s trigger_ok=%s strength=%.2f"
-                % (symbol, signal_side or side, "Y" if trigger_ok else "N", strength)
-            )
-            fabio_factors_line = (
-                "FABIO_FACTORS sym=%s ema_align=%s rsi_rev=%s vol=%s retest=%s struct=%s dist=%s weights=%s"
-                % (
-                    symbol,
-                    "Y" if factors.get("ema_align") else "N",
-                    "Y" if factors.get("rsi_reversal") else "N",
-                    "Y" if factors.get("vol") else "N",
-                    "Y" if factors.get("retest") else "N",
-                    "Y" if factors.get("structure") else "N",
-                    "Y" if factors.get("dist") else "N",
-                    weights,
-                )
-            )
-            fabio_trigger_decision = (
-                "FABIO_TRIGGER_DECISION sym=%s hard=%s soft=%s mode=%s soft_min=%.2f"
-                % (
-                    symbol,
-                    "Y" if trigger_hard else "N",
-                    "Y" if trigger_soft else "N",
-                    trigger_mode,
-                    ATLASFABIO_MIN_STRENGTH_SOFT,
-                )
-            )
-            if trigger_ok or strength >= ATLASFABIO_MIN_STRENGTH:
-                print(fabio_signal_line)
-                print(fabio_factors_line)
-                print(fabio_trigger_decision)
-                _append_atlasfabio_log(fabio_signal_line)
-                _append_atlasfabio_log(fabio_factors_line)
-                _append_atlasfabio_log(fabio_trigger_decision)
-
-            if not trigger_ok:
-                trigger_line = (
-                    "FABIO_TRIGGER_FACTORS sym=%s rsi=%s retest=%s vol=%s struct=%s ema=%s "
-                    "rsi3m_prev=%s rsi3m_last=%s rsi5m_prev=%s rsi5m_last=%s "
-                    "rsi_ltf=%s vol_now=%s vol_avg=%s vol_ratio=%s dist=%.4f atr=%s"
-                    % (
-                        symbol,
-                        "Y" if trigger_factors.get("rsi") else "N",
-                        "Y" if trigger_factors.get("retest") else "N",
-                        "Y" if trigger_factors.get("vol") else "N",
-                        "Y" if trigger_factors.get("struct") else "N",
-                        "Y" if trigger_factors.get("ema") else "N",
-                        _fmt_num(rsi_3m_prev, 2),
-                        _fmt_num(rsi_3m_last, 2),
-                        _fmt_num(rsi_5m_prev, 2),
-                        _fmt_num(rsi_5m_last, 2),
-                        _fmt_num(fabio_res.get("rsi"), 2),
-                        _fmt_num(fabio_res.get("vol_now"), 2),
-                        _fmt_num(fabio_res.get("vol_avg"), 2),
-                        _fmt_num(fabio_res.get("vol_ratio"), 2),
-                        float(fabio_res.get("dist_to_ema20") or 0.0),
-                        _fmt_num(fabio_res.get("atr_now"), 6),
-                    )
-                )
-                print(trigger_line)
-                print(fabio_trigger_decision)
-                _append_atlasfabio_log(trigger_line)
-                _append_atlasfabio_log(fabio_trigger_decision)
-
-            if trigger_ok and (signal_side == side):
-                candidates.append((side, fabio_res))
-
-        if candidates:
-            funnel["trigger_seen"] += len(candidates)
-        else:
-            funnel["no_trigger"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=NO_TRIGGER")
-            continue
-
-        def _candidate_key(item):
-            side, fabio_res = item
-            strength = float(fabio_res.get("signal_strength") or 0.0)
-            mode = fabio_res.get("trigger_mode") or "NONE"
-            hard_flag = 1 if mode == "HARD" else 0
-            return (strength, hard_flag)
-
-        best_side, best_res = max(candidates, key=_candidate_key)
-        if len(allowed_sides) > 1:
-            cand_parts = []
-            for side, fabio_res in candidates:
-                cand_parts.append(f"{side}:{float(fabio_res.get('signal_strength') or 0.0):.2f}")
-            _append_atlasfabio_log(
-                "ATLASFABIO_SIDE_SELECT sym=%s candidates=[%s] chosen=%s"
-                % (symbol, ", ".join(cand_parts), best_side)
-            )
-
-        side = best_side
-        _append_atlas_route_log(
-            "ATLASFABIO",
-            symbol,
-            {
-                "side": side,
-                "dir": gate.get("st_dir"),
-                "state": gate.get("state"),
-                "regime": gate.get("regime"),
-                "reason": gate.get("reason"),
-                "trade_allowed": gate.get("trade_allowed"),
-                "allow_long": gate.get("allow_long"),
-                "allow_short": gate.get("allow_short"),
-                "size_mult": size_mult,
-            },
-        )
-        trigger_hard = bool(best_res.get("trigger_hard"))
-        trigger_soft = bool(best_res.get("trigger_soft"))
-        trigger_mode = best_res.get("trigger_mode") or "NONE"
-        strength = float(best_res.get("signal_strength") or 0.0)
-        reasons = best_res.get("signal_reasons") or []
-
-        if "retest" not in reasons:
-            funnel["no_pullback"] += 1
-            _append_atlasfabio_log(
-                "ATLASFABIO_SKIP sym=%s reason=NO_PULLBACK strength=%.2f reasons=%s"
-                % (symbol, strength, reasons)
-            )
-            continue
-
-        if trigger_hard:
-            min_strength = ATLASFABIO_MIN_STRENGTH
-        elif trigger_soft:
-            min_strength = ATLASFABIO_MIN_STRENGTH_SOFT
-        else:
-            min_strength = ATLASFABIO_MIN_STRENGTH
-        if strength < min_strength:
-            funnel["weak_signal"] += 1
-            _append_atlasfabio_log(
-                "ATLASFABIO_SKIP sym=%s reason=WEAK_SIGNAL strength=%.2f < %.2f mode=%s"
-                % (symbol, strength, min_strength, trigger_mode)
-            )
-            continue
-
-        strength_mult = _strength_mult(strength)
-        final_usdt = _resolve_entry_usdt(USDT_PER_TRADE * size_mult * strength_mult)
-        ltf_mode = "5m_or_3m"
-        hit5m, hit3m, ltf_ok = _atlasfabio_ltf_hit(symbol, side, mode=ltf_mode)
-        if not ltf_ok and best_res.get("trend_cont_trigger"):
-            ltf_ok = True
-        if not ltf_ok:
-            funnel["blocked_ltf"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=LTF_BLOCK")
-            continue
-
-        try:
-            refresh_positions_cache(force=True)
-            if side == "LONG":
-                existing_amt = get_long_position_amount(symbol)
-            else:
-                existing_amt = get_short_position_amount(symbol)
-        except Exception:
-            existing_amt = 0.0
-        if isinstance(existing_amt, (int, float)) and existing_amt > 0:
-            st["in_pos"] = True
-            state[symbol] = st
-            funnel["blocked_in_pos"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=IN_POS")
-            continue
-
-        funnel["entry_ready"] += 1
-
-        cur_total = count_open_positions(force=True)
-        if not isinstance(cur_total, int):
-            cur_total = active_positions_total
-        gate_ok, gate_reason = _atlasfabio_entry_gate(
-            symbol,
-            side,
-            st,
-            now_ts,
-            "NA",
-            None,
-            live_ok=LONG_LIVE_TRADING if side == "LONG" else LIVE_TRADING,
-            max_positions=MAX_OPEN_POSITIONS,
-            active_positions=cur_total,
-        )
-        if (not gate_ok) and backtest_mode and gate_reason == "live_off":
-            funnel["entry_live_off"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=BACKTEST")
-            gate_ok = True
-        if not gate_ok:
-            funnel["entry_gate_skip"] += 1
-            if gate_reason == "in_pos":
-                funnel["entry_gate_skip_in_pos"] += 1
-            elif gate_reason == "cooldown":
-                funnel["entry_gate_skip_cooldown"] += 1
-            elif gate_reason == "max_pos":
-                funnel["entry_gate_skip_max_pos"] += 1
-            elif gate_reason == "live_off":
-                funnel["entry_gate_skip_live_off"] += 1
-                if _finalize_backtest_live_off(gate_reason):
-                    continue
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GATE_{gate_reason}")
-            continue
-
-        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="atlasfabio", side=side)
-        if not lock_ok:
-            funnel["entry_lock_skip"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_LOCK")
-            print(f"[ENTRY-LOCK] sym={symbol} owner=atlasfabio ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-            continue
-        if _entry_seen_blocked(state, symbol, side, "atlasfabio"):
-            funnel["entry_lock_skip"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_SEEN")
-            _entry_lock_release(state, symbol, owner="atlasfabio")
-            continue
-        entry_line = (
-            "ATLASFABIO_ENTRY sym=%s side=%s pass=Y strength=%.2f atlas_mult=%.2f strength_mult=%.2f final_usdt=%.2f reasons=%s"
-            % (symbol, side, strength, size_mult, strength_mult, final_usdt, reasons)
-        )
-        print(entry_line)
-        _append_atlasfabio_log(entry_line)
-        if not backtest_mode:
-            _append_entry_log("fabio/atlasfabio_entries.log", entry_line)
-        if callable(entry_callback):
-            try:
-                entry_callback(
-                    symbol=symbol,
-                    side=side,
-                    strength=strength,
-                    reasons=reasons,
-                    gate=gate,
-                    fabio_res=best_res,
-                )
-            except Exception:
-                pass
-
-        funnel["entry_signal"] += 1
-        if side == "LONG":
-            result["long_hits"] += 1
-        else:
-            result["short_hits"] += 1
-
-        cur_total = count_open_positions(force=True)
-        if not isinstance(cur_total, int):
-            cur_total = active_positions_total
-        if cur_total >= MAX_OPEN_POSITIONS:
-            funnel["entry_gate_skip_max_pos"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=MAX_POS")
-            _append_entry_gate_log(
-                "atlasfabio",
-                symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side={side}",
-                side=side,
-            )
-            _entry_lock_release(state, symbol, owner="atlasfabio")
-            continue
-
-        if ATLAS_FABIO_PAPER:
-            funnel["entry_paper_ok"] += 1
-            _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=PAPER")
-            _entry_lock_release(state, symbol, owner="atlasfabio")
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        if side == "LONG":
-            if LONG_LIVE_TRADING:
-                guard_key = _entry_guard_key(state, symbol, "LONG")
-                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
-                    funnel["entry_blocked_guard"] += 1
-                    _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
-                    _entry_lock_release(state, symbol, owner="atlasfabio")
-                else:
-                    try:
-                        res = long_market(
-                            symbol,
-                            usdt_amount=final_usdt,
-                            leverage=LEVERAGE,
-                            margin_mode=MARGIN_MODE,
-                        )
-                        entry_order_id = _order_id_from_res(res)
-                        fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                        qty = res.get("amount") or res.get("order", {}).get("amount")
-                        if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                            funnel["entry_order_ok"] += 1
-                            _entry_seen_mark(state, symbol, "LONG", "atlasfabio")
-                        st = state.get(symbol, {})
-                        st["in_pos"] = True
-                        _set_last_entry_state(st, "LONG", time.time())
-                        state[symbol] = st
-                        _log_trade_entry(
-                            state,
-                            side="LONG",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                            qty=qty if isinstance(qty, (int, float)) else None,
-                            usdt=final_usdt,
-                            entry_order_id=entry_order_id,
-                            meta={"reason": "atlasfabio_long"},
-                        )
-                        active_positions_total += 1
-                        if send_alert:
-                            _send_entry_alert(
-                                send_alert,
-                                side="LONG",
-                                symbol=symbol,
-                                engine="ATLASFABIO",
-                                entry_price=fill_price,
-                                usdt=final_usdt,
-                                reason="ATLAS + FABIO",
-                                live=LONG_LIVE_TRADING,
-                                entry_order_id=entry_order_id,
-                                sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                                tp=None,
-                            )
-                    except Exception as e:
-                        funnel["entry_gate_skip_exchange"] += 1
-                        _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=EXCHANGE_ERROR {e}")
-                    finally:
-                        _entry_guard_release(state, symbol, key=guard_key)
-                        _entry_lock_release(state, symbol, owner="atlasfabio")
-            else:
-                _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=SIGNAL")
-                _send_entry_alert(
-                    send_alert,
-                    side="LONG",
-                    symbol=symbol,
-                    engine="ATLASFABIO",
-                    entry_price=None,
-                    usdt=final_usdt,
-                    reason="ATLAS + FABIO",
-                    live=LONG_LIVE_TRADING,
-                    order_info="(알림 전용)",
-                    sl=None,
-                    tp=None,
-                )
-                _entry_lock_release(state, symbol, owner="atlasfabio")
-        else:
-            order_info = "(알림 전용)"
-            entry_price_disp = None
-            entry_order_id = None
-            if LIVE_TRADING:
-                guard_key = _entry_guard_key(state, symbol, "SHORT")
-                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="atlasfabio", side=side):
-                    funnel["entry_blocked_guard"] += 1
-                    _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=ENTRY_GUARD")
-                    _entry_lock_release(state, symbol, owner="atlasfabio")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    if get_short_position_amount(symbol) > 0:
-                        _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=IN_POS")
-                        _entry_lock_release(state, symbol, owner="atlasfabio")
-                        time.sleep(PER_SYMBOL_SLEEP)
-                        continue
-                    res = short_market(symbol, usdt_amount=final_usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    order_info = (
-                        f"entry_price={fill_price} qty={qty} usdt={final_usdt:.2f}"
-                    )
-                    entry_price_disp = fill_price
-                    st["in_pos"] = True
-                    _set_last_entry_state(st, "SHORT", time.time())
-                    funnel["entry_order_ok"] += 1
-                    state[symbol] = st
-                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                        _entry_seen_mark(state, symbol, "SHORT", "atlasfabio")
-                    _log_trade_entry(
-                        state,
-                        side="SHORT",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
-                        usdt=final_usdt,
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "atlasfabio_short"},
-                    )
-                    active_positions_total += 1
-                    if send_alert:
-                        _send_entry_alert(
-                            send_alert,
-                            side="SHORT",
-                            symbol=symbol,
-                            engine="ATLASFABIO",
-                            entry_price=fill_price,
-                            usdt=final_usdt,
-                            reason=reasons,
-                            live=LIVE_TRADING,
-                            order_info=order_info,
-                            entry_order_id=entry_order_id,
-                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                            tp=None,
-                        )
-                except Exception as e:
-                    order_info = f"order_error: {e}"
-                    funnel["entry_gate_skip_exchange"] += 1
-                    _append_atlasfabio_log(f"ATLASFABIO_SKIP sym={symbol} reason=EXCHANGE_ERROR {e}")
-                finally:
-                    _entry_guard_release(state, symbol, key=guard_key)
-                    _entry_lock_release(state, symbol, owner="atlasfabio")
-            else:
-                _append_atlasfabio_log(f"ATLASFABIO_ENTRY sym={symbol} pass=Y mode=SIGNAL")
-                _entry_lock_release(state, symbol, owner="atlasfabio")
-            _send_entry_alert(
-                send_alert,
-                side="SHORT",
-                symbol=symbol,
-                engine="ATLASFABIO",
-                entry_price=entry_price_disp,
-                usdt=final_usdt,
-                live=LIVE_TRADING,
-                order_info=order_info,
-                sl=_fmt_price_safe(entry_price_disp, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                tp=None,
-            )
-            time.sleep(PER_SYMBOL_SLEEP)
-
-    _set_thread_log_buffer(None)
-    funnel_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    funnel_line = (
-        "{ts} [atlasfabio-funnel] total={candidates_total} evaluated={evaluated} precheck={skip_precheck} "
-        "eval_none={skip_eval_none} gate_calls_long={atlas_gate_calls_long} gate_calls_short={atlas_gate_calls_short} "
-        "warmup={skip_warmup} dup={skip_dup_candle} trigger_seen={trigger_seen} "
-        "entry_ready={entry_ready} entry={entry_signal} order_ok={entry_order_ok} "
-        "ltf_block={blocked_ltf} cooldown={blocked_cooldown} in_pos={blocked_in_pos} "
-        "gate_skip={entry_gate_skip} gate_in_pos={entry_gate_skip_in_pos} gate_cooldown={entry_gate_skip_cooldown} "
-        "gate_maxpos={entry_gate_skip_max_pos} gate_live_off={entry_gate_skip_live_off} "
-        "exchange_skip={entry_gate_skip_exchange} atlas_block={atlas_block} d1_block={d1_block} side_block={side_block} "
-        "no_side_allowed={no_side_allowed} no_pullback={no_pullback} "
-        "entry_live_off={entry_live_off} "
-        "trigger_hard={trigger_hard} trigger_soft={trigger_soft} "
-        "strength_lt_055={strength_lt_055} strength_055_070={strength_055_070} "
-        "strength_070_085={strength_070_085} strength_ge_085={strength_ge_085} "
-        "weak_signal={weak_signal} no_trigger={no_trigger} data_missing={data_missing} "
-        "data_missing_rsi={data_missing_rsi} data_missing_atr={data_missing_atr} "
-        "data_missing_vol={data_missing_vol} data_missing_dist={data_missing_dist}".format(ts=funnel_ts, **funnel)
-    )
-    if not state.get("_atlasfabio_backtest_quiet"):
-        print(funnel_line)
-        _append_atlasfabio_log(funnel_line)
-    result["log"] = buf
-    return result
 def _run_dtfx_cycle(
     dtfx_engine,
     dtfx_universe,
@@ -3270,7 +4561,7 @@ def _run_dtfx_cycle(
     )
     for symbol in dtfx_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
+        if _both_sides_open(st):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         signals = dtfx_engine.scan_symbol(ctx, symbol)
@@ -3291,6 +4582,7 @@ def _run_dtfx_cycle(
                 except Exception:
                     existing_amt = 0.0
                 if existing_amt > 0:
+                    _set_in_pos_side(st, "LONG", True)
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
             if side == "SHORT":
@@ -3299,7 +4591,7 @@ def _run_dtfx_cycle(
                 except Exception:
                     existing_amt = 0.0
                 if existing_amt > 0:
-                    st["in_pos"] = True
+                    _set_in_pos_side(st, "SHORT", True)
                     state[symbol] = st
                     time.sleep(PER_SYMBOL_SLEEP)
                     continue
@@ -3333,401 +4625,51 @@ def _run_dtfx_cycle(
             guard_key = _entry_guard_key(state, symbol, side)
             if not _entry_guard_acquire(state, symbol, key=guard_key, engine="dtfx", side=side):
                 print(f"[dtfx] {side} 중복 차단 ({symbol})")
-                _entry_lock_release(state, symbol, owner="dtfx")
+                _entry_lock_release(state, symbol, owner="dtfx", side=side)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             if _entry_seen_blocked(state, symbol, side, "dtfx"):
-                _entry_lock_release(state, symbol, owner="dtfx")
+                _entry_guard_release(state, symbol, key=guard_key)
+                _entry_lock_release(state, symbol, owner="dtfx", side=side)
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
             try:
                 if side == "LONG":
-                    res = long_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    result["long_hits"] += 1
-                    _set_last_entry_state(st, "LONG", time.time())
-                    state[symbol] = st
-                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                        _entry_seen_mark(state, symbol, "LONG", "dtfx")
-                    _log_trade_entry(
+                    req_id = _enqueue_entry_request(
                         state,
+                        symbol=symbol,
                         side="LONG",
-                        symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
+                        engine="DTFX",
+                        reason="dtfx_long",
                         usdt=_resolve_entry_usdt(),
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "dtfx_long", "event": sig.pattern},
+                        live=LONG_LIVE_TRADING,
+                        alert_reason=f"event={sig.pattern}",
                     )
-                    active_positions_total += 1
-                    if write_dtfx_log:
-                        touch_ts = None
-                        try:
-                            touch_ts = (sig.meta or {}).get("dtfx", {}).get("touch", {}).get("ts")
-                        except Exception:
-                            touch_ts = None
-                        payload = {
-                            "ts": int(touch_ts or time.time() * 1000),
-                            "engine": (sig.meta or {}).get("dtfx_engine", "dtfx"),
-                            "symbol": symbol,
-                            "tf_ltf": (sig.meta or {}).get("dtfx_tf_ltf", dtfx_cfg.tf_ltf),
-                            "tf_mtf": (sig.meta or {}).get("dtfx_tf_mtf", dtfx_cfg.tf_mtf),
-                            "tf_htf": (sig.meta or {}).get("dtfx_tf_htf", dtfx_cfg.tf_htf),
-                            "event": (sig.meta or {}).get("dtfx_event", sig.pattern),
-                            "state": (sig.meta or {}).get("dtfx_state", "ENTRY"),
-                            "context": {
-                                "side": "LONG",
-                                "entry_price": fill_price,
-                                "qty": qty,
-                                "usdt": _resolve_entry_usdt(),
-                                "dtfx": (sig.meta or {}).get("dtfx", {}),
-                            },
-                        }
-                        write_dtfx_log(payload, prefix="entries", mode="entry")
-                    if send_alert:
-                        _send_entry_alert(
-                            send_alert,
-                            side="LONG",
-                            symbol=symbol,
-                            engine="DTFX",
-                            entry_price=fill_price,
-                            usdt=_resolve_entry_usdt(),
-                            reason=f"event={sig.pattern}",
-                            live=LONG_LIVE_TRADING,
-                            entry_order_id=entry_order_id,
-                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_LONG_SL_PCT, side="LONG"),
-                        )
+                    if req_id:
+                        result["long_hits"] += 1
+                        active_positions_total += 1
                 else:
-                    res = short_market(symbol, usdt_amount=_resolve_entry_usdt(), leverage=LEVERAGE, margin_mode=MARGIN_MODE)
-                    entry_order_id = _order_id_from_res(res)
-                    fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                    qty = res.get("amount") or res.get("order", {}).get("amount")
-                    result["short_hits"] += 1
-                    st["in_pos"] = True
-                    _set_last_entry_state(st, "SHORT", time.time())
-                    state[symbol] = st
-                    if res.get("order") or res.get("status") in ("ok", "dry_run"):
-                        _entry_seen_mark(state, symbol, "SHORT", "dtfx")
-                    _log_trade_entry(
+                    req_id = _enqueue_entry_request(
                         state,
-                        side="SHORT",
                         symbol=symbol,
-                        entry_ts=time.time(),
-                        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                        qty=qty if isinstance(qty, (int, float)) else None,
+                        side="SHORT",
+                        engine="DTFX",
+                        reason="dtfx_short",
                         usdt=_resolve_entry_usdt(),
-                        entry_order_id=entry_order_id,
-                        meta={"reason": "dtfx_short", "event": sig.pattern},
+                        live=LIVE_TRADING,
+                        alert_reason=f"event={sig.pattern}",
                     )
-                    active_positions_total += 1
-                    if write_dtfx_log:
-                        touch_ts = None
-                        try:
-                            touch_ts = (sig.meta or {}).get("dtfx", {}).get("touch", {}).get("ts")
-                        except Exception:
-                            touch_ts = None
-                        payload = {
-                            "ts": int(touch_ts or time.time() * 1000),
-                            "engine": (sig.meta or {}).get("dtfx_engine", "dtfx"),
-                            "symbol": symbol,
-                            "tf_ltf": (sig.meta or {}).get("dtfx_tf_ltf", dtfx_cfg.tf_ltf),
-                            "tf_mtf": (sig.meta or {}).get("dtfx_tf_mtf", dtfx_cfg.tf_mtf),
-                            "tf_htf": (sig.meta or {}).get("dtfx_tf_htf", dtfx_cfg.tf_htf),
-                            "event": (sig.meta or {}).get("dtfx_event", sig.pattern),
-                            "state": (sig.meta or {}).get("dtfx_state", "ENTRY"),
-                            "context": {
-                                "side": "SHORT",
-                                "entry_price": fill_price,
-                                "qty": qty,
-                                "usdt": _resolve_entry_usdt(),
-                                "dtfx": (sig.meta or {}).get("dtfx", {}),
-                            },
-                        }
-                        write_dtfx_log(payload, prefix="entries", mode="entry")
-                    if send_alert:
-                        _send_entry_alert(
-                            send_alert,
-                            side="SHORT",
-                            symbol=symbol,
-                            engine="DTFX",
-                            entry_price=fill_price,
-                            usdt=_resolve_entry_usdt(),
-                            reason=f"event={sig.pattern}",
-                            live=LIVE_TRADING,
-                            entry_order_id=entry_order_id,
-                            sl=_fmt_price_safe(fill_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                        )
+                    if req_id:
+                        result["short_hits"] += 1
+                        active_positions_total += 1
             except Exception as e:
-                print(f"[dtfx] order error {symbol} side={side}: {e}")
+                print(f"[dtfx] queue error {symbol} side={side}: {e}")
             finally:
                 _entry_guard_release(state, symbol, key=guard_key)
-                _entry_lock_release(state, symbol, owner="dtfx")
+                _entry_lock_release(state, symbol, owner="dtfx", side=side)
         time.sleep(PER_SYMBOL_SLEEP)
     _set_thread_log_buffer(None)
     result["log"] = buf
-    return result
-
-def _pumpfade_tf_seconds(tf: str) -> int:
-    try:
-        unit = tf[-1]
-        val = int(tf[:-1])
-    except Exception:
-        return 0
-    if unit == "m":
-        return val * 60
-    if unit == "h":
-        return val * 3600
-    if unit == "d":
-        return val * 86400
-    return 0
-
-def _run_pumpfade_cycle(
-    pumpfade_engine,
-    pumpfade_universe,
-    state: Dict[str, dict],
-    send_alert,
-    pumpfade_cfg,
-):
-    result = {"hits": 0}
-    if not pumpfade_engine or not pumpfade_cfg:
-        return result
-    if not pumpfade_universe:
-        print("[pumpfade] 스캔 대상 없음")
-        return result
-    now_ts = time.time()
-    tf_sec = _pumpfade_tf_seconds(pumpfade_cfg.tf_trigger) or 900
-    bucket = state.setdefault("_pumpfade", {})
-    date_tag = time.strftime("%Y%m%d")
-    _ensure_log_file(f"pumpfade/pumpfade_live_{date_tag}.log")
-    _ensure_log_file(f"pumpfade/pumpfade_entries_{date_tag}.log")
-
-    def _pumpfade_log(msg: str) -> None:
-        _append_entry_log(f"pumpfade/pumpfade_live_{date_tag}.log", msg)
-
-    ctx = EngineContext(exchange=exchange, state=state, now_ts=now_ts, logger=_pumpfade_log, config=pumpfade_cfg)
-
-    for symbol in pumpfade_universe:
-        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        pf = bucket.get(symbol, {})
-        pending_id = pf.get("pending_order_id")
-        pending_deadline = float(pf.get("pending_deadline_ts") or 0.0)
-        pending_prior_hh = pf.get("pending_prior_hh")
-        in_pos = bool(st.get("in_pos"))
-
-        try:
-            existing_amt = get_short_position_amount(symbol)
-        except Exception:
-            existing_amt = 0.0
-
-        if pending_id:
-            if existing_amt > 0:
-                st["in_pos"] = True
-                _set_last_entry_state(st, "SHORT", time.time())
-                state[symbol] = st
-                detail = get_short_position_detail(symbol)
-                _log_trade_entry(
-                    state,
-                    side="SHORT",
-                    symbol=symbol,
-                    entry_ts=time.time(),
-                    entry_price=detail.get("entry") if isinstance(detail.get("entry"), (int, float)) else None,
-                    qty=detail.get("qty") if isinstance(detail.get("qty"), (int, float)) else None,
-                    usdt=_resolve_entry_usdt(),
-                    meta={"reason": "pumpfade_short", "pending_order_id": pending_id},
-                )
-                pf["pending_order_id"] = None
-                pf["pending_deadline_ts"] = None
-                bucket[symbol] = pf
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            if pending_deadline and now_ts >= pending_deadline:
-                cancel_open_orders(symbol)
-                pf["pending_order_id"] = None
-                pf["pending_deadline_ts"] = None
-                pf["last_attempt_ts"] = time.time()
-                bucket[symbol] = pf
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            if isinstance(pending_prior_hh, (int, float)):
-                df15 = cycle_cache.get_df(symbol, pumpfade_cfg.tf_trigger, limit=3)
-                if not df15.empty and len(df15) >= 2:
-                    try:
-                        last_high = float(df15["high"].iloc[-1])
-                        if last_high >= float(pending_prior_hh) * (1 + pumpfade_cfg.failure_eps):
-                            cancel_open_orders(symbol)
-                            pf["pending_order_id"] = None
-                            pf["pending_deadline_ts"] = None
-                            pf["last_attempt_ts"] = time.time()
-                            bucket[symbol] = pf
-                            time.sleep(PER_SYMBOL_SLEEP)
-                            continue
-                    except Exception:
-                        pass
-
-        if in_pos and existing_amt <= 0:
-            st["in_pos"] = False
-            state[symbol] = st
-            pf["cooldown_until_ts"] = now_ts + tf_sec * int(pumpfade_cfg.cooldown_bars)
-            bucket[symbol] = pf
-
-        if existing_amt > 0:
-            st["in_pos"] = True
-            state[symbol] = st
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        cooldown_until = float(pf.get("cooldown_until_ts") or 0.0)
-        if cooldown_until and now_ts < cooldown_until:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        if pending_id:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        sig = pumpfade_engine.on_tick(ctx, symbol)
-        if not sig:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        meta = sig.meta or {}
-        hh_n = meta.get("hh_n")
-        atr15 = meta.get("atr15")
-        last_hh = pf.get("last_retest_hh")
-        last_prior_hh = pf.get("last_prior_hh")
-        if isinstance(hh_n, (int, float)) and isinstance(last_hh, (int, float)) and isinstance(atr15, (int, float)):
-            if abs(float(hh_n) - float(last_hh)) <= float(atr15) * 0.2:
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-
-        cur_total = count_open_positions(force=True)
-        if not isinstance(cur_total, int):
-            cur_total = 0
-        if cur_total >= MAX_OPEN_POSITIONS:
-            _append_entry_gate_log(
-                "pumpfade",
-                symbol,
-                f"포지션제한={cur_total}/{MAX_OPEN_POSITIONS} side=SHORT",
-                side="SHORT",
-            )
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        if _exit_cooldown_blocked(state, symbol, "pumpfade", "SHORT"):
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        entry_price = float(sig.entry_price or 0.0)
-        if entry_price <= 0:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        order_info = "(알림 전용)"
-        entry_usdt = _resolve_entry_usdt()
-        try:
-            date_tag = time.strftime("%Y%m%d")
-            _append_entry_log(
-                f"pumpfade/pumpfade_entries_{date_tag}.log",
-                "engine=pumpfade side=SHORT symbol=%s state=ENTRY_READY hh=%s prior_hh=%s retest=Y "
-                "failure_high=%s failure_low=%s confirm_close=%s confirm=%s confirm_sub=%s aggr=%s vol_ok=%s vol_rel=%.2f "
-                "rsi=%s rsi_turn=%s macd_inc=%s entry=%.6g reasons=%s"
-                % (
-                    symbol,
-                    f"{meta.get('hh_n'):.6g}" if isinstance(meta.get("hh_n"), (int, float)) else "N/A",
-                    f"{meta.get('prior_hh'):.6g}" if isinstance(meta.get("prior_hh"), (int, float)) else "N/A",
-                    f"{meta.get('failure_high'):.6g}" if isinstance(meta.get("failure_high"), (int, float)) else "N/A",
-                    f"{meta.get('failure_low'):.6g}" if isinstance(meta.get("failure_low"), (int, float)) else "N/A",
-                    f"{meta.get('confirm_close'):.6g}" if isinstance(meta.get("confirm_close"), (int, float)) else "N/A",
-                    f"{meta.get('confirm_type') or 'N/A'}",
-                    f"{meta.get('confirm_subtype') or meta.get('confirm_type') or 'N/A'}",
-                    "1" if meta.get("aggressive_mode") else "0",
-                    "Y" if meta.get("vol_ok") else "N",
-                    (
-                        float(meta.get("vol_failure") or 0.0) / float(meta.get("vol_peak") or 1.0)
-                        if isinstance(meta.get("vol_failure"), (int, float)) and isinstance(meta.get("vol_peak"), (int, float)) and meta.get("vol_peak")
-                        else 0.0
-                    ),
-                    f"{meta.get('rsi'):.2f}" if isinstance(meta.get("rsi"), (int, float)) else "N/A",
-                    "Y" if meta.get("rsi_turn") else "N",
-                    "Y" if meta.get("macd_hist_increasing") else "N",
-                    entry_price,
-                    ",".join(meta.get("reasons") or []),
-                ),
-            )
-        except Exception:
-            pass
-        if LIVE_TRADING:
-            lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="pumpfade", side="SHORT")
-            if not lock_ok:
-                print(f"[ENTRY-LOCK] sym={symbol} owner=pumpfade ok=0 held_by={lock_owner} age_s={lock_age:.1f}")
-                time.sleep(PER_SYMBOL_SLEEP)
-                continue
-            try:
-                guard_key = _entry_guard_key(state, symbol, "SHORT")
-                if not _entry_guard_acquire(state, symbol, key=guard_key, engine="pumpfade", side="SHORT"):
-                    print(f"[pumpfade] 숏 중복 차단 ({symbol})")
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                if _entry_seen_blocked(state, symbol, "SHORT", "pumpfade"):
-                    time.sleep(PER_SYMBOL_SLEEP)
-                    continue
-                try:
-                    res = short_market(
-                        symbol,
-                        usdt_amount=entry_usdt,
-                        leverage=LEVERAGE,
-                        margin_mode=MARGIN_MODE,
-                    )
-                    order_id = _order_id_from_res(res)
-                    status = res.get("status")
-                    order_info = f"market usdt={entry_usdt} status={status}"
-                    if status in ("ok",) and order_id:
-                        _entry_seen_mark(state, symbol, "SHORT", "pumpfade")
-                        pf["pending_order_id"] = None
-                        pf["pending_deadline_ts"] = None
-                        pf["last_retest_hh"] = hh_n if isinstance(hh_n, (int, float)) else last_hh
-                        prior_hh = meta.get("prior_hh")
-                        if isinstance(prior_hh, (int, float)):
-                            pf["pending_prior_hh"] = prior_hh
-                            pf["last_prior_hh"] = prior_hh
-                        bucket[symbol] = pf
-                    elif status == "dry_run":
-                        st["in_pos"] = True
-                        _set_last_entry_state(st, "SHORT", time.time())
-                        state[symbol] = st
-                        _entry_seen_mark(state, symbol, "SHORT", "pumpfade")
-                        _log_trade_entry(
-                            state,
-                            side="SHORT",
-                            symbol=symbol,
-                            entry_ts=time.time(),
-                            entry_price=entry_price,
-                            qty=None,
-                            usdt=entry_usdt,
-                            meta={"reason": "pumpfade_short", "dry_run": True},
-                        )
-                finally:
-                    _entry_guard_release(state, symbol, key=guard_key)
-            finally:
-                _entry_lock_release(state, symbol, owner="pumpfade")
-        reason = ",".join(meta.get("reasons") or [])
-        _send_entry_alert(
-            send_alert,
-            side="SHORT",
-            symbol=symbol,
-            engine="PUMPFADE",
-            entry_price=entry_price,
-            usdt=entry_usdt,
-            reason=reason or "ENTRY_READY",
-            live=LIVE_TRADING,
-            order_info=order_info,
-            sl=_fmt_price_safe(meta.get("failure_high"), AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-            tp=None,
-        )
-        result["hits"] += 1
-        time.sleep(PER_SYMBOL_SLEEP)
     return result
 
 def _run_atlas_rs_fail_short_cycle(
@@ -3770,7 +4712,7 @@ def _run_atlas_rs_fail_short_cycle(
         )
     for symbol in arsf_universe:
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if st.get("in_pos"):
+        if _is_in_pos_side(st, "SHORT"):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         sig = arsf_engine.on_tick(ctx, symbol)
@@ -3867,53 +4809,29 @@ def _run_atlas_rs_fail_short_cycle(
                 continue
             try:
                 entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE * float(size_mult or 1.0))
-                res = short_market(
-                    symbol,
-                    usdt_amount=entry_usdt,
-                    leverage=LEVERAGE,
-                    margin_mode=MARGIN_MODE,
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side="SHORT",
+                    engine="ATLAS_RS_FAIL_SHORT",
+                    reason="atlas_rs_fail_short",
+                    usdt=entry_usdt,
+                    live=LIVE_TRADING,
+                    alert_reason="PULLBACK_FAIL",
+                    entry_price_hint=entry_price,
+                    size_mult=size_mult,
                 )
-                entry_order_id = _order_id_from_res(res)
-                fill_price = res.get("last") or res.get("order", {}).get("average") or res.get("order", {}).get("price")
-                qty = res.get("amount") or res.get("order", {}).get("amount")
-                st["in_pos"] = True
-                _set_last_entry_state(st, "SHORT", time.time())
-                state[symbol] = st
-                if isinstance(bucket, dict):
+                if req_id and isinstance(bucket, dict):
                     rec = bucket.get(symbol)
                     if isinstance(rec, dict):
-                        now_entry_ts = time.time()
-                        rec["last_entry_ts"] = now_entry_ts
+                        rec["last_entry_ts"] = time.time()
                         bucket[symbol] = rec
-                _log_trade_entry(
-                    state,
-                    side="SHORT",
-                    symbol=symbol,
-                    entry_ts=time.time(),
-                    entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
-                    qty=qty if isinstance(qty, (int, float)) else None,
-                    usdt=entry_usdt,
-                    entry_order_id=entry_order_id,
-                    meta={"reason": "atlas_rs_fail_short"},
-                )
-                _send_entry_alert(
-                    send_alert,
-                    side="SHORT",
-                    symbol=symbol,
-                    engine="ATLAS_RS_FAIL_SHORT",
-                    entry_price=fill_price if fill_price is not None else entry_price,
-                    usdt=entry_usdt,
-                    reason="PULLBACK_FAIL",
-                    live=LIVE_TRADING,
-                    entry_order_id=entry_order_id,
-                    sl=_fmt_price_safe(fill_price or entry_price, AUTO_EXIT_SHORT_SL_PCT, side="SHORT"),
-                )
             except Exception as e:
-                print(f"[atlas-rs-fail-short] order error {symbol}: {e}")
+                print(f"[atlas-rs-fail-short] queue error {symbol}: {e}")
             finally:
                 _entry_guard_release(state, symbol, key=guard_key)
         finally:
-            _entry_lock_release(state, symbol, owner="atlas_rs_fail_short")
+            _entry_lock_release(state, symbol, owner="atlas_rs_fail_short", side="SHORT")
         time.sleep(PER_SYMBOL_SLEEP)
     return result
 
@@ -4093,11 +5011,171 @@ def _read_report_csv_records(report_date: str) -> Optional[list]:
     except Exception:
         return None
 
-def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dict]:
+def _load_db_entry_events_map(
+    report_date: Optional[str] = None,
+    since_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    include_alerts: bool = False,
+    include_engine_signals: bool = False,
+) -> tuple[dict, dict]:
+    by_id: dict = {}
+    by_symbol_side: dict = {}
+    if not dbrec or not dbrec.ENABLED:
+        return by_id, by_symbol_side
+    try:
+        db_path = getattr(dbrec, "DB_PATH", "") or "logs/trades.db"
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        if include_alerts:
+            clauses = ["event_type IN ('ENTRY','ALERT_ENTRY')"]
+        else:
+            clauses = ["event_type = 'ENTRY'"]
+        params: list = []
+        if report_date:
+            clauses.append("date(datetime(ts, 'unixepoch')) = ?")
+            params.append(report_date)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(float(since_ts))
+        if end_ts is not None:
+            clauses.append("ts <= ?")
+            params.append(float(end_ts))
+        where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = cur.execute(
+            f"""
+            SELECT ts, symbol, side, source, avg_entry, meta_json
+            FROM events
+            {where_sql}
+            """,
+            tuple(params),
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            try:
+                ts_val = float(row[0]) if row[0] is not None else None
+            except Exception:
+                ts_val = None
+            if ts_val is None:
+                continue
+            symbol = row[1] or ""
+            side = (row[2] or "").upper()
+            if not symbol or side not in ("LONG", "SHORT"):
+                continue
+            engine = row[3] or "unknown"
+            entry_price = None
+            try:
+                entry_price = float(row[4]) if row[4] is not None else None
+            except Exception:
+                entry_price = None
+            meta = None
+            raw_meta = row[5]
+            if raw_meta:
+                try:
+                    meta = json.loads(raw_meta)
+                except Exception:
+                    meta = None
+            if isinstance(meta, dict):
+                meta_engine = meta.get("engine") or meta.get("source_engine")
+                if meta_engine:
+                    engine = meta_engine
+                meta_entry_price = meta.get("entry_price") or meta.get("avg_entry")
+                if entry_price is None and isinstance(meta_entry_price, (int, float)):
+                    entry_price = float(meta_entry_price)
+                entry_order_id = meta.get("entry_order_id")
+            else:
+                entry_order_id = None
+            record = {
+                "entry_ts": ts_val,
+                "entry_order_id": entry_order_id,
+                "symbol": symbol,
+                "side": side,
+                "engine": engine,
+                "entry_price": entry_price,
+                "record_type": "event",
+                "event_type": "ENTRY",
+                "source": row[3],
+                "meta": meta if isinstance(meta, dict) else None,
+            }
+            if entry_order_id:
+                by_id[str(entry_order_id)] = record
+            key = (symbol, side)
+            by_symbol_side.setdefault(key, []).append(record)
+        if include_engine_signals:
+            try:
+                clauses = []
+                params = []
+                if report_date:
+                    clauses.append("date(datetime(ts, 'unixepoch')) = ?")
+                    params.append(report_date)
+                if since_ts is not None:
+                    clauses.append("ts >= ?")
+                    params.append(float(since_ts))
+                if end_ts is not None:
+                    clauses.append("ts <= ?")
+                    params.append(float(end_ts))
+                where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+                sig_rows = cur.execute(
+                    f"""
+                    SELECT ts, symbol, side, engine, reason
+                    FROM engine_signals
+                    {where_sql}
+                    """,
+                    tuple(params),
+                ).fetchall()
+                for row in sig_rows:
+                    try:
+                        ts_val = float(row[0]) if row[0] is not None else None
+                    except Exception:
+                        ts_val = None
+                    if ts_val is None:
+                        continue
+                    symbol = row[1] or ""
+                    side = (row[2] or "").upper()
+                    if not symbol or side not in ("LONG", "SHORT"):
+                        continue
+                    engine = row[3] or "unknown"
+                    record = {
+                        "entry_ts": ts_val,
+                        "entry_order_id": None,
+                        "symbol": symbol,
+                        "side": side,
+                        "engine": engine,
+                        "entry_price": None,
+                        "record_type": "engine_signal",
+                        "event_type": None,
+                        "source": row[4],
+                        "meta": None,
+                    }
+                    key = (symbol, side)
+                    by_symbol_side.setdefault(key, []).append(record)
+            except Exception:
+                pass
+        return by_id, by_symbol_side
+    except Exception:
+        return by_id, by_symbol_side
+
+def _load_entry_events_map(
+    report_date: Optional[str] = None,
+    since_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    include_alerts: bool = False,
+    include_engine_signals: bool = False,
+) -> tuple[dict, dict]:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if dbrec and dbrec.ENABLED:
+        by_id, by_symbol_side = _load_db_entry_events_map(
+            report_date=report_date,
+            since_ts=since_ts,
+            end_ts=end_ts,
+            include_alerts=include_alerts,
+            include_engine_signals=include_engine_signals,
+        )
+        if by_id or by_symbol_side:
+            return by_id, by_symbol_side
     by_id = {}
     by_symbol_side = {}
     paths: list[str] = []
-    entry_dir = os.path.join("logs", "entry")
+    entry_dir = os.path.join(base_dir, "logs", "entry")
     if os.path.isdir(entry_dir):
         try:
             for name in sorted(os.listdir(entry_dir)):
@@ -4105,11 +5183,11 @@ def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dic
                     paths.append(os.path.join(entry_dir, name))
         except Exception:
             pass
-    legacy_path = os.path.join("logs", "entry_events.log")
+    legacy_path = os.path.join(base_dir, "logs", "entry_events.log")
     if os.path.exists(legacy_path):
         paths.append(legacy_path)
     if report_date:
-        dated_path = os.path.join("logs", "entry", f"entry_events-{report_date}.log")
+        dated_path = os.path.join(base_dir, "logs", "entry", f"entry_events-{report_date}.log")
         if os.path.exists(dated_path) and dated_path not in paths:
             paths.append(dated_path)
     if not paths:
@@ -4148,6 +5226,7 @@ def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dic
                         "symbol": symbol,
                         "side": side,
                         "engine": engine,
+                        "entry_price": payload.get("entry_price"),
                     }
                     if entry_id:
                         by_id[str(entry_id)] = record
@@ -4157,6 +5236,50 @@ def _load_entry_events_map(report_date: Optional[str] = None) -> tuple[dict, dic
     except Exception:
         return by_id, by_symbol_side
     return by_id, by_symbol_side
+
+def _load_swaggy_trade_engine_map(needed: set) -> dict:
+    if not needed:
+        return {}
+    out = {}
+    path = os.path.join("logs", "swaggy_trades.jsonl")
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("event") != "SWAGGY_TRADE":
+                    continue
+                sym = rec.get("symbol")
+                side = (rec.get("side") or "").upper()
+                if not sym or side not in ("LONG", "SHORT"):
+                    continue
+                key = (sym, side)
+                if key not in needed:
+                    continue
+                ts_val = None
+                ts = rec.get("entry_ts") or rec.get("ts")
+                if isinstance(ts, (int, float)):
+                    ts_val = float(ts)
+                elif isinstance(ts, str):
+                    try:
+                        ts_val = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        ts_val = None
+                if ts_val is None:
+                    continue
+                cur = out.get(key)
+                if not cur or ts_val > float(cur.get("ts") or 0.0):
+                    out[key] = {"engine": rec.get("engine"), "ts": ts_val}
+    except Exception:
+        return out
+    return out
 
 def _sync_report_with_api(state: Dict[str, dict], report_date: str) -> bool:
     if executor_mod is None or not hasattr(executor_mod, "exchange"):
@@ -4517,16 +5640,19 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
             continue
         if still_open:
             continue
-        print(f"[long-exit] {symbol} position closed detected, canceling open orders")
+        if LOG_LONG_EXIT:
+            print(f"[long-exit] {symbol} position closed detected, canceling open orders")
         meta = tr.get("meta") or {}
         try:
             cancel_conditional_by_side(symbol, "LONG")
         except Exception as e:
-            print(f"[long-exit] {symbol} cancel_conditional_by_side failed: {e}")
+            if LOG_LONG_EXIT:
+                print(f"[long-exit] {symbol} cancel_conditional_by_side failed: {e}")
         try:
             cancel_stop_orders(symbol)
         except Exception as e:
-            print(f"[long-exit] {symbol} cancel_stop_orders failed: {e}")
+            if LOG_LONG_EXIT:
+                print(f"[long-exit] {symbol} cancel_stop_orders failed: {e}")
         exit_ts = time.time()
         entry_ts_ms = tr.get("entry_ts_ms")
         realized_pnl = None
@@ -4569,13 +5695,13 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
         ):
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
-            order_block = _format_order_id_block(tr.get("entry_order_id"), tr.get("exit_order_id"))
-            order_line = f"{order_block}\n" if order_block else ""
+            entry_time = _fmt_entry_time(tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
             send_telegram(
                 f"{EXIT_ICON} <b>롱 청산</b>\n"
                 f"<b>{symbol}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
-                f"{order_line}"
+                f"{entry_line}"
                 f"청산가={price_str}\n"
                 f"손익={pnl_str}"
             )
@@ -4660,7 +5786,8 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
                     f"grace_left={grace_left} last_entry_age={last_entry_age}"
                 )
                 st = state.get(symbol, {})
-                st["in_pos"] = True
+                if isinstance(st, dict):
+                    _set_in_pos_side(st, "SHORT", True)
                 state[symbol] = st
                 continue
             print(
@@ -4676,7 +5803,8 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
                 state[symbol] = st
         if amt > SHORT_RECONCILE_EPS:
             st = state.get(symbol, {})
-            st["in_pos"] = True
+            if isinstance(st, dict):
+                _set_in_pos_side(st, "SHORT", True)
             state[symbol] = st
             continue
         age_sec = None
@@ -4760,14 +5888,15 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
             pnl_str = f"{pnl:+.3f} USDT" if isinstance(pnl, (int, float)) else "N/A"
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
             exit_tag = "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
-            order_block = _format_order_id_block(tr.get("entry_order_id"), tr.get("exit_order_id"))
-            order_line = f"{order_block}\n" if order_block else ""
+            entry_time = _fmt_entry_time(tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+            icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
             send_telegram(
-                f"🔴 <b>숏 청산</b>\n"
+                f"{icon} <b>숏 청산</b>\n"
                 f"<b>{symbol}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
-                f"{order_line}"
+                f"{entry_line}"
                 f"청산가={price_str}\n"
                 f"손익={pnl_str}"
             )
@@ -4791,6 +5920,479 @@ def _get_manage_tickers(state: dict, exchange, ttl_sec: float) -> dict:
     except Exception as e:
         print("[manage] tickers fetch failed:", e)
         return cached if isinstance(cached, dict) else {}
+
+def _process_manage_queue(state: dict, send_telegram) -> None:
+    offset = state.get("_manage_queue_offset", 0)
+    try:
+        offset = int(offset or 0)
+    except Exception:
+        offset = 0
+    offset, reqs = manage_queue.read_requests_from_offset(offset)
+    state["_manage_queue_offset"] = offset
+    if not reqs:
+        return
+    status = state.setdefault("_manage_queue_status", {})
+    now = time.time()
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        if req.get("type") != "entry":
+            continue
+        engine = str(req.get("engine") or "").upper()
+        allowed_engines = {
+            "SWAGGY_ATLAS_LAB",
+            "SWAGGY_ATLAS_LAB_V2",
+            "SWAGGY_NO_ATLAS",
+            "ATLAS_RS_FAIL_SHORT",
+            "DTFX",
+            "RSI",
+            "MANUAL",
+            "UNKNOWN",
+        }
+        if engine and engine not in allowed_engines:
+            status_key = str(req.get("id") or "").strip() or f"skip:{engine}"
+            status[status_key] = {"status": "failed", "ts": now, "reason": "engine_removed"}
+            print(f"[manage-queue] skip engine={engine} symbol={req.get('symbol')}")
+            continue
+        req_id = str(req.get("id") or "").strip()
+        if not req_id:
+            continue
+        st = status.get(req_id)
+        if isinstance(st, dict) and st.get("status") in ("done", "executing"):
+            continue
+        status[req_id] = {"status": "executing", "ts": now}
+        symbol = str(req.get("symbol") or "")
+        side = str(req.get("side") or "").upper()
+        if engine in ("SWAGGY_NO_ATLAS", "SWAGGY_ATLAS_LAB", "SWAGGY_ATLAS_LAB_V2"):
+            if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now):
+                _append_entry_gate_log(
+                    engine.lower() if engine else "unknown",
+                    symbol,
+                    "off_window=saturday",
+                    side=side,
+                )
+                status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window_saturday"}
+                continue
+            if engine == "SWAGGY_NO_ATLAS" and _is_in_off_window(SWAGGY_NO_ATLAS_OFF_WINDOWS, now):
+                _append_entry_gate_log(
+                    engine.lower() if engine else "unknown",
+                    symbol,
+                    f"off_window={SWAGGY_NO_ATLAS_OFF_WINDOWS}",
+                    side=side,
+                )
+                status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window"}
+                continue
+            if engine == "SWAGGY_ATLAS_LAB" and _is_in_off_window(SWAGGY_ATLAS_LAB_OFF_WINDOWS, now):
+                _append_entry_gate_log(
+                    engine.lower() if engine else "unknown",
+                    symbol,
+                    f"off_window={SWAGGY_ATLAS_LAB_OFF_WINDOWS}",
+                    side=side,
+                )
+                status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window"}
+                continue
+            if engine == "SWAGGY_ATLAS_LAB_V2" and _is_in_off_window(SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, now):
+                _append_entry_gate_log(
+                    engine.lower() if engine else "unknown",
+                    symbol,
+                    f"off_window={SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS}",
+                    side=side,
+                )
+                status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window"}
+                continue
+        ok = _execute_manage_entry_request(state, req, send_telegram)
+        status[req_id] = {"status": "done" if ok else "failed", "ts": time.time()}
+
+def _record_position_event(
+    symbol: str,
+    side: str,
+    event_type: str,
+    source: str,
+    qty: Optional[float],
+    avg_entry: Optional[float],
+    price: Optional[float],
+    meta: Optional[dict],
+) -> None:
+    if not dbrec or not dbrec.ENABLED:
+        return
+    try:
+        dbrec.record_event(
+            symbol=symbol,
+            side=side,
+            event_type=event_type,
+            source=source,
+            qty=qty,
+            avg_entry=avg_entry,
+            price=price,
+            meta=meta,
+            ts=time.time(),
+        )
+    except Exception:
+        pass
+
+def _detect_position_events(state: dict, send_telegram) -> None:
+    try:
+        pos_syms = list_open_position_symbols(force=True)
+    except Exception:
+        return
+    def _recent_entry_event(symbol: str, side: str, now_ts: float, window_sec: float = 180.0) -> Optional[dict]:
+        report_date = _report_day_str(now_ts)
+        _by_id, by_symbol = _load_entry_events_map(report_date)
+        recs = by_symbol.get((symbol, side)) or []
+        if not recs:
+            return None
+        recs = sorted(recs, key=lambda r: float(r.get("entry_ts") or 0.0), reverse=True)
+        for rec in recs:
+            ts_val = rec.get("entry_ts")
+            if not isinstance(ts_val, (int, float)):
+                continue
+            if (now_ts - float(ts_val)) > window_sec:
+                continue
+            engine = str(rec.get("engine") or "").upper()
+            if engine and engine not in ("UNKNOWN", "MANUAL"):
+                return rec
+        return None
+    snap = state.setdefault("_pos_snapshot", {})
+    now = time.time()
+    def _handle(symbol: str, side: str, detail: Optional[dict]) -> None:
+        open_tr = _get_open_trade(state, side, symbol)
+        managed = isinstance(open_tr, dict)
+        managed_engine = (open_tr.get("meta") or {}).get("engine") if managed else None
+        changed = False
+        key = f"{symbol}|{side}"
+        prev = snap.get(key) if isinstance(snap, dict) else None
+        prev_qty = prev.get("qty") if isinstance(prev, dict) else None
+        prev_entry = prev.get("entry") if isinstance(prev, dict) else None
+        qty = None
+        avg_entry = None
+        mark = None
+        if isinstance(detail, dict):
+            qty = detail.get("qty") or detail.get("amount")
+            avg_entry = detail.get("entry")
+            mark = detail.get("mark")
+        try:
+            qty = float(qty) if qty is not None else None
+        except Exception:
+            qty = None
+        if side == "SHORT" and isinstance(qty, (int, float)):
+            qty = abs(qty)
+        try:
+            avg_entry = float(avg_entry) if avg_entry is not None else None
+        except Exception:
+            avg_entry = None
+        if isinstance(qty, (int, float)) and qty <= 0:
+            qty = None
+        if prev_qty is None and qty is not None:
+            if not managed:
+                recent = _recent_entry_event(symbol, side, now)
+                if isinstance(recent, dict):
+                    engine_label = str(recent.get("engine") or "").upper()
+                    reason = _reason_from_engine_label(engine_label, side)
+                    entry_price = avg_entry if isinstance(avg_entry, (int, float)) else recent.get("entry_price")
+                    _log_trade_entry(
+                        state,
+                        side=side,
+                        symbol=symbol,
+                        entry_ts=float(recent.get("entry_ts") or now),
+                        entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+                        qty=qty if isinstance(qty, (int, float)) else None,
+                        usdt=None,
+                        entry_order_id=recent.get("entry_order_id"),
+                        meta={"reason": reason, "engine": engine_label} if reason else {"engine": engine_label},
+                    )
+                    return
+                _record_position_event(symbol, side, "ENTRY", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
+                changed = True
+                _send_entry_alert(
+                    send_telegram,
+                    side=side,
+                    symbol=symbol,
+                    engine="MANUAL",
+                    entry_price=avg_entry,
+                    usdt=None,
+                    reason="manual_entry",
+                    live=True,
+                    order_info="(pos-snap)",
+                    entry_order_id=None,
+                    sl=_fmt_price_safe(
+                        avg_entry,
+                        AUTO_EXIT_SHORT_SL_PCT if side == "SHORT" else AUTO_EXIT_LONG_SL_PCT,
+                        side=side,
+                    ),
+                    tp=None,
+                    state=state,
+                )
+        elif prev_qty is not None and qty is not None:
+            if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > prev_qty * 1.0001:
+                if not managed:
+                    _record_position_event(symbol, side, "DCA", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
+                    changed = True
+                    label = "DCA" if DCA_ENABLED else "ADD"
+                    send_telegram(
+                        f"➕ <b>{label}</b> {symbol} {side} adds mark={mark} entry={avg_entry} qty={qty}"
+                    )
+        elif prev_qty is not None and qty is None:
+            source = managed_engine or ("AUTO" if managed else "MANUAL")
+            _record_position_event(symbol, side, "EXIT", source, prev_qty, prev_entry, mark, {"source": "pos_snapshot"})
+            changed = True
+        if isinstance(snap, dict):
+            if qty is not None:
+                snap[key] = {"qty": qty, "entry": avg_entry, "ts": now}
+            else:
+                snap.pop(key, None)
+        if changed:
+            try:
+                save_state(state)
+            except Exception:
+                pass
+    for sym in pos_syms.get("short") or []:
+        detail = None
+        try:
+            detail = get_short_position_detail(sym)
+        except Exception:
+            detail = None
+        _handle(sym, "SHORT", detail)
+    for sym in pos_syms.get("long") or []:
+        detail = None
+        try:
+            detail = get_long_position_detail(sym)
+        except Exception:
+            detail = None
+        _handle(sym, "LONG", detail)
+
+def _detect_manual_positions(state: dict, send_telegram) -> None:
+    try:
+        pos_syms = list_open_position_symbols(force=True)
+    except Exception:
+        return
+    for side_key, side_label in (("short", "SHORT"), ("long", "LONG")):
+        syms = pos_syms.get(side_key) or set()
+        for sym in syms:
+            if _get_open_trade(state, side_label, sym):
+                continue
+            detail = get_short_position_detail(sym) if side_label == "SHORT" else get_long_position_detail(sym)
+            if not isinstance(detail, dict):
+                continue
+            qty = detail.get("qty") or detail.get("amount")
+            entry = detail.get("entry")
+            mark = detail.get("mark")
+            try:
+                qty = float(qty)
+            except Exception:
+                qty = None
+            if side_label == "SHORT" and isinstance(qty, (int, float)):
+                qty = abs(qty)
+            st = state.get(sym) if isinstance(state.get(sym), dict) else {}
+            if not isinstance(st, dict):
+                st = {}
+            prev_qty = st.get(f"manual_qty_{side_key}")
+            if not _is_in_pos_side(st, side_label):
+                info = _manual_alert_info(state, sym, side_label)
+                if info:
+                    prev_entry = info.get("entry")
+                    prev_qty = info.get("qty")
+                    prev_ts = info.get("ts")
+                    same_entry = False
+                    if isinstance(prev_entry, (int, float)) and isinstance(entry, (int, float)) and entry > 0:
+                        same_entry = abs(float(prev_entry) - float(entry)) / float(entry) <= 0.001
+                    elif prev_entry is None or entry is None:
+                        same_entry = True
+                    same_qty = False
+                    if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > 0:
+                        same_qty = abs(float(prev_qty) - float(qty)) / float(qty) <= 0.01
+                    elif prev_qty is None or qty is None:
+                        same_qty = True
+                    ttl_ok = False
+                    if isinstance(prev_ts, (int, float)):
+                        ttl_ok = (time.time() - float(prev_ts)) <= MANUAL_ALERT_TTL_SEC
+                    if same_entry and same_qty and ttl_ok:
+                        _set_in_pos_side(st, side_label, True)
+                        st[f"manual_qty_{side_key}"] = qty
+                        st.setdefault(f"manual_dca_adds_{side_key}", 0)
+                        state[sym] = st
+                        continue
+                _log_trade_entry(
+                    state,
+                    side=side_label,
+                    symbol=sym,
+                    entry_ts=time.time(),
+                    entry_price=entry if isinstance(entry, (int, float)) else None,
+                    qty=qty if isinstance(qty, (int, float)) else None,
+                    usdt=None,
+                    entry_order_id=None,
+                    meta={"reason": "manual_entry"},
+                )
+                _send_entry_alert(
+                    send_telegram,
+                    side=side_label,
+                    symbol=sym,
+                    engine="MANUAL",
+                    entry_price=entry if isinstance(entry, (int, float)) else None,
+                    usdt=None,
+                    reason="manual_entry",
+                    live=True,
+                    order_info="(manual)",
+                    entry_order_id=None,
+                    sl=_fmt_price_safe(entry, AUTO_EXIT_SHORT_SL_PCT if side_label == "SHORT" else AUTO_EXIT_LONG_SL_PCT, side=side_label),
+                    tp=None,
+                    state=state,
+                )
+                _mark_manual_alerted(state, sym, side_label, entry_price=entry, qty=qty)
+                try:
+                    save_state(state)
+                except Exception:
+                    pass
+                _set_in_pos_side(st, side_label, True)
+                st[f"manual_qty_{side_key}"] = qty
+                st[f"manual_dca_adds_{side_key}"] = 0
+                _set_last_entry_state(st, side_label, time.time())
+                state[sym] = st
+                continue
+            if isinstance(qty, (int, float)) and isinstance(prev_qty, (int, float)) and qty > prev_qty * 1.0001:
+                adds_key = f"manual_dca_adds_{side_key}"
+                adds_done = int(st.get(adds_key, 0) or 0)
+                st[adds_key] = adds_done + 1
+                st[f"manual_qty_{side_key}"] = qty
+                state[sym] = st
+                send_telegram(
+                    f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} "
+                    f"mark={mark} entry={entry} qty={qty}"
+                )
+                try:
+                    save_state(state)
+                except Exception:
+                    pass
+
+def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool:
+    symbol = req.get("symbol")
+    side = str(req.get("side") or "").upper()
+    if not symbol or side not in ("LONG", "SHORT"):
+        return False
+    engine = str(req.get("engine") or "").upper()
+    if engine and not _is_engine_enabled(engine):
+        _clear_manage_pending(state, symbol, side)
+        return False
+    try:
+        refresh_positions_cache(force=True)
+    except Exception:
+        pass
+    cur_total = None
+    try:
+        cur_total = count_open_positions(force=True)
+    except Exception:
+        cur_total = None
+    if not isinstance(cur_total, int):
+        cur_total = _count_open_positions_state(state)
+    alert_tag = req.get("alert_tag")
+    reason = str(req.get("reason") or "").lower()
+    is_multi_req = False
+    if isinstance(alert_tag, str) and alert_tag.startswith("MULTI_ENTRY"):
+        is_multi_req = True
+    if "multi" in reason:
+        is_multi_req = True
+    if engine == "SWAGGY_NO_ATLAS" or is_multi_req:
+        _append_swaggy_no_atlas_log(
+            f"SWAGGY_NO_ATLAS_MANAGE_REQ sym={symbol} side={side} "
+            f"multi={int(is_multi_req)} reason={req.get('reason')} tag={alert_tag or ''}"
+        )
+    if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS and not is_multi_req:
+        _clear_manage_pending(state, symbol, side)
+        _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
+        return False
+    try:
+        if side == "SHORT" and get_short_position_amount(symbol) > 0 and not is_multi_req:
+            _clear_manage_pending(state, symbol, side)
+            _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, "already_in_position", side=side)
+            if engine == "SWAGGY_NO_ATLAS":
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_MANAGE_SKIP sym={symbol} side={side} reason=ALREADY_IN_POSITION"
+                )
+            return True
+        if side == "LONG" and get_long_position_amount(symbol) > 0 and not is_multi_req:
+            _clear_manage_pending(state, symbol, side)
+            _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, "already_in_position", side=side)
+            if engine == "SWAGGY_NO_ATLAS":
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_MANAGE_SKIP sym={symbol} side={side} reason=ALREADY_IN_POSITION"
+                )
+            return True
+    except Exception:
+        pass
+    live = bool(req.get("live"))
+    try:
+        set_dry_run(False if live else True)
+    except Exception:
+        pass
+    usdt = float(req.get("usdt") or 0.0)
+    res = {}
+    try:
+        if side == "SHORT":
+            res = short_market(symbol, usdt_amount=usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+        else:
+            res = long_market(symbol, usdt_amount=usdt, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+    except Exception as e:
+        print(f"[manage-queue] execute failed sym={symbol} side={side} err={e}")
+        _clear_manage_pending(state, symbol, side)
+        return False
+    entry_order_id = _order_id_from_res(res)
+    fill_price = res.get("last") or (res.get("order") or {}).get("average") or (res.get("order") or {}).get("price")
+    qty = res.get("amount") or (res.get("order") or {}).get("amount")
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    if not isinstance(st, dict):
+        st = {}
+    _set_in_pos_side(st, side, True)
+    st.setdefault("dca_adds", 0)
+    st.setdefault("dca_adds_long", 0)
+    st.setdefault("dca_adds_short", 0)
+    _set_last_entry_state(st, side, time.time())
+    state[symbol] = st
+    _log_trade_entry(
+        state,
+        side=side,
+        symbol=symbol,
+        entry_ts=time.time(),
+        entry_price=fill_price if isinstance(fill_price, (int, float)) else None,
+        qty=qty if isinstance(qty, (int, float)) else None,
+        usdt=usdt,
+        entry_order_id=entry_order_id,
+        meta={"reason": req.get("reason"), "engine": req.get("engine")},
+    )
+    _record_position_event(
+        symbol,
+        side,
+        "ENTRY",
+        str(req.get("engine") or "AUTO"),
+        qty if isinstance(qty, (int, float)) else None,
+        fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
+        fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
+        {"source": "manage_queue", "reason": req.get("reason")},
+    )
+    try:
+        _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
+    except Exception:
+        pass
+    _send_entry_alert(
+        (lambda text: send_telegram(text, allow_early=True)),
+        side=side,
+        symbol=symbol,
+        engine=req.get("engine") or "UNKNOWN",
+        entry_price=fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
+        usdt=usdt,
+        reason=req.get("alert_reason") or req.get("reason") or "",
+        live=live,
+        order_info=None,
+        entry_order_id=entry_order_id,
+        label_tag=str(alert_tag) if isinstance(alert_tag, str) and alert_tag.startswith("MULTI_ENTRY") else None,
+        sl=_fmt_price_safe(
+            fill_price if isinstance(fill_price, (int, float)) else None,
+            _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
+            side=side,
+        ),
+        tp=None,
+        state=state,
+    )
+    _clear_manage_pending(state, symbol, side)
+    return True
 
 
 def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> None:
@@ -4832,9 +6434,12 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         print("[rate-limit] executor backoff active during manage-mode; skip manage this cycle")
         return
 
+    _process_manage_queue(state, send_telegram)
+    _detect_position_events(state, send_telegram)
+
     exit_force_refreshed = False
     for sym, st in list(state.items()):
-        if not isinstance(st, dict) or not st.get("in_pos"):
+        if not isinstance(st, dict) or not _symbol_in_pos_any(st):
             continue
         roi = None
         last_ping = float(st.get("manage_ping_ts", 0.0) or 0.0)
@@ -4899,14 +6504,15 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 and _trade_has_entry(open_tr)
                 and not _recent_auto_exit(state, sym, now)
             ):
-                order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
-                order_line = f"{order_block}\n" if order_block else ""
+                entry_time = _fmt_entry_time(open_tr)
+                entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+                icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
                 send_telegram(
-                    f"🔴 <b>숏 청산</b>\n"
+                    f"{icon} <b>숏 청산</b>\n"
                     f"<b>{sym}</b>\n"
                     f"엔진: {_display_engine_label(engine_label)}\n"
                     f"사유: {exit_tag}\n"
-                    f"{order_line}".rstrip()
+                    f"{entry_line}".rstrip()
                 )
             time.sleep(0.1)
             continue
@@ -4932,6 +6538,11 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 f"sym={sym} pos_amt={amt} raw_position={raw_pos} "
                 f"update_ts={update_ts} latency_hint={latency_hint}"
             )
+
+        open_tr = _get_open_trade(state, "SHORT", sym)
+        engine_label = _engine_label_from_reason(
+            (open_tr.get("meta") or {}).get("reason") if open_tr else None
+        )
 
         if AUTO_EXIT_ENABLED:
             last_exit = float(st.get("manage_exit_ts", 0.0) or 0.0)
@@ -4962,11 +6573,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                             profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
                     except Exception:
                         profit_unlev = None
-                if profit_unlev is not None and profit_unlev >= AUTO_EXIT_SHORT_TP_PCT:
+                if open_tr is None:
                     open_tr = _get_open_trade(state, "SHORT", sym)
+                if engine_label is None:
                     engine_label = _engine_label_from_reason(
                         (open_tr.get("meta") or {}).get("reason") if open_tr else None
                     )
+                tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "SHORT")
+                if profit_unlev is not None and profit_unlev >= tp_pct:
                     pnl_usdt = pos_detail.get("pnl") if isinstance(pos_detail, dict) else None
                     try:
                         set_dry_run(False if LIVE_TRADING else True)
@@ -5012,17 +6626,15 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         _set_last_exit_state(st, "SHORT", now, "auto_exit_tp")
                         state[sym] = st
                     _append_report_line(sym, "SHORT", profit_unlev, pnl_usdt, engine_label)
-                    order_block = _format_order_id_block(
-                        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-                        exit_order_id,
-                    )
-                    order_line = f"{order_block}\n" if order_block else ""
+                    entry_time = _fmt_entry_time(open_tr)
+                    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+                    icon = EXIT_ICON if exit_tag == "TP" else EXIT_SL_ICON
                     send_telegram(
-                        f"{EXIT_ICON} <b>숏 청산</b>\n"
+                        f"{icon} <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
-                        f"{order_line}"
+                        f"{entry_line}"
                         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                         f"{'' if pnl_usdt is None else f' 손익={pnl_usdt:+.3f} USDT'}"
@@ -5030,11 +6642,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     )
                     time.sleep(0.15)
                     continue
-                if profit_unlev is not None and profit_unlev <= -AUTO_EXIT_SHORT_SL_PCT:
-                    open_tr = _get_open_trade(state, "SHORT", sym)
-                    engine_label = _engine_label_from_reason(
-                        (open_tr.get("meta") or {}).get("reason") if open_tr else None
-                    )
+                if profit_unlev is not None and profit_unlev <= -sl_pct:
                     pnl_usdt = pos_detail.get("pnl") if isinstance(pos_detail, dict) else None
                     try:
                         set_dry_run(False if LIVE_TRADING else True)
@@ -5075,17 +6683,15 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         _set_last_exit_state(st, "SHORT", now, "auto_exit_sl")
                         state[sym] = st
                     _append_report_line(sym, "SHORT", profit_unlev, pnl_usdt, engine_label)
-                    order_block = _format_order_id_block(
-                        open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-                        exit_order_id,
-                    )
-                    order_line = f"{order_block}\n" if order_block else ""
+                    entry_time = _fmt_entry_time(open_tr)
+                    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+                    icon = EXIT_ICON if exit_tag == "TP" else EXIT_SL_ICON
                     send_telegram(
-                        f"🔴 <b>숏 청산</b>\n"
+                        f"{icon} <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
-                        f"{order_line}"
+                        f"{entry_line}"
                         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                         f"{'' if pnl_usdt is None else f' 손익={pnl_usdt:+.3f} USDT'}"
@@ -5100,14 +6706,40 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         state[sym] = st
 
         adds_done = int(st.get("dca_adds_short", st.get("dca_adds", 0)))
+        open_tr = _get_open_trade(state, "SHORT", sym)
+        engine_label = _engine_label_from_reason(
+            (open_tr.get("meta") or {}).get("reason") if open_tr else None
+        )
         dca_res = dca_short_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
         if dca_res.get("status") not in ("skip", "warn"):
-            st["dca_adds_short"] = adds_done + 1
-            state[sym] = st
-            send_telegram(
-                f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
-            )
-            time.sleep(0.1)
+            if not _dca_alerted(state, sym, "SHORT", adds_done + 1):
+                st["dca_adds_short"] = adds_done + 1
+                state[sym] = st
+                qty = dca_res.get("amount") or (dca_res.get("order") or {}).get("amount")
+                _record_position_event(
+                    sym,
+                    "SHORT",
+                    "DCA",
+                    engine_label or "AUTO",
+                    qty if isinstance(qty, (int, float)) else None,
+                    dca_res.get("entry") if isinstance(dca_res.get("entry"), (int, float)) else None,
+                    dca_res.get("mark") if isinstance(dca_res.get("mark"), (int, float)) else None,
+                    {
+                        "engine": engine_label or "AUTO",
+                        "adds_done": adds_done + 1,
+                        "dca_usdt": dca_res.get("dca_usdt"),
+                        "source": "manage_dca",
+                    },
+                )
+                send_telegram(
+                    f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
+                )
+                _mark_dca_alerted(state, sym, "SHORT", adds_done + 1)
+                try:
+                    save_state(state)
+                except Exception:
+                    pass
+                time.sleep(0.1)
 
     long_syms = set(_get_open_symbols(state, "LONG"))
     try:
@@ -5148,21 +6780,21 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 )
                 _append_report_line(sym, "LONG", None, None, engine_label)
                 st = state.get(sym, {}) if isinstance(state, dict) else {}
-                st["in_pos"] = False
+                _set_in_pos_side(st, "LONG", False)
                 st["last_ok"] = False
                 st["dca_adds"] = 0
                 st["dca_adds_long"] = 0
                 st["dca_adds_short"] = 0
                 state[sym] = st
                 if engine_label != "UNKNOWN" and _trade_has_entry(open_tr) and not _recent_auto_exit(state, sym, now):
-                    order_block = _format_order_id_block(open_tr.get("entry_order_id"), open_tr.get("exit_order_id"))
-                    order_line = f"{order_block}\n" if order_block else ""
+                    entry_time = _fmt_entry_time(open_tr)
+                    entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                     send_telegram(
                         f"{EXIT_ICON} <b>롱 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: MANUAL\n"
-                        f"{order_line}".rstrip()
+                        f"{entry_line}".rstrip()
                     )
                 time.sleep(0.1)
                 continue
@@ -5172,22 +6804,18 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             )
             skip_line = f"[long-exit-skip] sym={sym} reason=no_position_detail engine={engine_label}"
             print(skip_line)
-            if engine_label == "ATLASFABIO":
-                try:
-                    os.makedirs(os.path.join("logs", "fabio"), exist_ok=True)
-                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                    with open(os.path.join("logs", "fabio", "atlasfabio_funnel.log"), "a", encoding="utf-8") as f:
-                        f.write(f"{ts} {skip_line}\n")
-                except Exception:
-                    pass
             continue
         entry_px = detail.get("entry")
         mark_px = detail.get("mark")
         if not isinstance(entry_px, (int, float)) or not isinstance(mark_px, (int, float)) or entry_px <= 0:
             continue
+        engine_label = _engine_label_from_reason(
+            (open_tr.get("meta") or {}).get("reason") if open_tr else None
+        )
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
         closed = False
-        if AUTO_EXIT_ENABLED and profit_unlev >= AUTO_EXIT_LONG_TP_PCT:
+        tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "LONG")
+        if AUTO_EXIT_ENABLED and profit_unlev >= tp_pct:
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
@@ -5222,24 +6850,21 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 _set_last_exit_state(st, "LONG", now, "auto_exit_tp")
                 state[sym] = st
             _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
-            order_block = _format_order_id_block(
-                open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-                exit_order_id,
-            )
-            order_line = f"{order_block}\n" if order_block else ""
+            entry_time = _fmt_entry_time(open_tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
             send_telegram(
                 f"{EXIT_ICON} <b>롱 청산</b>\n"
                 f"<b>{sym}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
-                f"{order_line}"
+                f"{entry_line}"
                 f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                 f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                 f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
             )
             time.sleep(0.15)
             closed = True
-        elif AUTO_EXIT_ENABLED and profit_unlev <= -AUTO_EXIT_LONG_SL_PCT:
+        elif AUTO_EXIT_ENABLED and profit_unlev <= -sl_pct:
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
@@ -5274,17 +6899,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 _set_last_exit_state(st, "LONG", now, "auto_exit_sl")
                 state[sym] = st
             _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
-            order_block = _format_order_id_block(
-                open_tr.get("entry_order_id") if isinstance(open_tr, dict) else None,
-                exit_order_id,
-            )
-            order_line = f"{order_block}\n" if order_block else ""
+            entry_time = _fmt_entry_time(open_tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
             send_telegram(
-                        f"{EXIT_ICON} <b>롱 청산</b>\n"
+                f"{EXIT_SL_ICON} <b>롱 청산</b>\n"
                 f"<b>{sym}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
-                f"{order_line}"
+                f"{entry_line}"
                 f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                 f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
                 f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
@@ -5298,15 +6920,41 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 st["manage_eval_long_ts"] = now
                 state[sym] = st
                 adds_done = int(st.get("dca_adds_long", st.get("dca_adds", 0)))
+                open_tr = _get_open_trade(state, "LONG", sym)
+                engine_label = _engine_label_from_reason(
+                    (open_tr.get("meta") or {}).get("reason") if open_tr else None
+                )
                 dca_res = dca_long_if_needed(sym, adds_done=adds_done, margin_mode=MARGIN_MODE)
                 if dca_res.get("status") not in ("skip", "warn"):
-                    st["dca_adds_long"] = adds_done + 1
-                    state[sym] = st
-                    send_telegram(
-                        f"➕ <b>DCA</b> {sym} LONG adds {adds_done}->{adds_done+1} "
-                        f"mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
-                    )
-                    time.sleep(0.1)
+                    if not _dca_alerted(state, sym, "LONG", adds_done + 1):
+                        st["dca_adds_long"] = adds_done + 1
+                        state[sym] = st
+                        qty = dca_res.get("amount") or (dca_res.get("order") or {}).get("amount")
+                        _record_position_event(
+                            sym,
+                            "LONG",
+                            "DCA",
+                            engine_label or "AUTO",
+                            qty if isinstance(qty, (int, float)) else None,
+                            dca_res.get("entry") if isinstance(dca_res.get("entry"), (int, float)) else None,
+                            dca_res.get("mark") if isinstance(dca_res.get("mark"), (int, float)) else None,
+                            {
+                                "engine": engine_label or "AUTO",
+                                "adds_done": adds_done + 1,
+                                "dca_usdt": dca_res.get("dca_usdt"),
+                                "source": "manage_dca",
+                            },
+                        )
+                        send_telegram(
+                            f"➕ <b>DCA</b> {sym} LONG adds {adds_done}->{adds_done+1} "
+                            f"mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
+                        )
+                        _mark_dca_alerted(state, sym, "LONG", adds_done + 1)
+                        try:
+                            save_state(state)
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
 
     tickers = _get_manage_tickers(state, exchange, MANAGE_TICKER_TTL_SEC)
     _reconcile_long_trades(state, cached_long_ex, tickers)
@@ -5326,7 +6974,19 @@ def _manage_loop_worker(state: dict, exchange, cached_long_ex, send_telegram) ->
             _set_thread_log_buffer(None)
         time.sleep(MANAGE_LOOP_SLEEP_SEC)
 
+
 def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = None, skip_keys: Optional[set] = None) -> None:
+    global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
+    global ENGINE_EXIT_OVERRIDES
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED
+    global SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+    global SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE
+    global SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI, SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX, SWAGGY_D1_OVEREXT_ATR_MULT
+    global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
+    global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
+    global RSI_ENABLED, PUMPFADE_ENABLED
+    global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     try:
         disk = load_state_from(state_path) if state_path else load_state()
     except Exception:
@@ -5339,6 +6999,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_auto_exit_long_sl_pct",
         "_auto_exit_short_tp_pct",
         "_auto_exit_short_sl_pct",
+        "_engine_exit_overrides",
         "_live_trading",
         "_long_live",
         "_max_open_positions",
@@ -5349,14 +7010,27 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_dca_second_pct",
         "_dca_third_pct",
         "_exit_cooldown_hours",
-        "_atlas_fabio_enabled",
+        "_sat_trade",
         "_swaggy_atlas_lab_enabled",
-        "_div15m_long_enabled",
-        "_div15m_short_enabled",
+        "_swaggy_atlas_lab_v2_enabled",
+        "_swaggy_no_atlas_enabled",
+        "_swaggy_atlas_lab_off_windows",
+        "_swaggy_atlas_lab_v2_off_windows",
+        "_swaggy_no_atlas_off_windows",
+        "_swaggy_no_atlas_overext_min",
+        "_swaggy_no_atlas_overext_min_enabled",
+        "_swaggy_no_atlas_multi_enabled",
+        "_swaggy_no_atlas_multi_mode",
+        "_swaggy_no_atlas_multi_roi",
+        "_swaggy_no_atlas_multi_max",
+        "_swaggy_d1_overext_atr_mult",
         "_rsi_enabled",
         "_dtfx_enabled",
-        "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
+        "_atlas_fabio_enabled",
+        "_pumpfade_enabled",
+        "_div15m_long_enabled",
+        "_div15m_short_enabled",
         "_chat_id",
         "_manage_ws_mode",
         "_entry_event_offset",
@@ -5367,10 +7041,20 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
             continue
         if key in disk:
             state[key] = disk.get(key)
-    global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
-    global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
-    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
+    if isinstance(state.get("_atlas_rs_fail_short_enabled"), dict):
+        state["_atlas_rs_fail_short_enabled"] = False
+    if isinstance(state.get("_atlas_rs_fail_short_universe"), dict):
+        state["_atlas_rs_fail_short_universe"] = []
+    if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
+        state["_swaggy_no_atlas_enabled"] = False
+    if isinstance(state.get("_swaggy_no_atlas_overext_min"), dict):
+        state["_swaggy_no_atlas_overext_min"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+    if isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), dict):
+        state["_swaggy_no_atlas_overext_min_enabled"] = SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
+    if isinstance(state.get("_swaggy_d1_overext_atr_mult"), dict):
+        state["_swaggy_d1_overext_atr_mult"] = SWAGGY_D1_OVEREXT_ATR_MULT
+    if isinstance(state.get("_swaggy_no_atlas_multi_enabled"), dict):
+        state["_swaggy_no_atlas_multi_enabled"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED
     if (not skip_keys or "_auto_exit" not in skip_keys) and isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
     if (not skip_keys or "_auto_exit_long_tp_pct" not in skip_keys) and isinstance(state.get("_auto_exit_long_tp_pct"), (int, float)):
@@ -5381,6 +7065,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         AUTO_EXIT_SHORT_TP_PCT = float(state.get("_auto_exit_short_tp_pct"))
     if (not skip_keys or "_auto_exit_short_sl_pct" not in skip_keys) and isinstance(state.get("_auto_exit_short_sl_pct"), (int, float)):
         AUTO_EXIT_SHORT_SL_PCT = float(state.get("_auto_exit_short_sl_pct"))
+    if (not skip_keys or "_engine_exit_overrides" not in skip_keys) and isinstance(state.get("_engine_exit_overrides"), dict):
+        ENGINE_EXIT_OVERRIDES = dict(state.get("_engine_exit_overrides"))
     if (not skip_keys or "_live_trading" not in skip_keys) and isinstance(state.get("_live_trading"), bool):
         LIVE_TRADING = bool(state.get("_live_trading"))
     if (not skip_keys or "_long_live" not in skip_keys) and isinstance(state.get("_long_live"), bool):
@@ -5392,15 +7078,25 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
             pass
     if (not skip_keys or "_entry_usdt" not in skip_keys) and isinstance(state.get("_entry_usdt"), (int, float)):
         USDT_PER_TRADE = float(state.get("_entry_usdt"))
-    if isinstance(state.get("_atlas_fabio_enabled"), bool):
-        ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
-    if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
+    if (not skip_keys or "_swaggy_atlas_lab_enabled" not in skip_keys) and isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
-    if isinstance(state.get("_div15m_long_enabled"), bool):
-        DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
-    if isinstance(state.get("_div15m_short_enabled"), bool):
-        DIV15M_SHORT_ENABLED = bool(state.get("_div15m_short_enabled"))
-    if isinstance(state.get("_rsi_enabled"), bool):
+    if (not skip_keys or "_swaggy_atlas_lab_v2_enabled" not in skip_keys) and isinstance(state.get("_swaggy_atlas_lab_v2_enabled"), bool):
+        SWAGGY_ATLAS_LAB_V2_ENABLED = bool(state.get("_swaggy_atlas_lab_v2_enabled"))
+    if (not skip_keys or "_swaggy_no_atlas_enabled" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_enabled"), bool):
+        SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
+    if (not skip_keys or "_swaggy_atlas_lab_off_windows" not in skip_keys) and isinstance(state.get("_swaggy_atlas_lab_off_windows"), str):
+        SWAGGY_ATLAS_LAB_OFF_WINDOWS = str(state.get("_swaggy_atlas_lab_off_windows") or "")
+    if (not skip_keys or "_swaggy_atlas_lab_v2_off_windows" not in skip_keys) and isinstance(state.get("_swaggy_atlas_lab_v2_off_windows"), str):
+        SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = str(state.get("_swaggy_atlas_lab_v2_off_windows") or "")
+    if (not skip_keys or "_swaggy_no_atlas_off_windows" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_off_windows"), str):
+        SWAGGY_NO_ATLAS_OFF_WINDOWS = str(state.get("_swaggy_no_atlas_off_windows") or "")
+    if (not skip_keys or "_swaggy_no_atlas_overext_min" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_overext_min"), (int, float)):
+        SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(state.get("_swaggy_no_atlas_overext_min"))
+    if (not skip_keys or "_swaggy_no_atlas_overext_min_enabled" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), bool):
+        SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = bool(state.get("_swaggy_no_atlas_overext_min_enabled"))
+    if (not skip_keys or "_swaggy_d1_overext_atr_mult" not in skip_keys) and isinstance(state.get("_swaggy_d1_overext_atr_mult"), (int, float)):
+        SWAGGY_D1_OVEREXT_ATR_MULT = float(state.get("_swaggy_d1_overext_atr_mult"))
+    if (not skip_keys or "_rsi_enabled" not in skip_keys) and isinstance(state.get("_rsi_enabled"), bool):
         RSI_ENABLED = bool(state.get("_rsi_enabled"))
     if (not skip_keys or "_dca_enabled" not in skip_keys) and isinstance(state.get("_dca_enabled"), bool):
         DCA_ENABLED = bool(state.get("_dca_enabled"))
@@ -5422,20 +7118,44 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         DCA_THIRD_PCT = float(state.get("_dca_third_pct"))
         if executor_mod:
             executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
+    if (not skip_keys or "_sat_trade" not in skip_keys) and isinstance(state.get("_sat_trade"), bool):
+        SATURDAY_TRADE_ENABLED = bool(state.get("_sat_trade"))
+    if (not skip_keys or "_swaggy_no_atlas_multi_enabled" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_multi_enabled"), bool):
+        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = bool(state.get("_swaggy_no_atlas_multi_enabled"))
+    if (not skip_keys or "_swaggy_no_atlas_multi_mode" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_multi_mode"), str):
+        SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = str(state.get("_swaggy_no_atlas_multi_mode") or "roi")
+    if (not skip_keys or "_swaggy_no_atlas_multi_roi" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_multi_roi"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = abs(float(state.get("_swaggy_no_atlas_multi_roi") or 0.0))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_multi_max" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_multi_max"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = int(state.get("_swaggy_no_atlas_multi_max") or 0)
+        except Exception:
+            pass
     if (not skip_keys or "_exit_cooldown_hours" not in skip_keys) and isinstance(state.get("_exit_cooldown_hours"), (int, float)):
         EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
-        EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
-    if isinstance(state.get("_dtfx_enabled"), bool):
+        COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+        EXIT_COOLDOWN_SEC = COOLDOWN_SEC
+    if (not skip_keys or "_dtfx_enabled" not in skip_keys) and isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
-    if isinstance(state.get("_pumpfade_enabled"), bool):
-        PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
-    if isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
+    if (not skip_keys or "_atlas_rs_fail_short_enabled" not in skip_keys) and isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
         ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
+    if (not skip_keys or "_atlas_fabio_enabled" not in skip_keys) and isinstance(state.get("_atlas_fabio_enabled"), bool):
+        ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
+    if (not skip_keys or "_pumpfade_enabled" not in skip_keys) and isinstance(state.get("_pumpfade_enabled"), bool):
+        PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
+    if (not skip_keys or "_div15m_long_enabled" not in skip_keys) and isinstance(state.get("_div15m_long_enabled"), bool):
+        DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
+    if (not skip_keys or "_div15m_short_enabled" not in skip_keys) and isinstance(state.get("_div15m_short_enabled"), bool):
+        DIV15M_SHORT_ENABLED = bool(state.get("_div15m_short_enabled"))
     if state.get("_chat_id"):
         CHAT_ID_RUNTIME = str(state.get("_chat_id"))
-    if isinstance(state.get("_manage_ws_mode"), bool):
+    if (not skip_keys or "_manage_ws_mode" not in skip_keys) and isinstance(state.get("_manage_ws_mode"), bool):
         MANAGE_WS_MODE = bool(state.get("_manage_ws_mode"))
     _maybe_reload_rsi_config()
+
 
 _RSI_CONFIG_MTIME: Optional[float] = None
 _RSI_CONFIG_LOGGED: bool = False
@@ -5533,6 +7253,7 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_auto_exit_long_sl_pct",
         "_auto_exit_short_tp_pct",
         "_auto_exit_short_sl_pct",
+        "_engine_exit_overrides",
         "_live_trading",
         "_long_live",
         "_max_open_positions",
@@ -5543,13 +7264,18 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_dca_second_pct",
         "_dca_third_pct",
         "_exit_cooldown_hours",
-        "_atlas_fabio_enabled",
+        "_sat_trade",
         "_swaggy_atlas_lab_enabled",
-        "_div15m_long_enabled",
-        "_div15m_short_enabled",
+        "_swaggy_atlas_lab_v2_enabled",
+        "_swaggy_no_atlas_enabled",
+        "_swaggy_no_atlas_overext_min",
+        "_swaggy_no_atlas_multi_enabled",
+        "_swaggy_no_atlas_multi_mode",
+        "_swaggy_no_atlas_multi_roi",
+        "_swaggy_no_atlas_multi_max",
+        "_swaggy_d1_overext_atr_mult",
         "_rsi_enabled",
         "_dtfx_enabled",
-        "_pumpfade_enabled",
         "_atlas_rs_fail_short_enabled",
         "_tg_offset",
         "_tg_queue_offset",
@@ -5756,7 +7482,8 @@ def _sync_short_positions_state(state: dict, symbols: list) -> None:
         except Exception:
             amt = 0
         if amt > 0:
-            st.setdefault("in_pos", True)
+            st["in_pos_short"] = True
+            st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
             st.setdefault("dca_adds", 0)
             st.setdefault("dca_adds_long", 0)
             st.setdefault("dca_adds_short", 0)
@@ -5765,7 +7492,8 @@ def _sync_short_positions_state(state: dict, symbols: list) -> None:
             state[sym] = st
         else:
             if isinstance(st, dict):
-                st["in_pos"] = False
+                st["in_pos_short"] = False
+                st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
                 state[sym] = st
 
 def _sync_positions_state(state: dict, symbols: list) -> None:
@@ -5783,29 +7511,22 @@ def _sync_positions_state(state: dict, symbols: list) -> None:
         except Exception:
             long_amt = 0
         was_in_pos = bool(st.get("in_pos"))
-        if short_amt > 0 or long_amt > 0:
-            st.setdefault("in_pos", True)
+        in_long = bool(long_amt > 0)
+        in_short = bool(short_amt > 0)
+        st["in_pos_long"] = in_long
+        st["in_pos_short"] = in_short
+        st["in_pos"] = bool(in_long or in_short)
+        if in_short or in_long:
             st.setdefault("dca_adds", 0)
             st.setdefault("dca_adds_long", 0)
             st.setdefault("dca_adds_short", 0)
             st.setdefault("last_entry", now)
             st.setdefault("manage_ping_ts", now - MANAGE_PING_COOLDOWN_SEC)
-            if not was_in_pos:
-                try:
-                    side = "LONG" if long_amt > 0 else "SHORT" if short_amt > 0 else "UNKNOWN"
-                    dbrec and dbrec.record_engine_signal(
-                        symbol=sym,
-                        side=side,
-                        engine="MANUAL",
-                        reason="manual_entry",
-                        meta={"source": "pos_sync"},
-                        ts=now,
-                    )
-                except Exception:
-                    pass
             state[sym] = st
         else:
             if isinstance(st, dict):
+                st["in_pos_long"] = False
+                st["in_pos_short"] = False
                 st["in_pos"] = False
                 state[sym] = st
 
@@ -5931,6 +7652,23 @@ def _coerce_state_int(val: object) -> int:
                 return _coerce_state_int(val.get(key))
     return 0
 
+
+def _coerce_state_float(val: object) -> float:
+    if isinstance(val, bool):
+        return float(val)
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+    if isinstance(val, dict):
+        for key in ("value", "offset", "id", "last"):
+            if key in val:
+                return _coerce_state_float(val.get(key))
+    return 0.0
+
 def handle_telegram_commands(state: Dict[str, dict]) -> None:
     """텔레그램으로부터 런타임 명령을 받아 AUTO_EXIT 토글/상태를 제어한다.
     - /auto_exit on|off|status
@@ -5939,9 +7677,9 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE, SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI, SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
-    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
         return
     last_update_id = _coerce_state_int(state.get("_tg_offset", 0))
@@ -6004,6 +7742,180 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                 reply_chat_id = chat_id
                 def _reply(msg: str) -> bool:
                     return send_telegram(msg, allow_early=True, chat_id=reply_chat_id)
+                def _build_positions_message() -> str:
+                    try:
+                        refresh_positions_cache(force=True)
+                    except Exception:
+                        pass
+                    print("[positions] build message start", flush=True)
+                    pos_map = executor_mod._POS_ALL_CACHE.get("positions_by_symbol") if executor_mod else None
+                    pos_map = pos_map or {}
+                    open_trades = [tr for tr in (_get_trade_log(state) or []) if tr.get("status") == "open"]
+                    engine_by_key = {}
+                    entry_by_id, entry_by_symbol = _load_entry_events_map(
+                        None, include_alerts=True, include_engine_signals=True
+                    )
+                    position_keys = set()
+                    for sym, positions in pos_map.items():
+                        if not positions:
+                            continue
+                        for p in positions:
+                            try:
+                                size = executor_mod._position_size_abs(p)
+                            except Exception:
+                                size = 0.0
+                            if not size:
+                                continue
+                            side = "LONG" if executor_mod._is_long_position(p) else "SHORT" if executor_mod._is_short_position(p) else "UNKNOWN"
+                            if side in ("LONG", "SHORT"):
+                                position_keys.add((sym, side))
+                    swaggy_trade_map = _load_swaggy_trade_engine_map(position_keys)
+                    try:
+                        print(f"[positions] entry_by_id={len(entry_by_id)} entry_by_symbol={len(entry_by_symbol)}", flush=True)
+                    except Exception:
+                        pass
+                    entry_by_symbol_norm = {}
+                    entry_by_symbol_flat = {}
+                    def _pick_entry_record(recs: list) -> Optional[dict]:
+                        if not recs:
+                            return None
+                        def _is_event(rec: dict) -> bool:
+                            return (rec.get("record_type") or "") == "event" or rec.get("event_type") in ("ENTRY", "ALERT_ENTRY")
+                        def _ts_val(rec: dict) -> float:
+                            try:
+                                return float(rec.get("entry_ts") or 0.0)
+                            except Exception:
+                                return 0.0
+                        def _is_manual_pos_snapshot(rec: dict) -> bool:
+                            eng = str(rec.get("engine") or "").strip().upper()
+                            if eng not in ("MANUAL", "MANUAL_ENTRY"):
+                                return False
+                            meta = rec.get("meta") or {}
+                            src = (rec.get("source") or "").strip().lower()
+                            meta_src = str(meta.get("source") or "").strip().lower()
+                            return src == "pos_snapshot" or meta_src == "pos_snapshot"
+                        def _rank(rec: dict) -> tuple:
+                            # Prefer non-pos_snapshot records even if older; then by ts; then event vs signal.
+                            return (
+                                0 if _is_manual_pos_snapshot(rec) else 1,
+                                _ts_val(rec),
+                                1 if _is_event(rec) else 0,
+                            )
+                        try:
+                            return max(recs, key=_rank)
+                        except Exception:
+                            return recs[-1]
+                    if isinstance(entry_by_symbol, dict):
+                        for (sym_key, side_key), recs in entry_by_symbol.items():
+                            if not sym_key or not side_key or not recs:
+                                continue
+                            sym_norm = str(sym_key).replace("/USDT:USDT", "").replace("/USDT", "")
+                            rec = _pick_entry_record(recs)
+                            if rec is None:
+                                continue
+                            entry_by_symbol_norm[(sym_norm, str(side_key).upper())] = rec
+                            entry_by_symbol_flat.setdefault(sym_norm, []).append(rec)
+                    if entry_by_symbol_flat:
+                        for sym_norm, recs in list(entry_by_symbol_flat.items()):
+                            rec = _pick_entry_record(recs)
+                            if rec is None:
+                                continue
+                            entry_by_symbol_flat[sym_norm] = rec
+                    for tr in open_trades:
+                        sym = tr.get("symbol")
+                        side = (tr.get("side") or "").upper()
+                        if not sym or not side:
+                            continue
+                        engine = tr.get("engine_label") or (tr.get("meta") or {}).get("engine") or (tr.get("meta") or {}).get("reason")
+                        if engine:
+                            eng_norm = str(engine).strip()
+                            eng_upper = eng_norm.upper()
+                            if eng_upper not in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                                engine_by_key[(sym, side)] = eng_norm
+                                sym_norm = str(sym).replace("/USDT:USDT", "").replace("/USDT", "")
+                                engine_by_key[(sym_norm, side)] = eng_norm
+                    rows = []
+                    sym_col = 0
+                    eng_col = 0
+                    for sym, positions in pos_map.items():
+                        if not positions:
+                            continue
+                        for p in positions:
+                            try:
+                                size = executor_mod._position_size_abs(p)
+                            except Exception:
+                                size = 0.0
+                            if not size:
+                                continue
+                            side = "LONG" if executor_mod._is_long_position(p) else "SHORT" if executor_mod._is_short_position(p) else "UNKNOWN"
+                            sym_norm = (sym or "").replace("/USDT:USDT", "").replace("/USDT", "")
+                            engine = engine_by_key.get((sym, side)) or engine_by_key.get((sym_norm, side))
+                            if isinstance(engine, str) and engine.strip().upper() in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                                engine = None
+                            if not engine:
+                                st = state.get(sym, {}) if isinstance(state, dict) else {}
+                                entry_order_id = None
+                                if isinstance(st, dict):
+                                    entry_order_id = st.get(f"entry_order_id_{side.lower()}")
+                                debug_info = {
+                                    "sym": sym,
+                                    "side": side,
+                                    "sym_norm": sym_norm,
+                                    "state_entry_id": entry_order_id,
+                                    "engine_by_key": engine_by_key.get((sym, side)) or engine_by_key.get((sym_norm, side)),
+                                }
+                                if entry_order_id and isinstance(entry_by_id, dict):
+                                    rec = entry_by_id.get(str(entry_order_id))
+                                    engine = rec.get("engine") if isinstance(rec, dict) else None
+                                    if engine:
+                                        debug_info["engine_by_id"] = engine
+                                if not engine and isinstance(entry_by_symbol, dict):
+                                    recs = entry_by_symbol.get((sym, side)) or []
+                                    rec = _pick_entry_record(recs)
+                                    if isinstance(rec, dict):
+                                        engine = rec.get("engine")
+                                        if engine:
+                                            debug_info["engine_by_sym"] = engine
+                                if not engine and entry_by_symbol_norm:
+                                    rec = entry_by_symbol_norm.get((sym_norm, side))
+                                    if isinstance(rec, dict):
+                                        engine = rec.get("engine")
+                                        if engine:
+                                            debug_info["engine_by_sym_norm"] = engine
+                                if not engine and entry_by_symbol_flat:
+                                    rec = entry_by_symbol_flat.get(sym_norm)
+                                    if isinstance(rec, dict):
+                                        engine = rec.get("engine")
+                                        if engine:
+                                            debug_info["engine_by_sym_flat"] = engine
+                                if not engine:
+                                    print(f"[positions-map] unresolved {debug_info}")
+                            if not engine:
+                                print(f"[positions-map] unresolved {debug_info}", flush=True)
+                            print(f"[positions-map] sym={sym} side={side} engine={engine}", flush=True)
+                            if not engine or str(engine).strip().upper() in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                                rec = swaggy_trade_map.get((sym, side))
+                                if isinstance(rec, dict):
+                                    swaggy_engine = rec.get("engine")
+                                    if swaggy_engine:
+                                        engine = swaggy_engine
+                            engine = engine or "UNKNOWN"
+                            base = (sym or "").replace("/USDT:USDT", "")
+                            sym_col = max(sym_col, len(base))
+                            eng_col = max(eng_col, len(str(engine)))
+                            tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
+                            rows.append((base, side, engine, tp_pct, sl_pct))
+                    lines = [f"ℹ️ positions total={len(rows)} pid={os.getpid()}"]
+                    if not rows:
+                        lines.append("none")
+                    else:
+                        for base, side, engine, tp_pct, sl_pct in sorted(rows, key=lambda r: (r[2], r[0], r[1])):
+                            tp_str = f"{tp_pct:.2f}%" if isinstance(tp_pct, (int, float)) else "N/A"
+                            sl_str = f"{sl_pct:.2f}%" if isinstance(sl_pct, (int, float)) else "N/A"
+                            lines.append(
+                                f"{base.ljust(sym_col)}  {side.ljust(5)}  {str(engine).ljust(eng_col)}  tp={tp_str} sl={sl_str}"
+                            )
+                    return "\n".join(lines)
 
                 lower = text.lower()
                 if "status" in lower:
@@ -6043,6 +7955,87 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] auto_exit cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/sat_trade", "sat_trade")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SATURDAY_TRADE_ENABLED = True
+                        state["_sat_trade"] = True
+                        state_dirty = True
+                        resp = "✅ saturday trade ON (토요일 진입 허용)"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SATURDAY_TRADE_ENABLED = False
+                        state["_sat_trade"] = False
+                        state_dirty = True
+                        resp = "⛔ saturday trade OFF (토요일 진입 차단)"
+                    else:
+                        resp = f"ℹ️ saturday trade 상태: {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n사용법: /sat_trade on|off|status"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] sat_trade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+
+                if cmd in ("/engine_exit", "engine_exit") and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("status", "list"):
+                        resp = f"ℹ️ engine-exit: {_format_engine_exit_overrides()}\n사용법: /engine_exit ENGINE SIDE tp sl"
+                    else:
+                        if len(parts) < 3:
+                            resp = "⛔ 사용법: /engine_exit ENGINE SIDE tp sl | /engine_exit ENGINE off"
+                        else:
+                            engine_key = _normalize_engine_key(parts[1])
+                            side_key = parts[2].upper()
+                            if side_key == "OFF":
+                                if ENGINE_EXIT_OVERRIDES.pop(engine_key, None) is not None:
+                                    state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
+                                    state_dirty = True
+                                resp = f"✅ engine-exit cleared: {engine_key}"
+                            elif side_key not in ("LONG", "SHORT"):
+                                resp = "⛔ SIDE는 LONG 또는 SHORT (또는 off)만 가능"
+                            else:
+                                if len(parts) >= 4 and parts[3].lower() == "off":
+                                    entry = ENGINE_EXIT_OVERRIDES.get(engine_key) if isinstance(ENGINE_EXIT_OVERRIDES, dict) else None
+                                    if isinstance(entry, dict):
+                                        entry.pop(side_key, None)
+                                        if not entry:
+                                            ENGINE_EXIT_OVERRIDES.pop(engine_key, None)
+                                        else:
+                                            ENGINE_EXIT_OVERRIDES[engine_key] = entry
+                                        state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
+                                        state_dirty = True
+                                    resp = f"✅ engine-exit cleared: {engine_key} {side_key}"
+                                elif len(parts) < 5:
+                                    resp = "⛔ 사용법: /engine_exit ENGINE SIDE tp sl (예: /engine_exit SWAGGY_ATLAS_LAB SHORT 2 6)"
+                                else:
+                                    tp_raw = parts[3]
+                                    sl_raw = parts[4]
+                                    try:
+                                        tp = float(tp_raw)
+                                        sl = float(sl_raw)
+                                        if tp <= 0 or sl <= 0:
+                                            raise ValueError("non-positive")
+                                        entry = ENGINE_EXIT_OVERRIDES.get(engine_key) if isinstance(ENGINE_EXIT_OVERRIDES, dict) else None
+                                        if not isinstance(entry, dict):
+                                            entry = {}
+                                        entry[side_key] = {"tp": tp, "sl": sl}
+                                        ENGINE_EXIT_OVERRIDES[engine_key] = entry
+                                        state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
+                                        state_dirty = True
+                                        resp = f"✅ engine-exit set: {engine_key} {side_key} tp={tp:.2f}% sl={sl:.2f}%"
+                                    except Exception:
+                                        resp = "⛔ TP/SL은 0보다 큰 숫자여야 함"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] engine_exit cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+
+                if cmd in ("/positions", "/pos", "positions", "pos") and not responded:
+                    ok = _reply(_build_positions_message())
+                    print(f"[telegram] positions cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
 
                 if cmd in ("/admin_follow", "admin_follow"):
                     parts = lower.split()
@@ -6101,7 +8094,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     try:
                         open_pos = count_open_positions(force=True)
                         if not isinstance(open_pos, int):
-                            open_pos = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+                            open_pos = _count_open_positions_state(state)
                     except Exception as e:
                         open_pos = 0
                         print(f"[telegram] status open_pos error: {e}")
@@ -6110,6 +8103,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         status_msg = (
                             "🤖 상태\n"
                             f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
+                            f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
                             f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                             f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                             f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -6118,20 +8112,40 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                             f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                             f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
+                            f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
+                            f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
+                            f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
+                            f"/swaggy_no_atlas_multi: {'ON' if SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED else 'OFF'} "
+                            f"mode={SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE} roi={SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI:.2f}% "
+                            f"max={SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX}\n"
+                            f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
+                            f"/swaggy_atlas_lab_off: {SWAGGY_ATLAS_LAB_OFF_WINDOWS or 'NONE'}\n"
+                            f"/swaggy_atlas_lab_v2_off: {SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS or 'NONE'}\n"
+                            f"/swaggy_no_atlas_off: {SWAGGY_NO_ATLAS_OFF_WINDOWS or 'NONE'}\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
+                            f"/engine_exit: {_format_engine_exit_overrides()}\n"
+                            "--------------\n"
+                            f"엔진요약: swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
+                            f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
+                            f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
+                            f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
+                            f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
+                            f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
+                            ""
                             "--------------\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
-                            f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
+                            f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
+                            f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
-                            f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                             f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
-                            f"/div15m_long(추가진입): {'ON' if DIV15M_LONG_ENABLED else 'OFF'}\n"
-                            f"/div15m_short(추가진입): {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n"
+                            ""
                             "--------------\n"
                             "/report(리포트): /report today|yesterday|YYYY-MM-DD\n"
-                            f"open positions: {open_pos} (over_limit={over_limit})"
+                            f"open positions: {open_pos} (over_limit={over_limit})\n"
+                            "--------------\n"
+                            f"{_build_positions_message()}"
                         )
                     except Exception as e:
                         print(f"[telegram] status build error: {e}")
@@ -6149,7 +8163,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     try:
                         open_pos = count_open_positions(force=True)
                         if not isinstance(open_pos, int):
-                            open_pos = sum(1 for st in state.values() if isinstance(st, dict) and st.get("in_pos"))
+                            open_pos = _count_open_positions_state(state)
                     except Exception as e:
                         open_pos = 0
                         print(f"[telegram] status open_pos error: {e}")
@@ -6157,6 +8171,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     status_msg = (
                         "🤖 상태\n"
                         f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
+                        f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
                         f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                         f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                         f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -6165,20 +8180,40 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                         f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
+                        f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
+                        f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
+                        f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
+                        f"/swaggy_no_atlas_multi: {'ON' if SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED else 'OFF'} "
+                        f"mode={SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE} roi={SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI:.2f}% "
+                        f"max={SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX}\n"
+                        f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
+                        f"/swaggy_atlas_lab_off: {SWAGGY_ATLAS_LAB_OFF_WINDOWS or 'NONE'}\n"
+                        f"/swaggy_atlas_lab_v2_off: {SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS or 'NONE'}\n"
+                        f"/swaggy_no_atlas_off: {SWAGGY_NO_ATLAS_OFF_WINDOWS or 'NONE'}\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
+                        f"/engine_exit: {_format_engine_exit_overrides()}\n"
+                        "--------------\n"
+                        f"엔진요약: swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
+                        f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
+                        f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
+                        f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
+                        f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
+                        f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
+                        ""
                         "--------------\n"
                         f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
-                        f"/atlasfabio(추가진입): {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n"
+                        f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
+                        f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
-                        f"/pumpfade(추가진입): {'ON' if PUMPFADE_ENABLED else 'OFF'}\n"
                         f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
-                        f"/div15m_long(추가진입): {'ON' if DIV15M_LONG_ENABLED else 'OFF'}\n"
-                        f"/div15m_short(추가진입): {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n"
+                        ""
                         "--------------\n"
                         "/report(리포트): /report today|yesterday|YYYY-MM-DD\n"
-                        f"open positions: {open_pos} (over_limit={over_limit})"
+                        f"open positions: {open_pos} (over_limit={over_limit})\n"
+                        "--------------\n"
+                        f"{_build_positions_message()}"
                     )
                     ok = _reply(status_msg)
                     print(f"[telegram] status cmd fallback send={'ok' if ok else 'fail'}")
@@ -6437,7 +8472,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             if val <= 0:
                                 raise ValueError("non-positive")
                             EXIT_COOLDOWN_HOURS = float(val)
-                            EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+                            COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+                            EXIT_COOLDOWN_SEC = COOLDOWN_SEC
                             state["_exit_cooldown_hours"] = EXIT_COOLDOWN_HOURS
                             state_dirty = True
                             resp = f"✅ exit_cd_h set to {EXIT_COOLDOWN_HOURS:.2f}h"
@@ -6467,26 +8503,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] long_live cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
-                if (cmd in ("/atlasfabio", "atlasfabio")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        ATLAS_FABIO_ENABLED = True
-                        state["_atlas_fabio_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ atlasfabio ON (게이트 결합 엔진)"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        ATLAS_FABIO_ENABLED = False
-                        state["_atlas_fabio_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ atlasfabio OFF"
-                    else:
-                        resp = f"ℹ️ atlasfabio 상태: {'ON' if ATLAS_FABIO_ENABLED else 'OFF'}\n사용법: /atlasfabio on|off|status"
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] atlasfabio cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
                 if (cmd in ("/swaggy_atlas_lab", "swaggy_atlas_lab")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -6510,45 +8526,253 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_atlas_lab cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
-                if (cmd in ("/div15m_long", "div15m_long")) and not responded:
+                if (cmd in ("/swaggy_atlas_lab_off", "swaggy_atlas_lab_off")) and not responded:
+                    raw_arg = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+                    arg = (raw_arg or "").strip()
+                    if not arg or arg.lower() in ("off", "0", "false", "clear", "none", "disable", "disabled"):
+                        SWAGGY_ATLAS_LAB_OFF_WINDOWS = ""
+                        state["_swaggy_atlas_lab_off_windows"] = ""
+                        resp = "✅ swaggy_atlas_lab_off cleared"
+                    else:
+                        SWAGGY_ATLAS_LAB_OFF_WINDOWS = arg
+                        state["_swaggy_atlas_lab_off_windows"] = arg
+                        resp = f"✅ swaggy_atlas_lab_off set: {arg}"
+                    state_dirty = True
+                    ok = _reply(resp)
+                    print(f"[telegram] swaggy_atlas_lab_off cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
+                if (cmd in ("/swaggy_atlas_lab_v2", "swaggy_atlas_lab_v2")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
                     resp = None
                     if arg in ("on", "1", "true", "enable", "enabled"):
-                        DIV15M_LONG_ENABLED = True
-                        state["_div15m_long_enabled"] = True
+                        SWAGGY_ATLAS_LAB_V2_ENABLED = True
+                        state["_swaggy_atlas_lab_v2_enabled"] = True
                         state_dirty = True
-                        resp = "✅ div15m_long ON"
+                        resp = "✅ swaggy_atlas_lab_v2 ON (hard 모드)"
                     elif arg in ("off", "0", "false", "disable", "disabled"):
-                        DIV15M_LONG_ENABLED = False
-                        state["_div15m_long_enabled"] = False
+                        SWAGGY_ATLAS_LAB_V2_ENABLED = False
+                        state["_swaggy_atlas_lab_v2_enabled"] = False
                         state_dirty = True
-                        resp = "⛔ div15m_long OFF"
+                        resp = "⛔ swaggy_atlas_lab_v2 OFF"
                     else:
-                        resp = f"ℹ️ div15m_long 상태: {'ON' if DIV15M_LONG_ENABLED else 'OFF'}\n사용법: /div15m_long on|off|status"
+                        resp = (
+                            f"ℹ️ swaggy_atlas_lab_v2 상태: {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_atlas_lab_v2 on|off|status"
+                        )
                     if resp:
                         ok = _reply(resp)
-                        print(f"[telegram] div15m_long cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        print(f"[telegram] swaggy_atlas_lab_v2 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
-                if (cmd in ("/div15m_short", "div15m_short")) and not responded:
+                if (cmd in ("/swaggy_atlas_lab_v2_off", "swaggy_atlas_lab_v2_off")) and not responded:
+                    raw_arg = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+                    arg = (raw_arg or "").strip()
+                    if not arg or arg.lower() in ("off", "0", "false", "clear", "none", "disable", "disabled"):
+                        SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = ""
+                        state["_swaggy_atlas_lab_v2_off_windows"] = ""
+                        resp = "✅ swaggy_atlas_lab_v2_off cleared"
+                    else:
+                        SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = arg
+                        state["_swaggy_atlas_lab_v2_off_windows"] = arg
+                        resp = f"✅ swaggy_atlas_lab_v2_off set: {arg}"
+                    state_dirty = True
+                    ok = _reply(resp)
+                    print(f"[telegram] swaggy_atlas_lab_v2_off cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
+                if (cmd in ("/swaggy_no_atlas", "swaggy_no_atlas")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
                     resp = None
                     if arg in ("on", "1", "true", "enable", "enabled"):
-                        DIV15M_SHORT_ENABLED = True
-                        state["_div15m_short_enabled"] = True
+                        SWAGGY_NO_ATLAS_ENABLED = True
+                        state["_swaggy_no_atlas_enabled"] = True
                         state_dirty = True
-                        resp = "✅ div15m_short ON"
+                        resp = "✅ swaggy_no_atlas ON"
                     elif arg in ("off", "0", "false", "disable", "disabled"):
-                        DIV15M_SHORT_ENABLED = False
-                        state["_div15m_short_enabled"] = False
+                        SWAGGY_NO_ATLAS_ENABLED = False
+                        state["_swaggy_no_atlas_enabled"] = False
                         state_dirty = True
-                        resp = "⛔ div15m_short OFF"
+                        resp = "⛔ swaggy_no_atlas OFF"
                     else:
-                        resp = f"ℹ️ div15m_short 상태: {'ON' if DIV15M_SHORT_ENABLED else 'OFF'}\n사용법: /div15m_short on|off|status"
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas 상태: {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_no_atlas on|off|status"
+                        )
                     if resp:
                         ok = _reply(resp)
-                        print(f"[telegram] div15m_short cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        print(f"[telegram] swaggy_no_atlas cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_off", "swaggy_no_atlas_off")) and not responded:
+                    raw_arg = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+                    arg = (raw_arg or "").strip()
+                    if not arg or arg.lower() in ("off", "0", "false", "clear", "none", "disable", "disabled"):
+                        SWAGGY_NO_ATLAS_OFF_WINDOWS = ""
+                        state["_swaggy_no_atlas_off_windows"] = ""
+                        resp = "✅ swaggy_no_atlas_off cleared"
+                    else:
+                        SWAGGY_NO_ATLAS_OFF_WINDOWS = arg
+                        state["_swaggy_no_atlas_off_windows"] = arg
+                        resp = f"✅ swaggy_no_atlas_off set: {arg}"
+                    state_dirty = True
+                    ok = _reply(resp)
+                    print(f"[telegram] swaggy_no_atlas_off cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
+                if (cmd in ("/swaggy_no_atlas_overext", "swaggy_no_atlas_overext")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else ""
+                    resp = None
+                    if arg:
+                        try:
+                            val = float(arg)
+                            SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(val)
+                            state["_swaggy_no_atlas_overext_min"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+                            state_dirty = True
+                            resp = f"✅ swaggy_no_atlas_overext set: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f}"
+                        except Exception:
+                            resp = "⛔ 사용법: /swaggy_no_atlas_overext -0.70"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
+                            f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
+                            "사용법: /swaggy_no_atlas_overext -0.70"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_overext cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_overext_on", "swaggy_no_atlas_overext_on")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = True
+                        state["_swaggy_no_atlas_overext_min_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ swaggy_no_atlas_overext_on: ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = False
+                        state["_swaggy_no_atlas_overext_min_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ swaggy_no_atlas_overext_on: OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_no_atlas_overext_on on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_overext_on cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_multi", "swaggy_no_atlas_multi")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = True
+                        state["_swaggy_no_atlas_multi_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ swaggy_no_atlas_multi: ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = False
+                        state["_swaggy_no_atlas_multi_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ swaggy_no_atlas_multi: OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_multi: {'ON' if SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED else 'OFF'}\n"
+                            "사용법: /swaggy_no_atlas_multi on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_multi cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_multi_mode", "swaggy_no_atlas_multi_mode")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("roi", "always"):
+                        SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = arg
+                        state["_swaggy_no_atlas_multi_mode"] = arg
+                        state_dirty = True
+                        resp = f"✅ swaggy_no_atlas_multi_mode: {arg}"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_multi_mode: {SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE}\n"
+                            "사용법: /swaggy_no_atlas_multi_mode roi|always"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_multi_mode cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_multi_roi", "swaggy_no_atlas_multi_roi")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else ""
+                    resp = None
+                    if arg:
+                        try:
+                            val = abs(float(arg))
+                            SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = val
+                            state["_swaggy_no_atlas_multi_roi"] = val
+                            state_dirty = True
+                            resp = f"✅ swaggy_no_atlas_multi_roi: {val:.2f}%"
+                        except Exception:
+                            resp = "⛔ 사용법: /swaggy_no_atlas_multi_roi 1.5"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_multi_roi: {SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI:.2f}%\n"
+                            "사용법: /swaggy_no_atlas_multi_roi 1.5"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_multi_roi cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_no_atlas_multi_max", "swaggy_no_atlas_multi_max")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else ""
+                    resp = None
+                    if arg:
+                        try:
+                            val = int(float(arg))
+                            if val < 0:
+                                raise ValueError("negative")
+                            SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = val
+                            state["_swaggy_no_atlas_multi_max"] = val
+                            state_dirty = True
+                            resp = f"✅ swaggy_no_atlas_multi_max: {val}"
+                        except Exception:
+                            resp = "⛔ 사용법: /swaggy_no_atlas_multi_max 3"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_no_atlas_multi_max: {SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX}\n"
+                            "사용법: /swaggy_no_atlas_multi_max 3"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_no_atlas_multi_max cmd 처리 send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/swaggy_d1_overext", "swaggy_d1_overext")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else ""
+                    resp = None
+                    if arg:
+                        try:
+                            val = float(arg)
+                            if val <= 0:
+                                raise ValueError("non-positive")
+                            SWAGGY_D1_OVEREXT_ATR_MULT = float(val)
+                            state["_swaggy_d1_overext_atr_mult"] = SWAGGY_D1_OVEREXT_ATR_MULT
+                            state_dirty = True
+                            resp = f"✅ swaggy_d1_overext set: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}"
+                        except Exception:
+                            resp = "⛔ 사용법: /swaggy_d1_overext 1.2"
+                    else:
+                        resp = (
+                            f"ℹ️ swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
+                            "사용법: /swaggy_d1_overext 1.2"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] swaggy_d1_overext cmd 처리 send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/rsi", "rsi")) and not responded:
                     parts = lower.split()
@@ -6589,26 +8813,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] dtfx cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
-                if (cmd in ("/pumpfade", "pumpfade")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        PUMPFADE_ENABLED = True
-                        state["_pumpfade_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ pumpfade ON (PumpFade 엔진)"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        PUMPFADE_ENABLED = False
-                        state["_pumpfade_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ pumpfade OFF"
-                    else:
-                        resp = f"ℹ️ pumpfade 상태: {'ON' if PUMPFADE_ENABLED else 'OFF'}\n사용법: /pumpfade on|off|status"
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] pumpfade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/atlas_rs_fail_short", "atlas_rs_fail_short")) and not responded:
                     parts = lower.split()
@@ -6729,295 +8933,6 @@ def _compute_atlas_swaggy_local(symbol: str, decision, gate: Dict[str, Any], swa
         }
     return atlas_engine.compute_swaggy_local(symbol, decision, gate, cycle_cache, atlas_swaggy_cfg, swaggy_cfg)
 
-def _atlasfabio_gate_long(symbol: str, cfg) -> Optional[Dict[str, Any]]:
-    if atlas_engine:
-        gate = atlas_engine.evaluate_fabio_gate_long(symbol, cfg)
-        if gate is not None:
-            return gate
-    if atlas_fabio_engine:
-        return atlas_fabio_engine.evaluate_gate_long(symbol, cfg)
-    return None
-
-def _atlasfabio_gate_short(symbol: str, cfg) -> Optional[Dict[str, Any]]:
-    if atlas_engine:
-        gate = atlas_engine.evaluate_fabio_gate_short(symbol, cfg)
-        if gate is not None:
-            return gate
-    if atlas_fabio_engine:
-        return atlas_fabio_engine.evaluate_gate_short(symbol, cfg)
-    return None
-
-def _atlasfabio_gate(symbol: str, cfg) -> Optional[Dict[str, Any]]:
-    if atlas_engine:
-        gate = atlas_engine.evaluate_fabio_gate(symbol, cfg)
-        if gate is not None:
-            return gate
-    if atlas_fabio_engine:
-        return atlas_fabio_engine.evaluate_gate(symbol, cfg)
-    return None
-
-def _ema_align_ok(symbol: str, tf: str, limit: int = 120) -> bool:
-    df = cycle_cache.get_df(symbol, tf, limit)
-    if df.empty or len(df) < 70:
-        return False
-    df = df.iloc[:-1]
-    if len(df) < 70:
-        return False
-    ema20 = ema(df["close"], 20).iloc[-1]
-    ema60 = ema(df["close"], 60).iloc[-1]
-    if ema60 == 0:
-        return False
-    dist = abs(ema20 - ema60) / ema60
-    return dist >= EMA_ALIGN_DIST_PCT
-
-exchange = ccxt.binance({
-    "apiKey": os.getenv("BINANCE_API_KEY", ""),
-    "secret": os.getenv("BINANCE_API_SECRET", ""),
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
-    "timeout": 30_000,  # 30초로 증가
-    "rateLimit": 200,   # 요청 간격 증가
-})
-def _fetch_ohlcv_with_stats(symbol: str, tf: str, limit: int) -> Optional[list]:
-    try:
-        data = exchange.fetch_ohlcv(symbol, tf, limit=limit)
-        CURRENT_CYCLE_STATS["rest_calls"] = CURRENT_CYCLE_STATS.get("rest_calls", 0) + 1
-        return data
-    except Exception as e:
-        msg = str(e)
-        CURRENT_CYCLE_STATS["rest_fails"] = CURRENT_CYCLE_STATS.get("rest_fails", 0) + 1
-        if ("429" in msg) or ("-1003" in msg):
-            CURRENT_CYCLE_STATS["rest_429"] = CURRENT_CYCLE_STATS.get("rest_429", 0) + 1
-        print(f"[에러] {symbol} {tf} 데이터 가져오기 실패: {e}")
-        return None
-
-cycle_cache.set_fetcher(_fetch_ohlcv_with_stats)
-
-ATLASFABIO_LTF_RSI_LONG_MIN = 50.0
-ATLASFABIO_MID_RETEST_REASON = "atlas_mid_retest_bypass"
-FABIO_LONG_IMPULSE_ATR_FACTOR = 1.2
-FABIO_LONG_IMPULSE_ATR_PERIOD = 14
-FABIO_LONG_BB_PERIOD = 20
-FABIO_LONG_DIST_MAX = 0.8
-FABIO_RSI_OVERHEAT = 68.0
-
-USDT_PER_TRADE = 30.0  # 사용가능 USDT 대비 퍼센트
-LEVERAGE = 10
-MARGIN_MODE = "cross"
-MAX_OPEN_POSITIONS = 12
-AUTO_EXIT_ENABLED = False  # True이면 TP/SL 기준으로 자동 청산 (기본 OFF)
-AUTO_EXIT_LONG_TP_PCT = 3.0
-AUTO_EXIT_LONG_SL_PCT = 3.0
-AUTO_EXIT_SHORT_TP_PCT = 3.0
-AUTO_EXIT_SHORT_SL_PCT = 3.0
-LIVE_TRADING = True  # True이면 신호 발생 시 실제 주문 실행
-
-COOLDOWN_SEC = 3600
-PER_SYMBOL_SLEEP = 0.12
-CYCLE_SLEEP = 10.0
-SAME_CYCLE_SLEEP = 10.0
-SHORT_RECONCILE_GRACE_SEC = 45.0
-SHORT_RECONCILE_EPS = 0.0005
-SHORT_RECONCILE_ZERO_STREAK_N = 2
-SHORT_RECONCILE_SEEN_TTL_SEC = 3600  # 최근 숏 포지션 실제 존재 TTL
-
-# 옵션 최적화 설정
-STRUCTURE_TOP_N: Optional[int] = 20  # 구조용 상위 N개 (거래대금 기준)
-EMA_ALIGN_DIST_PCT = 0.003
-FABIO_EARLY_ALERT_COOLDOWN_SEC = 900
-FABIO_UNIVERSE_TOP_N = 30  # 파비오 엔진: top N (조건별 로테이션)
-FABIO_GAIN_TOP_N = 15
-FABIO_LOSS_TOP_N = 15
-ATLASFABIO_DIST_MAX = 0.03
-ATLASFABIO_PULLBACK_VOL_MAX = 1.5
-ATLASFABIO_RETEST_TOUCH_TOL = 0.0020
-ATLASFABIO_STRONG_SCORE = 85
-ATLASFABIO_MID_SCORE = 70
-ATLASFABIO_STRONG_DIST_MAX = 0.045
-ATLASFABIO_MID_DIST_MAX = 0.008
-ATLASFABIO_MID_PULLBACK_VOL_MAX = 1.5
-ATLASFABIO_MID_RETEST_TOUCH_TOL = 0.0035
-ATLASFABIO_MID_VOL_MULT = 1.05
-ATLASFABIO_MIN_STRENGTH = 0.55
-ATLASFABIO_MIN_STRENGTH_SOFT = 0.70
-MANAGE_EVAL_COOLDOWN_SEC: int = 20  # manage 모드 평가 주기 쿨다운(초) → fetch_positions 빈도 완화
-MANAGE_EXIT_COOLDOWN_SEC: int = 5  # auto-exit 전용 최소 평가 주기(초)
-MANAGE_PING_COOLDOWN_SEC: int = 7200  # manage 알림 주기(초) - 2시간
-MANUAL_CLOSE_GRACE_SEC: int = 60  # 진입 직후 포지션 캐시 오차로 인한 오탐 방지
-AUTO_EXIT_GRACE_SEC: int = 30     # 진입 직후 자동청산 금지 구간
-EXIT_COOLDOWN_HOURS: float = 2.0  # 청산 후 재진입 쿨다운(시간)
-EXIT_COOLDOWN_SEC: int = int(EXIT_COOLDOWN_HOURS * 3600)  # 청산 후 재진입 쿨다운(초)
-MANAGE_LOOP_ENABLED: bool = True  # 관리 루프 분리 실행 여부
-MANAGE_LOOP_SLEEP_SEC: float = 2.0  # 관리 루프 주기(초)
-MANAGE_TICKER_TTL_SEC: float = 5.0  # 관리 루프 티커 캐시 TTL(초)
-RUNTIME_CONFIG_RELOAD_SEC: float = 5.0  # 런타임 설정 변경사항 반영 주기
-MANAGE_WS_MODE: bool = False  # WS 관리 모듈 사용 시 메인 리컨실/관리 비활성
-SUPPRESS_RECONCILE_ALERTS: bool = True  # 리컨실 알림 억제용(기본 ON)
-REPORT_API_ONLY: bool = True  # 리포트는 API sync 결과만 사용
-DB_RECONCILE_ENABLED: bool = os.getenv("DB_RECONCILE_ENABLED", "0") == "1"
-DB_RECONCILE_SEC: float = float(os.getenv("DB_RECONCILE_SEC", "30"))
-DB_RECONCILE_LOOKBACK_SEC: float = float(os.getenv("DB_RECONCILE_LOOKBACK_SEC", "3600"))
-DB_RECONCILE_SYMBOLS_RAW = os.getenv("DB_RECONCILE_SYMBOLS", "").strip()
-DB_REPORT_LOOKBACK_SEC: float = float(os.getenv("DB_REPORT_LOOKBACK_SEC", "259200"))
-SHORT_POS_SAMPLE_DIV: int = 20  # 1/N 샘플링
-SHORT_POS_SAMPLE_RECENT_SEC: int = 120  # 최근 진입 심볼은 항상 샘플링
-
-FAST_TF_PREFETCH_TOPN = 30
-MAX_FAST_SYMBOLS = 30
-FAST_LIMIT_CAP = 120
-MID_LIMIT_CAP = 200
-SLOW_LIMIT_CAP = 300
-MID_TF_PREFETCH_EVERY_N = 3
-TTL_4H_SEC = 1800
-TTL_1D_SEC = 86400
-
-# LONG signal control (used by Fabio/AtlasFabio)
-LONG_LIVE_TRADING = True
-ATLAS_FABIO_ENABLED = True
-ATLAS_FABIO_PAPER = False
-SWAGGY_ENABLED = False
-SWAGGY_ATLAS_LAB_ENABLED = False
-DTFX_ENABLED = True
-PUMPFADE_ENABLED = False
-ATLAS_RS_FAIL_SHORT_ENABLED = False
-DIV15M_LONG_ENABLED = True
-DIV15M_SHORT_ENABLED = True
-ONLY_DIV15M_SHORT = False
-RSI_ENABLED = True
-
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-STATE_SAVE_LOCK = threading.Lock()
-
-# 청산 보수성 옵션
-REQUIRE_CLOSE_ABOVE_FOR_EXIT = True  # True이면 wick 터치만으로는 청산하지 않고 종가가 EMA20 이상이어야 함
-
-# 사이클 단위 데이터 캐시 (symbol, timeframe, limit) -> DataFrame
-CURRENT_CYCLE_STATS: Dict[str, dict] = {}
-# funding rate TTL 캐시: symbol -> (ts, rate, interval_hours)
-FUNDING_TTL_CACHE: Dict[str, tuple] = {}
-
-# 영속(사이클 간) OHLCV TTL 캐시: (symbol, tf, limit) -> (ts, df)
-TF_TTL_SECS = {"3m": 60, "5m": 120, "15m": 240, "1h": 300}
-PERSISTENT_OHLCV_CACHE: Dict[tuple, tuple] = {}
-
-# 429/-1003 백오프 제어
-GLOBAL_BACKOFF_UNTIL: float = 0.0
-_BACKOFF_SECS: float = 0.0
-# rate-limit 로그 쿨다운
-RATE_LIMIT_LOG_TS: float = 0.0
-TOTAL_CYCLES: int = 0
-TOTAL_ELAPSED: float = 0.0
-TOTAL_REST_CALLS: int = 0
-TOTAL_429_COUNT: int = 0
-
-FUNDING_INTERVAL_HOURS = 1
-FUNDING_BLOCK_PCT = -0.2
-FUNDING_TTL_SEC = 300
-
-def prune_ohlcv_cache():
-    """TTL 지난 OHLCV 캐시 청소(메모리 보호). 여유 3배를 준다."""
-    try:
-        now = time.time()
-        to_del = []
-        for (sym, tf, limit), (ts, _) in list(PERSISTENT_OHLCV_CACHE.items()):
-            ttl = TF_TTL_SECS.get(tf, 60) * 3
-            if (now - ts) > ttl:
-                to_del.append((sym, tf, limit))
-        for k in to_del:
-            PERSISTENT_OHLCV_CACHE.pop(k, None)
-        if to_del:
-            CURRENT_CYCLE_STATS.setdefault("cache_pruned", 0)
-            CURRENT_CYCLE_STATS["cache_pruned"] += len(to_del)
-    except Exception:
-        pass
-
-def _prefetch_ohlcv_for_cycle(
-    symbols: List[str],
-    ex,
-    plan: Dict[str, int],
-    label: str = "common",
-    ttl_by_tf: Optional[Dict[str, int]] = None,
-) -> Dict[str, Any]:
-    if not symbols or not plan:
-        return {"symbols": len(symbols), "tfs": list(plan.keys()), "fetched": 0, "failed": 0, "fresh_hits": {}}
-    fetched = 0
-    failed = 0
-    failed_429 = 0
-    fresh_hits: Dict[str, int] = {}
-    fetched_by_tf: Dict[str, int] = {}
-    ttl_by_tf = ttl_by_tf or {}
-    t0 = time.time()
-    for sym in symbols:
-        for tf, limit in plan.items():
-            key = (sym, tf)
-            cached_data = cycle_cache.get_raw(sym, tf)
-            if cached_data is not None and len(cached_data) >= limit:
-                continue
-            ttl = ttl_by_tf.get(tf)
-            if ttl and cycle_cache.is_fresh(sym, tf, ttl):
-                fresh_hits[tf] = fresh_hits.get(tf, 0) + 1
-                continue
-            try:
-                data = ex.fetch_ohlcv(sym, tf, limit=limit)
-                cycle_cache.set_raw(sym, tf, data)
-                fetched += 1
-                fetched_by_tf[tf] = fetched_by_tf.get(tf, 0) + 1
-            except Exception as e:
-                failed += 1
-                msg = str(e)
-                if ("429" in msg) or ("-1003" in msg):
-                    failed_429 += 1
-                print(f"[에러] {sym} {tf} 데이터 가져오기 실패: {e}")
-    if fetched > 0:
-        elapsed = time.time() - t0
-        print(f"[prefetch] {label} fetched={fetched} failed={failed} elapsed={elapsed:.2f}s")
-    CURRENT_CYCLE_STATS["rest_calls"] = CURRENT_CYCLE_STATS.get("rest_calls", 0) + fetched
-    CURRENT_CYCLE_STATS["rest_fails"] = CURRENT_CYCLE_STATS.get("rest_fails", 0) + failed
-    CURRENT_CYCLE_STATS["rest_429"] = CURRENT_CYCLE_STATS.get("rest_429", 0) + failed_429
-    return {
-        "symbols": len(symbols),
-        "tfs": list(plan.keys()),
-        "fetched": fetched,
-        "failed": failed,
-        "fresh_hits": fresh_hits,
-        "fetched_by_tf": fetched_by_tf,
-    }
-
-def _atlasfabio_ltf_hit(symbol: str, side: str, mode: str = "5m_or_3m") -> tuple[bool, bool, bool]:
-    if not rsi_engine:
-        return False, False, False
-    cfg = rsi_engine.config
-    side = (side or "").upper()
-    if side == "SHORT":
-        r5 = rsi_engine.fetch_rsi(symbol, "5m")
-        hit5m = (r5 is not None) and (r5 >= cfg.thresholds["5m"])
-        r3, r2, r1 = rsi_engine.fetch_rsi_last3(symbol, "3m")
-        hit3m = False
-        if r2 is not None and r1 is not None and r2 >= cfg.thresholds["3m"] and r2 > r1:
-            hit3m = True
-        if r3 is not None and r2 is not None and r3 >= cfg.thresholds["3m"] and r3 > r2:
-            hit3m = True
-        ltf_ok = hit3m if mode == "3m_only" else (hit5m or hit3m)
-        return hit5m, hit3m, ltf_ok
-
-    r5_prev, r5_last = rsi_engine.fetch_rsi_last2(symbol, "5m")
-    hit5m = False
-    if (
-        r5_prev is not None
-        and r5_last is not None
-        and r5_last >= ATLASFABIO_LTF_RSI_LONG_MIN
-        and r5_last > r5_prev
-    ):
-        hit5m = True
-    r3, r2, r1 = rsi_engine.fetch_rsi_last3(symbol, "3m")
-    hit3m = False
-    if r2 is not None and r1 is not None and r2 >= ATLASFABIO_LTF_RSI_LONG_MIN and r1 > r2:
-        hit3m = True
-    if r3 is not None and r2 is not None and r3 >= ATLASFABIO_LTF_RSI_LONG_MIN and r2 > r3:
-        hit3m = True
-    ltf_ok = hit3m if mode == "3m_only" else (hit5m or hit3m)
-    return hit5m, hit3m, ltf_ok
-
 def _parse_funding_interval_hours(info: dict) -> Optional[float]:
     for key in ("fundingIntervalHours", "fundingInterval", "intervalHours", "interval"):
         if key in info:
@@ -7028,6 +8943,27 @@ def _parse_funding_interval_hours(info: dict) -> Optional[float]:
             except Exception:
                 pass
     return None
+
+def _parse_onboard_date_ms(info: dict) -> Optional[int]:
+    if not isinstance(info, dict):
+        return None
+    for key in ("onboardDate", "listingDate", "listDate", "onboardTime"):
+        if key in info:
+            try:
+                val = int(info.get(key))
+            except Exception:
+                val = None
+            if isinstance(val, int) and val > 0:
+                return val
+    return None
+
+def _is_symbol_old_enough(market: dict, min_days: float) -> bool:
+    info = market.get("info") if isinstance(market, dict) else None
+    onboard_ms = _parse_onboard_date_ms(info or {})
+    if not onboard_ms:
+        return True
+    age_days = (time.time() * 1000.0 - float(onboard_ms)) / (1000.0 * 60 * 60 * 24)
+    return age_days >= min_days
 
 def fetch_funding_rate(symbol: str) -> (Optional[float], Optional[float]):
     now = time.time()
@@ -7064,9 +9000,15 @@ def get_symbols() -> List[str]:
     else:
         raise RuntimeError("load_markets 실패(재시도 초과)")
     symbols = []
+    skipped_new = 0
     for m in markets.values():
         if m.get("swap") and m.get("linear") and m.get("settle") == "USDT" and m.get("active", True):
+            if not _is_symbol_old_enough(m, MIN_LISTING_AGE_DAYS):
+                skipped_new += 1
+                continue
             symbols.append(m["symbol"])
+    if skipped_new:
+        print(f"[초기화] 신규 상장 필터: {skipped_new}개 제외 (상장 {MIN_LISTING_AGE_DAYS:.0f}일 미만)")
     return sorted(list(set(symbols)))
 
 def load_state() -> Dict[str, dict]:
@@ -7079,6 +9021,8 @@ def load_state() -> Dict[str, dict]:
 
 def save_state(state: Dict[str, dict]) -> None:
     path = _STATE_FILE_OVERRIDE or STATE_FILE
+    if not ENGINE_WRITE_STATE:
+        return
     disk = None
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -7095,6 +9039,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_auto_exit_long_sl_pct",
                 "_auto_exit_short_tp_pct",
                 "_auto_exit_short_sl_pct",
+                "_engine_exit_overrides",
                 "_live_trading",
                 "_long_live",
                 "_max_open_positions",
@@ -7105,13 +9050,16 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_dca_second_pct",
                 "_dca_third_pct",
                 "_exit_cooldown_hours",
-                "_atlas_fabio_enabled",
                 "_swaggy_enabled",
                 "_swaggy_atlas_lab_enabled",
+                "_swaggy_atlas_lab_v2_enabled",
+                "_swaggy_no_atlas_enabled",
+                "_swaggy_atlas_lab_off_windows",
+                "_swaggy_atlas_lab_v2_off_windows",
+                "_swaggy_no_atlas_off_windows",
+                "_swaggy_no_atlas_overext_min",
+                "_swaggy_d1_overext_atr_mult",
                 "_dtfx_enabled",
-                "_pumpfade_enabled",
-                "_div15m_long_enabled",
-                "_div15m_short_enabled",
                 "_rsi_enabled",
                 "_runtime_cfg_ts",
             ]
@@ -7394,11 +9342,18 @@ def run():
     else:
         state["_symbols"] = symbols
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
-    global swaggy_engine, swaggy_atlas_lab_engine, atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
+    try:
+        cycle_cache.set_fetcher(lambda sym, tf, limit: _fetch_ohlcv_with_retry(exchange, sym, tf, limit))
+    except Exception:
+        pass
+    global swaggy_engine, swaggy_atlas_lab_engine, swaggy_atlas_lab_v2_engine, swaggy_no_atlas_engine
+    global atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     swaggy_atlas_lab_engine = SwaggyAtlasLabEngine() if SwaggyAtlasLabEngine else None
-    atlas_engine = AtlasEngine() if AtlasEngine else None
-    atlas_swaggy_cfg = AtlasSwaggyConfig() if AtlasSwaggyConfig else None
+    swaggy_atlas_lab_v2_engine = SwaggyAtlasLabV2Engine() if SwaggyAtlasLabV2Engine else None
+    swaggy_no_atlas_engine = SwaggyNoAtlasEngine() if SwaggyNoAtlasEngine else None
+    atlas_engine = None
+    atlas_swaggy_cfg = None
     global rsi_engine
     rsi_engine = RsiEngine() if RsiEngine else None
     _maybe_reload_rsi_config()
@@ -7408,9 +9363,7 @@ def run():
     div15m_engine = Div15mLongEngine() if Div15mLongEngine else None
     div15m_short_engine = Div15mShortEngine() if Div15mShortEngine else None
     dtfx_engine = DTFXEngine() if DTFXEngine else None
-    dtfx_cfg = DTFXConfig() if DTFXConfig else None
-    pumpfade_engine = PumpFadeEngine() if PumpFadeEngine else None
-    pumpfade_cfg = PumpFadeConfig() if PumpFadeConfig else None
+    dtfx_cfg = DTFXConfig(tf_ltf="5m") if DTFXConfig else None
     atlas_rs_fail_short_engine = AtlasRsFailShortEngine() if AtlasRsFailShortEngine else None
     atlas_rs_fail_short_cfg = AtlasRsFailShortConfig() if AtlasRsFailShortConfig else None
     if dtfx_engine and dtfx_cfg and EngineContext:
@@ -7422,9 +9375,10 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED, DTFX_ENABLED, PUMPFADE_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE, SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI, SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED
+    global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
-    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
+    global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
     AUTO_EXIT_ENABLED = bool(state.get("_auto_exit", AUTO_EXIT_ENABLED))
     state["_auto_exit"] = AUTO_EXIT_ENABLED
@@ -7443,14 +9397,6 @@ def run():
         state["_long_live"] = LONG_LIVE_TRADING
     if isinstance(state.get("_live_trading"), bool):
         LIVE_TRADING = bool(state.get("_live_trading"))
-    if isinstance(state.get("_div15m_long_enabled"), bool):
-        DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
-    else:
-        state["_div15m_long_enabled"] = DIV15M_LONG_ENABLED
-    if isinstance(state.get("_div15m_short_enabled"), bool):
-        DIV15M_SHORT_ENABLED = bool(state.get("_div15m_short_enabled"))
-    else:
-        state["_div15m_short_enabled"] = DIV15M_SHORT_ENABLED
     if isinstance(state.get("_dca_enabled"), bool):
         DCA_ENABLED = bool(state.get("_dca_enabled"))
         if executor_mod:
@@ -7481,52 +9427,94 @@ def run():
             executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
     else:
         state["_dca_third_pct"] = DCA_THIRD_PCT
+    if isinstance(state.get("_sat_trade"), bool):
+        SATURDAY_TRADE_ENABLED = bool(state.get("_sat_trade"))
+    else:
+        state["_sat_trade"] = SATURDAY_TRADE_ENABLED
     if isinstance(state.get("_exit_cooldown_hours"), (int, float)):
         EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
-        EXIT_COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+        COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
+        EXIT_COOLDOWN_SEC = COOLDOWN_SEC
     else:
         state["_exit_cooldown_hours"] = EXIT_COOLDOWN_HOURS
     if isinstance(state.get("_rsi_enabled"), bool):
         RSI_ENABLED = bool(state.get("_rsi_enabled"))
     else:
         state["_rsi_enabled"] = RSI_ENABLED
-    if isinstance(state.get("_atlas_fabio_enabled"), bool):
-        ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
-    else:
-        state["_atlas_fabio_enabled"] = ATLAS_FABIO_ENABLED
     if isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     else:
         state["_swaggy_atlas_lab_enabled"] = SWAGGY_ATLAS_LAB_ENABLED
+    if isinstance(state.get("_swaggy_atlas_lab_v2_enabled"), bool):
+        SWAGGY_ATLAS_LAB_V2_ENABLED = bool(state.get("_swaggy_atlas_lab_v2_enabled"))
+    else:
+        state["_swaggy_atlas_lab_v2_enabled"] = SWAGGY_ATLAS_LAB_V2_ENABLED
+    if isinstance(state.get("_swaggy_atlas_lab_off_windows"), str):
+        SWAGGY_ATLAS_LAB_OFF_WINDOWS = str(state.get("_swaggy_atlas_lab_off_windows") or "")
+    else:
+        state["_swaggy_atlas_lab_off_windows"] = SWAGGY_ATLAS_LAB_OFF_WINDOWS
+    if isinstance(state.get("_swaggy_atlas_lab_v2_off_windows"), str):
+        SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS = str(state.get("_swaggy_atlas_lab_v2_off_windows") or "")
+    else:
+        state["_swaggy_atlas_lab_v2_off_windows"] = SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS
+    if isinstance(state.get("_swaggy_no_atlas_enabled"), bool):
+        SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
+    else:
+        state["_swaggy_no_atlas_enabled"] = SWAGGY_NO_ATLAS_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_off_windows"), str):
+        SWAGGY_NO_ATLAS_OFF_WINDOWS = str(state.get("_swaggy_no_atlas_off_windows") or "")
+    else:
+        state["_swaggy_no_atlas_off_windows"] = SWAGGY_NO_ATLAS_OFF_WINDOWS
+    if isinstance(state.get("_swaggy_no_atlas_overext_min"), (int, float)):
+        SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(state.get("_swaggy_no_atlas_overext_min"))
+    else:
+        state["_swaggy_no_atlas_overext_min"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+    if isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), bool):
+        SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = bool(state.get("_swaggy_no_atlas_overext_min_enabled"))
+    else:
+        state["_swaggy_no_atlas_overext_min_enabled"] = SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_multi_enabled"), bool):
+        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = bool(state.get("_swaggy_no_atlas_multi_enabled"))
+    else:
+        state["_swaggy_no_atlas_multi_enabled"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_multi_mode"), str):
+        SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = str(state.get("_swaggy_no_atlas_multi_mode") or "roi")
+    else:
+        state["_swaggy_no_atlas_multi_mode"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE
+    if isinstance(state.get("_swaggy_no_atlas_multi_roi"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = abs(float(state.get("_swaggy_no_atlas_multi_roi") or 0.0))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_multi_roi"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI
+    if isinstance(state.get("_swaggy_no_atlas_multi_max"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = int(state.get("_swaggy_no_atlas_multi_max") or 0)
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_multi_max"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX
+    if isinstance(state.get("_swaggy_d1_overext_atr_mult"), (int, float)):
+        SWAGGY_D1_OVEREXT_ATR_MULT = float(state.get("_swaggy_d1_overext_atr_mult"))
+    else:
+        state["_swaggy_d1_overext_atr_mult"] = SWAGGY_D1_OVEREXT_ATR_MULT
     if isinstance(state.get("_dtfx_enabled"), bool):
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
         state["_dtfx_enabled"] = DTFX_ENABLED
-    if isinstance(state.get("_pumpfade_enabled"), bool):
-        PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
-    else:
-        state["_pumpfade_enabled"] = PUMPFADE_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
+        state["_swaggy_no_atlas_enabled"] = False
+    if isinstance(state.get("_swaggy_atlas_lab_v2_enabled"), dict):
+        state["_swaggy_atlas_lab_v2_enabled"] = False
+    if isinstance(state.get("_atlas_rs_fail_short_enabled"), dict):
+        state["_atlas_rs_fail_short_enabled"] = False
+    if isinstance(state.get("_atlas_rs_fail_short_universe"), dict):
+        state["_atlas_rs_fail_short_universe"] = []
     if isinstance(state.get("_atlas_rs_fail_short_enabled"), bool):
         ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
     else:
         state["_atlas_rs_fail_short_enabled"] = ATLAS_RS_FAIL_SHORT_ENABLED
-    if "--only-div15m-short" in sys.argv:
-        ONLY_DIV15M_SHORT = True
-        DIV15M_LONG_ENABLED = False
-        DIV15M_SHORT_ENABLED = True
-        RSI_ENABLED = False
-        DTFX_ENABLED = False
-        PUMPFADE_ENABLED = False
-        ATLAS_RS_FAIL_SHORT_ENABLED = False
-        ATLAS_FABIO_ENABLED = False
-        state["_div15m_long_enabled"] = False
-        state["_div15m_short_enabled"] = True
-        state["_rsi_enabled"] = False
-        state["_dtfx_enabled"] = False
-        state["_pumpfade_enabled"] = False
-        state["_atlas_rs_fail_short_enabled"] = False
-        state["_atlas_fabio_enabled"] = False
-        print("[모드] ONLY_DIV15M_SHORT 활성화: div15m_short만 스캔")
     if isinstance(state.get("_entry_usdt"), (int, float)):
         try:
             val = float(state.get("_entry_usdt"))
@@ -7575,7 +9563,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /atlasfabio on|off|status, /swaggy_atlas_lab on|off|status, /div15m_long on|off|status, /div15m_short on|off|status, /rsi on|off|status, /dtfx on|off|status, /pumpfade on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_no_atlas_multi on|off|status, /swaggy_no_atlas_multi_mode roi|always, /swaggy_no_atlas_multi_roi n, /swaggy_no_atlas_multi_max n, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
     )
     if ACCOUNT_CONTEXTS:
         for acct in ACCOUNT_CONTEXTS:
@@ -7653,6 +9641,46 @@ def run():
                         set_dry_run(not LIVE_TRADING)
                     except Exception:
                         pass
+                    multi_entry_on = bool(SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED)
+                    if state.get("_pos_limit_reached") is True:
+                        verified = None
+                        try:
+                            verified = count_open_positions(force=True)
+                        except Exception:
+                            verified = None
+                        if isinstance(verified, int) and verified < MAX_OPEN_POSITIONS:
+                            state["_pos_limit_reached"] = False
+                            state["_active_positions_total"] = int(verified)
+                        else:
+                            state["_pos_limit_reached"] = True
+                            if not multi_entry_on:
+                                last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
+                                if (now - last_warn) >= 60:
+                                    print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
+                                    state["_pos_limit_skip_ts"] = now
+                                    _log_off_window_status(state, now, tag="pos_limit")
+                                time.sleep(1)
+                                continue
+                    active_positions_state = _count_open_positions_state(state)
+                    active_positions_total_est = active_positions_state
+                    verified = None
+                    try:
+                        verified = count_open_positions(force=True)
+                    except Exception:
+                        verified = None
+                    if isinstance(verified, int):
+                        active_positions_total_est = verified
+                        state["_active_positions_total"] = int(verified)
+                    if isinstance(active_positions_total_est, int) and active_positions_total_est >= MAX_OPEN_POSITIONS:
+                        state["_pos_limit_reached"] = True
+                        if not multi_entry_on:
+                            last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
+                            if (now - last_warn) >= 60:
+                                print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
+                                state["_pos_limit_skip_ts"] = now
+                                _log_off_window_status(state, now, tag="pos_limit")
+                            time.sleep(1)
+                            continue
 
                     # cycle ts debug (BTC 15m, prev candle only)
                     cycle_ts = None

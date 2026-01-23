@@ -1,7 +1,7 @@
 """
 ATR, 프랙탈, 세션 등 기술적 분석에 필요한 유틸리티 함수들을 포함합니다.
 """
-from typing import List, Tuple, Dict, Any # Added Dict, Any
+from typing import List, Tuple, Dict, Any, Optional # Added Dict, Any
 import numpy as np
 from ..core.types import Candle
 
@@ -85,3 +85,20 @@ def get_tick_size(market: Dict[str, Any]) -> Tuple[float, str]:
         return (None, "fallback_none")
         
     return (tick, source)
+
+
+def calculate_ema(candles: List[Candle], period: int) -> List[Optional[float]]:
+    if period <= 0:
+        return []
+    if len(candles) < period:
+        return [None for _ in candles]
+    closes = [c.c for c in candles]
+    ema: List[Optional[float]] = [None for _ in candles]
+    sma = float(np.mean(closes[:period]))
+    ema[period - 1] = sma
+    alpha = 2.0 / (period + 1.0)
+    prev = sma
+    for i in range(period, len(closes)):
+        prev = (closes[i] - prev) * alpha + prev
+        ema[i] = prev
+    return ema

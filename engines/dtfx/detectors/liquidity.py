@@ -61,17 +61,18 @@ def check_sell_side_sweep(
     eps = 1e-9 # Small epsilon to prevent division by zero
     strong2 = (body / max(candle_range, eps)) >= body_ratio_min
 
-    # strong3: 2 consecutive closes below level (for long)
+    # strong3: 3 consecutive closes below level (for long)
     consec_closes_below_deadband = 0
     # recent_candles should at least contain the current candle (index -1) and previous (index -2)
-    if len(recent_candles) >= 2:
-        # Check current and previous candle
+    if len(recent_candles) >= 3:
         if recent_candles[-1].c < (last_swing_low.price - deadband_value):
             consec_closes_below_deadband += 1
         if recent_candles[-2].c < (last_swing_low.price - deadband_value):
             consec_closes_below_deadband += 1
-    
-    strong3 = consec_closes_below_deadband >= 2
+        if recent_candles[-3].c < (last_swing_low.price - deadband_value):
+            consec_closes_below_deadband += 1
+
+    strong3 = consec_closes_below_deadband >= 3
 
     is_strong_breakout = strong1 and (strong2 or strong3) # Modified
     deadband_line = last_swing_low.price - deadband_value
@@ -160,15 +161,17 @@ def check_buy_side_sweep(
     eps = 1e-9 # Small epsilon to prevent division by zero
     strong2 = (body / max(candle_range, eps)) >= body_ratio_min
 
-    # strong3: 2 consecutive closes above level (for short)
+    # strong3: 3 consecutive closes above level (for short)
     consec_closes_above_deadband = 0
-    if len(recent_candles) >= 2:
+    if len(recent_candles) >= 3:
         if recent_candles[-1].c > (last_swing_high.price + deadband_value):
             consec_closes_above_deadband += 1
         if recent_candles[-2].c > (last_swing_high.price + deadband_value):
             consec_closes_above_deadband += 1
-    
-    strong3 = consec_closes_above_deadband >= 2
+        if recent_candles[-3].c > (last_swing_high.price + deadband_value):
+            consec_closes_above_deadband += 1
+
+    strong3 = consec_closes_above_deadband >= 3
 
     is_strong_breakout = strong1 and (strong2 or strong3) # Modified
     deadband_line = last_swing_high.price + deadband_value

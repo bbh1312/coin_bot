@@ -5,7 +5,7 @@ import ccxt
 from .core.types import Candle, Signal, DTFXState
 from .core.logger import get_logger
 from .detectors import swings, liquidity, structure, zones
-from .core.utils import calculate_atr, get_tick_size
+from .core.utils import calculate_atr, get_tick_size, calculate_ema
 from .config import ATR_PERIOD, ZONE_PIERCE_ATR_MULT, STRONGBREAKOUT_DEADBAND_ATR_MULT, TICK_SIZE_MULTIPLIER, BODY_RATIO_MIN, MAJOR_PCT_WEIGHT, ZONE_TOO_WIDE_ATR_MULT, ZONE_TOO_FAR_ATR_MULT, WICK_RATIO_MIN
 
 class DTFXShortEngine:
@@ -476,6 +476,25 @@ class DTFXShortEngine:
                     "reason": soft_reasons,
                 },
             })
+            if self.params.get("mss_soft_zone_enabled", False):
+                mss_context = {
+                    "dir": "down",
+                    "break_level": break_level,
+                    "ref_swing_ts": state['sweep_context']['ref_swing_ts'],
+                    "confirm_candle_ts": candle.ts,
+                    "soft": True,
+                    "confirmed": False,
+                    "deadband_mss_confirm": deadband_mss_confirm,
+                    "confirm_line": confirm_line,
+                }
+                state['mss_context'] = mss_context
+                self._change_state(state, DTFXState.MSS_CONFIRMED)
+                self._log_and_create_signal(state, candle, "MSS_SOFT_ZONE_ARMED", DTFXState.MSS_CONFIRMED, {
+                    "from_state": DTFXState.MSS_SOFT.value,
+                    "mss": mss_context,
+                    "sweep": state['sweep_context'],
+                })
+                return self._handle_mss_confirmed(state, candle, ltf, mtf, htf)
             return None
 
         self._log_and_create_signal(state, candle, "MSS_REJECTED", DTFXState.SWEEP_SEEN, {
@@ -630,22 +649,6 @@ class DTFXShortEngine:
             found_zone = ob_zone
             found_zone_type = "ob"
 
-        if not found_zone:
-            fvg_search_candles = ltf[max(0, mss_candle_idx - 10):mss_candle_idx + 1]
-            fvgs = zones.find_fair_value_gaps(fvg_search_candles)
-            down_fvgs = [fvg for fvg in fvgs if fvg['dir'] == 'down']
-            if down_fvgs:
-                found_zone = down_fvgs[-1]
-                found_zone_type = "fvg"
-
-        if not found_zone:
-            sweep_high_price = state['sweep_context']['sweep_candle_high']
-            mss_low_price = state['mss_context']['break_level']
-            ote_zone = zones.calculate_ote(sweep_high_price, mss_low_price)
-            if ote_zone:
-                 found_zone = ote_zone
-                 found_zone_type = "ote"
-
         skipped_reason = self._get_zone_skipped_reason_short(ltf, state['mss_context'], found_zone, found_zone_type)
 
         if skipped_reason:
@@ -671,7 +674,7 @@ class DTFXShortEngine:
             }) # Use Enum
         else:
             # Fallback for when no zone is found and no specific skipped reason applies
-            self._log_and_create_signal(state, candle, "ZONE_SKIPPED", DTFXState.IDLE, {"reason": "no_zone_found_general", "mss": state['mss_context']})
+            self._log_and_create_signal(state, candle, "ZONE_SKIPPED", DTFXState.IDLE, {"reason": "no_ob_found", "mss": state['mss_context']})
             self._change_state(state, DTFXState.IDLE)
         return None
     def _handle_retrace_zone_set(self, state: Dict[str, Any], candle: Candle, ltf: List[Candle], mtf: List[Candle], htf: List[Candle]) -> Optional[Signal]:
@@ -735,6 +738,42 @@ class DTFXShortEngine:
         
         # Check for any interaction with the padded zone
         if overlap:
+            mss_context = state.get("mss_context") if isinstance(state.get("mss_context"), dict) else {}
+            confirm_required = bool(mss_context.get("soft")) and bool(
+                self.params.get("mss_soft_confirm_required", True)
+            )
+            if confirm_required and not mss_context.get("confirmed"):
+                confirm_line = mss_context.get("confirm_line")
+                if not isinstance(confirm_line, (int, float)):
+                    break_level = mss_context.get("break_level")
+                    deadband_value = 0.0
+                    deadband_ctx = state['sweep_context'].get("deadband") if isinstance(state.get('sweep_context'), dict) else None
+                    if isinstance(deadband_ctx, dict):
+                        deadband_value = float(deadband_ctx.get("value") or 0.0)
+                    else:
+                        deadband_value = float(deadband_ctx or 0.0)
+                    tick_size = 0.0
+                    if state['symbol'] in self.exchange.markets:
+                        market_info = self.exchange.markets[state['symbol']]
+                        tick_size, _ = get_tick_size(market_info)
+                    tick_size = tick_size or 0.0
+                    deadband_mss_confirm = max(
+                        tick_size * self.params.get("mss_confirm_tick_mult", 3),
+                        deadband_value * self.params.get("mss_confirm_deadband_mult", 0.60),
+                    )
+                    if isinstance(break_level, (int, float)):
+                        confirm_line = break_level - deadband_mss_confirm
+                        mss_context["confirm_line"] = confirm_line
+                        mss_context["deadband_mss_confirm"] = deadband_mss_confirm
+                        state["mss_context"] = mss_context
+                if isinstance(confirm_line, (int, float)) and candle.c <= confirm_line:
+                    mss_context["confirmed"] = True
+                    mss_context["confirm_candle_ts"] = candle.ts
+                    state["mss_context"] = mss_context
+                    self._log_and_create_signal(state, candle, "MSS_SOFT_CONFIRMED", DTFXState.ZONE_SET, {
+                        "mss": mss_context,
+                        "sweep": state['sweep_context'],
+                    })
             self._log_and_create_signal(state, candle, "ZONE_TOUCH_SEEN", DTFXState.ZONE_SET, {
                 "zone": zone,
                 "zone_lo_pad": zone_lo,
@@ -758,6 +797,7 @@ class DTFXShortEngine:
             candle_is_opposite_color = candle.c > candle.o # Green candle for short entry
             candle_range = candle.h - candle.l
             upper_wick = candle.h - max(candle.o, candle.c) # For short, upper wick is more important
+            lower_wick = min(candle.o, candle.c) - candle.l
             eps = 1e-9 # Small epsilon to prevent division by zero
 
             if candle_range <= eps:
@@ -795,6 +835,11 @@ class DTFXShortEngine:
 
             entry_conditions = {
                 "mss_dir_aligned": mss_dir_aligned,
+                "mss_confirmed": (not confirm_required) or bool(mss_context.get("confirmed")),
+                "htf_filter_ok": False,
+                "htf_close": None,
+                "htf_ema60": None,
+                "htf_ema60_slope": None,
                 "candle_opposite_color": candle_is_opposite_color,
                 "candle_color_strict": require_color_strict,
                 "wick_ratio_ok": wick_ratio_ok,
@@ -814,6 +859,25 @@ class DTFXShortEngine:
             }
             if not mss_dir_aligned:
                 entry_conditions["failed"].append("mss_dir_aligned")
+            if confirm_required and not mss_context.get("confirmed"):
+                entry_conditions["failed"].append("mss_confirmed")
+            htf_filter_ok = False
+            htf_close = None
+            htf_ema60 = None
+            htf_ema60_slope = None
+            if htf and len(htf) >= 61:
+                htf_close = htf[-1].c
+                ema_series = calculate_ema(htf, 60)
+                if ema_series and ema_series[-1] is not None and ema_series[-2] is not None:
+                    htf_ema60 = float(ema_series[-1])
+                    htf_ema60_slope = float(ema_series[-1] - ema_series[-2])
+                    htf_filter_ok = (htf_close < htf_ema60) and (htf_ema60_slope <= 0)
+            entry_conditions["htf_filter_ok"] = htf_filter_ok
+            entry_conditions["htf_close"] = htf_close
+            entry_conditions["htf_ema60"] = htf_ema60
+            entry_conditions["htf_ema60_slope"] = htf_ema60_slope
+            if not htf_filter_ok:
+                entry_conditions["failed"].append("htf_filter")
             if not candle_is_opposite_color:
                 if require_color_strict:
                     entry_conditions["failed"].append("candle_opposite_color")
@@ -831,11 +895,23 @@ class DTFXShortEngine:
                 entry_conditions["failed"].append("requires_full_close")
             entry_conditions["all_pass"] = len(entry_conditions["failed"]) == 0
 
+            candle_details = {
+                "o": candle.o,
+                "h": candle.h,
+                "l": candle.l,
+                "c": candle.c,
+                "range": candle_range,
+                "body": body,
+                "upper_wick": upper_wick,
+                "lower_wick": lower_wick,
+                "atr": atr_entry,
+            }
             self._log_and_create_signal(state, candle, "ENTRY_CHECK", DTFXState.ZONE_SET, {
                 "sweep": state['sweep_context'],
                 "mss": state['mss_context'],
                 "zone": state['entry_zone'],
                 "touch": {"price": touch_price, "ts": candle.ts, "type": touch_type},
+                "candle": candle_details,
                 "entry_conditions": entry_conditions,
             })
 
@@ -845,6 +921,7 @@ class DTFXShortEngine:
                     "mss": state['mss_context'],
                     "zone": state['entry_zone'],
                     "touch": {"price": touch_price, "ts": candle.ts, "type": touch_type},
+                    "candle": candle_details,
                     "entry_conditions": entry_conditions,
                 })
                 return None

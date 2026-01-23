@@ -13,6 +13,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+
 from engine_runner import (
     _build_daily_report,
     _engine_label_from_reason,
@@ -27,12 +28,21 @@ from engine_runner import (
     AUTO_EXIT_ENABLED,
     MAX_OPEN_POSITIONS,
     USDT_PER_TRADE,
-    ATLAS_FABIO_ENABLED,
     SWAGGY_ATLAS_LAB_ENABLED,
+    SWAGGY_ATLAS_LAB_V2_ENABLED,
+    SWAGGY_NO_ATLAS_ENABLED,
+    SWAGGY_ATLAS_LAB_OFF_WINDOWS,
+    SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS,
+    SWAGGY_NO_ATLAS_OFF_WINDOWS,
+    SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
+    SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED,
+    SWAGGY_D1_OVEREXT_ATR_MULT,
+    SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED,
+    SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE,
+    SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI,
+    SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX,
+    SATURDAY_TRADE_ENABLED,
     DTFX_ENABLED,
-    PUMPFADE_ENABLED,
-    DIV15M_LONG_ENABLED,
-    DIV15M_SHORT_ENABLED,
     ATLAS_RS_FAIL_SHORT_ENABLED,
     RSI_ENABLED,
     DCA_ENABLED,
@@ -46,6 +56,7 @@ from engine_runner import (
     AUTO_EXIT_LONG_SL_PCT,
     AUTO_EXIT_SHORT_TP_PCT,
     AUTO_EXIT_SHORT_SL_PCT,
+    ENGINE_EXIT_OVERRIDES,
 )
 import accounts_db
 from executor import AccountExecutor
@@ -54,13 +65,22 @@ COMMAND_DEFS = [
     {"cmd": "/live", "key": "_live_trading", "label": "Live Shorts", "type": "toggle"},
     {"cmd": "/long_live", "key": "_long_live", "label": "Live Longs", "type": "toggle"},
     {"cmd": "/auto_exit", "key": "_auto_exit", "label": "Auto Exit", "type": "toggle"},
-    {"cmd": "/atlasfabio", "key": "_atlas_fabio_enabled", "label": "AtlasFabio", "type": "toggle"},
+    {"cmd": "/sat_trade", "key": "_sat_trade", "label": "토요일 진입", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
+    {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
+    {"cmd": "/swaggy_no_atlas", "key": "_swaggy_no_atlas_enabled", "label": "Swaggy No Atlas", "type": "toggle"},
+    {"cmd": "/swaggy_atlas_lab_off", "key": "_swaggy_atlas_lab_off_windows", "label": "Swaggy Lab Off Windows", "type": "text"},
+    {"cmd": "/swaggy_atlas_lab_v2_off", "key": "_swaggy_atlas_lab_v2_off_windows", "label": "Swaggy Lab V2 Off Windows", "type": "text"},
+    {"cmd": "/swaggy_no_atlas_off", "key": "_swaggy_no_atlas_off_windows", "label": "Swaggy No Atlas Off Windows", "type": "text"},
+    {"cmd": "/swaggy_no_atlas_overext", "key": "_swaggy_no_atlas_overext_min", "label": "No Atlas Overext Min", "type": "number", "step": 0.01},
+    {"cmd": "/swaggy_no_atlas_overext_on", "key": "_swaggy_no_atlas_overext_min_enabled", "label": "No Atlas Overext Min On/Off", "type": "toggle"},
+    {"cmd": "/swaggy_no_atlas_multi", "key": "_swaggy_no_atlas_multi_enabled", "label": "No Atlas Multi Entry", "type": "toggle"},
+    {"cmd": "/swaggy_no_atlas_multi_mode", "key": "_swaggy_no_atlas_multi_mode", "label": "No Atlas Multi Mode", "type": "text"},
+    {"cmd": "/swaggy_no_atlas_multi_roi", "key": "_swaggy_no_atlas_multi_roi", "label": "No Atlas Multi ROI", "type": "number", "step": 0.1},
+    {"cmd": "/swaggy_no_atlas_multi_max", "key": "_swaggy_no_atlas_multi_max", "label": "No Atlas Multi Max", "type": "int", "step": 1},
+    {"cmd": "/swaggy_d1_overext", "key": "_swaggy_d1_overext_atr_mult", "label": "Swaggy D1 Overext ATR", "type": "number", "step": 0.1},
     {"cmd": "/dtfx", "key": "_dtfx_enabled", "label": "DTFX", "type": "toggle"},
-    {"cmd": "/pumpfade", "key": "_pumpfade_enabled", "label": "PumpFade", "type": "toggle"},
     {"cmd": "/atlas_rs_fail_short", "key": "_atlas_rs_fail_short_enabled", "label": "Atlas RS Fail Short", "type": "toggle"},
-    {"cmd": "/div15m_long", "key": "_div15m_long_enabled", "label": "Div15m Long", "type": "toggle"},
-    {"cmd": "/div15m_short", "key": "_div15m_short_enabled", "label": "Div15m Short", "type": "toggle"},
     {"cmd": "/rsi", "key": "_rsi_enabled", "label": "RSI", "type": "toggle"},
     {"cmd": "/dca", "key": "_dca_enabled", "label": "DCA", "type": "toggle"},
     {"cmd": "/dca_pct", "key": "_dca_pct", "label": "DCA 진입 금액(%)", "type": "number", "step": 0.1},
@@ -73,6 +93,7 @@ COMMAND_DEFS = [
     {"cmd": "/l_exit_sl", "key": "_auto_exit_long_sl_pct", "label": "롱 SL (%)", "type": "number", "step": 0.1},
     {"cmd": "/s_exit_tp", "key": "_auto_exit_short_tp_pct", "label": "숏 TP (%)", "type": "number", "step": 0.1},
     {"cmd": "/s_exit_sl", "key": "_auto_exit_short_sl_pct", "label": "숏 SL (%)", "type": "number", "step": 0.1},
+    {"cmd": "/engine_exit", "key": "_engine_exit_overrides", "label": "엔진 TP/SL JSON", "type": "json"},
     {"cmd": "/max_pos", "key": "_max_open_positions", "label": "최대 포지션 수", "type": "int", "step": 1},
 ]
 COMMANDS_BY_CMD = {d["cmd"]: d for d in COMMAND_DEFS}
@@ -83,14 +104,23 @@ DEFAULTS = {
     "_live_trading": LIVE_TRADING,
     "_long_live": LONG_LIVE_TRADING,
     "_auto_exit": AUTO_EXIT_ENABLED,
+    "_sat_trade": SATURDAY_TRADE_ENABLED,
     "_max_open_positions": MAX_OPEN_POSITIONS,
     "_entry_usdt": USDT_PER_TRADE,
-    "_atlas_fabio_enabled": ATLAS_FABIO_ENABLED,
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
+    "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
+    "_swaggy_no_atlas_enabled": SWAGGY_NO_ATLAS_ENABLED,
+    "_swaggy_atlas_lab_off_windows": SWAGGY_ATLAS_LAB_OFF_WINDOWS,
+    "_swaggy_atlas_lab_v2_off_windows": SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS,
+    "_swaggy_no_atlas_off_windows": SWAGGY_NO_ATLAS_OFF_WINDOWS,
+    "_swaggy_no_atlas_overext_min": SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
+    "_swaggy_no_atlas_overext_min_enabled": SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED,
+    "_swaggy_no_atlas_multi_enabled": SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED,
+    "_swaggy_no_atlas_multi_mode": SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE,
+    "_swaggy_no_atlas_multi_roi": SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI,
+    "_swaggy_no_atlas_multi_max": SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX,
+    "_swaggy_d1_overext_atr_mult": SWAGGY_D1_OVEREXT_ATR_MULT,
     "_dtfx_enabled": DTFX_ENABLED,
-    "_pumpfade_enabled": PUMPFADE_ENABLED,
-    "_div15m_long_enabled": DIV15M_LONG_ENABLED,
-    "_div15m_short_enabled": DIV15M_SHORT_ENABLED,
     "_rsi_enabled": RSI_ENABLED,
     "_dca_enabled": DCA_ENABLED,
     "_dca_pct": DCA_PCT,
@@ -103,6 +133,7 @@ DEFAULTS = {
     "_auto_exit_long_sl_pct": AUTO_EXIT_LONG_SL_PCT,
     "_auto_exit_short_tp_pct": AUTO_EXIT_SHORT_TP_PCT,
     "_auto_exit_short_sl_pct": AUTO_EXIT_SHORT_SL_PCT,
+    "_engine_exit_overrides": ENGINE_EXIT_OVERRIDES,
 }
 
 
@@ -264,6 +295,13 @@ def _format_value(item: dict, value: object) -> str:
         return "ON" if bool(value) else "OFF"
     if item.get("type") == "int":
         return str(int(value))
+    if item.get("type") == "json":
+        try:
+            return json.dumps(value, ensure_ascii=True)
+        except Exception:
+            return str(value)
+    if item.get("type") == "text":
+        return str(value or "")
     try:
         return f"{float(value):.2f}"
     except Exception:
@@ -279,11 +317,22 @@ def _notify_change(item: dict, value: object) -> None:
         pass
 
 
+def _trade_log_entries(state: dict) -> list[dict]:
+    raw = state.get("_trade_log", [])
+    if isinstance(raw, dict):
+        items = raw.values()
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        return []
+    return [tr for tr in items if isinstance(tr, dict)]
+
+
 @app.route("/")
 def index():
     state = load_state()
     totals = {"LONG": 0, "SHORT": 0}
-    for tr in state.get("_trade_log", []):
+    for tr in _trade_log_entries(state):
         if tr.get("status") == "open":
             side = tr.get("side")
             if side in totals:
@@ -300,7 +349,7 @@ def index():
 @app.route("/status")
 def status():
     state = load_state()
-    positions = sum(1 for tr in state.get("_trade_log", []) if tr.get("status") == "open")
+    positions = sum(1 for tr in _trade_log_entries(state) if tr.get("status") == "open")
     payload = {
         "timestamp": datetime.now().isoformat(),
         "positions": positions,
@@ -308,6 +357,12 @@ def status():
     for item in COMMAND_DEFS:
         key = item["key"]
         value = state.get(key)
+        if item.get("type") == "toggle" and not isinstance(value, bool):
+            value = None
+        if item.get("type") in ("number", "int") and not isinstance(value, (int, float)):
+            value = None
+        if item.get("type") == "text" and not isinstance(value, str):
+            value = None
         if value is None and key in DEFAULTS:
             value = DEFAULTS[key]
         payload[key] = value
@@ -386,6 +441,24 @@ def command():
             if item["type"] == "int":
                 num = int(num)
             state[key] = num
+        elif item["type"] == "json":
+            if value is None or (isinstance(value, str) and not value.strip()):
+                return jsonify({"status": "missing value", "key": key}), 400
+            if isinstance(value, dict):
+                state[key] = value
+            else:
+                try:
+                    parsed = json.loads(value)
+                except Exception:
+                    return jsonify({"status": "invalid json", "key": key}), 400
+                if not isinstance(parsed, dict):
+                    return jsonify({"status": "json must be object", "key": key}), 400
+                state[key] = parsed
+        elif item["type"] == "text":
+            if value is None:
+                state[key] = ""
+            else:
+                state[key] = str(value).strip()
         state["_runtime_cfg_ts"] = time.time()
         save_state(state)
         _notify_change(item, state.get(key))

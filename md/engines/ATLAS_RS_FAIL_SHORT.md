@@ -7,7 +7,7 @@
 
 ## 데이터/타임프레임
 - LTF: `15m` (config: `ltf_tf=15m`)
-- LTF 데이터 윈도우: `ltf_limit=200`
+  - LTF 데이터 윈도우: `ltf_limit=300`
 - LTF는 `iloc[:-1]`로 **미완성봉 제외** 후 계산.
 
 ## Atlas 게이트 (진입 전 필터)
@@ -29,11 +29,17 @@ Atlas 게이트는 `compute_global_gate()` + `compute_atlas_local()` 결과로 �
 - `min_score=50`은 **진입 필수 조건이 아니라 리스크 태그 용도**
 - `rs_z`, `rs_z_slow` 등은 **직접 차단 조건에 없음**
 
+## 유니버스 필터
+- 최소 24h 거래대금: 8,000,000 USDT (코드 고정값)
+- 제외: 변동률 절대값 상위 20개
+- 제외: 거래대금 상위 30개
+- 최종 선택: 거래대금 상위 40개
+
 ## 기본 데이터 조건
 - ATR/EMA/RSI/BB/MACD/볼륨 SMA 계산 가능해야 함
 - 최소 데이터 길이: `max(ema_len, atr_len+2, rsi_len+2, bb_len+2, macd_slow+macd_signal+2, vol_sma_len+2)`
 - ATR 비율 필터: `atr_now / close_now >= 0.002` (`atr_min_ratio`)
-- 거래대금 필터: `min_quote_volume=0` (기본 OFF)
+- 거래대금 필터: `min_quote_volume=0` (기본 OFF, LTF 거래대금 SMA 기준)
 
 ## 위치/셋업 조건 (Fade 위치)
 - EMA 기준: `ema_len=20`
@@ -98,3 +104,11 @@ Atlas 게이트는 `compute_global_gate()` + `compute_atlas_local()` 결과로 �
 - HTF/MTF 별도 게이트는 없음 (LTF 단일 로직)
 - `size_mult`는 현재 1.0 고정
 - 실제 주문 실행 전에는 공통 게이트(포지션 중복/락/최대포지션/실주문 ON/OFF 등)가 추가로 적용됨
+
+## 백테스트 로그 (atlas_rs_fail_short)
+- 경로: `logs/atlas_rs_fail_short/backtest/backtest_YYYYMMDD.log`
+- 로그 특성: 날짜별 파일 생성
+- 심볼 요약 아래에 아래 항목이 출력됨
+  - `[BACKTEST][OPEN]` 미청산 진입(OPEN) 정보
+  - `[BACKTEST][EXIT]` 청산 완료 정보 (entry_dt/exit_dt 포함)
+- 정렬: OPEN/EXIT 로그는 entry_dt 기준 내림차순으로 출력

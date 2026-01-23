@@ -10,20 +10,16 @@ except Exception:
     SwaggyEngine = None
 from engines.atlas.atlas_engine import AtlasEngine
 from engines.dtfx.engine import DTFXEngine
-from engines.div15m_long.engine import Div15mLongEngine
-from engines.div15m_short.engine import Div15mShortEngine
-from engines.pumpfade.engine import PumpFadeEngine
 from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
+from engines.swaggy_no_atlas.engine import SwaggyNoAtlasEngine
 
 
 _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
     "rsi": RsiEngine,
     "atlas": AtlasEngine,
     "dtfx": DTFXEngine,
-    "div15m_long": Div15mLongEngine,
-    "div15m_short": Div15mShortEngine,
-    "pumpfade": PumpFadeEngine,
     "atlas_rs_fail_short": AtlasRsFailShortEngine,
+    "swaggy_no_atlas": SwaggyNoAtlasEngine,
 }
 if SwaggyEngine:
     _ENGINE_REGISTRY["swaggy"] = SwaggyEngine

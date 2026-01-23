@@ -27,6 +27,13 @@ def drop_raw_by_tf(tfs) -> None:
 
 def set_raw(symbol: str, tf: str, data: list) -> None:
     RAW_OHLCV[(symbol, tf)] = {"ts": time.time(), "data": data}
+    # Raw data updated; drop derived caches for this symbol/tf so next get_df/get_ind recompute.
+    for key in list(DF_CACHE.keys()):
+        if key[0] == symbol and key[1] == tf:
+            DF_CACHE.pop(key, None)
+    for key in list(IND_CACHE.keys()):
+        if key[0] == symbol and key[1] == tf:
+            IND_CACHE.pop(key, None)
 
 
 def get_raw(symbol: str, tf: str) -> Optional[list]:

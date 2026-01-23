@@ -52,6 +52,22 @@ POSITION_MODE = os.environ.get("POSITION_MODE", "hedge").lower().strip()
 # --- Position TTL cache (to reduce REST calls) ---
 POS_TTL_SEC = 30.0  # fetch_positions 호출 간 최소 간격을 늘려 레이트리밋 완화
 
+def _normalize_symbol_key(symbol: str) -> str:
+    if not isinstance(symbol, str):
+        return symbol
+    if symbol.endswith("/USDT") and not symbol.endswith("/USDT:USDT"):
+        return f"{symbol}:USDT"
+    return symbol
+
+def _alt_symbol_key(symbol: str) -> Optional[str]:
+    if not isinstance(symbol, str):
+        return None
+    if symbol.endswith("/USDT:USDT"):
+        return symbol.replace("/USDT:USDT", "/USDT")
+    if symbol.endswith("/USDT"):
+        return symbol.replace("/USDT", "/USDT:USDT")
+    return None
+
 # --- Balance TTL cache (USDT available) ---
 _BAL_TTL_SEC = 5.0
 
@@ -475,7 +491,11 @@ def _get_position_cached(symbol: str):
         ts_all = float(ctx.pos_all_cache.get("ts", 0.0) or 0.0)
         if (now - ts_all) <= ctx.pos_ttl_sec:
             pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
-            pos = _select_short_position(pos_map.get(symbol) or []) if symbol in pos_map else None
+            positions = pos_map.get(symbol)
+            if positions is None:
+                alt = _alt_symbol_key(symbol)
+                positions = pos_map.get(alt) if alt else None
+            pos = _select_short_position(positions or []) if positions else None
             ctx.pos_cache[symbol] = (now, pos)
             return pos
     except Exception:
@@ -497,6 +517,18 @@ def _get_position_cached(symbol: str):
         # keep previous cache if exists
         ctx.pos_cache[symbol] = (now, pos)
         return pos
+    if not positions:
+        alt = _alt_symbol_key(symbol)
+        if alt:
+            try:
+                positions = exchange.fetch_positions([alt])
+            except Exception as e:
+                msg = str(e)
+                print("[fetch_positions] warn:", e)
+                if ("429" in msg) or ("-1003" in msg):
+                    trigger_rate_limit_backoff(msg)
+                _POS_CACHE[symbol] = (now, pos)
+                return pos
     found = _select_short_position(positions)
     ctx.pos_cache[symbol] = (now, found)
     return found
@@ -509,7 +541,11 @@ def _get_long_position_cached(symbol: str):
         ts_all = float(ctx.pos_all_cache.get("ts", 0.0) or 0.0)
         if (now - ts_all) <= ctx.pos_ttl_sec:
             pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
-            pos = _select_long_position(pos_map.get(symbol) or []) if symbol in pos_map else None
+            positions = pos_map.get(symbol)
+            if positions is None:
+                alt = _alt_symbol_key(symbol)
+                positions = pos_map.get(alt) if alt else None
+            pos = _select_long_position(positions or []) if positions else None
             ctx.pos_long_cache[symbol] = (now, pos)
             return pos
     except Exception:
@@ -531,6 +567,18 @@ def _get_long_position_cached(symbol: str):
             trigger_rate_limit_backoff(msg)
         ctx.pos_long_cache[symbol] = (now, pos)
         return pos
+    if not positions:
+        alt = _alt_symbol_key(symbol)
+        if alt:
+            try:
+                positions = exchange.fetch_positions([alt])
+            except Exception as e:
+                msg = str(e)
+                print("[fetch_positions] warn:", e)
+                if ("429" in msg) or ("-1003" in msg):
+                    trigger_rate_limit_backoff(msg)
+                _POS_LONG_CACHE[symbol] = (now, pos)
+                return pos
     found = _select_long_position(positions)
     ctx.pos_long_cache[symbol] = (now, found)
     return found
@@ -619,7 +667,8 @@ def refresh_positions_cache(force: bool = False) -> bool:
         sym = p.get("symbol")
         if not sym:
             continue
-        pos_map.setdefault(sym, []).append(p)
+        sym_norm = _normalize_symbol_key(sym)
+        pos_map.setdefault(sym_norm, []).append(p)
     ctx.pos_all_cache["ts"] = now
     ctx.pos_all_cache["positions_by_symbol"] = pos_map
     return True
@@ -653,15 +702,19 @@ def count_open_positions(force: bool = False) -> Optional[int]:
 
 def list_open_position_symbols(force: bool = False) -> Dict[str, set]:
     """현재 열린 포지션 심볼을 롱/숏으로 반환한다."""
-    if not refresh_positions_cache(force=force):
-        return {"long": set(), "short": set()}
     ctx = _get_ctx()
-    pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
+    if not refresh_positions_cache(force=force):
+        pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
+        if not pos_map:
+            return {"long": set(), "short": set()}
+    else:
+        pos_map = ctx.pos_all_cache.get("positions_by_symbol") or {}
     longs = set()
     shorts = set()
     for sym, positions in pos_map.items():
         if not positions:
             continue
+        sym = _normalize_symbol_key(sym)
         for p in positions:
             if _is_long_position(p):
                 longs.add(sym)
@@ -741,10 +794,7 @@ def get_short_position_amount(symbol: str) -> float:
     if not _is_short_position(p):
         return 0.0
     amt = _position_size_abs(p)
-    if random.random() < 0.05:
-        info = p.get("info") or {}
-        raw_amt = info.get("positionAmt") or p.get("positionAmt") or p.get("contracts")
-        print(f"[pos-sample] sym={symbol} raw_amt={raw_amt} parsed={amt:.6f}")
+    # noisy sampling log disabled
     return amt
 
 def get_long_position_amount(symbol: str) -> float:

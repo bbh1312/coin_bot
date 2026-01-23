@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
-from typing import Dict, List
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional
 
 import ccxt
+import pandas as pd
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT_DIR not in sys.path:
@@ -54,6 +57,83 @@ def _append_backtest_entry_log(line: str) -> None:
         f.write(f"{ts} {line}\n")
 
 
+def _iso_kst_ms(ts_ms: int) -> str:
+    tz = timezone(timedelta(hours=9))
+    try:
+        dt = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=tz)
+        return dt.isoformat(timespec="seconds")
+    except Exception:
+        return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def _append_swaggy_trade_json(payload: Dict[str, object]) -> None:
+    try:
+        path = os.path.join("logs", "swaggy_trades.jsonl")
+        ensure_dir(os.path.dirname(path))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def _entry_quality_bucket(
+    atlas_pass_hard: Optional[bool],
+    confirm_pass: Optional[int],
+    overext_dist_at_entry: Optional[float],
+    trigger_combo: str,
+    trigger_parts: Dict[str, float],
+    strength_total: float,
+    strength_min_req: float,
+) -> tuple[str, List[str]]:
+    reasons: List[str] = []
+    if atlas_pass_hard:
+        reasons.append("ATLAS_HARD_OK")
+    if confirm_pass:
+        reasons.append("CONFIRM_OK")
+    if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry <= 1.0:
+        reasons.append("LOW_OVEREXT")
+    strong_combo = False
+    combo_set = {c.strip().upper() for c in (trigger_combo or "").split("+") if c.strip()}
+    if combo_set == {"SWEEP", "RECLAIM"}:
+        strong_combo = True
+    rej_strength = trigger_parts.get("REJECTION")
+    if rej_strength is not None and rej_strength >= 0.56:
+        strong_combo = True
+    if strong_combo:
+        reasons.append("TRIGGER_COMBO_STRONG")
+    if strength_total >= (strength_min_req + 0.08):
+        reasons.append("STRENGTH_ABOVE_MIN")
+
+    if (
+        atlas_pass_hard
+        and confirm_pass
+        and isinstance(overext_dist_at_entry, (int, float))
+        and overext_dist_at_entry <= 1.0
+        and strong_combo
+        and strength_total >= (strength_min_req + 0.08)
+    ):
+        return "A", reasons
+    if (
+        atlas_pass_hard
+        and confirm_pass
+        and isinstance(overext_dist_at_entry, (int, float))
+        and overext_dist_at_entry <= 1.35
+    ):
+        return "B", reasons
+    fail_reasons = []
+    if not atlas_pass_hard:
+        fail_reasons.append("ATLAS_HARD_FAIL")
+    if not confirm_pass:
+        fail_reasons.append("CONFIRM_FAIL")
+    if isinstance(overext_dist_at_entry, (int, float)) and overext_dist_at_entry > 1.35:
+        fail_reasons.append("HIGH_OVEREXT")
+    if not strong_combo:
+        fail_reasons.append("WEAK_TRIGGER")
+    if strength_total < (strength_min_req + 0.08):
+        fail_reasons.append("LOW_STRENGTH")
+    return "C", reasons + fail_reasons
+
+
 def _make_exchange() -> ccxt.Exchange:
     return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
 
@@ -73,8 +153,40 @@ def parse_args():
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
+    parser.add_argument("--d1-overext-atr", type=float, default=None)
+    parser.add_argument("--sat-trade", choices=["on", "off"], default="on", help="allow entries on Saturday (KST)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
+
+
+def _load_runtime_overrides() -> dict:
+    path = os.path.join(ROOT_DIR, "state.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _coerce_float(val) -> Optional[float]:
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(str(val))
+    except Exception:
+        return None
+
+
+def _is_saturday_kst_ms(ts_ms: int) -> bool:
+    try:
+        tz = timezone(timedelta(hours=9))
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=tz)
+        return dt.weekday() == 5
+    except Exception:
+        return False
 
 
 def _parse_universe_arg(text: str) -> int:
@@ -105,6 +217,11 @@ def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
 
 def main() -> None:
     args = parse_args()
+    sat_trade_enabled = str(args.sat_trade or "on").lower() == "on"
+    runtime_overrides = _load_runtime_overrides()
+    runtime_d1_overext = _coerce_float(runtime_overrides.get("_swaggy_d1_overext_atr_mult"))
+    if args.d1_overext_atr is None and runtime_d1_overext is not None:
+        args.d1_overext_atr = float(runtime_d1_overext)
     if args.sl_pct <= 0:
         raise SystemExit("--sl-pct is required")
     end_ms = int(time.time() * 1000)
@@ -132,6 +249,8 @@ def main() -> None:
         mode=args.mode,
     )
     sw_cfg = SwaggyConfig()
+    if isinstance(args.d1_overext_atr, (int, float)):
+        sw_cfg.d1_overext_atr_mult = float(args.d1_overext_atr)
     at_cfg = AtlasConfig()
     if isinstance(args.cooldown_min, int) and args.cooldown_min > 0:
         sw_cfg.cooldown_min = int(args.cooldown_min)
@@ -195,8 +314,15 @@ def main() -> None:
     ] if args.mode == "all" else [AtlasMode(args.mode)]
     trades: List[Dict] = []
     stats_by_key: Dict[tuple[str, str], Dict[str, float]] = {}
+    trade_logs: Dict[tuple[str, str], List[dict]] = {}
+    open_trades: Dict[tuple[str, str], Dict[str, object]] = {}
     overext_by_key: Dict[tuple[str, str], Dict[str, int]] = {}
     d1_block_by_key: Dict[tuple[str, str], int] = {}
+    last_close_by_sym: Dict[str, float] = {}
+    last_ts_by_sym: Dict[str, int] = {}
+    entry_syms_by_mode: Dict[str, set] = {}
+    last_day_exits_by_mode: Dict[str, int] = {}
+    last_day_start_ms = end_ms - 24 * 60 * 60 * 1000
 
     with open(log_path, "a", encoding="utf-8") as log_fp:
         for mode in modes:
@@ -208,6 +334,12 @@ def main() -> None:
             for sym in symbols:
                 sym_state = engine._state.setdefault(sym, {})
                 df_ltf = data_by_sym[sym][sw_cfg.tf_ltf]
+                if isinstance(df_ltf, pd.DataFrame) and not df_ltf.empty:
+                    try:
+                        last_close_by_sym[sym] = float(df_ltf.iloc[-1]["close"])
+                        last_ts_by_sym[sym] = int(df_ltf.iloc[-1]["ts"])
+                    except Exception:
+                        pass
                 df_mtf = data_by_sym[sym][sw_cfg.tf_mtf]
                 df_htf = data_by_sym[sym][sw_cfg.tf_htf]
                 df_htf2 = data_by_sym[sym][sw_cfg.tf_htf2]
@@ -224,6 +356,28 @@ def main() -> None:
                     prev_phase = sym_state.get("phase")
                     d1d = slice_df(df_d1, ts_ms)
                     signal = engine.evaluate_symbol(sym, d4h, d1h, d15, d5, d3, d1d, now_ts)
+                    debug = signal.debug if isinstance(signal.debug, dict) else {}
+                    event_list = debug.get("events") if isinstance(debug.get("events"), list) else []
+                    if event_list:
+                        for event in event_list:
+                            if not isinstance(event, dict):
+                                continue
+                            payload = {
+                                "ts": _iso_kst_ms(ts_ms),
+                                "event": event.get("event") or "SWAGGY_EVENT",
+                                "engine": "SWAGGY_ATLAS_LAB",
+                                "mode": mode.value,
+                                "symbol": sym,
+                                "side": event.get("side") or signal.side,
+                                "ltf": sw_cfg.tf_ltf,
+                                "mtf": sw_cfg.tf_mtf,
+                                "htf": sw_cfg.tf_htf,
+                                "htf2": sw_cfg.tf_htf2,
+                                "cycle_id": ts_ms,
+                                "range_id": event.get("range_id") or debug.get("touch_key"),
+                            }
+                            payload.update(event)
+                            _append_swaggy_trade_json(payload)
                     new_phase = sym_state.get("phase")
                     key = (mode.value, sym)
                     overext_stats = overext_by_key.setdefault(
@@ -299,6 +453,29 @@ def main() -> None:
                                     "atlas_shadow_reasons": trade.atlas_shadow_reasons,
                                 }
                             )
+                            if trade.context and trade.exit_ts is not None:
+                                payload = dict(trade.context)
+                                entry_price = float(payload.get("entry_price") or 0.0)
+                                atr14 = payload.get("atr14_ltf")
+                                mfe_atr = None
+                                mae_atr = None
+                                if isinstance(atr14, (int, float)) and atr14 > 0 and entry_price > 0:
+                                    mfe_atr = (trade.mfe * entry_price) / atr14
+                                    mae_atr = (abs(trade.mae) * entry_price) / atr14
+                                pnl_r = (pnl_pct / bt_cfg.sl_pct) if bt_cfg.sl_pct > 0 else None
+                                payload.update(
+                                    {
+                                        "exit_ts": _iso_kst_ms(trade.exit_ts),
+                                        "exit_price": trade.exit_price,
+                                        "exit_reason": trade.exit_reason,
+                                        "pnl_r": pnl_r,
+                                        "pnl_pct": pnl_pct,
+                                        "mfe_atr": mfe_atr,
+                                        "mae_atr": mae_atr,
+                                        "hold_bars_ltf": trade.bars,
+                                    }
+                                )
+                                _append_swaggy_trade_json(payload)
                             log_fp.write(
                                 f"EXIT ts={trade.exit_ts} sym={sym} pnl_usdt={pnl_usdt:.4f} "
                                 f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars}\n"
@@ -310,6 +487,8 @@ def main() -> None:
                             stats = stats_by_key.setdefault(
                                 key,
                                 {
+                                    "entries": 0,
+                                    "exits": 0,
                                     "trades": 0,
                                     "wins": 0,
                                     "losses": 0,
@@ -321,6 +500,7 @@ def main() -> None:
                                 },
                             )
                             stats["trades"] += 1
+                            stats["exits"] += 1
                             if pnl_pct >= 0:
                                 stats["wins"] += 1
                             else:
@@ -332,12 +512,47 @@ def main() -> None:
                             stats["mfe_sum"] += trade.mfe
                             stats["mae_sum"] += abs(trade.mae)
                             stats["hold_sum"] += float(trade.bars) * ltf_minutes
+                            if isinstance(trade.exit_ts, (int, float)) and trade.exit_ts >= last_day_start_ms:
+                                last_day_exits_by_mode[mode.value] = last_day_exits_by_mode.get(mode.value, 0) + 1
+                            entry_dt = ""
+                            if isinstance(trade.entry_ts, (int, float)) and trade.entry_ts:
+                                entry_dt = datetime.fromtimestamp(trade.entry_ts / 1000.0, tz=timezone.utc).strftime(
+                                    "%Y-%m-%d %H:%M"
+                                )
+                            exit_dt = ""
+                            if isinstance(trade.exit_ts, (int, float)) and trade.exit_ts:
+                                exit_dt = datetime.fromtimestamp(trade.exit_ts / 1000.0, tz=timezone.utc).strftime(
+                                    "%Y-%m-%d %H:%M"
+                                )
+                            trade_logs.setdefault(key, []).append(
+                                {
+                                    "entry_ts": trade.entry_ts or 0,
+                                    "line": "[BACKTEST][EXIT] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s "
+                                    "entry_px=%.6g exit_px=%.6g reason=%s"
+                                    % (
+                                        sym,
+                                        mode.value,
+                                        trade.side,
+                                        entry_dt,
+                                        exit_dt,
+                                        trade.entry_price,
+                                        trade.exit_price or 0.0,
+                                        trade.exit_reason,
+                                    ),
+                                }
+                            )
                         continue
 
                     if not signal.entry_ok or not side or entry_px is None:
                         continue
+                    if not sat_trade_enabled and _is_saturday_kst_ms(ts_ms):
+                        _append_backtest_log(
+                            f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=SATURDAY_OFF"
+                        )
+                        continue
 
                     atlas = None
+                    gate = None
                     if mode != AtlasMode.OFF:
                         btc_slice = slice_df(btc_df, ts_ms)
                         gate = evaluate_global_gate(btc_slice, at_cfg)
@@ -376,8 +591,113 @@ def main() -> None:
                     if not policy.allow:
                         continue
                     dist_at_entry = _overext_dist(d5, side, sw_cfg)
+                    dist_at_entry_abs = abs(dist_at_entry) if isinstance(dist_at_entry, (int, float)) else dist_at_entry
                     overext_blocked = bool(sym_state.get("overext_blocked"))
                     sym_state["overext_blocked"] = False
+                    beta_val = atlas.metrics.get("beta") if atlas and atlas.metrics else None
+                    if (
+                        sw_cfg.skip_beta_mid
+                        and isinstance(beta_val, (int, float))
+                        and 1.0 <= float(beta_val) < 1.5
+                    ):
+                        line = f"SKIP ts={ts_ms} sym={sym} reason=SKIP_BETA_MID beta={beta_val:.4g}"
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        continue
+                    if (
+                        sw_cfg.skip_overext_mid
+                        and isinstance(dist_at_entry_abs, (int, float))
+                        and 1.1 <= float(dist_at_entry_abs) < 1.4
+                    ):
+                        line = f"SKIP ts={ts_ms} sym={sym} reason=SKIP_OVEREXT_MID overext={dist_at_entry_abs:.4g}"
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        continue
+                    body_ratio = None
+                    confirm_metrics = debug.get("confirm_metrics") if isinstance(debug, dict) else None
+                    if isinstance(confirm_metrics, dict):
+                        body_ratio = confirm_metrics.get("body_ratio")
+                    if (
+                        sw_cfg.skip_confirm_body
+                        and isinstance(body_ratio, (int, float))
+                        and float(body_ratio) < 0.60
+                    ):
+                        line = f"SKIP ts={ts_ms} sym={sym} reason=SKIP_CONFIRM_BODY body_ratio={body_ratio:.4g}"
+                        log_fp.write(line + "\n")
+                        _append_backtest_log(line)
+                        continue
+                    entry_quality, entry_quality_reasons = _entry_quality_bucket(
+                        bool(atlas.pass_hard) if atlas and atlas.pass_hard is not None else False,
+                        int(debug.get("confirm_pass") or 0),
+                        dist_at_entry_abs,
+                        str(debug.get("trigger_combo") or ""),
+                        debug.get("trigger_parts") if isinstance(debug.get("trigger_parts"), dict) else {},
+                        float(debug.get("strength_total") or 0.0),
+                        float(debug.get("strength_min_req") or 0.0),
+                    )
+                    trade_context = {
+                        "ts": _iso_kst_ms(ts_ms),
+                        "event": "SWAGGY_TRADE",
+                        "engine": "SWAGGY_ATLAS_LAB",
+                        "mode": mode.value,
+                        "symbol": sym,
+                        "side": side,
+                        "ltf": sw_cfg.tf_ltf,
+                        "mtf": sw_cfg.tf_mtf,
+                        "htf": sw_cfg.tf_htf,
+                        "htf2": sw_cfg.tf_htf2,
+                        "cycle_id": ts_ms,
+                        "range_id": debug.get("touch_key"),
+                        "entry_ts": _iso_kst_ms(ts_ms),
+                        "entry_price": entry_px,
+                        "atr14_ltf": debug.get("atr14_ltf"),
+                        "atr14_htf": debug.get("atr14_htf"),
+                        "ema20_ltf": debug.get("ema20_ltf"),
+                        "ema20_htf": debug.get("ema20_htf"),
+                        "level_type": debug.get("level_type"),
+                        "level_price": debug.get("level_price"),
+                        "level_score": debug.get("level_score"),
+                        "touch_count": debug.get("touch_count"),
+                        "level_age_bars": debug.get("level_age_bars"),
+                        "touch_pct": debug.get("touch_pct"),
+                        "touch_atr_mult": debug.get("touch_atr_mult"),
+                        "touch_pass": int(debug.get("touch_pass") or 0),
+                        "touch_fail_reason": debug.get("touch_fail_reason"),
+                        "trigger_combo": debug.get("trigger_combo"),
+                        "trigger_strength_best": debug.get("trigger_strength_best"),
+                        "trigger_strength_min": debug.get("trigger_strength_min"),
+                        "trigger_strength_avg": debug.get("trigger_strength_avg"),
+                        "trigger_strength_used": debug.get("trigger_strength_used"),
+                        "trigger_parts": debug.get("trigger_parts"),
+                        "strength_total": debug.get("strength_total"),
+                        "strength_min_req": debug.get("strength_min_req"),
+                        "trigger_threshold_used": debug.get("trigger_threshold_used"),
+                        "use_trigger_min": debug.get("use_trigger_min"),
+                        "confirm_pass": int(debug.get("confirm_pass") or 0),
+                        "confirm_fail_reason": debug.get("confirm_fail"),
+                        "confirm_metrics": debug.get("confirm_metrics"),
+                        "confirm_body_ratio": (debug.get("confirm_metrics") or {}).get("body_ratio")
+                        if isinstance(debug.get("confirm_metrics"), dict)
+                        else None,
+                        "overext_ema_len": debug.get("overext_ema_len"),
+                        "overext_atr_mult": debug.get("overext_atr_mult"),
+                        "overext_dist_at_touch": debug.get("overext_dist_at_touch"),
+                        "overext_dist_at_entry": dist_at_entry_abs,
+                        "overext_blocked": 1 if overext_blocked else 0,
+                        "overext_state": "CHASE" if overext_blocked else "OK",
+                        "atlas_pass_soft": atlas.metrics.get("pass_soft") if atlas and atlas.metrics else None,
+                        "atlas_pass_hard": atlas.metrics.get("pass_hard") if atlas and atlas.metrics else None,
+                        "atlas_state": gate.get("reason") if gate else None,
+                        "atlas_regime": atlas.metrics.get("regime") if atlas and atlas.metrics else None,
+                        "atlas_rs": atlas.metrics.get("rs") if atlas and atlas.metrics else None,
+                        "atlas_rs_z": atlas.metrics.get("rs_z") if atlas and atlas.metrics else None,
+                        "atlas_corr": atlas.metrics.get("corr") if atlas and atlas.metrics else None,
+                        "atlas_beta": atlas.metrics.get("beta") if atlas and atlas.metrics else None,
+                        "atlas_vol_ratio": atlas.metrics.get("vol_ratio") if atlas and atlas.metrics else None,
+                        "atlas_block_reason": policy.policy_action if policy and not policy.allow else None,
+                        "entry_quality_bucket": entry_quality,
+                        "entry_quality_reasons": entry_quality_reasons,
+                    }
                     _append_backtest_entry_log(
                         "engine=swaggy_atlas_lab mode=%s symbol=%s side=%s entry=%.6g "
                         "final_usdt=%.2f sw_strength=%.3f sw_reasons=%s atlas_pass=%s atlas_mult=%s "
@@ -414,9 +734,36 @@ def main() -> None:
                         atlas_shadow_pass=shadow_pass if mode == AtlasMode.SHADOW else None,
                         atlas_shadow_reasons=shadow_reasons if mode == AtlasMode.SHADOW else None,
                         policy_action=policy.policy_action,
-                        overext_dist_at_entry=dist_at_entry,
+                        overext_dist_at_entry=dist_at_entry_abs,
                         overext_blocked=overext_blocked,
+                        context=trade_context,
                     )
+                    entry_syms_by_mode.setdefault(mode.value, set()).add(sym)
+                    stats = stats_by_key.setdefault(
+                        key,
+                        {
+                            "entries": 0,
+                            "exits": 0,
+                            "trades": 0,
+                            "wins": 0,
+                            "losses": 0,
+                            "tp": 0,
+                            "sl": 0,
+                            "mfe_sum": 0.0,
+                            "mae_sum": 0.0,
+                            "hold_sum": 0.0,
+                        },
+                    )
+                    stats["entries"] += 1
+                    # ENTRY summary is represented by OPEN/EXIT logs (avoid duplicate lines).
+        for sym, trade in broker.positions.items():
+            open_trades[(mode.value, sym)] = {
+                "sym": sym,
+                "mode": mode.value,
+                "side": trade.side,
+                "entry_price": trade.entry_price,
+                "entry_ts": trade.entry_ts,
+            }
 
     write_trades_csv(trades_path, trades)
     summary = build_summary(run_id, trades)
@@ -452,8 +799,11 @@ def main() -> None:
             key = (t.get("mode") or "", t.get("sym") or "")
             trades_by_key.setdefault(key, []).append(t)
         total_by_mode: Dict[str, Dict[str, float]] = {}
+        multi_mode = len({k[0] for k in stats_by_key.keys()}) > 1
         for (mode, sym), stats in stats_by_key.items():
             trades_count = int(stats.get("trades") or 0)
+            entries = int(stats.get("entries") or 0)
+            exits = int(stats.get("exits") or 0)
             wins = int(stats.get("wins") or 0)
             losses = int(stats.get("losses") or 0)
             tp = int(stats.get("tp") or 0)
@@ -467,12 +817,21 @@ def main() -> None:
             long_losses = sum(1 for t in sym_trades if t.get("side") == "LONG" and float(t.get("pnl_pct") or 0.0) <= 0)
             short_wins = sum(1 for t in sym_trades if t.get("side") == "SHORT" and float(t.get("pnl_pct") or 0.0) > 0)
             short_losses = sum(1 for t in sym_trades if t.get("side") == "SHORT" and float(t.get("pnl_pct") or 0.0) <= 0)
+            label = f"{sym}@{mode}" if multi_mode else sym
+            last_day_exits = last_day_exits_by_mode.get(mode, 0)
+            base_usdt = float(bt_cfg.base_usdt or 0.0)
+            tp_sum_usdt = tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
+            sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
+            net_sum_usdt = tp_sum_usdt - sl_sum_usdt
+            entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
             print(
-                "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f "
-                "long_wins=%d long_losses=%d short_wins=%d short_losses=%d"
+                "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
                 % (
-                    f"{sym}@{mode}",
+                    label,
+                    entries,
+                    exits,
                     trades_count,
                     wins,
                     losses,
@@ -482,33 +841,64 @@ def main() -> None:
                     avg_mfe,
                     avg_mae,
                     avg_hold,
-                    long_wins,
-                    long_losses,
-                    short_wins,
-                    short_losses,
+                    last_day_exits,
+                    base_usdt,
+                    tp_sum_usdt,
+                    sl_sum_usdt,
+                    net_sum_usdt,
+                    entry_sym_count,
                 )
             )
-            for t in trades_by_key.get((mode, sym), []):
-                hold_min = float(t.get("duration_bars") or 0) * ltf_minutes
-                pnl_pct = float(t.get("pnl_pct") or 0.0)
-                outcome = "WIN" if pnl_pct > 0 else "LOSS"
-                print(
-                    "[ENTRY] sym=%s side=%s outcome=%s mode=%s entry_ts=%s exit_ts=%s reason=%s pnl_pct=%.4f hold_min=%.1f"
-                    % (
-                        t.get("sym"),
-                        t.get("side"),
-                        outcome,
-                        t.get("mode"),
-                        t.get("entry_ts"),
-                        t.get("exit_ts"),
-                        t.get("exit_reason"),
-                        pnl_pct,
-                        hold_min,
+            entries = list(trade_logs.get((mode, sym), []))
+            open_trade = open_trades.get((mode, sym))
+            if isinstance(open_trade, dict):
+                entry_dt = ""
+                entry_ts = open_trade.get("entry_ts")
+                if isinstance(entry_ts, (int, float)) and entry_ts > 0:
+                    entry_dt = datetime.fromtimestamp(entry_ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                entry_px = open_trade.get("entry_price")
+                side = (open_trade.get("side") or "").upper()
+                last_px = last_close_by_sym.get(sym)
+                last_ts = last_ts_by_sym.get(sym)
+                last_dt = ""
+                if isinstance(last_ts, (int, float)) and last_ts > 0:
+                    last_dt = datetime.fromtimestamp(float(last_ts) / 1000.0, tz=timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M"
                     )
+                unrealized = None
+                if isinstance(entry_px, (int, float)) and isinstance(last_px, (int, float)) and entry_px > 0:
+                    if side == "SHORT":
+                        unrealized = (float(entry_px) - float(last_px)) / float(entry_px) * 100.0
+                    else:
+                        unrealized = (float(last_px) - float(entry_px)) / float(entry_px) * 100.0
+                last_disp = f"{float(last_px):.6g}" if isinstance(last_px, (int, float)) else "N/A"
+                pnl_disp = f"{float(unrealized):.2f}%" if isinstance(unrealized, (int, float)) else "N/A"
+                entries.append(
+                    {
+                        "entry_ts": entry_ts or 0,
+                        "line": "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s entry_px=%.6g "
+                        "last_px=%s last_dt=%s unrealized_pct=%s"
+                        % (
+                            open_trade.get("sym"),
+                            open_trade.get("mode"),
+                            open_trade.get("side"),
+                            entry_dt,
+                            "",
+                            float(entry_px or 0.0),
+                            last_disp,
+                            last_dt or "N/A",
+                            pnl_disp,
+                        ),
+                    }
                 )
+            entries.sort(key=lambda item: item.get("entry_ts") or 0, reverse=True)
+            for entry in entries:
+                print(entry.get("line", ""))
             mode_total = total_by_mode.setdefault(
                 mode,
                 {
+                    "entries": 0,
+                    "exits": 0,
                     "trades": 0,
                     "wins": 0,
                     "losses": 0,
@@ -523,7 +913,7 @@ def main() -> None:
                     "short_losses": 0,
                 },
             )
-            for key in ("trades", "wins", "losses", "tp", "sl"):
+            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
                 mode_total[key] += int(stats.get(key) or 0)
             mode_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
             mode_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
@@ -533,6 +923,8 @@ def main() -> None:
             mode_total["short_wins"] += short_wins
             mode_total["short_losses"] += short_losses
         grand_total = {
+            "entries": 0,
+            "exits": 0,
             "trades": 0,
             "wins": 0,
             "losses": 0,
@@ -548,6 +940,8 @@ def main() -> None:
         }
         for mode, stats in total_by_mode.items():
             trades_count = int(stats.get("trades") or 0)
+            entries = int(stats.get("entries") or 0)
+            exits = int(stats.get("exits") or 0)
             wins = int(stats.get("wins") or 0)
             losses = int(stats.get("losses") or 0)
             tp = int(stats.get("tp") or 0)
@@ -556,12 +950,21 @@ def main() -> None:
             avg_mfe = (stats.get("mfe_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
+            label = f"TOTAL@{mode}" if multi_mode else "TOTAL"
+            last_day_exits = last_day_exits_by_mode.get(mode, 0)
+            base_usdt = float(bt_cfg.base_usdt or 0.0)
+            tp_sum_usdt = tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
+            sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
+            net_sum_usdt = tp_sum_usdt - sl_sum_usdt
+            entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
             print(
-                "[BACKTEST] %s trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f "
-                "long_wins=%d long_losses=%d short_wins=%d short_losses=%d"
+                "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
                 % (
-                    f"TOTAL@{mode}",
+                    label,
+                    entries,
+                    exits,
                     trades_count,
                     wins,
                     losses,
@@ -571,13 +974,15 @@ def main() -> None:
                     avg_mfe,
                     avg_mae,
                     avg_hold,
-                    int(stats.get("long_wins") or 0),
-                    int(stats.get("long_losses") or 0),
-                    int(stats.get("short_wins") or 0),
-                    int(stats.get("short_losses") or 0),
+                    last_day_exits,
+                    base_usdt,
+                    tp_sum_usdt,
+                    sl_sum_usdt,
+                    net_sum_usdt,
+                    entry_sym_count,
                 )
             )
-            for key in ("trades", "wins", "losses", "tp", "sl"):
+            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
                 grand_total[key] += int(stats.get(key) or 0)
             grand_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
             grand_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
@@ -585,6 +990,8 @@ def main() -> None:
             for key in ("long_wins", "long_losses", "short_wins", "short_losses"):
                 grand_total[key] += int(stats.get(key) or 0)
         total_trades = int(grand_total.get("trades") or 0)
+        total_entries = int(grand_total.get("entries") or 0)
+        total_exits = int(grand_total.get("exits") or 0)
         total_wins = int(grand_total.get("wins") or 0)
         total_losses = int(grand_total.get("losses") or 0)
         total_tp = int(grand_total.get("tp") or 0)
@@ -593,26 +1000,36 @@ def main() -> None:
         total_avg_mfe = (grand_total.get("mfe_sum", 0.0) / total_trades) if total_trades else 0.0
         total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
         total_avg_hold = (grand_total.get("hold_sum", 0.0) / total_trades) if total_trades else 0.0
-        print(
-            "[BACKTEST] TOTAL trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-            "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f "
-            "long_wins=%d long_losses=%d short_wins=%d short_losses=%d"
-            % (
-                total_trades,
-                total_wins,
-                total_losses,
-                total_win_rate,
-                total_tp,
-                total_sl,
-                total_avg_mfe,
-                total_avg_mae,
-                total_avg_hold,
-                int(grand_total.get("long_wins") or 0),
-                int(grand_total.get("long_losses") or 0),
-                int(grand_total.get("short_wins") or 0),
-                int(grand_total.get("short_losses") or 0),
+        if multi_mode:
+            base_usdt = float(bt_cfg.base_usdt or 0.0)
+            total_tp_sum = total_tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
+            total_sl_sum = total_sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
+            total_net_sum = total_tp_sum - total_sl_sum
+            total_entry_syms = len(set().union(*entry_syms_by_mode.values())) if entry_syms_by_mode else 0
+            print(
+                "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
+                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
+                % (
+                    total_entries,
+                    total_exits,
+                    total_trades,
+                    total_wins,
+                    total_losses,
+                    total_win_rate,
+                    total_tp,
+                    total_sl,
+                    total_avg_mfe,
+                    total_avg_mae,
+                    total_avg_hold,
+                    sum(last_day_exits_by_mode.values()),
+                    base_usdt,
+                    total_tp_sum,
+                    total_sl_sum,
+                    total_net_sum,
+                    total_entry_syms,
+                )
             )
-        )
         if d1_block_by_key:
             by_mode: Dict[str, int] = {}
             total_blocks = 0
@@ -629,6 +1046,14 @@ def main() -> None:
             line = f"[BACKTEST] TOTAL block=D1_EMA7_DIST count={total_blocks}"
             print(line)
             _append_backtest_log(line)
+    else:
+        base_usdt = float(bt_cfg.base_usdt or 0.0)
+        print(
+            "[BACKTEST] TOTAL entries=0 exits=0 trades=0 wins=0 losses=0 winrate=0.00%% tp=0 sl=0 "
+            "avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0 last_day_exits=0 "
+            "base_usdt=%.2f tp_sum=0.000 sl_sum=0.000 net_sum=0.000 entry_syms=0"
+            % base_usdt
+        )
 
 
 if __name__ == "__main__":

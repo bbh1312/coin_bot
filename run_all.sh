@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-python "$ROOT_DIR/manage_ws.py" &
+MANAGE_WS_WRITE_STATE=1 MANAGE_WS_SAVE_RUNTIME=1 python "$ROOT_DIR/manage_ws.py" &
 WS_PID=$!
 
 ENGINE_ARGS=("$@")
@@ -25,4 +25,4 @@ if [[ $NEED_NO_MANAGE_LOOP -eq 1 ]]; then
   ENGINE_ARGS+=("--no-manage-loop")
 fi
 
-python "$ROOT_DIR/engine_runner.py" "${ENGINE_ARGS[@]}"
+ENGINE_WRITE_STATE=0 python "$ROOT_DIR/engine_runner.py" "${ENGINE_ARGS[@]}"

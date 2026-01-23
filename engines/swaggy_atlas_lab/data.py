@@ -32,13 +32,34 @@ def fetch_ohlcv_all(
     timeframe: str,
     start_ms: int,
     end_ms: int,
-    limit: int = 1000,
+    limit: Optional[int] = None,
 ) -> List[list]:
+    if limit is None:
+        try:
+            limit = int(os.getenv("BACKTEST_OHLCV_LIMIT", "500"))
+        except Exception:
+            limit = 500
+    limit = max(50, min(int(limit), 1000))
+    def _fetch_with_retry(since_ms: int) -> List[list]:
+        max_retries = 8
+        backoff = max(1.0, (exchange.rateLimit or 0) / 1000.0)
+        for attempt in range(max_retries):
+            try:
+                return exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+            except (ccxt.DDoSProtection, ccxt.RateLimitExceeded, ccxt.ExchangeNotAvailable) as e:
+                wait_s = min(backoff * (2 ** attempt), 60.0)
+                print(f"[rate-limit] {symbol} {timeframe} since={since_ms} retry={attempt+1}/{max_retries} wait={wait_s:.1f}s err={e}")
+                time.sleep(wait_s)
+            except Exception:
+                # Re-raise unknown errors to avoid masking data issues.
+                raise
+        return []
+
     out: List[list] = []
     since = start_ms
     tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
     while since < end_ms:
-        batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+        batch = _fetch_with_retry(since)
         if not batch:
             break
         for row in batch:

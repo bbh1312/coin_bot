@@ -27,6 +27,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Atlas RS Fail Short Backtest Runner")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--ltf", type=str, default="15m")
+    parser.add_argument("--reentry-minutes", type=int, default=120)
     parser.add_argument("--sl-pct", type=float, default=0.03)
     parser.add_argument("--tp-pct", type=float, default=0.03)
     parser.add_argument("--out", type=str, default="")
@@ -132,6 +133,16 @@ def _log_summary(line: str, path: str) -> None:
     _log_file(line, path)
 
 
+def _kst_dt_from_ms(ts_ms: Optional[float]) -> Optional[datetime]:
+    if not isinstance(ts_ms, (int, float)) or ts_ms <= 0:
+        return None
+    try:
+        tz = timezone(timedelta(hours=9))
+        return datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=tz)
+    except Exception:
+        return None
+
+
 def run_backtest(
     symbols: List[str],
     days: int,
@@ -143,6 +154,7 @@ def run_backtest(
     out_decisions: str,
     sl_pct: float,
     tp_pct: float,
+    reentry_minutes: int,
     log_path: str,
     sleep_ms: int,
     max_retries: int,
@@ -161,18 +173,15 @@ def run_backtest(
     symbol_data: Dict[str, List[list]] = {}
     block_counts: Dict[str, Dict[str, int]] = {}
     eval_counts: Dict[str, int] = {}
-    signal_logs: Dict[str, str] = {}
     stats_map: Dict[str, Dict[str, float]] = {}
+    trade_logs: Dict[str, List[dict]] = {}
     trades: Dict[str, Optional[dict]] = {}
+    entry_times: List[int] = []
+    exit_events: List[dict] = []
+    reentry_until: Dict[str, float] = {}
     idx_ref = -1
 
     for symbol in symbols:
-        sym_tag = symbol.replace("/", "_").replace(":", "_")
-        signal_log_path = ""
-        if log_path:
-            base_dir = os.path.dirname(log_path)
-            signal_log_path = os.path.join(base_dir, f"signals_{sym_tag}.log")
-        signal_logs[symbol] = signal_log_path
         _log_file(
             f"[BACKTEST] Fetching {symbol} LTF={cfg.ltf_tf} from last {days} days",
             log_path,
@@ -183,6 +192,8 @@ def run_backtest(
             continue
         symbol_data[symbol] = ltf_raw
         stats_map[symbol] = {
+            "entries": 0,
+            "exits": 0,
             "trades": 0,
             "wins": 0,
             "losses": 0,
@@ -192,9 +203,11 @@ def run_backtest(
             "mae_sum": 0.0,
             "hold_sum": 0.0,
         }
+        trade_logs[symbol] = []
         block_counts[symbol] = {}
         eval_counts[symbol] = 0
         trades[symbol] = None
+        reentry_until[symbol] = 0.0
 
     if not symbol_data:
         return stats_map
@@ -246,7 +259,24 @@ def run_backtest(
                 exit_px = trade["tp_px"]
             if exit_reason:
                 pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
+                trade_logs[symbol].append(
+                    {
+                        "entry_ts": trade.get("entry_ts") or 0,
+                        "exit_reason": exit_reason,
+                        "line": "[BACKTEST][EXIT] symbol=%s entry_dt=%s exit_dt=%s entry_px=%.6g exit_px=%.6g reason=%s"
+                        % (
+                            symbol,
+                            trade.get("entry_dt"),
+                            datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            trade["entry_px"],
+                            exit_px,
+                            exit_reason,
+                        ),
+                    }
+                )
+                exit_events.append({"entry_ts": trade.get("entry_ts") or 0, "exit_reason": exit_reason})
                 stats = stats_map[symbol]
+                stats["exits"] += 1
                 stats["trades"] += 1
                 if pnl_pct >= 0:
                     stats["wins"] += 1
@@ -263,18 +293,19 @@ def run_backtest(
                 hold_minutes = holding_bars * ltf_minutes
                 if log_path:
                     _log_file(
-                        "[BACKTEST] TRADE symbol=%s entry=%s exit=%s pnl_pct=%.4f hold_min=%.1f reason=%s"
-                        % (symbol, trade.get("entry_dt"), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                           pnl_pct, hold_minutes, exit_reason),
+                        "[BACKTEST][EXIT] symbol=%s entry_dt=%s exit_dt=%s entry_px=%.6g exit_px=%.6g "
+                        "pnl_pct=%.4f hold_min=%.1f reason=%s"
+                        % (
+                            symbol,
+                            trade.get("entry_dt"),
+                            datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            trade.get("entry_px") or 0.0,
+                            exit_px,
+                            pnl_pct,
+                            hold_minutes,
+                            exit_reason,
+                        ),
                         log_path,
-                    )
-                signal_log_path = signal_logs.get(symbol)
-                if signal_log_path:
-                    _log_file(
-                        "TRADE entry=%s exit=%s pnl_pct=%.4f hold_min=%.1f reason=%s"
-                        % (trade.get("entry_dt"), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                           pnl_pct, hold_minutes, exit_reason),
-                        signal_log_path,
                     )
                 _append_line(
                     out_trades,
@@ -306,6 +337,8 @@ def run_backtest(
                     ),
                 )
                 trades[symbol] = None
+                if reentry_minutes and reentry_minutes > 0:
+                    reentry_until[symbol] = (ts / 1000.0) + (reentry_minutes * 60)
                 st = state.get(symbol, {})
                 if isinstance(st, dict):
                     st["in_pos"] = False
@@ -342,8 +375,31 @@ def run_backtest(
             str(tech.get("trigger_bits") or ""),
         ]
         _append_line(out_decisions, ",".join(decision_row))
+        if reason == "TRIGGER_BLOCK_WICK_MACD_ONLY" and log_path:
+            _log_file(
+                "[BACKTEST][BLOCKED] symbol=%s dt=%s close=%s ema20=%s atr=%s rsi=%s trigger=%s risk_tags=%s block_reason=%s"
+                % (
+                    symbol,
+                    dt,
+                    str(tech.get("close") or ""),
+                    str(tech.get("ema20") or ""),
+                    str(tech.get("atr") or ""),
+                    str(tech.get("rsi") or ""),
+                    str(tech.get("trigger_bits") or ""),
+                    _fmt_tags(meta.get("risk_tags") if isinstance(meta.get("risk_tags"), list) else None),
+                    reason,
+                ),
+                log_path,
+            )
         if not sig.entry_ready or sig.entry_price is None:
             continue
+        if reentry_minutes and reentry_minutes > 0:
+            if (ts / 1000.0) < float(reentry_until.get(symbol) or 0.0):
+                bc = block_counts[symbol]
+                bc["reentry_cooldown"] = bc.get("reentry_cooldown", 0) + 1
+                if log_path:
+                    _log_file(f"[BACKTEST] SKIP reentry_cooldown symbol={symbol} ts={dt}", log_path)
+                continue
 
         _append_line(
             out_path,
@@ -372,19 +428,21 @@ def run_backtest(
                 ]
             ),
         )
-        signal_log_path = signal_logs.get(symbol)
-        if signal_log_path:
+        if log_path:
             _log_file(
-                "SIGNAL entry=%s entry_px=%.6g confirm=%s rsi=%s atr=%s trigger=%s"
+                "[BACKTEST][ENTRY] symbol=%s entry_dt=%s entry_px=%.6g sl_px=%.6g tp_px=%.6g confirm=%s rsi=%s atr=%s trigger=%s"
                 % (
+                    symbol,
                     dt,
                     float(sig.entry_price or 0.0),
+                    float(sig.entry_price or 0.0) * (1 + sl_pct),
+                    float(sig.entry_price or 0.0) * (1 - tp_pct),
                     str(tech.get("confirm_type") or ""),
                     str(tech.get("rsi") or ""),
                     str(tech.get("atr") or ""),
                     str(tech.get("trigger_bits") or ""),
                 ),
-                signal_log_path,
+                log_path,
             )
         trades[symbol] = {
             "entry_px": sig.entry_price,
@@ -406,6 +464,8 @@ def run_backtest(
             "high_minus_ema20": tech.get("high_minus_ema20"),
             "trigger_bits": tech.get("trigger_bits"),
         }
+        entry_times.append(ts)
+        stats_map[symbol]["entries"] += 1
         st = state.get(symbol, {})
         if isinstance(st, dict):
             st["in_pos"] = True
@@ -423,22 +483,91 @@ def run_backtest(
             f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}",
             log_path,
         )
+        entries = list(trade_logs.get(symbol, []))
+        open_trade = trades.get(symbol)
+        if isinstance(open_trade, dict):
+            entries.append(
+                {
+                    "entry_ts": open_trade.get("entry_ts") or 0,
+                    "line": "[BACKTEST][OPEN] symbol=%s entry_px=%.6g entry_dt=%s"
+                    % (
+                        symbol,
+                        open_trade.get("entry_px") or 0.0,
+                        open_trade.get("entry_dt") or "",
+                    ),
+                }
+            )
+        entries.sort(key=lambda item: item.get("entry_ts") or 0, reverse=True)
+        for entry in entries:
+            _log_summary(entry.get("line", ""), log_path)
         eval_count = eval_counts.get(symbol, 0)
         if eval_count:
             for reason, count in sorted(block_counts[symbol].items(), key=lambda x: x[1], reverse=True):
                 ratio = count / eval_count * 100.0
                 _log_file(f"[BACKTEST] {symbol} block={reason} count={count} ratio={ratio:.2f}%", log_path)
+
+    # KST time buckets (entries based on entry_ts)
+    if entry_times or exit_events:
+        hour_stats: Dict[int, Dict[str, int]] = {h: {"entries": 0, "tp": 0, "sl": 0} for h in range(24)}
+        dow_stats: Dict[int, Dict[str, int]] = {d: {"entries": 0, "tp": 0, "sl": 0} for d in range(7)}
+        for ts in entry_times:
+            dt_kst = _kst_dt_from_ms(ts)
+            if dt_kst is None:
+                continue
+            hour_stats[dt_kst.hour]["entries"] += 1
+            dow_stats[dt_kst.weekday()]["entries"] += 1
+        for ev in exit_events:
+            dt_kst = _kst_dt_from_ms(ev.get("entry_ts"))
+            if dt_kst is None:
+                continue
+            reason = (ev.get("exit_reason") or "").upper()
+            if reason == "TP":
+                hour_stats[dt_kst.hour]["tp"] += 1
+                dow_stats[dt_kst.weekday()]["tp"] += 1
+            elif reason == "SL":
+                hour_stats[dt_kst.hour]["sl"] += 1
+                dow_stats[dt_kst.weekday()]["sl"] += 1
+
+        header = "[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate"
+        _log_summary(header, log_path)
+        for h in range(24):
+            e = hour_stats[h]["entries"]
+            tp = hour_stats[h]["tp"]
+            sl = hour_stats[h]["sl"]
+            sl_rate = (sl / e * 100.0) if e else 0.0
+            _log_summary(f"[BACKTEST] HOUR {h:02d} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%", log_path)
+
+        dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        header = "[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate"
+        _log_summary(header, log_path)
+        for d in range(7):
+            e = dow_stats[d]["entries"]
+            tp = dow_stats[d]["tp"]
+            sl = dow_stats[d]["sl"]
+            sl_rate = (sl / e * 100.0) if e else 0.0
+            _log_summary(f"[BACKTEST] DOW {dow_labels[d]} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%", log_path)
     return stats_map
 
 
 def main():
     args = parse_args()
-    exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    exchange = ccxt.binance(
+        {
+            "apiKey": os.getenv("BACKTEST_BINANCE_API_KEY", ""),
+            "secret": os.getenv("BACKTEST_BINANCE_API_SECRET", ""),
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap"},
+        }
+    )
     exchange.load_markets()
 
     base_dir = os.path.join("logs", "atlas_rs_fail_short", "backtest")
     os.makedirs(base_dir, exist_ok=True)
-    log_path = os.path.join(base_dir, os.path.basename(args.log_path)) if args.log_path else os.path.join(base_dir, "backtest.log")
+    date_tag = time.strftime("%Y%m%d")
+    if args.log_path:
+        log_path = os.path.join(base_dir, os.path.basename(args.log_path))
+    else:
+        log_path = os.path.join(base_dir, f"backtest_{date_tag}.log")
 
     cfg = AtlasRsFailShortConfig()
     if args.ltf and args.ltf != cfg.ltf_tf:
@@ -502,6 +631,8 @@ def main():
     )
 
     total = {
+        "entries": 0,
+        "exits": 0,
         "trades": 0,
         "wins": 0,
         "losses": 0,
@@ -522,6 +653,7 @@ def main():
         out_decisions,
         args.sl_pct,
         args.tp_pct,
+        args.reentry_minutes,
         log_path,
         args.sleep_ms,
         args.retry,
@@ -538,7 +670,8 @@ def main():
     avg_mae = (total["mae_sum"] / total["trades"]) if total["trades"] > 0 else 0.0
     avg_hold = (total["hold_sum"] / total["trades"]) if total["trades"] > 0 else 0.0
     _log_summary(
-        f"[BACKTEST] total trades={total['trades']} wins={total['wins']} losses={total['losses']} "
+        f"[BACKTEST] total entries={total['entries']} exits={total['exits']} trades={total['trades']} "
+        f"wins={total['wins']} losses={total['losses']} "
         f"winrate={winrate:.2f}% tp={total['tp']} sl={total['sl']} "
         f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}",
         log_path,
