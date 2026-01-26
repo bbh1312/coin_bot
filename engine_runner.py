@@ -6999,11 +6999,10 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ENGINE_EXIT_OVERRIDES
     global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, ATLAS_FABIO_ENABLED, SWAGGY_ATLAS_LAB_ENABLED
     global SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
-    global SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED, SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE
-    global SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI, SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX, SWAGGY_D1_OVEREXT_ATR_MULT
+    global SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
-    global RSI_ENABLED, PUMPFADE_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     try:
@@ -7038,10 +7037,6 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_swaggy_no_atlas_off_windows",
         "_swaggy_no_atlas_overext_min",
         "_swaggy_no_atlas_overext_min_enabled",
-        "_swaggy_no_atlas_multi_enabled",
-        "_swaggy_no_atlas_multi_mode",
-        "_swaggy_no_atlas_multi_roi",
-        "_swaggy_no_atlas_multi_max",
         "_swaggy_d1_overext_atr_mult",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
@@ -7049,7 +7044,6 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_dtfx_enabled",
         "_atlas_rs_fail_short_enabled",
         "_atlas_fabio_enabled",
-        "_pumpfade_enabled",
         "_div15m_long_enabled",
         "_div15m_short_enabled",
         "_chat_id",
@@ -7074,8 +7068,6 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         state["_swaggy_no_atlas_overext_min_enabled"] = SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
     if isinstance(state.get("_swaggy_d1_overext_atr_mult"), dict):
         state["_swaggy_d1_overext_atr_mult"] = SWAGGY_D1_OVEREXT_ATR_MULT
-    if isinstance(state.get("_swaggy_no_atlas_multi_enabled"), dict):
-        state["_swaggy_no_atlas_multi_enabled"] = SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED
     if (not skip_keys or "_auto_exit" not in skip_keys) and isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
     if (not skip_keys or "_auto_exit_long_tp_pct" not in skip_keys) and isinstance(state.get("_auto_exit_long_tp_pct"), (int, float)):
@@ -7148,20 +7140,6 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
             executor_mod.DCA_THIRD_PCT = DCA_THIRD_PCT
     if (not skip_keys or "_sat_trade" not in skip_keys) and isinstance(state.get("_sat_trade"), bool):
         SATURDAY_TRADE_ENABLED = bool(state.get("_sat_trade"))
-    if (not skip_keys or "_swaggy_no_atlas_multi_enabled" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_multi_enabled"), bool):
-        SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED = bool(state.get("_swaggy_no_atlas_multi_enabled"))
-    if (not skip_keys or "_swaggy_no_atlas_multi_mode" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_multi_mode"), str):
-        SWAGGY_NO_ATLAS_MULTI_ENTRY_MODE = str(state.get("_swaggy_no_atlas_multi_mode") or "roi")
-    if (not skip_keys or "_swaggy_no_atlas_multi_roi" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_multi_roi"), (int, float)):
-        try:
-            SWAGGY_NO_ATLAS_MULTI_ENTRY_ROI = abs(float(state.get("_swaggy_no_atlas_multi_roi") or 0.0))
-        except Exception:
-            pass
-    if (not skip_keys or "_swaggy_no_atlas_multi_max" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_multi_max"), (int, float)):
-        try:
-            SWAGGY_NO_ATLAS_MULTI_ENTRY_MAX = int(state.get("_swaggy_no_atlas_multi_max") or 0)
-        except Exception:
-            pass
     if (not skip_keys or "_exit_cooldown_hours" not in skip_keys) and isinstance(state.get("_exit_cooldown_hours"), (int, float)):
         EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
         COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
@@ -7172,8 +7150,6 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         ATLAS_RS_FAIL_SHORT_ENABLED = bool(state.get("_atlas_rs_fail_short_enabled"))
     if (not skip_keys or "_atlas_fabio_enabled" not in skip_keys) and isinstance(state.get("_atlas_fabio_enabled"), bool):
         ATLAS_FABIO_ENABLED = bool(state.get("_atlas_fabio_enabled"))
-    if (not skip_keys or "_pumpfade_enabled" not in skip_keys) and isinstance(state.get("_pumpfade_enabled"), bool):
-        PUMPFADE_ENABLED = bool(state.get("_pumpfade_enabled"))
     if (not skip_keys or "_div15m_long_enabled" not in skip_keys) and isinstance(state.get("_div15m_long_enabled"), bool):
         DIV15M_LONG_ENABLED = bool(state.get("_div15m_long_enabled"))
     if (not skip_keys or "_div15m_short_enabled" not in skip_keys) and isinstance(state.get("_div15m_short_enabled"), bool):
@@ -9108,7 +9084,6 @@ def save_state_to(state: Dict[str, dict], path: str) -> None:
                 "_swaggy_enabled",
                 "_swaggy_atlas_lab_enabled",
                 "_dtfx_enabled",
-                "_pumpfade_enabled",
                 "_div15m_long_enabled",
                 "_div15m_short_enabled",
                 "_rsi_enabled",
@@ -9341,7 +9316,7 @@ def run():
     except Exception:
         pass
     global swaggy_engine, swaggy_atlas_lab_engine, swaggy_atlas_lab_v2_engine, swaggy_no_atlas_engine
-    global atlas_engine, atlas_swaggy_cfg, dtfx_engine, pumpfade_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
+    global atlas_engine, atlas_swaggy_cfg, dtfx_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
     swaggy_atlas_lab_engine = SwaggyAtlasLabEngine() if SwaggyAtlasLabEngine else None
     swaggy_atlas_lab_v2_engine = SwaggyAtlasLabV2Engine() if SwaggyAtlasLabV2Engine else None
@@ -9626,7 +9601,6 @@ def run():
                         set_dry_run(not LIVE_TRADING)
                     except Exception:
                         pass
-                    multi_entry_on = bool(SWAGGY_NO_ATLAS_MULTI_ENTRY_ENABLED)
                     if state.get("_pos_limit_reached") is True:
                         verified = None
                         try:
@@ -9638,14 +9612,13 @@ def run():
                             state["_active_positions_total"] = int(verified)
                         else:
                             state["_pos_limit_reached"] = True
-                            if not multi_entry_on:
-                                last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
-                                if (now - last_warn) >= 60:
-                                    print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
-                                    state["_pos_limit_skip_ts"] = now
-                                    _log_off_window_status(state, now, tag="pos_limit")
-                                time.sleep(1)
-                                continue
+                            last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
+                            if (now - last_warn) >= 60:
+                                print(f"[제한] 동시 포지션 제한 플래그 → 조회 스킵")
+                                state["_pos_limit_skip_ts"] = now
+                                _log_off_window_status(state, now, tag="pos_limit")
+                            time.sleep(1)
+                            continue
                     active_positions_state = _count_open_positions_state(state)
                     active_positions_total_est = active_positions_state
                     verified = None
@@ -9658,14 +9631,13 @@ def run():
                         state["_active_positions_total"] = int(verified)
                     if isinstance(active_positions_total_est, int) and active_positions_total_est >= MAX_OPEN_POSITIONS:
                         state["_pos_limit_reached"] = True
-                        if not multi_entry_on:
-                            last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
-                            if (now - last_warn) >= 60:
-                                print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
-                                state["_pos_limit_skip_ts"] = now
-                                _log_off_window_status(state, now, tag="pos_limit")
-                            time.sleep(1)
-                            continue
+                        last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
+                        if (now - last_warn) >= 60:
+                            print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
+                            state["_pos_limit_skip_ts"] = now
+                            _log_off_window_status(state, now, tag="pos_limit")
+                        time.sleep(1)
+                        continue
 
                     # cycle ts debug (BTC 15m, prev candle only)
                     cycle_ts = None
@@ -9933,18 +9905,6 @@ def run():
                         dtfx_universe = dtfx_engine.build_universe(ctx)
                         state["_dtfx_universe"] = dtfx_universe
 
-                    pumpfade_universe = []
-                    if PUMPFADE_ENABLED and pumpfade_engine and pumpfade_cfg and EngineContext:
-                        ctx = EngineContext(
-                            exchange=exchange,
-                            state=state,
-                            now_ts=time.time(),
-                            logger=print,
-                            config=pumpfade_cfg,
-                        )
-                        pumpfade_universe = pumpfade_engine.build_universe(ctx)
-                        state["_pumpfade_universe"] = pumpfade_universe
-
                     atlas_rs_fail_short_universe = []
                     if ATLAS_RS_FAIL_SHORT_ENABLED and atlas_rs_fail_short_engine and atlas_rs_fail_short_cfg and EngineContext:
                         ctx = EngineContext(
@@ -9965,7 +9925,6 @@ def run():
                                 + fabio_universe
                                 + (swaggy_universe or [])
                                 + (dtfx_universe or [])
-                                + (pumpfade_universe or [])
                                 + (atlas_rs_fail_short_universe or [])
                             )
                         )
@@ -9981,7 +9940,6 @@ def run():
                                 + fabio_universe
                                 + (swaggy_universe or [])
                                 + (dtfx_universe or [])
-                                + (pumpfade_universe or [])
                                 + (atlas_rs_fail_short_universe or [])
                             )
                         )
@@ -10020,7 +9978,6 @@ def run():
                     swaggy_universe_len = len(swaggy_universe) if swaggy_universe else 0
                     swaggy_atlas_lab_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_ENABLED else 0
                     dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
-                    pumpfade_universe_len = len(pumpfade_universe) if pumpfade_universe else 0
                     atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
                     universe_structure_len = len(universe_structure)
                     universe_union_len = len(universe_union)
@@ -10038,7 +9995,6 @@ def run():
                         and swaggy_universe
                     )
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
-                    pumpfade_ran = bool(PUMPFADE_ENABLED and pumpfade_engine and pumpfade_cfg and pumpfade_universe)
                     atlas_rs_fail_short_ran = bool(
                         ATLAS_RS_FAIL_SHORT_ENABLED
                         and atlas_rs_fail_short_engine
@@ -10078,9 +10034,6 @@ def run():
                     for s in swaggy_universe or []:
                         if s not in slow_symbols_ordered:
                             slow_symbols_ordered.append(s)
-                    for s in pumpfade_universe or []:
-                        if s not in slow_symbols_ordered:
-                            slow_symbols_ordered.append(s)
                     for s in atlas_rs_fail_short_universe or []:
                         if s not in slow_symbols_ordered:
                             slow_symbols_ordered.append(s)
@@ -10106,9 +10059,6 @@ def run():
                     if swaggy_atlas_lab_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
                         mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_atlas_lab_cfg.vp_lookback_1h))
-                    if pumpfade_cfg:
-                        mid_plan["15m"] = max(mid_plan.get("15m", 0), int(max(80, pumpfade_cfg.lookback_hh + 10)))
-                        mid_plan["1h"] = max(mid_plan.get("1h", 0), 40)
                     if atlas_rs_fail_short_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
                     if atlas_cfg:
@@ -10324,8 +10274,6 @@ def run():
                     swaggy_atlas_lab_thread = None
                     dtfx_result = {}
                     dtfx_thread = None
-                    pumpfade_result = {}
-                    pumpfade_thread = None
                     atlas_rs_fail_short_result = {}
                     atlas_rs_fail_short_thread = None
                     if heavy_scan and ATLAS_FABIO_ENABLED and fabio_cfg_atlas and atlas_cfg:
@@ -10397,20 +10345,6 @@ def run():
                             daemon=True,
                         )
                         dtfx_thread.start()
-                    if PUMPFADE_ENABLED and pumpfade_cfg and pumpfade_engine:
-                        pumpfade_thread = threading.Thread(
-                            target=lambda: pumpfade_result.update(
-                                _run_pumpfade_cycle(
-                                    pumpfade_engine,
-                                    pumpfade_universe,
-                                    state,
-                                    send_telegram,
-                                    pumpfade_cfg,
-                                )
-                            ),
-                            daemon=True,
-                        )
-                        pumpfade_thread.start()
                     if ATLAS_RS_FAIL_SHORT_ENABLED and atlas_rs_fail_short_cfg and atlas_rs_fail_short_engine:
                         atlas_rs_fail_short_thread = threading.Thread(
                             target=lambda: atlas_rs_fail_short_result.update(
@@ -11046,8 +10980,6 @@ def run():
                         swaggy_atlas_lab_thread.join()
                     if dtfx_thread:
                         dtfx_thread.join()
-                    if pumpfade_thread:
-                        pumpfade_thread.join()
                     if atlas_rs_fail_short_thread:
                         atlas_rs_fail_short_thread.join()
                     _set_thread_log_buffer(None)
@@ -11078,11 +11010,11 @@ def run():
                         f"[universe] rule=qVol>={int(shared_min_qv):,} sort=abs(pct) topN={shared_top_n} anchors={anchors_disp} "
                         f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
                         f"dtfx={dtfx_universe_len} "
-                        f"pumpfade={pumpfade_universe_len} arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
+                        f"arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
                     )
                     print(
                         "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) atlasfabio=%s(%d) "
-                        "swaggy_atlas_lab=%s(%d) dtfx=%s(%d) pumpfade=%s(%d) arsf=%s(%d)"
+                        "swaggy_atlas_lab=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
                         % (
                             "ON" if rsi_ran else "OFF",
                             rsi_universe_len,
@@ -11096,8 +11028,6 @@ def run():
                             swaggy_atlas_lab_universe_len,
                             "ON" if dtfx_ran else "OFF",
                             dtfx_universe_len,
-                            "ON" if pumpfade_ran else "OFF",
-                            pumpfade_universe_len,
                             "ON" if atlas_rs_fail_short_ran else "OFF",
                             atlas_rs_fail_short_universe_len,
                         )
