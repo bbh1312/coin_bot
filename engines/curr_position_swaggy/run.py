@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+
+STATE_FILE = os.path.join(ROOT_DIR, "state.json")
+LOSS_HEDGE_ENGINE_KEY = "LOSS_HEDGE_ENGINE"
+LOSS_HEDGE_MIN_PCT = -10.0
+DEFAULT_TP_PCT = 3.0
+DEFAULT_SL_PCT = 30.0
+DEFAULT_LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+DEFAULT_MARGIN_MODE = os.getenv("MARGIN_MODE", "cross").lower().strip()
 
 from env_loader import load_env
 import cycle_cache
@@ -17,13 +26,182 @@ from atlas_test.notifier_telegram import send_message
 from engines.curr_position_swaggy.config import CurrPositionSwaggyConfig
 from engines.swaggy_no_atlas.engine import SwaggyNoAtlasEngine
 from engines.swaggy_no_atlas.config import SwaggyNoAtlasConfig
-from executor import exchange, list_open_position_symbols, get_long_position_detail, get_short_position_detail
+from executor import (
+    exchange,
+    list_open_position_symbols,
+    get_long_position_detail,
+    get_short_position_detail,
+    get_available_usdt,
+)
 
 
 def _fmt_kst_now() -> str:
     kst = timezone(timedelta(hours=9))
     return datetime.now(tz=kst).strftime("%Y-%m-%d %H:%M:%S KST")
 
+def _load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    base_dir = os.path.dirname(STATE_FILE) or "."
+    os.makedirs(base_dir, exist_ok=True)
+    tmp_path = f"{STATE_FILE}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=True)
+    os.replace(tmp_path, STATE_FILE)
+
+
+def _state_bool(state: dict, key: str, default: bool = False) -> bool:
+    val = state.get(key)
+    if isinstance(val, bool):
+        return val
+    return default
+
+
+def _state_number(state: dict, key: str, default: float) -> float:
+    val = state.get(key)
+    if isinstance(val, (int, float)):
+        return float(val)
+    return float(default)
+
+
+def _loss_hedge_enabled(state: dict) -> bool:
+    return _state_bool(state, "_loss_hedge_engine_enabled", False)
+
+
+def _live_enabled(state: dict, side: str) -> bool:
+    side_key = (side or "").upper()
+    if side_key == "SHORT":
+        return _state_bool(state, "_live_trading", True)
+    return _state_bool(state, "_long_live", True)
+
+
+def _resolve_entry_usdt(entry_pct: float) -> float:
+    if entry_pct <= 0:
+        return 0.0
+    avail = None
+    try:
+        avail = get_available_usdt()
+    except Exception:
+        avail = None
+    if not isinstance(avail, (int, float)) or avail <= 0:
+        if os.getenv("DRY_RUN", "1") == "1":
+            try:
+                avail = float(os.getenv("SIM_USDT_BALANCE", "1000"))
+            except Exception:
+                avail = 1000.0
+        else:
+            return 0.0
+    pct = min(float(entry_pct), 100.0)
+    return max(0.0, float(avail) * (pct / 100.0))
+
+
+def _engine_tp_sl(state: dict, side: str) -> Tuple[float, float]:
+    tp = DEFAULT_TP_PCT
+    sl = DEFAULT_SL_PCT
+    overrides = state.get("_engine_exit_overrides")
+    if not isinstance(overrides, dict):
+        return tp, sl
+    key = LOSS_HEDGE_ENGINE_KEY
+    entry = overrides.get(key) or overrides.get(key.lower())
+    if not isinstance(entry, dict):
+        return tp, sl
+    side_key = (side or "").upper()
+    side_cfg = entry.get(side_key) or entry.get(side_key.lower())
+    if isinstance(side_cfg, dict):
+        if isinstance(side_cfg.get("tp"), (int, float)):
+            tp = float(side_cfg.get("tp"))
+        if isinstance(side_cfg.get("sl"), (int, float)):
+            sl = float(side_cfg.get("sl"))
+    return tp, sl
+
+
+def _profit_unlev_pct(detail: dict, side: str) -> Optional[float]:
+    if not isinstance(detail, dict):
+        return None
+    entry = detail.get("entry")
+    mark = detail.get("mark")
+    try:
+        entry = float(entry)
+        mark = float(mark)
+    except Exception:
+        return None
+    if entry <= 0:
+        return None
+    side_key = (side or "").upper()
+    if side_key == "SHORT":
+        return (entry - mark) / entry * 100.0
+    return (mark - entry) / entry * 100.0
+
+
+def _append_trade_log_entry(
+    state: dict,
+    side: str,
+    symbol: str,
+    entry_price: Optional[float],
+    qty: Optional[float],
+    usdt: Optional[float],
+    entry_order_id: Optional[str],
+) -> None:
+    log = state.get("_trade_log")
+    if not isinstance(log, list):
+        log = []
+        state["_trade_log"] = log
+    entry_ts = time.time()
+    tr = {
+        "side": side,
+        "symbol": symbol,
+        "entry_ts": float(entry_ts),
+        "entry_ts_ms": int(entry_ts * 1000),
+        "entry_price": entry_price,
+        "qty": qty,
+        "usdt": usdt,
+        "entry_order_id": entry_order_id,
+        "status": "open",
+        "meta": {"reason": "loss_hedge_engine"},
+        "engine_label": LOSS_HEDGE_ENGINE_KEY,
+    }
+    log.append(tr)
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    if not isinstance(st, dict):
+        st = {}
+    if (side or "").upper() == "LONG":
+        st["in_pos_long"] = True
+    elif (side or "").upper() == "SHORT":
+        st["in_pos_short"] = True
+    st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
+    st["last_entry"] = entry_ts
+    state[symbol] = st
+
+
+def _build_entry_message(
+    symbol: str,
+    side: str,
+    entry_px: Optional[float],
+    usdt: float,
+    loss_pct: Optional[float],
+    tp_pct: float,
+    sl_pct: float,
+    live: bool,
+) -> str:
+    sym = symbol.replace("/USDT:USDT", "")
+    loss_str = f"{loss_pct:.2f}%" if isinstance(loss_pct, (int, float)) else "n/a"
+    entry_str = f"{float(entry_px):.6g}" if isinstance(entry_px, (int, float)) else "n/a"
+    live_str = "LIVE" if live else "ALERT_ONLY"
+    return (
+        f"🛡️ 손실방지엔진 진입\n"
+        f"{sym}\n"
+        f"방향: {_side_kr(side)} ({live_str})\n"
+        f"진입가≈{entry_str} (USDT {usdt:.2f})\n"
+        f"TP={tp_pct:.2f}% SL={sl_pct:.2f}%\n"
+        f"기존포지션 손실={loss_str}"
+    )
 
 def _sleep_to_boundary(interval_sec: int) -> None:
     now = time.time()
@@ -89,7 +267,7 @@ def _fmt_entry_px(entry_px: object) -> str:
 
 def _build_message(entries: list[dict]) -> str:
     lines = [
-        "[CURR-POS-SWAGGY] 15m 진입 판단",
+        "[손실방지엔진] 1h 진입 판단",
         f"시간: {_fmt_kst_now()}",
         "----",
     ]
@@ -147,9 +325,15 @@ def main() -> None:
     tf_3m_limit = 30
     exchange.load_markets()
 
-    print("[curr-pos-swaggy] start (15m)")
+    print("[curr-pos-swaggy] start (1h)")
     while True:
         cycle_ts = _fmt_kst_now()
+        state = _load_state()
+        engine_on = _loss_hedge_enabled(state)
+        entry_pct = _state_number(state, "_entry_usdt", float(os.getenv("ENTRY_USDT_PCT", "8.0")))
+        interval_min = int(_state_number(state, "_loss_hedge_interval_min", 15.0))
+        if interval_min > 0:
+            cfg.interval_sec = max(60, interval_min * 60)
         pos_map = _build_pos_side_map()
         if not pos_map:
             print(f"[curr-pos-swaggy] cycle {cycle_ts} 결과: 없음 (포지션 없음)")
@@ -204,6 +388,41 @@ def main() -> None:
                         "candle_ts": candle_ts,
                     }
                 )
+                if not engine_on:
+                    continue
+                if interval_min > 0:
+                    if int(time.time() // 60) % interval_min != 0:
+                        continue
+                if pos_side not in ("LONG", "SHORT"):
+                    continue
+                signal_side = (signal.side or "").upper()
+                opp_side = "SHORT" if pos_side == "LONG" else "LONG"
+                if signal_side != opp_side:
+                    continue
+                pos_detail = (
+                    get_long_position_detail(sym) if pos_side == "LONG" else get_short_position_detail(sym)
+                )
+                loss_pct = _profit_unlev_pct(pos_detail, pos_side)
+                if not isinstance(loss_pct, (int, float)) or loss_pct > LOSS_HEDGE_MIN_PCT:
+                    continue
+                entry_usdt = _resolve_entry_usdt(entry_pct)
+                if entry_usdt <= 0:
+                    continue
+                entry_price = signal.entry_px
+                live = False
+                tp_pct, sl_pct = _engine_tp_sl(state, opp_side)
+                msg = _build_entry_message(
+                    symbol=sym,
+                    side=opp_side,
+                    entry_px=entry_price if isinstance(entry_price, (int, float)) else None,
+                    usdt=entry_usdt,
+                    loss_pct=loss_pct,
+                    tp_pct=tp_pct,
+                    sl_pct=sl_pct,
+                    live=live,
+                )
+                ok = send_message(token, chat_id, msg)
+                print(f"[loss-hedge] alert sent={ok} sym={sym} side={opp_side} usdt={entry_usdt:.2f}")
         if not entries:
             print(f"[curr-pos-swaggy] cycle {cycle_ts} 결과: 없음")
             _sleep_to_boundary(cfg.interval_sec)

@@ -171,6 +171,11 @@ def parse_args():
     parser.add_argument("--cooldown-min", type=int, default=0)
     parser.add_argument("--d1-overext-atr", type=float, default=None)
     parser.add_argument("--sat-trade", choices=["on", "off"], default="on", help="allow entries on Saturday (KST)")
+    parser.add_argument("--loss-hedge", action="store_true", help="enable loss-hedge entries")
+    parser.add_argument("--loss-hedge-min", type=float, default=-10.0, help="trigger loss% (e.g. -10)")
+    parser.add_argument("--loss-hedge-tp", type=float, default=0.03, help="loss-hedge TP pct (e.g. 0.03)")
+    parser.add_argument("--loss-hedge-sl", type=float, default=0.30, help="loss-hedge SL pct (e.g. 0.30)")
+    parser.add_argument("--loss-hedge-interval-min", type=int, default=0, help="loss-hedge check interval minutes (0=every bar)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -339,6 +344,7 @@ def main() -> None:
     entry_syms_by_mode: Dict[str, set] = {}
     last_day_exits_by_mode: Dict[str, int] = {}
     last_day_start_ms = end_ms - 24 * 60 * 60 * 1000
+    loss_hedge_entered: set[tuple[str, str]] = set()
 
     with open(log_path, "a", encoding="utf-8") as log_fp:
         for mode in modes:
@@ -576,6 +582,77 @@ def main() -> None:
                                     ),
                                 }
                             )
+
+                    cur_long = broker.has_position(sym, "LONG")
+                    cur_short = broker.has_position(sym, "SHORT")
+                    if args.loss_hedge and signal and signal.entry_ok:
+                        if isinstance(args.loss_hedge_interval_min, int) and args.loss_hedge_interval_min > 0:
+                            if int(ts_ms // 60000) % int(args.loss_hedge_interval_min) != 0:
+                                continue
+                        if not (cur_long and cur_short):
+                            base_side = "LONG" if cur_long else ("SHORT" if cur_short else "")
+                            if base_side:
+                                opp_side = "SHORT" if base_side == "LONG" else "LONG"
+                                if (signal.side or "").upper() == opp_side:
+                                    if not broker.has_position(sym, opp_side) and (sym, opp_side) not in loss_hedge_entered:
+                                        trade = broker.get_trade(sym, base_side)
+                                        entry_price = trade.entry_price if trade else None
+                                        if isinstance(entry_price, (int, float)) and entry_price > 0:
+                                            close_px = float(cur["close"])
+                                            if base_side == "LONG":
+                                                loss_pct = (close_px - entry_price) / entry_price * 100.0
+                                            else:
+                                                loss_pct = (entry_price - close_px) / entry_price * 100.0
+                                            if loss_pct <= float(args.loss_hedge_min):
+                                                broker.enter(
+                                                    sym,
+                                                    opp_side,
+                                                    ts_ms,
+                                                    i,
+                                                    close_px,
+                                                    bt_cfg.base_usdt,
+                                                    tp_pct=args.loss_hedge_tp,
+                                                    sl_pct=args.loss_hedge_sl,
+                                                    policy_action="LOSS_HEDGE",
+                                                    context={
+                                                        "ts": _iso_kst_ms(ts_ms),
+                                                        "event": "LOSS_HEDGE_ENTRY",
+                                                        "engine": "LOSS_HEDGE_ENGINE",
+                                                        "mode": mode.value,
+                                                        "symbol": sym,
+                                                        "side": opp_side,
+                                                        "entry_ts": _iso_kst_ms(ts_ms),
+                                                        "entry_price": close_px,
+                                                        "loss_pct": loss_pct,
+                                                        "base_side": base_side,
+                                                    },
+                                                )
+                                                loss_hedge_entered.add((sym, opp_side))
+                                                stats = stats_by_key.setdefault(
+                                                    key,
+                                                    {
+                                                        "entries": 0,
+                                                        "exits": 0,
+                                                        "trades": 0,
+                                                        "wins": 0,
+                                                        "losses": 0,
+                                                        "tp": 0,
+                                                        "sl": 0,
+                                                        "mfe_sum": 0.0,
+                                                        "mae_sum": 0.0,
+                                                        "hold_sum": 0.0,
+                                                    },
+                                                )
+                                                stats["entries"] += 1
+                                                entry_syms_by_mode.setdefault(mode.value, set()).add(sym)
+                                                log_fp.write(
+                                                    f"LOSS_HEDGE_ENTRY ts={ts_ms} sym={sym} base={base_side} side={opp_side} "
+                                                    f"entry={close_px:.6g} loss_pct={loss_pct:.2f}\n"
+                                                )
+                                                _append_backtest_log(
+                                                    f"LOSS_HEDGE_ENTRY ts={ts_ms} sym={sym} base={base_side} side={opp_side} "
+                                                    f"entry={close_px:.6g} loss_pct={loss_pct:.2f}"
+                                                )
 
                     if not signal.entry_ok or not side or entry_px is None:
                         continue

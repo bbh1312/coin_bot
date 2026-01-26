@@ -92,10 +92,6 @@ def parse_args():
     parser.add_argument("--entry-windows", default="", help="off windows (HH[:MM]-HH[:MM], comma-separated, UTC by default)")
     parser.add_argument("--entry-tz-offset", type=float, default=0.0, help="hours offset from UTC for entry windows (e.g. 9 for KST)")
     parser.add_argument("--sat-trade", choices=["on", "off"], default="on", help="allow entries on Saturday (KST)")
-    parser.add_argument("--multi-entry", choices=["on", "off"], default="off", help="allow add when same-side signal repeats")
-    parser.add_argument("--multi-entry-mode", choices=["roi", "always"], default="roi", help="multi-entry condition")
-    parser.add_argument("--multi-entry-roi", type=float, default=0.0, help="roi threshold for multi-entry (use positive number)")
-    parser.add_argument("--multi-entry-max", type=int, default=0, help="max multi-entry adds (0 = unlimited)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -353,10 +349,6 @@ def main() -> None:
     entry_windows = _parse_entry_windows(args.entry_windows)
     entry_tz_offset = float(args.entry_tz_offset or 0.0)
     sat_trade_enabled = str(args.sat_trade or "on").lower() == "on"
-    multi_entry_enabled = str(args.multi_entry or "off").lower() == "on"
-    multi_entry_mode = str(args.multi_entry_mode or "roi").lower()
-    multi_entry_roi = abs(float(args.multi_entry_roi or 0.0))
-    multi_entry_max = int(args.multi_entry_max or 0)
     dca_enabled = str(args.dca or "off").lower() == "on"
     dca_thresholds: List[float] = []
     for part in str(args.dca_thresholds or "").split(","):
@@ -645,86 +637,6 @@ def main() -> None:
                     )
                     continue
                 if (side == "LONG" and had_long) or (side == "SHORT" and had_short):
-                    if not multi_entry_enabled:
-                        continue
-                    trade_live = broker.get_position(sym, side)
-                    if not trade_live:
-                        continue
-                    if multi_entry_max > 0 and int(trade_live.multi_entry_adds or 0) >= multi_entry_max:
-                        _append_backtest_log(
-                            f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=MULTI_MAX_REACHED"
-                        )
-                        continue
-                    if multi_entry_mode == "roi":
-                        entry_ref = float(trade_live.entry_price or 0.0)
-                        close_px = float(cur["close"])
-                        roi_pct = 0.0
-                        if entry_ref > 0:
-                            if side == "LONG":
-                                roi_pct = (close_px - entry_ref) / entry_ref * 100.0
-                            else:
-                                roi_pct = (entry_ref - close_px) / entry_ref * 100.0
-                        if roi_pct > -multi_entry_roi:
-                            _append_backtest_log(
-                                f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=MULTI_ROI roi={roi_pct:.2f}%"
-                            )
-                            continue
-                    add_trade = broker.add_position(
-                        sym,
-                        entry_px,
-                        bt_cfg.base_usdt,
-                        float(cur["high"]),
-                        float(cur["low"]),
-                        side=side,
-                        mode="multi",
-                    )
-                    if add_trade:
-                        line = (
-                            "ENTRY_ADD ts=%d sym=%s side=%s entry_px=%.6g avg_px=%.6g add_usdt=%.2f "
-                            "size_usdt=%.2f multi_adds=%d multi_usdt=%.2f"
-                            % (
-                                ts_ms,
-                                sym,
-                                side,
-                                float(entry_px or 0.0),
-                                float(add_trade.entry_price or 0.0),
-                                float(bt_cfg.base_usdt or 0.0),
-                                float(add_trade.size_usdt or 0.0),
-                                int(add_trade.multi_entry_adds or 0),
-                                float(add_trade.multi_entry_usdt or 0.0),
-                            )
-                        )
-                        log_fp.write(line + "\n")
-                        _append_backtest_log(line)
-                        _append_backtest_entry_log(
-                            "engine=swaggy_no_atlas mode=%s symbol=%s side=%s entry_add=%.6g avg_px=%.6g add_usdt=%.2f"
-                            % (
-                                mode_name,
-                                sym,
-                                side,
-                                float(entry_px or 0.0),
-                                float(add_trade.entry_price or 0.0),
-                                float(bt_cfg.base_usdt or 0.0),
-                            )
-                        )
-                    stats = stats_by_key.setdefault(
-                        key,
-                        {
-                            "entries": 0,
-                            "exits": 0,
-                            "trades": 0,
-                            "wins": 0,
-                            "losses": 0,
-                            "tp": 0,
-                            "sl": 0,
-                            "dca_adds": 0,
-                            "mfe_sum": 0.0,
-                            "mae_sum": 0.0,
-                            "hold_sum": 0.0,
-                        },
-                    )
-                    stats["entries"] += 1
-                    entry_syms_by_mode.setdefault(mode_name, set()).add(sym)
                     continue
 
                 dist_at_entry = _overext_dist(d5, side, sw_cfg)
@@ -814,8 +726,6 @@ def main() -> None:
             "entry_ts": trade.entry_ts,
             "dca_adds": trade.dca_adds,
             "dca_usdt": trade.dca_usdt,
-            "multi_entry_adds": trade.multi_entry_adds,
-            "multi_entry_usdt": trade.multi_entry_usdt,
             "size_usdt": trade.size_usdt,
         }
 

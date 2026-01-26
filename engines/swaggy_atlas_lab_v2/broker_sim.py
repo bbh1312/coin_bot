@@ -75,6 +75,8 @@ class BrokerSim:
         entry_index: int,
         entry_px: float,
         size_usdt: float,
+        tp_pct: Optional[float] = None,
+        sl_pct: Optional[float] = None,
         sw_strength: float = 0.0,
         sw_reasons: Optional[list[str]] = None,
         atlas_pass: Optional[bool] = None,
@@ -88,12 +90,14 @@ class BrokerSim:
         context: Optional[Dict[str, Any]] = None,
     ) -> Trade:
         side = side.upper()
+        tp_used = self.tp_pct if tp_pct is None else float(tp_pct)
+        sl_used = self.sl_pct if sl_pct is None else float(sl_pct)
         if side == "LONG":
-            sl_px = entry_px * (1 - self.sl_pct)
-            tp_px = entry_px * (1 + self.tp_pct)
+            sl_px = entry_px * (1 - sl_used)
+            tp_px = entry_px * (1 + tp_used)
         else:
-            sl_px = entry_px * (1 + self.sl_pct)
-            tp_px = entry_px * (1 - self.tp_pct)
+            sl_px = entry_px * (1 + sl_used)
+            tp_px = entry_px * (1 - tp_used)
         trade = Trade(
             sym=sym,
             side=side,
@@ -117,6 +121,9 @@ class BrokerSim:
         )
         self.positions[self._key(sym, side)] = trade
         return trade
+
+    def get_trade(self, sym: str, side: Optional[str] = None) -> Optional[Trade]:
+        return self.positions.get(self._key(sym, side)) if side or self.hedge_mode else self.positions.get(sym)
 
     def on_bar(
         self,
