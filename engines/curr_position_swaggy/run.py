@@ -267,7 +267,7 @@ def _fmt_entry_px(entry_px: object) -> str:
 
 def _build_message(entries: list[dict]) -> str:
     lines = [
-        "[손실방지엔진] 1h 진입 판단",
+        "[손실방지엔진] 15m 진입 판단",
         f"시간: {_fmt_kst_now()}",
         "----",
     ]
@@ -325,7 +325,13 @@ def main() -> None:
     tf_3m_limit = 30
     exchange.load_markets()
 
-    print("[curr-pos-swaggy] start (1h)")
+    initial_state = _load_state()
+    initial_interval = int(_state_number(initial_state, "_loss_hedge_interval_min", 15.0))
+    if initial_interval > 0:
+        cfg.interval_sec = max(60, initial_interval * 60)
+        print(f"[curr-pos-swaggy] start ({initial_interval}m)")
+    else:
+        print("[curr-pos-swaggy] start (15m)")
     while True:
         cycle_ts = _fmt_kst_now()
         state = _load_state()
