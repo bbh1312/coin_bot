@@ -19,8 +19,8 @@ import executor as executor_mod
 import engine_runner as er
 import db_reconcile as dbrecon
 
-MANAGE_WS_WRITE_STATE = os.getenv("MANAGE_WS_WRITE_STATE", "0") == "1"
-MANAGE_WS_SAVE_RUNTIME = os.getenv("MANAGE_WS_SAVE_RUNTIME", "0") == "1"
+MANAGE_WS_WRITE_STATE = os.getenv("MANAGE_WS_WRITE_STATE", "1") == "1"
+MANAGE_WS_SAVE_RUNTIME = os.getenv("MANAGE_WS_SAVE_RUNTIME", "1") == "1"
 
 _ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_BY_SYMBOL_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
@@ -1265,6 +1265,10 @@ def main():
             tickers = _get_tickers(tickers_cache)
             er._reconcile_long_trades(state, cached_long_ex, tickers)
             er._reconcile_short_trades(state, tickers)
+            try:
+                er._detect_manual_positions(state, er.send_telegram)
+            except Exception:
+                pass
             last_reconcile_ts = now_ts
         for symbol in watch_syms:
             if not isinstance(symbol, str) or "/" not in symbol:

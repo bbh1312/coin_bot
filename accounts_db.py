@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-DB_PATH = os.getenv("ACCOUNTS_DB_PATH", "logs/accounts.db")
+DB_PATH = os.getenv("ACCOUNTS_DB_PATH", "logs/trades.db")
 
 DEFAULT_SETTINGS = {
     "entry_pct": 30.0,
