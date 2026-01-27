@@ -96,7 +96,7 @@ class AtlasConfig:
     indep_risk_beta: float = 1.10
     vol_pass: float = 1.3
     vol_override: float = 1.5
-    exception_min_score: int = 3
+    exception_min_score: int = 1
     trend_norm_bull: float = 0.35
     trend_norm_bear: float = -0.35
     trend_norm_flat: float = 0.20

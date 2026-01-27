@@ -85,7 +85,15 @@ def parse_args():
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
+    parser.add_argument("--structure-lookback", type=int, default=3)
+    parser.add_argument("--structure-wait-bars", type=int, default=9)
+    parser.add_argument("--use-wick-break", choices=["on", "off"], default="off")
+    parser.add_argument("--break-margin-strong", type=float, default=0.08)
+    parser.add_argument("--break-margin-weak", type=float, default=0.02)
+    parser.add_argument("--weak-timeout-bars", type=int, default=9)
+    parser.add_argument("--weak-no-progress-mfe-atr", type=float, default=0.03)
     parser.add_argument("--overext-min", type=float, default=None)
+    parser.add_argument("--overext-min-strong", type=float, default=-2.5)
     parser.add_argument("--d1-overext-atr", type=float, default=None)
     parser.add_argument("--last-day-entry", choices=["on", "off"], default="on")
     parser.add_argument("--last-day-entry-days", type=int, default=1)
@@ -362,6 +370,118 @@ def main() -> None:
     if not dca_thresholds:
         dca_thresholds = [20.0, 30.0, 40.0]
     dca_max_adds = len(dca_thresholds)
+    structure_strong = 0
+    structure_weak = 0
+    structure_skip = 0
+
+    def _finalize_trade(trade, exit_ts: int, exit_px: float, exit_reason: str, bar_index: int) -> None:
+        trade.exit_ts = exit_ts
+        trade.exit_price = exit_px
+        trade.exit_reason = exit_reason
+        trade.bars = max(0, bar_index - trade.entry_index + 1)
+        pnl_pct = broker.calc_pnl_pct(trade)
+        pnl_usdt = pnl_pct * trade.size_usdt
+        fee = trade.size_usdt * bt_cfg.fee_rate * 2
+        trades.append(
+            {
+                "run_id": run_id,
+                "mode": mode_name,
+                "sym": trade.sym,
+                "side": trade.side,
+                "entry_ts": trade.entry_ts,
+                "entry_price": trade.entry_price,
+                "exit_ts": trade.exit_ts,
+                "exit_price": trade.exit_price,
+                "exit_reason": trade.exit_reason,
+                "pnl_usdt": pnl_usdt,
+                "pnl_pct": pnl_pct,
+                "dca_adds": trade.dca_adds,
+                "dca_usdt": trade.dca_usdt,
+                "policy_action": trade.policy_action,
+                "overext_dist_at_entry": trade.overext_dist_at_entry,
+                "overext_blocked": "Y" if trade.overext_blocked else "N",
+                "fee": fee,
+                "duration_bars": trade.bars,
+                "mfe": trade.mfe,
+                "mae": abs(trade.mae),
+                "sw_strength": trade.sw_strength,
+                "sw_reasons": trade.sw_reasons,
+                "atlas_pass": trade.atlas_pass,
+                "atlas_mult": trade.atlas_mult,
+                "atlas_reasons": trade.atlas_reasons,
+                "atlas_shadow_pass": trade.atlas_shadow_pass,
+                "atlas_shadow_reasons": trade.atlas_shadow_reasons,
+            }
+        )
+        if isinstance(trade.exit_ts, (int, float)) and trade.exit_ts >= last_day_start_ms:
+            last_day_exits_by_mode[mode_name] = last_day_exits_by_mode.get(mode_name, 0) + 1
+        log_fp.write(
+            f"EXIT ts={trade.exit_ts} sym={trade.sym} pnl_usdt={pnl_usdt:.4f} "
+            f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars} "
+            f"dca_adds={int(trade.dca_adds or 0)} dca_usdt={float(trade.dca_usdt or 0.0):.2f}\n"
+        )
+        _append_backtest_log(
+            f"EXIT ts={trade.exit_ts} sym={trade.sym} pnl_usdt={pnl_usdt:.4f} "
+            f"pnl_pct={pnl_pct:.4f} reason={trade.exit_reason} duration_bars={trade.bars} "
+            f"dca_adds={int(trade.dca_adds or 0)} dca_usdt={float(trade.dca_usdt or 0.0):.2f}"
+        )
+        stats = stats_by_key.setdefault(
+            (mode_name, trade.sym),
+            {
+                "entries": 0,
+                "exits": 0,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "tp": 0,
+                "sl": 0,
+                "loss_pnl_sum": 0.0,
+                "dca_adds": 0,
+                "mfe_sum": 0.0,
+                "mae_sum": 0.0,
+                "hold_sum": 0.0,
+            },
+        )
+        stats["trades"] += 1
+        stats["exits"] += 1
+        if pnl_pct >= 0:
+            stats["wins"] += 1
+        else:
+            stats["losses"] += 1
+        stats.setdefault("loss_pnl_sum", 0.0)
+        if trade.exit_reason == "TP":
+            stats["tp"] += 1
+        elif trade.exit_reason == "SL":
+            stats["sl"] += 1
+        if pnl_usdt < 0:
+            stats["loss_pnl_sum"] += float(pnl_usdt)
+        reason_key = (mode_name, trade.exit_reason or "UNKNOWN")
+        exit_pnl_by_reason[reason_key] = exit_pnl_by_reason.get(reason_key, 0.0) + float(pnl_usdt)
+        stats["dca_adds"] += int(trade.dca_adds or 0)
+        stats["mfe_sum"] += trade.mfe
+        stats["mae_sum"] += abs(trade.mae)
+        stats["hold_sum"] += float(trade.bars) * ltf_minutes
+        entry_dt = _fmt_kst_ms(trade.entry_ts)
+        exit_dt = _fmt_kst_ms(trade.exit_ts)
+        trade_logs.setdefault((mode_name, trade.sym), []).append(
+            {
+                "entry_ts": trade.entry_ts or 0,
+                "line": "[BACKTEST][EXIT] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s "
+                "entry_px=%.6g exit_px=%.6g reason=%s dca_adds=%d dca_usdt=%.2f"
+                % (
+                    trade.sym,
+                    mode_name,
+                    trade.side,
+                    entry_dt,
+                    exit_dt,
+                    trade.entry_price,
+                    trade.exit_price or 0.0,
+                    trade.exit_reason,
+                    int(trade.dca_adds or 0),
+                    float(trade.dca_usdt or 0.0),
+                ),
+            }
+        )
 
     ensure_dir(os.path.dirname(log_path))
     with open(log_path, "a", encoding="utf-8") as log_fp:
@@ -371,6 +491,7 @@ def main() -> None:
             f"off_windows={args.entry_windows or 'NONE'} entry_tz_offset={entry_tz_offset:.2f}"
         )
         log_fp.write(run_line + "\n")
+        print(run_line, flush=True)
         _append_backtest_log(run_line)
         engine = SwaggySignalEngine(sw_cfg)
         broker = BrokerSim(
@@ -445,12 +566,109 @@ def main() -> None:
                     overext_stats["overext_recover_count"] += 1
                 side = signal.side or ""
                 entry_px = signal.entry_px
+                if signal.entry_ok and side and entry_px is None:
+                    try:
+                        entry_px = float(cur["close"])
+                    except Exception:
+                        entry_px = None
+                    if entry_px is not None:
+                        _append_backtest_log(
+                            f"ENTRY_PX_FALLBACK ts={ts_ms} sym={sym} side={side} entry_px={entry_px}"
+                        )
+
+                entry_quality = None
+                break_margin = None
+                entry_atr = None
+                wait_ctx = sym_state.get("structure_wait")
+                if isinstance(wait_ctx, dict):
+                    wait_side = str(wait_ctx.get("side") or "").upper()
+                    if signal.entry_ok and side and side.upper() != wait_side:
+                        _append_backtest_log(
+                            f"STRUCTURE_BREAK_FAIL ts={ts_ms} sym={sym} side={wait_side} reason=REVERSE_SIGNAL"
+                        )
+                        sym_state.pop("structure_wait", None)
+                    else:
+                        cur_idx = i
+                        deadline_idx = wait_ctx.get("deadline_idx")
+                        if isinstance(deadline_idx, (int, float)) and cur_idx > int(deadline_idx):
+                            _append_backtest_log(
+                                f"STRUCTURE_BREAK_FAIL ts={ts_ms} sym={sym} side={wait_side} reason=TIMEOUT"
+                            )
+                            sym_state.pop("structure_wait", None)
+                            continue
+                        structure_level = wait_ctx.get("structure_level")
+                        entry_atr = wait_ctx.get("entry_atr")
+                        try:
+                            structure_level = float(structure_level)
+                        except Exception:
+                            structure_level = None
+                        try:
+                            entry_atr = float(entry_atr)
+                        except Exception:
+                            entry_atr = None
+                        if isinstance(structure_level, (int, float)) and isinstance(entry_atr, (int, float)) and entry_atr > 0:
+                            close_now = float(cur["close"])
+                            if wait_side == "LONG":
+                                break_margin = (close_now - float(structure_level)) / float(entry_atr)
+                            else:
+                                break_margin = (float(structure_level) - close_now) / float(entry_atr)
+                            if break_margin >= float(args.break_margin_strong):
+                                entry_quality = "STRONG"
+                                structure_strong += 1
+                            elif break_margin >= float(args.break_margin_weak):
+                                entry_quality = "WEAK"
+                                structure_weak += 1
+                        if entry_quality:
+                            _append_backtest_log(
+                                f"STRUCTURE_BREAK_PASS ts={ts_ms} sym={sym} side={wait_side} "
+                                f"quality={entry_quality} margin={break_margin:.4f}"
+                            )
+                            sym_state.pop("structure_wait", None)
+                            entry_px = float(cur["close"])
+                        else:
+                            continue
 
                 had_long = broker.has_position(sym, "LONG")
                 had_short = broker.has_position(sym, "SHORT")
+                confirm_fail = ""
+                if isinstance(signal.debug, dict):
+                    confirm_fail = str(signal.debug.get("confirm_fail") or "")
                 for pos_side in ("LONG", "SHORT"):
-                    if not broker.has_position(sym, pos_side):
+                    trade = broker.get_position(sym, pos_side)
+                    if trade is None:
                         continue
+                    ctx = trade.context or {}
+                    if ctx.get("entry_quality") == "WEAK":
+                        trade.bars = max(0, i - trade.entry_index + 1)
+                        if trade.side == "LONG":
+                            trade.mfe = max(trade.mfe, (float(cur["high"]) - trade.entry_price) / trade.entry_price)
+                            trade.mae = min(trade.mae, (float(cur["low"]) - trade.entry_price) / trade.entry_price)
+                        else:
+                            trade.mfe = max(trade.mfe, (trade.entry_price - float(cur["low"])) / trade.entry_price)
+                            trade.mae = min(trade.mae, (trade.entry_price - float(cur["high"])) / trade.entry_price)
+                        if confirm_fail:
+                            broker.positions.pop(broker._key(sym, pos_side), None)
+                            _finalize_trade(trade, ts_ms, float(cur["close"]), "WEAK_CONFIRM_FAIL", i)
+                            continue
+                        entry_atr = ctx.get("entry_atr")
+                        mfe_abs = None
+                        try:
+                            window = d5.iloc[trade.entry_index : i + 1]
+                            if trade.side == "LONG":
+                                mfe_abs = float(window["high"].max()) - float(trade.entry_price)
+                            else:
+                                mfe_abs = float(trade.entry_price) - float(window["low"].min())
+                        except Exception:
+                            mfe_abs = None
+                        if (
+                            isinstance(entry_atr, (int, float))
+                            and isinstance(mfe_abs, (int, float))
+                            and trade.bars >= int(args.weak_timeout_bars)
+                            and mfe_abs < float(entry_atr) * float(args.weak_no_progress_mfe_atr)
+                        ):
+                            broker.positions.pop(broker._key(sym, pos_side), None)
+                            _finalize_trade(trade, ts_ms, float(cur["close"]), "WEAK_NO_PROGRESS", i)
+                            continue
                     trade = broker.on_bar(
                         sym,
                         ts_ms,
@@ -481,6 +699,8 @@ def main() -> None:
                                 "pnl_pct": pnl_pct,
                                 "dca_adds": trade.dca_adds,
                                 "dca_usdt": trade.dca_usdt,
+                                "sw_ok": (trade.context or {}).get("sw_ok"),
+                                "entry_quality": (trade.context or {}).get("entry_quality"),
                                 "policy_action": trade.policy_action,
                                 "overext_dist_at_entry": trade.overext_dist_at_entry,
                                 "overext_blocked": "Y" if trade.overext_blocked else "N",
@@ -622,7 +842,8 @@ def main() -> None:
                                     dca_adds_by_key[key] = dca_adds_by_key.get(key, 0) + 1
                                     dca_usdt_by_key[key] = dca_usdt_by_key.get(key, 0.0) + float(dca_usdt)
 
-                if not signal.entry_ok or not side or entry_px is None:
+                entry_ok_effective = bool(signal.entry_ok) or bool(entry_quality)
+                if (not entry_ok_effective) or (not side) or (entry_px is None):
                     continue
                 if last_day_entry == "off" and ts_ms >= last_day_start_ms:
                     continue
@@ -640,37 +861,113 @@ def main() -> None:
                     continue
 
                 dist_at_entry = _overext_dist(d5, side, sw_cfg)
-                if isinstance(dist_at_entry, (int, float)) and dist_at_entry < float(args.overext_min):
+                overext_thresh = float(args.overext_min)
+                if entry_quality == "STRONG":
+                    try:
+                        overext_thresh = float(args.overext_min_strong)
+                    except Exception:
+                        overext_thresh = float(args.overext_min)
+                if isinstance(dist_at_entry, (int, float)) and dist_at_entry < overext_thresh:
                     _append_backtest_log(
                         f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=OVEREXT_DEEP dist={dist_at_entry:.4f}"
                     )
                     continue
 
+                if entry_quality == "STRONG" and any(
+                    reason in ("REGIME_BLOCK", "WEAK_SIGNAL") for reason in (signal.reasons or [])
+                ):
+                    _append_backtest_log(
+                        f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=STRONG_BLOCK_REASONS "
+                        f"sw_reasons={','.join(signal.reasons or [])}"
+                    )
+                    continue
+
+                if entry_quality is None:
+                    touch_count = 0
+                    try:
+                        touch_count = int(signal.debug.get("touch_count") or 0)
+                    except Exception:
+                        touch_count = 0
+                    lookback = 5 if touch_count >= 2 else 3
+                    ready_idx = i
+                    start_idx = ready_idx - lookback
+                    if start_idx < 0 or start_idx >= ready_idx:
+                        _append_backtest_log(
+                            f"STRUCTURE_SKIP ts={ts_ms} sym={sym} side={side} reason=INSUFFICIENT_BARS"
+                        )
+                        structure_skip += 1
+                        continue
+                    window = d5.iloc[start_idx:ready_idx]
+                    structure_level = None
+                    if side == "LONG":
+                        try:
+                            structure_level = float(window["high"].max())
+                        except Exception:
+                            structure_level = None
+                    elif side == "SHORT":
+                        try:
+                            structure_level = float(window["low"].min())
+                        except Exception:
+                            structure_level = None
+                    try:
+                        entry_atr = float(atr(d5, 14))
+                    except Exception:
+                        entry_atr = None
+                    if not isinstance(entry_atr, (int, float)) or entry_atr <= 0:
+                        _append_backtest_log(
+                            f"STRUCTURE_SKIP ts={ts_ms} sym={sym} side={side} reason=BAD_ATR"
+                        )
+                        structure_skip += 1
+                        continue
+                    deadline_idx = ready_idx + int(args.structure_wait_bars)
+                    sym_state["structure_wait"] = {
+                        "side": side,
+                        "ready_idx": ready_idx,
+                        "deadline_idx": deadline_idx,
+                        "structure_level": structure_level,
+                        "entry_atr": entry_atr,
+                    }
+                    _append_backtest_log(
+                        f"STRUCTURE_WAIT_START ts={ts_ms} sym={sym} side={side} level={structure_level} "
+                        f"atr={entry_atr} deadline_idx={deadline_idx} lookback={lookback}"
+                    )
+                    continue
+
+                if entry_px is None:
+                    _append_backtest_log(
+                        f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=ENTRY_PX_NONE"
+                    )
+                    continue
                 d1_dist = _d1_dist_atr(d1d, float(entry_px), sw_cfg) if isinstance(entry_px, (int, float)) else None
                 entry_line = (
                     "ENTRY ts=%d sym=%s side=%s mode=%s sw_ok=%s sw_strength=%.3f sw_reasons=%s "
-                    "base_usdt=%.2f final_usdt=%.2f policy_action=%s d1_dist_atr=%s"
+                    "base_usdt=%.2f final_usdt=%.2f policy_action=%s d1_dist_atr=%s "
+                    "entry_quality=%s break_margin=%s"
                     % (
                         ts_ms,
                         sym,
                         side,
                         mode_name,
                         "Y" if signal.entry_ok else "N",
-                        signal.strength,
+                        float(signal.strength or 0.0),
                         signal.reasons,
                         bt_cfg.base_usdt,
                         bt_cfg.base_usdt,
                         "NO_ATLAS",
                         "N/A" if d1_dist is None else f"{d1_dist:.4f}",
+                        entry_quality or "NA",
+                        "N/A" if break_margin is None else f"{break_margin:.4f}",
                     )
                 )
                 log_fp.write(entry_line + "\n")
                 _append_backtest_log(entry_line)
+                entry_sw_ok = "Y" if signal.entry_ok else "N"
                 overext_blocked = bool(sym_state.get("overext_blocked"))
                 sym_state["overext_blocked"] = False
                 _append_backtest_entry_log(
                     "engine=swaggy_no_atlas mode=%s symbol=%s side=%s entry=%.6g "
-                    "final_usdt=%.2f sw_strength=%.3f sw_reasons=%s policy_action=%s d1_dist_atr=%s"
+                    "final_usdt=%.2f sw_strength=%.3f sw_reasons=%s policy_action=%s d1_dist_atr=%s "
+                    "entry_quality=%s break_margin=%s"
                     % (
                         mode_name,
                         sym,
@@ -681,6 +978,8 @@ def main() -> None:
                         ",".join(signal.reasons or []),
                         "NO_ATLAS",
                         "N/A" if d1_dist is None else f"{d1_dist:.4f}",
+                        entry_quality or "NA",
+                        "N/A" if break_margin is None else f"{break_margin:.4f}",
                     )
                 )
                 broker.enter(
@@ -695,6 +994,12 @@ def main() -> None:
                     policy_action="NO_ATLAS",
                     overext_dist_at_entry=dist_at_entry,
                     overext_blocked=overext_blocked,
+                    context={
+                        "entry_quality": entry_quality,
+                        "entry_atr": entry_atr,
+                        "break_margin": break_margin,
+                        "sw_ok": entry_sw_ok,
+                    },
                 )
                 entry_syms_by_mode.setdefault(mode_name, set()).add(sym)
                 stats = stats_by_key.setdefault(
@@ -731,6 +1036,33 @@ def main() -> None:
 
     write_trades_csv(trades_path, trades)
     summary = build_summary(run_id, trades)
+    summary["structure_strong"] = structure_strong
+    summary["structure_weak"] = structure_weak
+    summary["structure_skip"] = structure_skip
+    summary["strong_sw_ok"] = 0
+    summary["strong_sw_no"] = 0
+    for rec in trades:
+        if rec.get("mode") != mode_name:
+            continue
+        if rec.get("policy_action") != "NO_ATLAS":
+            continue
+        eq = (rec.get("entry_quality") or "").upper()
+        if eq != "STRONG":
+            continue
+        sw_ok = str(rec.get("sw_ok") or "").upper()
+        if sw_ok == "Y":
+            summary["strong_sw_ok"] += 1
+        elif sw_ok == "N":
+            summary["strong_sw_no"] += 1
+    total_quality = structure_strong + structure_weak + structure_skip
+    strong_rate = (structure_strong / total_quality) if total_quality else 0.0
+    weak_rate = (structure_weak / total_quality) if total_quality else 0.0
+    structure_line = (
+        "STRUCTURE_STATS strong=%d weak=%d skip=%d strong_rate=%.4f weak_rate=%.4f"
+        % (structure_strong, structure_weak, structure_skip, strong_rate, weak_rate)
+    )
+    _append_backtest_log(structure_line)
+    print(structure_line, flush=True)
     open_stats_by_mode: Dict[str, Dict[str, float]] = {}
     for key_tuple, rec in open_trades.items():
         mode = key_tuple[0]
@@ -830,7 +1162,8 @@ def main() -> None:
                     avg_hold,
                     int(stats.get("dca_adds") or dca_adds_by_key.get((mode, sym), 0)),
                     float(dca_usdt_by_key.get((mode, sym), 0.0)),
-                )
+                ),
+                flush=True,
             )
             entries_list = list(trade_logs.get((mode, sym), []))
             open_trade_items = [
@@ -877,7 +1210,7 @@ def main() -> None:
                 )
             entries_list.sort(key=lambda item: item.get("entry_ts") or 0, reverse=True)
             for entry in entries_list:
-                print(entry.get("line", ""))
+                print(entry.get("line", ""), flush=True)
             mode_total = total_by_mode.setdefault(
                 mode,
                 {
@@ -1072,20 +1405,20 @@ def main() -> None:
             total_blocks = 0
             for (mode, sym), count in sorted(d1_block_by_key.items()):
                 line = f"[BACKTEST] {sym}@{mode} block=D1_EMA7_DIST count={count}"
-                print(line)
+                print(line, flush=True)
                 _append_backtest_log(line)
                 by_mode[mode] = by_mode.get(mode, 0) + count
                 total_blocks += count
             for mode, count in sorted(by_mode.items()):
                 line = f"[BACKTEST] TOTAL@{mode} block=D1_EMA7_DIST count={count}"
-                print(line)
+                print(line, flush=True)
                 _append_backtest_log(line)
             line = f"[BACKTEST] TOTAL block=D1_EMA7_DIST count={total_blocks}"
-            print(line)
+            print(line, flush=True)
             _append_backtest_log(line)
     if stats_by_key:
         for line in total_lines:
-            print(line)
+            print(line, flush=True)
         # KST time buckets (entries based on entry_ts)
         hour_stats: Dict[int, Dict[str, int]] = {h: {"entries": 0, "tp": 0, "sl": 0} for h in range(24)}
         dow_stats: Dict[int, Dict[str, int]] = {d: {"entries": 0, "tp": 0, "sl": 0} for d in range(7)}
@@ -1107,7 +1440,7 @@ def main() -> None:
                 dow_stats[dow]["sl"] += 1
 
         header = "[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate"
-        print(header)
+        print(header, flush=True)
         _append_backtest_log(header)
         for h in range(24):
             e = hour_stats[h]["entries"]
@@ -1115,12 +1448,12 @@ def main() -> None:
             sl = hour_stats[h]["sl"]
             sl_rate = (sl / e * 100.0) if e else 0.0
             line = f"[BACKTEST] HOUR {h:02d} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
-            print(line)
+            print(line, flush=True)
             _append_backtest_log(line)
 
         dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         header = "[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate"
-        print(header)
+        print(header, flush=True)
         _append_backtest_log(header)
         for d in range(7):
             e = dow_stats[d]["entries"]
@@ -1128,8 +1461,12 @@ def main() -> None:
             sl = dow_stats[d]["sl"]
             sl_rate = (sl / e * 100.0) if e else 0.0
             line = f"[BACKTEST] DOW {dow_labels[d]} entries={e} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
-            print(line)
+            print(line, flush=True)
             _append_backtest_log(line)
+    else:
+        line = "[BACKTEST] no trades/entries"
+        print(line, flush=True)
+        _append_backtest_log(line)
 
 
 if __name__ == "__main__":

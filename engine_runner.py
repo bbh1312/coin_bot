@@ -210,6 +210,8 @@ ENGINE_WRITE_STATE = os.getenv("ENGINE_WRITE_STATE", "1") == "1"
 LOG_LONG_EXIT = os.getenv("LOG_LONG_EXIT", "0") == "1"
 LIVE_TRADING = True
 LONG_LIVE_TRADING = True
+ACCOUNT_REFRESH_SEC = float(os.getenv("ACCOUNT_REFRESH_SEC", "60"))
+_LAST_ACCOUNT_REFRESH_TS = 0.0
 
 ADMIN_ACCOUNT_CONTEXT: Optional[AccountContext] = None
 FOLLOWER_CONTEXTS: List[AccountContext] = []
@@ -220,6 +222,16 @@ BROADCAST_RETRY_MAX = int(os.getenv("BROADCAST_RETRY_MAX", "2"))
 BROADCAST_RETRY_BASE_SEC = float(os.getenv("BROADCAST_RETRY_BASE_SEC", "0.7"))
 BROADCAST_RETRY_BACKOFF = float(os.getenv("BROADCAST_RETRY_BACKOFF", "1.7"))
 BROADCAST_NOTIFY = os.getenv("BROADCAST_NOTIFY", "1") == "1"
+BROADCAST_NOTIFY_ACTIONS = os.getenv(
+    "BROADCAST_NOTIFY_ACTIONS",
+    "long_market,short_market,close_long_market,close_short_market",
+)
+
+def _parse_action_allowlist(val: str) -> set:
+    if not isinstance(val, str):
+        return set()
+    items = [s.strip() for s in val.split(",") if s.strip()]
+    return set(items)
 
 def _infer_symbol_from_args(args, kwargs) -> Optional[str]:
     if "symbol" in kwargs:
@@ -353,6 +365,9 @@ def _refresh_admin_settings_from_db(state: Optional[dict] = None) -> None:
 
 def _send_broadcast_summary(action_name: str, meta: dict, results: list) -> None:
     if not BROADCAST_NOTIFY:
+        return
+    allowlist = _parse_action_allowlist(BROADCAST_NOTIFY_ACTIONS)
+    if allowlist and action_name not in allowlist:
         return
     try:
         symbol = meta.get("symbol") or ""
@@ -685,7 +700,15 @@ SWAGGY_ATLAS_LAB_ENABLED = False
 SWAGGY_ATLAS_LAB_V2_ENABLED = False
 SWAGGY_NO_ATLAS_ENABLED = False
 SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = -0.7
+SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG = float(os.getenv("SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG", "-2.5"))
 SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = True
+SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK = int(os.getenv("SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK", "3"))
+SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS = int(os.getenv("SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS", "9"))
+SWAGGY_NO_ATLAS_USE_WICK_BREAK = str(os.getenv("SWAGGY_NO_ATLAS_USE_WICK_BREAK", "false")).strip().lower() in ("1", "true", "yes", "on")
+SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG = float(os.getenv("SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG", "0.08"))
+SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK = float(os.getenv("SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK", "0.02"))
+SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS = int(os.getenv("SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS", "9"))
+SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR = float(os.getenv("SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR", "0.03"))
 SWAGGY_NO_ATLAS_DEBUG_SYMBOLS = os.getenv("SWAGGY_NO_ATLAS_DEBUG_SYMBOLS", "").strip()
 LOSS_HEDGE_ENGINE_ENABLED = False
 LOSS_HEDGE_INTERVAL_MIN = 15
@@ -2612,51 +2635,32 @@ def _run_swaggy_no_atlas_cycle(
                 payload.update(event)
                 _append_swaggy_trade_json(payload)
 
-        if not signal.entry_ok or not signal.side or signal.entry_px is None:
-            if symbol in debug_syms or _symbol_in_pos_any(st):
-                phase_info = None
-                if isinstance(swaggy_no_atlas_engine, object):
-                    try:
-                        phase_info = (swaggy_no_atlas_engine._state or {}).get(symbol)
-                    except Exception:
-                        phase_info = None
-                cooldown_until = None
-                last_signal_ts = None
-                if isinstance(phase_info, dict):
-                    cooldown_until = phase_info.get("cooldown_until")
-                    last_signal_ts = phase_info.get("last_signal_ts")
-                cooldown_until_fmt = None
-                last_signal_fmt = None
-                try:
-                    if isinstance(cooldown_until, (int, float)):
-                        cooldown_until_fmt = _iso_kst(float(cooldown_until))
-                except Exception:
-                    cooldown_until_fmt = None
-                try:
-                    if isinstance(last_signal_ts, (int, float)):
-                        last_signal_fmt = _iso_kst(float(last_signal_ts))
-                except Exception:
-                    last_signal_fmt = None
-                _append_swaggy_no_atlas_log(
-                    "SWAGGY_NO_ATLAS_SKIP sym=%s reason=ENTRY_NOT_READY entry_ok=%s side=%s entry_px=%s "
-                    "phase=%s reasons=%s confirm_pass=%s confirm_fail=%s cooldown_until=%s last_signal=%s"
-                    % (
-                        symbol,
-                        int(bool(signal.entry_ok)),
-                        signal.side,
-                        _fmt(debug.get("entry_px") or signal.entry_px),
-                        new_phase or prev_phase,
-                        ",".join(signal.reasons or []),
-                        _fmt(debug.get("confirm_pass")),
-                        _fmt(debug.get("confirm_fail")),
-                        cooldown_until_fmt or "N/A",
-                        last_signal_fmt or "N/A",
-                    )
-                )
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-        side = signal.side.upper()
+        struct_ctx = None
+        entry_from_structure = False
+
         entry_px = signal.entry_px
+        if signal.entry_ok and signal.side and entry_px is None:
+            try:
+                entry_px = float(df_5m.iloc[-1]["close"])
+            except Exception:
+                entry_px = None
+            if entry_px is not None:
+                _append_swaggy_no_atlas_log(
+                    "SWAGGY_NO_ATLAS_ENTRY_PX_FALLBACK sym=%s side=%s entry_px=%s"
+                    % (symbol, signal.side, _fmt(entry_px))
+                )
+        if entry_from_structure:
+            side = str(struct_ctx.get("side") or "").upper() if struct_ctx else ""
+            last = df_5m.iloc[-1]
+            entry_px = float(last["close"])
+            struct_debug = struct_ctx.get("debug") if isinstance(struct_ctx, dict) else None
+            if isinstance(struct_debug, dict):
+                debug = struct_debug
+        else:
+            side = signal.side.upper()
+            # entry_px fallback already applied above
+            if entry_px is None:
+                entry_px = signal.entry_px
         if symbol in debug_syms or _symbol_in_pos_any(st):
             try:
                 live_amt_dbg = (
@@ -2687,6 +2691,9 @@ def _run_swaggy_no_atlas_cycle(
                     in_pos_same = True
             except Exception:
                 pass
+        if not in_pos_same and isinstance(st.get("_no_atlas_weak"), dict):
+            st.pop("_no_atlas_weak", None)
+            state[symbol] = st
         live_amt_same = None
         if not in_pos_same:
             try:
@@ -2715,24 +2722,77 @@ def _run_swaggy_no_atlas_cycle(
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
         if in_pos_same:
+            weak_ctx = st.get("_no_atlas_weak")
+            if isinstance(weak_ctx, dict) and str(weak_ctx.get("side") or "").upper() == side:
+                confirm_fail = ""
+                try:
+                    confirm_fail = str(debug.get("confirm_fail") or "")
+                except Exception:
+                    confirm_fail = ""
+                if confirm_fail:
+                    _append_swaggy_no_atlas_log(
+                        "SWAGGY_NO_ATLAS_WEAK_EXIT sym=%s side=%s reason=CONFIRM_FAIL confirm_fail=%s"
+                        % (symbol, side, confirm_fail)
+                    )
+                    if side == "LONG":
+                        close_long_market(symbol)
+                    else:
+                        close_short_market(symbol)
+                    _set_last_exit_state(st, side, now_ts, "weak_confirm_fail")
+                    st.pop("_no_atlas_weak", None)
+                    state[symbol] = st
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                entry_idx = weak_ctx.get("entry_idx")
+                entry_px = weak_ctx.get("entry_px")
+                entry_atr = weak_ctx.get("entry_atr")
+                cur_idx = len(df_5m) - 1
+                bars_elapsed = None
+                try:
+                    bars_elapsed = int(cur_idx) - int(entry_idx) + 1
+                except Exception:
+                    bars_elapsed = None
+                mfe_abs = None
+                if isinstance(entry_idx, int) and isinstance(entry_px, (int, float)):
+                    try:
+                        window = df_5m.iloc[int(entry_idx) : int(cur_idx) + 1]
+                        if side == "LONG":
+                            mfe_abs = float(window["high"].max()) - float(entry_px)
+                        else:
+                            mfe_abs = float(entry_px) - float(window["low"].min())
+                    except Exception:
+                        mfe_abs = None
+                if (
+                    isinstance(bars_elapsed, int)
+                    and bars_elapsed >= int(SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS)
+                    and isinstance(entry_atr, (int, float))
+                    and isinstance(mfe_abs, (int, float))
+                    and mfe_abs < float(entry_atr) * float(SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR)
+                ):
+                    _append_swaggy_no_atlas_log(
+                        "SWAGGY_NO_ATLAS_WEAK_EXIT sym=%s side=%s reason=NO_PROGRESS bars=%s mfe_abs=%s entry_atr=%s"
+                        % (
+                            symbol,
+                            side,
+                            _fmt(bars_elapsed),
+                            _fmt(mfe_abs),
+                            _fmt(entry_atr),
+                        )
+                    )
+                    if side == "LONG":
+                        close_long_market(symbol)
+                    else:
+                        close_short_market(symbol)
+                    _set_last_exit_state(st, side, now_ts, "weak_no_progress")
+                    st.pop("_no_atlas_weak", None)
+                    state[symbol] = st
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
             _append_swaggy_no_atlas_log(
                 f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=IN_POS side={side}"
             )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-        overext_signed = _swaggy_no_atlas_overext_dist(df_5m, side, swaggy_cfg)
-        if (
-            SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
-            and isinstance(overext_signed, (int, float))
-            and overext_signed < SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
-        ):
-            _append_swaggy_no_atlas_log(
-                f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=SKIP_OVEREXT_DEEP overext={overext_signed:.4g}"
-            )
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-
         if swaggy_cfg:
             overext_val = debug.get("overext_dist_at_entry")
             if isinstance(overext_val, (int, float)):
@@ -2748,16 +2808,207 @@ def _run_swaggy_no_atlas_cycle(
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
 
+        break_margin = None
         entry_quality = "NA"
+        wait_ctx = st.get("_no_atlas_structure_wait")
+        if isinstance(wait_ctx, dict):
+            wait_side = str(wait_ctx.get("side") or "").upper()
+            if signal.entry_ok and signal.side and signal.side.upper() != wait_side:
+                _append_swaggy_no_atlas_log(
+                    "STRUCTURE_BREAK_FAIL sym=%s side=%s reason=REVERSE_SIGNAL"
+                    % (symbol, wait_side)
+                )
+                st.pop("_no_atlas_structure_wait", None)
+                state[symbol] = st
+            else:
+                cur_idx = len(df_5m) - 1
+                deadline_idx = wait_ctx.get("deadline_idx")
+                if isinstance(deadline_idx, (int, float)) and cur_idx > int(deadline_idx):
+                    _append_swaggy_no_atlas_log(
+                        "STRUCTURE_BREAK_FAIL sym=%s side=%s reason=TIMEOUT"
+                        % (symbol, wait_side)
+                    )
+                    st.pop("_no_atlas_structure_wait", None)
+                    state[symbol] = st
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+                structure_level = wait_ctx.get("structure_level")
+                entry_atr = wait_ctx.get("entry_atr")
+                try:
+                    structure_level = float(structure_level)
+                except Exception:
+                    structure_level = None
+                try:
+                    entry_atr = float(entry_atr)
+                except Exception:
+                    entry_atr = None
+                if isinstance(structure_level, (int, float)) and isinstance(entry_atr, (int, float)) and entry_atr > 0:
+                    close_now = float(df_5m.iloc[-1]["close"])
+                    if wait_side == "LONG":
+                        break_margin = (close_now - float(structure_level)) / float(entry_atr)
+                    else:
+                        break_margin = (float(structure_level) - close_now) / float(entry_atr)
+                    if break_margin >= float(SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG):
+                        entry_quality = "STRONG"
+                    elif break_margin >= float(SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK):
+                        entry_quality = "WEAK"
+                if entry_quality != "NA":
+                    _append_swaggy_no_atlas_log(
+                        "STRUCTURE_BREAK_PASS sym=%s side=%s quality=%s margin=%.4f"
+                        % (symbol, wait_side, entry_quality, float(break_margin or 0.0))
+                    )
+                    st.pop("_no_atlas_structure_wait", None)
+                    state[symbol] = st
+                    entry_px = close_now
+                else:
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+        if signal.entry_ok and side and isinstance(entry_px, (int, float)) and entry_quality == "NA":
+            touch_count = 0
+            try:
+                touch_count = int(debug.get("touch_count") or 0)
+            except Exception:
+                touch_count = 0
+            lookback = 5 if touch_count >= 2 else 3
+            ready_idx = len(df_5m) - 1
+            start_idx = ready_idx - lookback
+            if start_idx < 0 or start_idx >= ready_idx:
+                _append_swaggy_no_atlas_log(
+                    "STRUCTURE_SKIP sym=%s side=%s reason=INSUFFICIENT_BARS" % (symbol, side)
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            window = df_5m.iloc[start_idx:ready_idx]
+            structure_level = None
+            if side == "LONG":
+                try:
+                    structure_level = float(window["high"].max())
+                except Exception:
+                    structure_level = None
+            elif side == "SHORT":
+                try:
+                    structure_level = float(window["low"].min())
+                except Exception:
+                    structure_level = None
+            try:
+                cur_atr = float(atr(df_5m, 14))
+            except Exception:
+                cur_atr = None
+            if not isinstance(cur_atr, (int, float)) or cur_atr <= 0:
+                _append_swaggy_no_atlas_log(
+                    "STRUCTURE_SKIP sym=%s side=%s reason=BAD_ATR" % (symbol, side)
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            last = df_5m.iloc[-1]
+            close_now = float(last["close"])
+            if isinstance(structure_level, (int, float)):
+                if side == "LONG":
+                    break_margin = (close_now - float(structure_level)) / float(cur_atr)
+                else:
+                    break_margin = (float(structure_level) - close_now) / float(cur_atr)
+            if not isinstance(break_margin, (int, float)):
+                _append_swaggy_no_atlas_log(
+                    "STRUCTURE_SKIP sym=%s side=%s reason=BAD_MARGIN" % (symbol, side)
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            deadline_idx = ready_idx + int(SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS)
+            st["_no_atlas_structure_wait"] = {
+                "side": side,
+                "ready_idx": ready_idx,
+                "deadline_idx": deadline_idx,
+                "structure_level": structure_level,
+                "entry_atr": cur_atr,
+            }
+            state[symbol] = st
+            _append_swaggy_no_atlas_log(
+                "STRUCTURE_WAIT_START sym=%s side=%s level=%s atr=%s deadline_idx=%s lookback=%d"
+                % (symbol, side, _fmt(structure_level), _fmt(cur_atr), _fmt(deadline_idx), int(lookback))
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        overext_signed = _swaggy_no_atlas_overext_dist(df_5m, side, swaggy_cfg)
+        if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED and isinstance(overext_signed, (int, float)):
+            overext_thresh = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+            if entry_quality == "STRONG":
+                overext_thresh = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG
+            if overext_signed < overext_thresh:
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=SKIP_OVEREXT_DEEP overext={overext_signed:.4g}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+        if entry_quality == "STRONG" and any(
+            reason in ("REGIME_BLOCK", "WEAK_SIGNAL") for reason in (signal.reasons or [])
+        ):
+            _append_swaggy_no_atlas_log(
+                "SWAGGY_NO_ATLAS_SKIP sym=%s reason=STRONG_BLOCK_REASONS sw_reasons=%s"
+                % (symbol, ",".join(signal.reasons or []))
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        entry_ok_effective = bool(signal.entry_ok) or entry_quality != "NA"
+        if not entry_ok_effective or not signal.side or entry_px is None:
+            if symbol in debug_syms or _symbol_in_pos_any(st):
+                phase_info = None
+                if isinstance(swaggy_no_atlas_engine, object):
+                    try:
+                        phase_info = (swaggy_no_atlas_engine._state or {}).get(symbol)
+                    except Exception:
+                        phase_info = None
+                cooldown_until = None
+                last_signal_ts = None
+                if isinstance(phase_info, dict):
+                    cooldown_until = phase_info.get("cooldown_until")
+                    last_signal_ts = phase_info.get("last_signal_ts")
+                cooldown_until_fmt = None
+                last_signal_fmt = None
+                try:
+                    if isinstance(cooldown_until, (int, float)):
+                        cooldown_until_fmt = _iso_kst(float(cooldown_until))
+                except Exception:
+                    cooldown_until_fmt = None
+                try:
+                    if isinstance(last_signal_ts, (int, float)):
+                        last_signal_fmt = _iso_kst(float(last_signal_ts))
+                except Exception:
+                    last_signal_fmt = None
+                _append_swaggy_no_atlas_log(
+                    "SWAGGY_NO_ATLAS_SKIP sym=%s reason=ENTRY_NOT_READY entry_ok=%s side=%s entry_px=%s "
+                    "phase=%s reasons=%s confirm_pass=%s confirm_fail=%s cooldown_until=%s last_signal=%s"
+                    % (
+                        symbol,
+                        int(bool(entry_ok_effective)),
+                        signal.side,
+                        _fmt(debug.get("entry_px") or entry_px),
+                        new_phase or prev_phase,
+                        ",".join(signal.reasons or []),
+                        _fmt(debug.get("confirm_pass")),
+                        _fmt(debug.get("confirm_fail")),
+                        cooldown_until_fmt or "N/A",
+                        last_signal_fmt or "N/A",
+                    )
+                )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
         entry_quality_reasons = ["NO_ATLAS"]
         entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE)
-        strength_val = float(signal.strength or 0.0)
-        reasons_val = signal.reasons
+        if entry_from_structure and isinstance(struct_ctx, dict):
+            strength_val = float(struct_ctx.get("strength") or 0.0)
+            reasons_val = struct_ctx.get("reasons")
+        else:
+            strength_val = float(signal.strength or 0.0)
+            reasons_val = signal.reasons
         entry_line = (
             "SWAGGY_NO_ATLAS_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
             "final_usdt=%.2f "
             "level_score=%s touch_count=%s level_age=%s trigger_combo=%s confirm_pass=%s confirm_fail=%s "
-            "overext_dist_at_touch=%s overext_dist_at_entry=%s entry_quality=%s"
+            "overext_dist_at_touch=%s overext_dist_at_entry=%s entry_quality=%s break_margin=%s"
             % (
                 symbol,
                 side,
@@ -2773,9 +3024,29 @@ def _run_swaggy_no_atlas_cycle(
                 _fmt(debug.get("overext_dist_at_touch")),
                 _fmt(debug.get("overext_dist_at_entry")),
                 _fmt(entry_quality),
+                _fmt(break_margin),
             )
         )
         _append_swaggy_no_atlas_log(entry_line)
+        if entry_quality == "WEAK":
+            try:
+                ready_idx = len(df_5m) - 1
+            except Exception:
+                ready_idx = None
+            entry_atr = None
+            try:
+                entry_atr = float(atr(df_5m, 14))
+            except Exception:
+                entry_atr = None
+            st["_no_atlas_weak"] = {
+                "side": side,
+                "entry_ts": now_ts,
+                "entry_idx": ready_idx,
+                "entry_px": entry_px,
+                "entry_atr": entry_atr,
+                "break_margin": break_margin,
+            }
+            state[symbol] = st
         body_ratio = None
         confirm_metrics = debug.get("confirm_metrics")
         if isinstance(confirm_metrics, dict):
@@ -7536,6 +7807,11 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED
     global SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
     global SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT
+    global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS
+    global SWAGGY_NO_ATLAS_USE_WICK_BREAK
+    global SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG, SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
+    global SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS, SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR
+    global SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
@@ -7572,8 +7848,16 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_swaggy_atlas_lab_v2_off_windows",
         "_swaggy_no_atlas_off_windows",
         "_swaggy_no_atlas_overext_min",
+        "_swaggy_no_atlas_overext_min_strong",
         "_swaggy_no_atlas_overext_min_enabled",
         "_swaggy_d1_overext_atr_mult",
+        "_swaggy_no_atlas_structure_lookback",
+        "_swaggy_no_atlas_structure_wait_bars",
+        "_swaggy_no_atlas_use_wick_break",
+        "_swaggy_no_atlas_break_margin_strong",
+        "_swaggy_no_atlas_break_margin_weak",
+        "_swaggy_no_atlas_weak_timeout_bars",
+        "_swaggy_no_atlas_weak_no_progress_mfe_atr",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
         "_rsi_enabled",
@@ -7599,10 +7883,28 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         state["_swaggy_no_atlas_enabled"] = False
     if isinstance(state.get("_swaggy_no_atlas_overext_min"), dict):
         state["_swaggy_no_atlas_overext_min"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+    if isinstance(state.get("_swaggy_no_atlas_overext_min_strong"), dict):
+        state["_swaggy_no_atlas_overext_min_strong"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG
     if isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), dict):
         state["_swaggy_no_atlas_overext_min_enabled"] = SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
     if isinstance(state.get("_swaggy_d1_overext_atr_mult"), dict):
         state["_swaggy_d1_overext_atr_mult"] = SWAGGY_D1_OVEREXT_ATR_MULT
+    if isinstance(state.get("_swaggy_no_atlas_structure_lookback"), dict):
+        state["_swaggy_no_atlas_structure_lookback"] = SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK
+    if isinstance(state.get("_swaggy_no_atlas_structure_wait_bars"), dict):
+        state["_swaggy_no_atlas_structure_wait_bars"] = SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS
+    if isinstance(state.get("_swaggy_no_atlas_use_wick_break"), dict):
+        state["_swaggy_no_atlas_use_wick_break"] = SWAGGY_NO_ATLAS_USE_WICK_BREAK
+    if isinstance(state.get("_swaggy_no_atlas_break_margin_strong"), dict):
+        state["_swaggy_no_atlas_break_margin_strong"] = SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG
+    if isinstance(state.get("_swaggy_no_atlas_break_margin_weak"), dict):
+        state["_swaggy_no_atlas_break_margin_weak"] = SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
+    if isinstance(state.get("_swaggy_no_atlas_weak_timeout_bars"), dict):
+        state["_swaggy_no_atlas_weak_timeout_bars"] = SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS
+    if isinstance(state.get("_swaggy_no_atlas_weak_no_progress_mfe_atr"), dict):
+        state["_swaggy_no_atlas_weak_no_progress_mfe_atr"] = SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR
+    if isinstance(state.get("_swaggy_no_atlas_structure_min_strength"), dict):
+        state["_swaggy_no_atlas_structure_min_strength"] = SWAGGY_NO_ATLAS_STRUCTURE_MIN_STRENGTH
     if (not skip_keys or "_auto_exit" not in skip_keys) and isinstance(state.get("_auto_exit"), bool):
         AUTO_EXIT_ENABLED = bool(state.get("_auto_exit"))
     if (not skip_keys or "_auto_exit_long_tp_pct" not in skip_keys) and isinstance(state.get("_auto_exit_long_tp_pct"), (int, float)):
@@ -7647,10 +7949,44 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         SWAGGY_NO_ATLAS_OFF_WINDOWS = str(state.get("_swaggy_no_atlas_off_windows") or "")
     if (not skip_keys or "_swaggy_no_atlas_overext_min" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_overext_min"), (int, float)):
         SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(state.get("_swaggy_no_atlas_overext_min"))
+    if (not skip_keys or "_swaggy_no_atlas_overext_min_strong" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_overext_min_strong"), (int, float)):
+        SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG = float(state.get("_swaggy_no_atlas_overext_min_strong"))
     if (not skip_keys or "_swaggy_no_atlas_overext_min_enabled" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), bool):
         SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = bool(state.get("_swaggy_no_atlas_overext_min_enabled"))
     if (not skip_keys or "_swaggy_d1_overext_atr_mult" not in skip_keys) and isinstance(state.get("_swaggy_d1_overext_atr_mult"), (int, float)):
         SWAGGY_D1_OVEREXT_ATR_MULT = float(state.get("_swaggy_d1_overext_atr_mult"))
+    if (not skip_keys or "_swaggy_no_atlas_structure_lookback" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_structure_lookback"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK = max(1, int(state.get("_swaggy_no_atlas_structure_lookback")))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_structure_wait_bars" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_structure_wait_bars"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS = max(1, int(state.get("_swaggy_no_atlas_structure_wait_bars")))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_use_wick_break" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_use_wick_break"), bool):
+        SWAGGY_NO_ATLAS_USE_WICK_BREAK = bool(state.get("_swaggy_no_atlas_use_wick_break"))
+    if (not skip_keys or "_swaggy_no_atlas_break_margin_strong" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_break_margin_strong"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG = float(state.get("_swaggy_no_atlas_break_margin_strong"))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_break_margin_weak" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_break_margin_weak"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK = float(state.get("_swaggy_no_atlas_break_margin_weak"))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_weak_timeout_bars" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_weak_timeout_bars"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS = max(1, int(state.get("_swaggy_no_atlas_weak_timeout_bars")))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_weak_no_progress_mfe_atr" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_weak_no_progress_mfe_atr"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR = float(state.get("_swaggy_no_atlas_weak_no_progress_mfe_atr"))
+        except Exception:
+            pass
     if (not skip_keys or "_rsi_enabled" not in skip_keys) and isinstance(state.get("_rsi_enabled"), bool):
         RSI_ENABLED = bool(state.get("_rsi_enabled"))
     if (not skip_keys or "_dca_enabled" not in skip_keys) and isinstance(state.get("_dca_enabled"), bool):
@@ -8267,6 +8603,10 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
         return
+    # manage_ws 프로세스에서 contexts가 비어있는 경우가 있어 주기적으로 리프레시
+    _maybe_refresh_accounts(reason="telegram_periodic")
+    if not ACCOUNT_CONTEXTS:
+        _reload_account_contexts(reason="telegram_boot")
     last_update_id = _coerce_state_int(state.get("_tg_offset", 0))
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     params = {
@@ -8714,6 +9054,24 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] admin_follow cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+
+                if cmd in ("/reload_accounts", "reload_accounts") and not responded:
+                    info = _reload_account_contexts(reason="telegram")
+                    if info.get("ok"):
+                        resp = f"✅ accounts reloaded\n{info.get('summary')}"
+                    else:
+                        resp = f"⛔ accounts reload failed\n{info.get('summary')}"
+                    ok = _reply(resp)
+                    print(f"[telegram] reload_accounts cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
+
+                if cmd in ("/accounts", "accounts") and not responded:
+                    db_path = getattr(accounts_db, "DB_PATH", "unknown")
+                    summary = _format_account_summary(ACCOUNT_CONTEXTS, ADMIN_ACCOUNT_CONTEXT)
+                    resp = f"ℹ️ accounts\n{summary}\ndb={db_path}"
+                    ok = _reply(resp)
+                    print(f"[telegram] accounts cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
 
                 if cmd in ("/live", "live"):
                     parts = lower.split()
@@ -9873,6 +10231,84 @@ def _build_account_contexts() -> List[AccountContext]:
     return contexts
 
 
+def _pick_admin_context(
+    contexts: List[AccountContext],
+    prev_admin_name: Optional[str] = None,
+) -> Optional[AccountContext]:
+    if not contexts:
+        return None
+    for ctx in contexts:
+        if str(ctx.name) == "admin":
+            return ctx
+    if prev_admin_name:
+        for ctx in contexts:
+            if str(ctx.name) == str(prev_admin_name):
+                return ctx
+    return contexts[0]
+
+
+def _format_account_summary(contexts: List[AccountContext], admin_ctx: Optional[AccountContext]) -> str:
+    names = [str(c.name) for c in contexts]
+    admin_name = admin_ctx.name if admin_ctx else "none"
+    follower_names = [str(c.name) for c in contexts if c is not admin_ctx] if contexts else []
+    base = f"active={len(contexts)} admin={admin_name} followers={len(follower_names)}"
+    if names:
+        base += " names=" + ",".join(names)
+    return base
+
+
+def _reload_account_contexts(reason: str = "runtime") -> Dict[str, Any]:
+    global ACCOUNT_CONTEXTS, ADMIN_ACCOUNT_CONTEXT, FOLLOWER_CONTEXTS
+    global _LAST_ACCOUNT_REFRESH_TS
+    prev_admin_name = ADMIN_ACCOUNT_CONTEXT.name if ADMIN_ACCOUNT_CONTEXT else None
+    try:
+        new_contexts = _build_account_contexts()
+    except Exception as e:
+        print(f"[accounts] reload failed ({reason}): {e}")
+        return {
+            "ok": False,
+            "reason": reason,
+            "error": str(e),
+            "summary": _format_account_summary(ACCOUNT_CONTEXTS, ADMIN_ACCOUNT_CONTEXT),
+        }
+    if not new_contexts:
+        print(f"[accounts] reload empty ({reason}); keeping current")
+        return {
+            "ok": False,
+            "reason": reason,
+            "error": "empty",
+            "summary": _format_account_summary(ACCOUNT_CONTEXTS, ADMIN_ACCOUNT_CONTEXT),
+        }
+    new_admin = _pick_admin_context(new_contexts, prev_admin_name=prev_admin_name)
+    new_followers = [c for c in new_contexts if c is not new_admin]
+    ACCOUNT_CONTEXTS = new_contexts
+    ADMIN_ACCOUNT_CONTEXT = new_admin
+    FOLLOWER_CONTEXTS = new_followers
+    _LAST_ACCOUNT_REFRESH_TS = time.time()
+    db_path = getattr(accounts_db, "DB_PATH", "unknown")
+    summary = _format_account_summary(ACCOUNT_CONTEXTS, ADMIN_ACCOUNT_CONTEXT)
+    print(f"[accounts] reload ok ({reason}) db={db_path} {summary}")
+    if len(ACCOUNT_CONTEXTS) > 1 and not FOLLOWER_CONTEXTS:
+        print(f"[accounts] warning: followers empty with multiple accounts ({summary})")
+    return {
+        "ok": True,
+        "reason": reason,
+        "summary": summary,
+        "db_path": db_path,
+    }
+
+
+def _maybe_refresh_accounts(now_ts: Optional[float] = None, reason: str = "periodic") -> None:
+    global _LAST_ACCOUNT_REFRESH_TS
+    if now_ts is None:
+        now_ts = time.time()
+    if ACCOUNT_REFRESH_SEC <= 0:
+        return
+    if (now_ts - float(_LAST_ACCOUNT_REFRESH_TS or 0.0)) < ACCOUNT_REFRESH_SEC:
+        return
+    _reload_account_contexts(reason=reason)
+
+
 @contextmanager
 def _use_account_context(account_ctx: Optional[AccountContext]):
     prev_client = getattr(_THREAD_TG, "client", None)
@@ -9958,7 +10394,7 @@ def _use_account_context(account_ctx: Optional[AccountContext]):
 
 def run():
     # 전역 백오프 변수는 run 스코프에서 재할당 하므로 선 선언 필요
-    global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, RATE_LIMIT_LOG_TS
+    global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, RATE_LIMIT_LOG_TS, _LAST_ACCOUNT_REFRESH_TS
     global TOTAL_CYCLES, TOTAL_ELAPSED, TOTAL_REST_CALLS, TOTAL_429_COUNT
     global MANAGE_LOOP_ENABLED, MANAGE_WS_MODE
     _install_error_hooks()
@@ -9970,17 +10406,22 @@ def run():
     try:
         ACCOUNT_CONTEXTS = _build_account_contexts()
         if ACCOUNT_CONTEXTS:
-            print(f"[accounts] active={len(ACCOUNT_CONTEXTS)} default=admin")
+            db_path = getattr(accounts_db, "DB_PATH", "unknown")
+            print(f"[accounts] active={len(ACCOUNT_CONTEXTS)} default=admin db={db_path}")
+            print(f"[accounts] names={','.join([str(a.name) for a in ACCOUNT_CONTEXTS])}")
         else:
             print("[accounts] no active accounts in DB (fallback to env default)")
     except Exception as e:
-        print(f"[accounts] load failed: {e}")
+        db_path = getattr(accounts_db, "DB_PATH", "unknown")
+        print(f"[accounts] load failed: {e} db={db_path}")
         ACCOUNT_CONTEXTS = []
     if ACCOUNT_CONTEXTS:
-        ADMIN_ACCOUNT_CONTEXT = next((a for a in ACCOUNT_CONTEXTS if str(a.name) == "admin"), ACCOUNT_CONTEXTS[0])
+        ADMIN_ACCOUNT_CONTEXT = _pick_admin_context(ACCOUNT_CONTEXTS)
         FOLLOWER_CONTEXTS = [a for a in ACCOUNT_CONTEXTS if a is not ADMIN_ACCOUNT_CONTEXT]
         if FOLLOWER_CONTEXTS:
             print(f"[accounts] followers={len(FOLLOWER_CONTEXTS)}")
+        elif len(ACCOUNT_CONTEXTS) > 1:
+            print(f"[accounts] warning: followers empty with multiple accounts ({_format_account_summary(ACCOUNT_CONTEXTS, ADMIN_ACCOUNT_CONTEXT)})")
         with _use_account_context(ADMIN_ACCOUNT_CONTEXT):
             state = load_state()
         state["_symbols"] = symbols
@@ -10024,8 +10465,11 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
+    global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS, SWAGGY_NO_ATLAS_USE_WICK_BREAK
+    global SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG, SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
+    global SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS, SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
@@ -10118,10 +10562,67 @@ def run():
         SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN = float(state.get("_swaggy_no_atlas_overext_min"))
     else:
         state["_swaggy_no_atlas_overext_min"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN
+    if isinstance(state.get("_swaggy_no_atlas_overext_min_strong"), (int, float)):
+        SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG = float(state.get("_swaggy_no_atlas_overext_min_strong"))
+    else:
+        state["_swaggy_no_atlas_overext_min_strong"] = SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG
     if isinstance(state.get("_swaggy_no_atlas_overext_min_enabled"), bool):
         SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED = bool(state.get("_swaggy_no_atlas_overext_min_enabled"))
     else:
         state["_swaggy_no_atlas_overext_min_enabled"] = SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED
+    if isinstance(state.get("_swaggy_no_atlas_structure_lookback"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK = max(1, int(state.get("_swaggy_no_atlas_structure_lookback")))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_structure_lookback"] = SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK
+    if isinstance(state.get("_swaggy_no_atlas_structure_wait_bars"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS = max(1, int(state.get("_swaggy_no_atlas_structure_wait_bars")))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_structure_wait_bars"] = SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS
+    if isinstance(state.get("_swaggy_no_atlas_use_wick_break"), bool):
+        SWAGGY_NO_ATLAS_USE_WICK_BREAK = bool(state.get("_swaggy_no_atlas_use_wick_break"))
+    else:
+        state["_swaggy_no_atlas_use_wick_break"] = SWAGGY_NO_ATLAS_USE_WICK_BREAK
+    if isinstance(state.get("_swaggy_no_atlas_break_margin_strong"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG = float(state.get("_swaggy_no_atlas_break_margin_strong"))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_break_margin_strong"] = SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG
+    if isinstance(state.get("_swaggy_no_atlas_break_margin_weak"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK = float(state.get("_swaggy_no_atlas_break_margin_weak"))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_break_margin_weak"] = SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
+    if isinstance(state.get("_swaggy_no_atlas_weak_timeout_bars"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS = max(1, int(state.get("_swaggy_no_atlas_weak_timeout_bars")))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_weak_timeout_bars"] = SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS
+    if isinstance(state.get("_swaggy_no_atlas_weak_no_progress_mfe_atr"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR = float(state.get("_swaggy_no_atlas_weak_no_progress_mfe_atr"))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_weak_no_progress_mfe_atr"] = SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR
+    if isinstance(state.get("_swaggy_no_atlas_structure_min_strength"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_STRUCTURE_MIN_STRENGTH = float(state.get("_swaggy_no_atlas_structure_min_strength"))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_structure_min_strength"] = SWAGGY_NO_ATLAS_STRUCTURE_MIN_STRENGTH
     if isinstance(state.get("_swaggy_d1_overext_atr_mult"), (int, float)):
         SWAGGY_D1_OVEREXT_ATR_MULT = float(state.get("_swaggy_d1_overext_atr_mult"))
     else:
@@ -10203,7 +10704,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -10231,6 +10732,10 @@ def run():
     last_cfg_reload_ts = 0.0
     global _LAST_CYCLE_TS_MEM
     while True:
+        now_refresh = time.time()
+        if ACCOUNT_REFRESH_SEC > 0 and (now_refresh - _LAST_ACCOUNT_REFRESH_TS) >= ACCOUNT_REFRESH_SEC:
+            _reload_account_contexts(reason="periodic")
+            _LAST_ACCOUNT_REFRESH_TS = now_refresh
         active_accounts = [ADMIN_ACCOUNT_CONTEXT] if ADMIN_ACCOUNT_CONTEXT else [None]
         for account_ctx in active_accounts:
             account_state = state
