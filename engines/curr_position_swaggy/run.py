@@ -12,6 +12,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 STATE_FILE = os.path.join(ROOT_DIR, "state.json")
+LOG_DIR = os.path.join(ROOT_DIR, "logs", "curr_position_swaggy")
 LOSS_HEDGE_ENGINE_KEY = "LOSS_HEDGE_ENGINE"
 LOSS_HEDGE_MIN_PCT = -10.0
 DEFAULT_TP_PCT = 3.0
@@ -24,8 +25,11 @@ import cycle_cache
 from atlas_test.data_feed import fetch_ohlcv
 from atlas_test.notifier_telegram import send_message
 from engines.curr_position_swaggy.config import CurrPositionSwaggyConfig
-from engines.swaggy_no_atlas.engine import SwaggyNoAtlasEngine
-from engines.swaggy_no_atlas.config import SwaggyNoAtlasConfig
+from engines.swaggy_atlas_lab_v2.swaggy_signal import SwaggySignalEngine as SwaggyAtlasLabV2Engine
+from engines.swaggy_atlas_lab_v2.config import SwaggyConfig as SwaggyAtlasLabV2Config
+from engines.swaggy_atlas_lab_v2.config import AtlasConfig as SwaggyAtlasLabV2AtlasConfig
+from engines.swaggy_atlas_lab_v2.atlas_eval import evaluate_global_gate, evaluate_local
+from engines.swaggy_atlas_lab_v2.policy import apply_policy, AtlasMode
 from executor import (
     exchange,
     list_open_position_symbols,
@@ -55,6 +59,23 @@ def _save_state(state: dict) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=True)
     os.replace(tmp_path, STATE_FILE)
+
+
+def _append_log(msg: str) -> None:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        day = datetime.now(tz=timezone(timedelta(hours=9))).strftime("%Y%m%d")
+        path = os.path.join(LOG_DIR, f"curr_position_swaggy_{day}.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(msg.rstrip() + "\n")
+    except Exception:
+        return
+
+
+def _log_kst(msg: str) -> None:
+    line = f"{_fmt_kst_now()} {msg}"
+    print(line)
+    _append_log(line)
 
 
 def _state_bool(state: dict, key: str, default: bool = False) -> bool:
@@ -312,11 +333,15 @@ def main() -> None:
     chat_id = os.environ.get("TELEGRAM_CHAT_ID_CURR_POSITION", "").strip()
     if not token or not chat_id:
         print("[curr-pos-swaggy] missing TELEGRAM_BOT_TOKEN_CURR_POSITION or TELEGRAM_CHAT_ID_CURR_POSITION")
+        _append_log("[curr-pos-swaggy] missing TELEGRAM_BOT_TOKEN_CURR_POSITION or TELEGRAM_CHAT_ID_CURR_POSITION")
         return
 
     cfg = CurrPositionSwaggyConfig()
-    swaggy_cfg = SwaggyNoAtlasConfig()
-    swaggy_engine = SwaggyNoAtlasEngine(swaggy_cfg)
+    swaggy_cfg = SwaggyAtlasLabV2Config()
+    swaggy_engine = SwaggyAtlasLabV2Engine(swaggy_cfg)
+    atlas_cfg = SwaggyAtlasLabV2AtlasConfig()
+    # Match SwaggyLab v2 live engine exception_min_score
+    atlas_cfg.exception_min_score = 2
     ltf_limit = max(int(swaggy_cfg.ltf_limit), 120)
     mtf_limit = 200
     htf_limit = max(int(swaggy_cfg.vp_lookback_1h), 120)
@@ -330,8 +355,10 @@ def main() -> None:
     if initial_interval > 0:
         cfg.interval_sec = max(60, initial_interval * 60)
         print(f"[curr-pos-swaggy] start ({initial_interval}m)")
+        _append_log(f"[curr-pos-swaggy] start ({initial_interval}m)")
     else:
         print("[curr-pos-swaggy] start (15m)")
+        _append_log("[curr-pos-swaggy] start (15m)")
     while True:
         cycle_ts = _fmt_kst_now()
         state = _load_state()
@@ -343,8 +370,11 @@ def main() -> None:
         pos_map = _build_pos_side_map()
         if not pos_map:
             print(f"[curr-pos-swaggy] cycle {cycle_ts} 결과: 없음 (포지션 없음)")
+            _append_log(f"[curr-pos-swaggy] cycle {cycle_ts} 결과: 없음 (포지션 없음)")
             _sleep_to_boundary(cfg.interval_sec)
             continue
+        btc_15m_limit = max(120, int(getattr(atlas_cfg, "corr_m_slow", 96)) + 5)
+        _fetch_and_cache(atlas_cfg.ref_symbol, "15m", btc_15m_limit)
         entries: list[dict] = []
         for sym, pos_side in sorted(pos_map.items()):
             if not _fetch_and_cache(sym, swaggy_cfg.tf_ltf, ltf_limit):
@@ -374,6 +404,11 @@ def main() -> None:
             except Exception:
                 candle_ts = None
 
+            prev_phase = None
+            try:
+                prev_phase = (swaggy_engine._state.get(sym) or {}).get("phase")
+            except Exception:
+                prev_phase = None
             signal = swaggy_engine.evaluate_symbol(
                 sym,
                 df_4h,
@@ -384,7 +419,62 @@ def main() -> None:
                 df_1d,
                 time.time(),
             )
+            new_phase = None
+            try:
+                new_phase = (swaggy_engine._state.get(sym) or {}).get("phase")
+            except Exception:
+                new_phase = None
+            if signal:
+                reasons = ",".join(signal.reasons or []) if isinstance(signal.reasons, list) else str(signal.reasons or "")
+                side_disp = (signal.side or "").upper() if signal.side else "N/A"
+                if prev_phase != new_phase or signal.entry_ok:
+                    _log_kst(
+                        f"SWAGGY_ATLAS_LAB_V2_PHASE sym={sym} side={side_disp} prev={prev_phase} now={new_phase} reasons={reasons}"
+                    )
             if signal and signal.entry_ok:
+                btc_df = cycle_cache.get_df(atlas_cfg.ref_symbol, "15m", limit=btc_15m_limit, force=True)
+                if btc_df.empty:
+                    continue
+                atlas_gate = evaluate_global_gate(btc_df, atlas_cfg)
+                atlas_decision = evaluate_local(sym, (signal.side or "").upper(), df_15m, btc_df, atlas_gate, atlas_cfg)
+                policy = apply_policy(AtlasMode.HARD, float(entry_pct or 0.0), atlas_decision)
+                if not policy.allow:
+                    _log_kst(
+                        "SWAGGY_ATLAS_LAB_V2_POLICY sym=%s side=%s action=%s atlas_reasons=%s"
+                        % (
+                            sym,
+                            (signal.side or "").upper() if signal.side else "N/A",
+                            policy.policy_action,
+                            ",".join(policy.atlas_reasons or []),
+                        )
+                    )
+                    _log_kst(
+                        f"SWAGGY_ATLAS_LAB_V2_SKIP sym={sym} reason=ATLAS_POLICY block={policy.policy_action}"
+                    )
+                    continue
+                atlas_reasons = []
+                atlas_action = None
+                if policy:
+                    atlas_action = policy.policy_action
+                    atlas_reasons = policy.atlas_reasons or []
+                    _log_kst(
+                        "SWAGGY_ATLAS_LAB_V2_POLICY sym=%s side=%s action=%s atlas_reasons=%s"
+                        % (
+                            sym,
+                            (signal.side or "").upper() if signal.side else "N/A",
+                            atlas_action,
+                            ",".join(atlas_reasons or []),
+                        )
+                    )
+                    _log_kst(
+                        "SWAGGY_ATLAS_LAB_V2_PASS sym=%s side=%s action=%s atlas_reasons=%s"
+                        % (
+                            sym,
+                            (signal.side or "").upper() if signal.side else "N/A",
+                            atlas_action,
+                            ",".join(atlas_reasons or []),
+                        )
+                    )
                 entries.append(
                     {
                         "symbol": sym,
@@ -392,30 +482,39 @@ def main() -> None:
                         "side": (signal.side or "").upper() if signal.side else "N/A",
                         "entry_px": signal.entry_px,
                         "candle_ts": candle_ts,
+                        "atlas_action": atlas_action,
+                        "atlas_reasons": atlas_reasons,
                     }
                 )
                 if not engine_on:
                     continue
-                if interval_min > 0:
-                    if int(time.time() // 60) % interval_min != 0:
-                        continue
-                if pos_side not in ("LONG", "SHORT"):
-                    continue
                 signal_side = (signal.side or "").upper()
                 opp_side = "SHORT" if pos_side == "LONG" else "LONG"
-                if signal_side != opp_side:
-                    continue
-                pos_detail = (
-                    get_long_position_detail(sym) if pos_side == "LONG" else get_short_position_detail(sym)
-                )
-                loss_pct = _profit_unlev_pct(pos_detail, pos_side)
-                if not isinstance(loss_pct, (int, float)) or loss_pct > LOSS_HEDGE_MIN_PCT:
-                    continue
+                live = _live_enabled(state, opp_side)
+                loss_pct = None
+                # Alert-only: always notify when engine is ON and signal is ready.
+                if pos_side in ("LONG", "SHORT"):
+                    pos_detail = (
+                        get_long_position_detail(sym) if pos_side == "LONG" else get_short_position_detail(sym)
+                    )
+                    loss_pct = _profit_unlev_pct(pos_detail, pos_side)
                 entry_usdt = _resolve_entry_usdt(entry_pct)
-                if entry_usdt <= 0:
-                    continue
+                # live_ready reserved for future live execution (alerts always sent)
+                live_ready = False
+                if live:
+                    if interval_min > 0 and int(time.time() // 60) % interval_min != 0:
+                        live_ready = False
+                    elif pos_side not in ("LONG", "SHORT"):
+                        live_ready = False
+                    elif signal_side != opp_side:
+                        live_ready = False
+                    elif not isinstance(loss_pct, (int, float)) or loss_pct > LOSS_HEDGE_MIN_PCT:
+                        live_ready = False
+                    elif entry_usdt <= 0:
+                        live_ready = False
+                    else:
+                        live_ready = True
                 entry_price = signal.entry_px
-                live = False
                 tp_pct, sl_pct = _engine_tp_sl(state, opp_side)
                 msg = _build_entry_message(
                     symbol=sym,
@@ -428,7 +527,37 @@ def main() -> None:
                     live=live,
                 )
                 ok = send_message(token, chat_id, msg)
-                print(f"[loss-hedge] alert sent={ok} sym={sym} side={opp_side} usdt={entry_usdt:.2f}")
+                debug = signal.debug if hasattr(signal, "debug") else {}
+                _log_kst(
+                    "SWAGGY_ATLAS_LAB_V2_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
+                    "final_usdt=%.2f level_score=%s touch_count=%s level_age=%s trigger_combo=%s confirm_pass=%s confirm_fail=%s "
+                    "overext_dist_at_touch=%s overext_dist_at_entry=%s"
+                    % (
+                        sym,
+                        (signal.side or "").upper() if signal.side else "N/A",
+                        float(signal.strength or 0.0),
+                        ",".join(signal.reasons or []),
+                        float(entry_usdt or 0.0),
+                        debug.get("level_score"),
+                        debug.get("touch_count"),
+                        debug.get("level_age_sec"),
+                        debug.get("trigger_combo"),
+                        debug.get("confirm_pass"),
+                        debug.get("confirm_fail"),
+                        debug.get("overext_dist_at_touch"),
+                        debug.get("overext_dist_at_entry"),
+                    )
+                )
+                log_line = (
+                    f"[loss-hedge] alert sent={ok} sym={sym} pos_side={pos_side} "
+                    f"signal_side={signal_side} opp_side={opp_side} "
+                    f"entry_px={_fmt_entry_px(entry_price)} usdt={entry_usdt:.2f} "
+                    f"loss_pct={_fmt_roi(loss_pct)} live={live} "
+                    f"atlas_action={atlas_action or 'N/A'} "
+                    f"atlas_reasons={','.join(atlas_reasons or []) or 'N/A'}"
+                )
+                print(log_line)
+                _append_log(log_line)
         if not entries:
             print(f"[curr-pos-swaggy] cycle {cycle_ts} 결과: 없음")
             _sleep_to_boundary(cfg.interval_sec)
@@ -436,13 +565,18 @@ def main() -> None:
         lines = [f"[curr-pos-swaggy] cycle {cycle_ts} 결과:"]
         for item in entries:
             sym = item["symbol"].replace("/USDT:USDT", "")
+            atlas_action = item.get("atlas_action") or "N/A"
+            atlas_reasons = ",".join(item.get("atlas_reasons") or []) or "N/A"
             lines.append(
-                f"- {sym} / {item['pos_side']} / entry={_fmt_entry_px(item.get('entry_px'))}"
+                f"- {sym} / {item['pos_side']} / entry={_fmt_entry_px(item.get('entry_px'))} "
+                f"/ atlas={atlas_action} ({atlas_reasons})"
             )
         print("\n".join(lines))
+        _append_log("\n".join(lines))
         msg = _build_message(entries)
         ok = send_message(token, chat_id, msg)
         print(f"[curr-pos-swaggy] sent={ok} count={len(entries)}")
+        _append_log(f"[curr-pos-swaggy] sent={ok} count={len(entries)}")
         _sleep_to_boundary(cfg.interval_sec)
 
 

@@ -209,6 +209,9 @@ def evaluate_local(
     if rs_pass:
         score += 1
         reasons.append("RS")
+    else:
+        # Require RS to pass before considering hard approval
+        reasons.append("RS_REQUIRED_FAIL")
     if indep_pass:
         score += 1
         reasons.append("INDEP")
@@ -216,7 +219,7 @@ def evaluate_local(
         score += 1
         reasons.append("VOL")
 
-    pass_hard = score >= cfg.exception_min_score
+    pass_hard = rs_pass and (score >= cfg.exception_min_score)
     pass_soft = score >= 1
     if not pass_hard:
         reasons.append("QUALITY_FAIL")

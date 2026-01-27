@@ -92,6 +92,13 @@ def parse_args():
     parser.add_argument("--break-margin-weak", type=float, default=0.02)
     parser.add_argument("--weak-timeout-bars", type=int, default=9)
     parser.add_argument("--weak-no-progress-mfe-atr", type=float, default=0.03)
+    parser.add_argument("--expansion-mult", type=float, default=1.2)
+    parser.add_argument("--delay-wait-bars", type=int, default=2)
+    parser.add_argument("--delay-close-pct", type=float, default=0.0015)
+    parser.add_argument("--delay-vol-mult", type=float, default=1.2)
+    parser.add_argument("--delay-vol-ma", type=int, default=20)
+    parser.add_argument("--delay-sweep-lookback", type=int, default=3)
+    parser.add_argument("--sw-okn-min-margin", type=float, default=0.20)
     parser.add_argument("--overext-min", type=float, default=None)
     parser.add_argument("--overext-min-strong", type=float, default=-2.5)
     parser.add_argument("--d1-overext-atr", type=float, default=None)
@@ -842,7 +849,83 @@ def main() -> None:
                                     dca_adds_by_key[key] = dca_adds_by_key.get(key, 0) + 1
                                     dca_usdt_by_key[key] = dca_usdt_by_key.get(key, 0.0) + float(dca_usdt)
 
-                entry_ok_effective = bool(signal.entry_ok) or bool(entry_quality)
+                delay_ctx = sym_state.get("entry_delay")
+                delay_passed = False
+                delay_used = None
+                entry_sw_ok = bool(signal.entry_ok)
+                entry_sw_strength = float(signal.strength or 0.0)
+                entry_sw_reasons = list(signal.reasons or [])
+                if isinstance(delay_ctx, dict):
+                    delay_side = str(delay_ctx.get("side") or "").upper()
+                    deadline_idx = delay_ctx.get("deadline_idx")
+                    ready_px = delay_ctx.get("entry_px")
+                    cur_idx = i
+                    if isinstance(deadline_idx, (int, float)) and cur_idx > int(deadline_idx):
+                        _append_backtest_log(
+                            f"ENTRY_DELAY_FAIL ts={ts_ms} sym={sym} side={delay_side} reason=TIMEOUT"
+                        )
+                        sym_state.pop("entry_delay", None)
+                    else:
+                        close_now = float(cur["close"])
+                        low_now = float(cur["low"])
+                        high_now = float(cur["high"])
+                        if delay_side == "LONG":
+                            close_ok = isinstance(ready_px, (int, float)) and close_now > float(ready_px) * (
+                                1.0 + float(args.delay_close_pct)
+                            )
+                        else:
+                            close_ok = isinstance(ready_px, (int, float)) and close_now < float(ready_px) * (
+                                1.0 - float(args.delay_close_pct)
+                            )
+                        strict_delay = not bool(delay_ctx.get("sw_ok"))
+                        sweep_ok = False
+                        vol_ok = False
+                        if not strict_delay:
+                            try:
+                                lookback = max(1, int(args.delay_sweep_lookback))
+                                if delay_side == "LONG":
+                                    prev_low = float(d5["low"].iloc[-lookback - 1 : -1].min())
+                                    sweep_ok = low_now < prev_low and close_now > float(ready_px or close_now)
+                                else:
+                                    prev_high = float(d5["high"].iloc[-lookback - 1 : -1].max())
+                                    sweep_ok = high_now > prev_high and close_now < float(ready_px or close_now)
+                            except Exception:
+                                sweep_ok = False
+                            try:
+                                vol_ma = float(d5["volume"].iloc[-int(args.delay_vol_ma) : -1].mean())
+                                vol_now = float(cur["volume"])
+                                if vol_ma > 0:
+                                    vol_ok = vol_now >= vol_ma * float(args.delay_vol_mult)
+                            except Exception:
+                                vol_ok = False
+                        if strict_delay:
+                            streak = int(delay_ctx.get("close_streak") or 0)
+                            streak = streak + 1 if close_ok else 0
+                            delay_ctx["close_streak"] = streak
+                            sym_state["entry_delay"] = delay_ctx
+                            pass_ok = streak >= 2
+                        else:
+                            pass_ok = close_ok or sweep_ok or vol_ok
+                        if pass_ok:
+                            _append_backtest_log(
+                                f"ENTRY_DELAY_PASS ts={ts_ms} sym={sym} side={delay_side} "
+                                f"close={int(bool(close_ok))} sweep={int(bool(sweep_ok))} vol={int(bool(vol_ok))}"
+                            )
+                            sym_state.pop("entry_delay", None)
+                            delay_passed = True
+                            delay_used = delay_ctx
+                            entry_px = float(cur["close"])
+                            entry_quality = str(delay_ctx.get("entry_quality") or entry_quality or "STRONG")
+                            break_margin = delay_ctx.get("break_margin", break_margin)
+                            entry_atr = delay_ctx.get("entry_atr", entry_atr)
+                            side = delay_side or side
+                            entry_sw_ok = bool(delay_ctx.get("sw_ok"))
+                            entry_sw_strength = float(delay_ctx.get("sw_strength") or entry_sw_strength)
+                            entry_sw_reasons = list(delay_ctx.get("sw_reasons") or entry_sw_reasons)
+                        else:
+                            continue
+
+                entry_ok_effective = bool(entry_sw_ok) or bool(entry_quality) or bool(delay_passed)
                 if (not entry_ok_effective) or (not side) or (entry_px is None):
                     continue
                 if last_day_entry == "off" and ts_ms >= last_day_start_ms:
@@ -874,13 +957,54 @@ def main() -> None:
                     continue
 
                 if entry_quality == "STRONG" and any(
-                    reason in ("REGIME_BLOCK", "WEAK_SIGNAL") for reason in (signal.reasons or [])
+                    reason in ("REGIME_BLOCK", "WEAK_SIGNAL") for reason in (entry_sw_reasons or [])
                 ):
                     _append_backtest_log(
                         f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=STRONG_BLOCK_REASONS "
-                        f"sw_reasons={','.join(signal.reasons or [])}"
+                        f"sw_reasons={','.join(entry_sw_reasons or [])}"
                     )
                     continue
+
+                if not entry_sw_ok:
+                    reasons_set = set(entry_sw_reasons or [])
+                    if reasons_set and "CHASE" not in reasons_set:
+                        _append_backtest_log(
+                            f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=SW_OKN_REASON "
+                            f"sw_reasons={','.join(entry_sw_reasons or [])}"
+                        )
+                        continue
+                    if not isinstance(break_margin, (int, float)):
+                        _append_backtest_log(
+                            f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=SW_OKN_NO_MARGIN"
+                        )
+                        continue
+                    if float(break_margin) < float(args.sw_okn_min_margin):
+                        _append_backtest_log(
+                            f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=SW_OKN_MARGIN "
+                            f"margin={float(break_margin):.4f}"
+                        )
+                        continue
+
+                if entry_quality == "STRONG" and int(args.delay_wait_bars or 0) > 0 and not delay_passed and not entry_sw_ok:
+                    if not isinstance(sym_state.get("entry_delay"), dict):
+                        sym_state["entry_delay"] = {
+                            "side": side,
+                            "ready_idx": i,
+                            "deadline_idx": i + int(args.delay_wait_bars),
+                            "entry_px": entry_px,
+                            "entry_quality": entry_quality,
+                            "break_margin": break_margin,
+                            "entry_atr": entry_atr,
+                            "sw_ok": entry_sw_ok,
+                            "sw_strength": entry_sw_strength,
+                            "sw_reasons": entry_sw_reasons,
+                            "close_streak": 0,
+                        }
+                        _append_backtest_log(
+                            f"ENTRY_DELAY_START ts={ts_ms} sym={sym} side={side} entry_px={entry_px} "
+                            f"wait_bars={int(args.delay_wait_bars)}"
+                        )
+                        continue
 
                 if entry_quality is None:
                     touch_count = 0
@@ -939,6 +1063,12 @@ def main() -> None:
                     )
                     continue
                 d1_dist = _d1_dist_atr(d1d, float(entry_px), sw_cfg) if isinstance(entry_px, (int, float)) else None
+                entry_mult = 1.0
+                if entry_quality == "STRONG" and any(
+                    reason == "EXPANSION_BAR" for reason in (entry_sw_reasons or [])
+                ):
+                    entry_mult = float(args.expansion_mult or 1.0)
+                final_usdt = float(bt_cfg.base_usdt or 0.0) * float(entry_mult)
                 entry_line = (
                     "ENTRY ts=%d sym=%s side=%s mode=%s sw_ok=%s sw_strength=%.3f sw_reasons=%s "
                     "base_usdt=%.2f final_usdt=%.2f policy_action=%s d1_dist_atr=%s "
@@ -948,11 +1078,11 @@ def main() -> None:
                         sym,
                         side,
                         mode_name,
-                        "Y" if signal.entry_ok else "N",
-                        float(signal.strength or 0.0),
-                        signal.reasons,
+                        "Y" if entry_sw_ok else "N",
+                        float(entry_sw_strength),
+                        entry_sw_reasons,
                         bt_cfg.base_usdt,
-                        bt_cfg.base_usdt,
+                        final_usdt,
                         "NO_ATLAS",
                         "N/A" if d1_dist is None else f"{d1_dist:.4f}",
                         entry_quality or "NA",
@@ -961,7 +1091,7 @@ def main() -> None:
                 )
                 log_fp.write(entry_line + "\n")
                 _append_backtest_log(entry_line)
-                entry_sw_ok = "Y" if signal.entry_ok else "N"
+                entry_sw_ok = "Y" if entry_sw_ok else "N"
                 overext_blocked = bool(sym_state.get("overext_blocked"))
                 sym_state["overext_blocked"] = False
                 _append_backtest_entry_log(
@@ -973,9 +1103,9 @@ def main() -> None:
                         sym,
                         side,
                         float(entry_px or 0.0),
-                        float(bt_cfg.base_usdt or 0.0),
-                        float(signal.strength or 0.0),
-                        ",".join(signal.reasons or []),
+                        final_usdt,
+                        float(entry_sw_strength),
+                        ",".join(entry_sw_reasons or []),
                         "NO_ATLAS",
                         "N/A" if d1_dist is None else f"{d1_dist:.4f}",
                         entry_quality or "NA",
@@ -988,9 +1118,9 @@ def main() -> None:
                     ts_ms,
                     i,
                     entry_px,
-                    bt_cfg.base_usdt,
-                    sw_strength=signal.strength,
-                    sw_reasons=signal.reasons,
+                    final_usdt,
+                    sw_strength=entry_sw_strength,
+                    sw_reasons=entry_sw_reasons,
                     policy_action="NO_ATLAS",
                     overext_dist_at_entry=dist_at_entry,
                     overext_blocked=overext_blocked,
@@ -999,6 +1129,7 @@ def main() -> None:
                         "entry_atr": entry_atr,
                         "break_margin": break_margin,
                         "sw_ok": entry_sw_ok,
+                        "entry_mult": entry_mult,
                     },
                 )
                 entry_syms_by_mode.setdefault(mode_name, set()).add(sym)

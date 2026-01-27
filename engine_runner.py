@@ -537,13 +537,15 @@ def _broadcast_exec(action_name: str, exec_fn, *args, **kwargs):
     return res
 
 def _resolve_entry_usdt_for_executor(executor: AccountExecutor, pct: Optional[float]) -> float:
-    global _LAST_ENTRY_PCT_USED, _LAST_ENTRY_USDT_USED
+    global _LAST_ENTRY_PCT_USED, _LAST_ENTRY_USDT_USED, _LAST_ENTRY_PCT_TS
     prev_pct = _LAST_ENTRY_PCT_USED
     prev_usdt = _LAST_ENTRY_USDT_USED
+    prev_ts = _LAST_ENTRY_PCT_TS
     with executor.activate():
         val = _resolve_entry_usdt(pct)
     _LAST_ENTRY_PCT_USED = prev_pct
     _LAST_ENTRY_USDT_USED = prev_usdt
+    _LAST_ENTRY_PCT_TS = prev_ts
     return val
 
 def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = LEVERAGE, margin_mode: str = "isolated") -> dict:
@@ -559,6 +561,9 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
         _set_last_entry_broadcast(symbol, "SHORT", admin_status, admin_ok, [])
         return res
     use_pct = _LAST_ENTRY_PCT_USED if _LAST_ENTRY_USDT_USED == usdt_amount else None
+    if use_pct is None and _LAST_ENTRY_PCT_USED is not None:
+        if (time.time() - float(_LAST_ENTRY_PCT_TS or 0.0)) <= 5.0:
+            use_pct = _LAST_ENTRY_PCT_USED
     follower_calls = []
     for acct in followers:
         follower_usdt = usdt_amount
@@ -590,6 +595,8 @@ def short_limit(*args, **kwargs) -> dict:
     if usdt_amount is None and len(args) >= 3:
         usdt_amount = args[2]
     if _LAST_ENTRY_USDT_USED == usdt_amount:
+        use_pct = _LAST_ENTRY_PCT_USED
+    elif _LAST_ENTRY_PCT_USED is not None and (time.time() - float(_LAST_ENTRY_PCT_TS or 0.0)) <= 5.0:
         use_pct = _LAST_ENTRY_PCT_USED
     follower_calls = []
     for acct in followers:
@@ -624,6 +631,9 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
         _set_last_entry_broadcast(symbol, "LONG", admin_status, admin_ok, [])
         return res
     use_pct = _LAST_ENTRY_PCT_USED if _LAST_ENTRY_USDT_USED == usdt_amount else None
+    if use_pct is None and _LAST_ENTRY_PCT_USED is not None:
+        if (time.time() - float(_LAST_ENTRY_PCT_TS or 0.0)) <= 5.0:
+            use_pct = _LAST_ENTRY_PCT_USED
     follower_calls = []
     for acct in followers:
         follower_usdt = usdt_amount
@@ -708,8 +718,15 @@ SWAGGY_NO_ATLAS_STRUCTURE_MIN_STRENGTH = float(os.getenv("SWAGGY_NO_ATLAS_STRUCT
 SWAGGY_NO_ATLAS_USE_WICK_BREAK = str(os.getenv("SWAGGY_NO_ATLAS_USE_WICK_BREAK", "false")).strip().lower() in ("1", "true", "yes", "on")
 SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG = float(os.getenv("SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG", "0.08"))
 SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK = float(os.getenv("SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK", "0.02"))
+SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN = float(os.getenv("SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN", "0.20"))
 SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS = int(os.getenv("SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS", "9"))
 SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR = float(os.getenv("SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR", "0.03"))
+SWAGGY_NO_ATLAS_EXPANSION_MULT = float(os.getenv("SWAGGY_NO_ATLAS_EXPANSION_MULT", "1.2"))
+SWAGGY_NO_ATLAS_DELAY_WAIT_BARS = int(os.getenv("SWAGGY_NO_ATLAS_DELAY_WAIT_BARS", "2"))
+SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT = float(os.getenv("SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT", "0.0015"))
+SWAGGY_NO_ATLAS_DELAY_VOL_MULT = float(os.getenv("SWAGGY_NO_ATLAS_DELAY_VOL_MULT", "1.2"))
+SWAGGY_NO_ATLAS_DELAY_VOL_MA = int(os.getenv("SWAGGY_NO_ATLAS_DELAY_VOL_MA", "20"))
+SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK = int(os.getenv("SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK", "3"))
 SWAGGY_NO_ATLAS_DEBUG_SYMBOLS = os.getenv("SWAGGY_NO_ATLAS_DEBUG_SYMBOLS", "").strip()
 LOSS_HEDGE_ENGINE_ENABLED = False
 LOSS_HEDGE_INTERVAL_MIN = 15
@@ -958,10 +975,11 @@ def _get_entry_guard(state: Dict[str, dict]) -> Dict[str, float]:
 _ENTRY_PCT_WARN_TS = 0.0
 _LAST_ENTRY_PCT_USED = None
 _LAST_ENTRY_USDT_USED = None
+_LAST_ENTRY_PCT_TS = 0.0
 
 def _resolve_entry_usdt(pct: Optional[float] = None) -> float:
     """entry_usdt는 사용가능 USDT 대비 퍼센트로 해석한다."""
-    global _ENTRY_PCT_WARN_TS, _LAST_ENTRY_PCT_USED, _LAST_ENTRY_USDT_USED
+    global _ENTRY_PCT_WARN_TS, _LAST_ENTRY_PCT_USED, _LAST_ENTRY_USDT_USED, _LAST_ENTRY_PCT_TS
     try:
         pct_val = float(USDT_PER_TRADE if pct is None else pct)
     except Exception:
@@ -991,6 +1009,7 @@ def _resolve_entry_usdt(pct: Optional[float] = None) -> float:
     usdt_val = max(0.0, float(avail) * (effective_pct / 100.0))
     _LAST_ENTRY_PCT_USED = pct_val
     _LAST_ENTRY_USDT_USED = usdt_val
+    _LAST_ENTRY_PCT_TS = time.time()
     return usdt_val
 
 
@@ -2811,6 +2830,10 @@ def _run_swaggy_no_atlas_cycle(
 
         break_margin = None
         entry_quality = "NA"
+        entry_atr = None
+        entry_sw_ok = bool(signal.entry_ok)
+        entry_sw_strength = float(signal.strength or 0.0)
+        entry_sw_reasons = list(signal.reasons or [])
         wait_ctx = st.get("_no_atlas_structure_wait")
         if isinstance(wait_ctx, dict):
             wait_side = str(wait_ctx.get("side") or "").upper()
@@ -2942,17 +2965,144 @@ def _run_swaggy_no_atlas_cycle(
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
 
+        delay_ctx = st.get("_no_atlas_entry_delay")
+        delay_passed = False
+        if isinstance(delay_ctx, dict):
+            delay_side = str(delay_ctx.get("side") or "").upper()
+            deadline_idx = delay_ctx.get("deadline_idx")
+            ready_idx = delay_ctx.get("ready_idx")
+            ready_px = delay_ctx.get("entry_px")
+            cur_idx = len(df_5m) - 1
+            if isinstance(deadline_idx, (int, float)) and cur_idx > int(deadline_idx):
+                _append_swaggy_no_atlas_log(
+                    "ENTRY_DELAY_FAIL sym=%s side=%s reason=TIMEOUT"
+                    % (symbol, delay_side)
+                )
+                st.pop("_no_atlas_entry_delay", None)
+                state[symbol] = st
+            else:
+                close_now = float(df_5m.iloc[-1]["close"])
+                low_now = float(df_5m.iloc[-1]["low"])
+                high_now = float(df_5m.iloc[-1]["high"])
+                close_ok = isinstance(ready_px, (int, float)) and close_now > float(ready_px) * (
+                    1.0 + float(SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT)
+                ) if delay_side == "LONG" else isinstance(ready_px, (int, float)) and close_now < float(ready_px) * (
+                    1.0 - float(SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT)
+                )
+                strict_delay = not bool(delay_ctx.get("sw_ok"))
+                sweep_ok = False
+                vol_ok = False
+                if not strict_delay:
+                    try:
+                        lookback = max(1, int(SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK))
+                        if delay_side == "LONG":
+                            prev_low = float(df_5m["low"].iloc[-lookback - 1 : -1].min())
+                            sweep_ok = low_now < prev_low and close_now > float(ready_px or close_now)
+                        else:
+                            prev_high = float(df_5m["high"].iloc[-lookback - 1 : -1].max())
+                            sweep_ok = high_now > prev_high and close_now < float(ready_px or close_now)
+                    except Exception:
+                        sweep_ok = False
+                    try:
+                        vol_ma = float(df_5m["volume"].iloc[-SWAGGY_NO_ATLAS_DELAY_VOL_MA : -1].mean())
+                        vol_now = float(df_5m.iloc[-1]["volume"])
+                        if vol_ma > 0:
+                            vol_ok = vol_now >= vol_ma * float(SWAGGY_NO_ATLAS_DELAY_VOL_MULT)
+                    except Exception:
+                        vol_ok = False
+                if strict_delay:
+                    streak = int(delay_ctx.get("close_streak") or 0)
+                    streak = streak + 1 if close_ok else 0
+                    delay_ctx["close_streak"] = streak
+                    st["_no_atlas_entry_delay"] = delay_ctx
+                    pass_ok = streak >= 2
+                else:
+                    pass_ok = close_ok or sweep_ok or vol_ok
+                if pass_ok:
+                    _append_swaggy_no_atlas_log(
+                        "ENTRY_DELAY_PASS sym=%s side=%s pass=Y close=%s sweep=%s vol=%s"
+                        % (
+                            symbol,
+                            delay_side,
+                            int(bool(close_ok)),
+                            int(bool(sweep_ok)),
+                            int(bool(vol_ok)),
+                        )
+                    )
+                    st.pop("_no_atlas_entry_delay", None)
+                    state[symbol] = st
+                    entry_px = close_now
+                    delay_passed = True
+                    entry_quality = str(delay_ctx.get("entry_quality") or entry_quality or "STRONG")
+                    break_margin = delay_ctx.get("break_margin", break_margin)
+                    entry_atr = delay_ctx.get("entry_atr", entry_atr)
+                    side = delay_side or side
+                    entry_sw_ok = bool(delay_ctx.get("sw_ok"))
+                    entry_sw_strength = float(delay_ctx.get("sw_strength") or entry_sw_strength)
+                    entry_sw_reasons = list(delay_ctx.get("sw_reasons") or entry_sw_reasons)
+                else:
+                    time.sleep(PER_SYMBOL_SLEEP)
+                    continue
+
         if entry_quality == "STRONG" and any(
-            reason in ("REGIME_BLOCK", "WEAK_SIGNAL") for reason in (signal.reasons or [])
+            reason in ("REGIME_BLOCK", "WEAK_SIGNAL") for reason in (entry_sw_reasons or [])
         ):
             _append_swaggy_no_atlas_log(
                 "SWAGGY_NO_ATLAS_SKIP sym=%s reason=STRONG_BLOCK_REASONS sw_reasons=%s"
-                % (symbol, ",".join(signal.reasons or []))
+                % (symbol, ",".join(entry_sw_reasons or []))
             )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
-        entry_ok_effective = bool(signal.entry_ok) or entry_quality != "NA"
+        if not entry_sw_ok:
+            reasons_set = set(entry_sw_reasons or [])
+            if reasons_set and "CHASE" not in reasons_set:
+                _append_swaggy_no_atlas_log(
+                    "SWAGGY_NO_ATLAS_SKIP sym=%s reason=SW_OKN_REASON sw_reasons=%s"
+                    % (symbol, ",".join(entry_sw_reasons or []))
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if not isinstance(break_margin, (int, float)):
+                _append_swaggy_no_atlas_log(
+                    "SWAGGY_NO_ATLAS_SKIP sym=%s reason=SW_OKN_NO_MARGIN" % (symbol,)
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+            if float(break_margin) < float(SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN):
+                _append_swaggy_no_atlas_log(
+                    "SWAGGY_NO_ATLAS_SKIP sym=%s reason=SW_OKN_MARGIN margin=%.4f"
+                    % (symbol, float(break_margin))
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+        if entry_quality == "STRONG" and SWAGGY_NO_ATLAS_DELAY_WAIT_BARS > 0 and not delay_passed and not entry_sw_ok:
+            delay_ctx = st.get("_no_atlas_entry_delay")
+            if not isinstance(delay_ctx, dict):
+                cur_idx = len(df_5m) - 1
+                st["_no_atlas_entry_delay"] = {
+                    "side": side,
+                    "ready_idx": cur_idx,
+                    "deadline_idx": cur_idx + int(SWAGGY_NO_ATLAS_DELAY_WAIT_BARS),
+                    "entry_px": entry_px,
+                    "entry_quality": entry_quality,
+                    "break_margin": break_margin,
+                    "entry_atr": entry_atr,
+                    "sw_ok": entry_sw_ok,
+                    "sw_strength": entry_sw_strength,
+                    "sw_reasons": entry_sw_reasons,
+                    "close_streak": 0,
+                }
+                state[symbol] = st
+                _append_swaggy_no_atlas_log(
+                    "ENTRY_DELAY_START sym=%s side=%s entry_px=%s wait_bars=%d"
+                    % (symbol, side, _fmt(entry_px), int(SWAGGY_NO_ATLAS_DELAY_WAIT_BARS))
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
+
+        entry_ok_effective = bool(entry_sw_ok) or entry_quality != "NA" or delay_passed
         if not entry_ok_effective or not signal.side or entry_px is None:
             if symbol in debug_syms or _symbol_in_pos_any(st):
                 phase_info = None
@@ -2999,12 +3149,16 @@ def _run_swaggy_no_atlas_cycle(
 
         entry_quality_reasons = ["NO_ATLAS"]
         entry_usdt = _resolve_entry_usdt(USDT_PER_TRADE)
+        if entry_quality == "STRONG" and any(
+            reason == "EXPANSION_BAR" for reason in (entry_sw_reasons or [])
+        ):
+            entry_usdt = float(entry_usdt or 0.0) * float(SWAGGY_NO_ATLAS_EXPANSION_MULT)
         if entry_from_structure and isinstance(struct_ctx, dict):
             strength_val = float(struct_ctx.get("strength") or 0.0)
             reasons_val = struct_ctx.get("reasons")
         else:
-            strength_val = float(signal.strength or 0.0)
-            reasons_val = signal.reasons
+            strength_val = float(entry_sw_strength)
+            reasons_val = entry_sw_reasons
         entry_line = (
             "SWAGGY_NO_ATLAS_ENTRY sym=%s side=%s sw_strength=%.3f sw_reasons=%s "
             "final_usdt=%.2f "
@@ -7811,8 +7965,18 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS
     global SWAGGY_NO_ATLAS_USE_WICK_BREAK
     global SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG, SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
+    global SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
+    global SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
+    global SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
+    global SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
+    global SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
+    global SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
+    global SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
     global SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS, SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR
     global SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG
+    global SWAGGY_NO_ATLAS_EXPANSION_MULT
+    global SWAGGY_NO_ATLAS_DELAY_WAIT_BARS, SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT
+    global SWAGGY_NO_ATLAS_DELAY_VOL_MULT, SWAGGY_NO_ATLAS_DELAY_VOL_MA, SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
@@ -7857,8 +8021,15 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_swaggy_no_atlas_use_wick_break",
         "_swaggy_no_atlas_break_margin_strong",
         "_swaggy_no_atlas_break_margin_weak",
+        "_swaggy_no_atlas_sw_okn_min_margin",
         "_swaggy_no_atlas_weak_timeout_bars",
         "_swaggy_no_atlas_weak_no_progress_mfe_atr",
+        "_swaggy_no_atlas_expansion_mult",
+        "_swaggy_no_atlas_delay_wait_bars",
+        "_swaggy_no_atlas_delay_close_pct",
+        "_swaggy_no_atlas_delay_vol_mult",
+        "_swaggy_no_atlas_delay_vol_ma",
+        "_swaggy_no_atlas_delay_sweep_lookback",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
         "_rsi_enabled",
@@ -7900,10 +8071,24 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         state["_swaggy_no_atlas_break_margin_strong"] = SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG
     if isinstance(state.get("_swaggy_no_atlas_break_margin_weak"), dict):
         state["_swaggy_no_atlas_break_margin_weak"] = SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
+    if isinstance(state.get("_swaggy_no_atlas_sw_okn_min_margin"), dict):
+        state["_swaggy_no_atlas_sw_okn_min_margin"] = SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
     if isinstance(state.get("_swaggy_no_atlas_weak_timeout_bars"), dict):
         state["_swaggy_no_atlas_weak_timeout_bars"] = SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS
     if isinstance(state.get("_swaggy_no_atlas_weak_no_progress_mfe_atr"), dict):
         state["_swaggy_no_atlas_weak_no_progress_mfe_atr"] = SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR
+    if isinstance(state.get("_swaggy_no_atlas_expansion_mult"), dict):
+        state["_swaggy_no_atlas_expansion_mult"] = SWAGGY_NO_ATLAS_EXPANSION_MULT
+    if isinstance(state.get("_swaggy_no_atlas_delay_wait_bars"), dict):
+        state["_swaggy_no_atlas_delay_wait_bars"] = SWAGGY_NO_ATLAS_DELAY_WAIT_BARS
+    if isinstance(state.get("_swaggy_no_atlas_delay_close_pct"), dict):
+        state["_swaggy_no_atlas_delay_close_pct"] = SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT
+    if isinstance(state.get("_swaggy_no_atlas_delay_vol_mult"), dict):
+        state["_swaggy_no_atlas_delay_vol_mult"] = SWAGGY_NO_ATLAS_DELAY_VOL_MULT
+    if isinstance(state.get("_swaggy_no_atlas_delay_vol_ma"), dict):
+        state["_swaggy_no_atlas_delay_vol_ma"] = SWAGGY_NO_ATLAS_DELAY_VOL_MA
+    if isinstance(state.get("_swaggy_no_atlas_delay_sweep_lookback"), dict):
+        state["_swaggy_no_atlas_delay_sweep_lookback"] = SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK
     if isinstance(state.get("_swaggy_no_atlas_structure_min_strength"), dict):
         state["_swaggy_no_atlas_structure_min_strength"] = SWAGGY_NO_ATLAS_STRUCTURE_MIN_STRENGTH
     if (not skip_keys or "_auto_exit" not in skip_keys) and isinstance(state.get("_auto_exit"), bool):
@@ -7978,6 +8163,11 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
             SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK = float(state.get("_swaggy_no_atlas_break_margin_weak"))
         except Exception:
             pass
+    if (not skip_keys or "_swaggy_no_atlas_sw_okn_min_margin" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_sw_okn_min_margin"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN = float(state.get("_swaggy_no_atlas_sw_okn_min_margin"))
+        except Exception:
+            pass
     if (not skip_keys or "_swaggy_no_atlas_weak_timeout_bars" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_weak_timeout_bars"), (int, float)):
         try:
             SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS = max(1, int(state.get("_swaggy_no_atlas_weak_timeout_bars")))
@@ -7986,6 +8176,36 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     if (not skip_keys or "_swaggy_no_atlas_weak_no_progress_mfe_atr" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_weak_no_progress_mfe_atr"), (int, float)):
         try:
             SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR = float(state.get("_swaggy_no_atlas_weak_no_progress_mfe_atr"))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_expansion_mult" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_expansion_mult"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_EXPANSION_MULT = float(state.get("_swaggy_no_atlas_expansion_mult"))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_delay_wait_bars" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_delay_wait_bars"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_WAIT_BARS = max(1, int(state.get("_swaggy_no_atlas_delay_wait_bars")))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_delay_close_pct" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_delay_close_pct"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT = float(state.get("_swaggy_no_atlas_delay_close_pct"))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_delay_vol_mult" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_delay_vol_mult"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_VOL_MULT = float(state.get("_swaggy_no_atlas_delay_vol_mult"))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_delay_vol_ma" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_delay_vol_ma"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_VOL_MA = max(1, int(state.get("_swaggy_no_atlas_delay_vol_ma")))
+        except Exception:
+            pass
+    if (not skip_keys or "_swaggy_no_atlas_delay_sweep_lookback" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_delay_sweep_lookback"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK = max(1, int(state.get("_swaggy_no_atlas_delay_sweep_lookback")))
         except Exception:
             pass
     if (not skip_keys or "_rsi_enabled" not in skip_keys) and isinstance(state.get("_rsi_enabled"), bool):
@@ -10470,7 +10690,11 @@ def run():
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS, SWAGGY_NO_ATLAS_USE_WICK_BREAK
     global SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG, SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
+    global SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
     global SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS, SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR
+    global SWAGGY_NO_ATLAS_EXPANSION_MULT
+    global SWAGGY_NO_ATLAS_DELAY_WAIT_BARS, SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT
+    global SWAGGY_NO_ATLAS_DELAY_VOL_MULT, SWAGGY_NO_ATLAS_DELAY_VOL_MA, SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK
     global USDT_PER_TRADE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     # 서버 재시작 시 auto_exit는 마지막 상태를 유지
@@ -10603,6 +10827,13 @@ def run():
             pass
     else:
         state["_swaggy_no_atlas_break_margin_weak"] = SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
+    if isinstance(state.get("_swaggy_no_atlas_sw_okn_min_margin"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN = float(state.get("_swaggy_no_atlas_sw_okn_min_margin"))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_sw_okn_min_margin"] = SWAGGY_NO_ATLAS_SW_OKN_MIN_MARGIN
     if isinstance(state.get("_swaggy_no_atlas_weak_timeout_bars"), (int, float)):
         try:
             SWAGGY_NO_ATLAS_WEAK_TIMEOUT_BARS = max(1, int(state.get("_swaggy_no_atlas_weak_timeout_bars")))
@@ -10617,6 +10848,48 @@ def run():
             pass
     else:
         state["_swaggy_no_atlas_weak_no_progress_mfe_atr"] = SWAGGY_NO_ATLAS_WEAK_NO_PROGRESS_MFE_ATR
+    if isinstance(state.get("_swaggy_no_atlas_expansion_mult"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_EXPANSION_MULT = float(state.get("_swaggy_no_atlas_expansion_mult"))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_expansion_mult"] = SWAGGY_NO_ATLAS_EXPANSION_MULT
+    if isinstance(state.get("_swaggy_no_atlas_delay_wait_bars"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_WAIT_BARS = max(1, int(state.get("_swaggy_no_atlas_delay_wait_bars")))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_delay_wait_bars"] = SWAGGY_NO_ATLAS_DELAY_WAIT_BARS
+    if isinstance(state.get("_swaggy_no_atlas_delay_close_pct"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT = float(state.get("_swaggy_no_atlas_delay_close_pct"))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_delay_close_pct"] = SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT
+    if isinstance(state.get("_swaggy_no_atlas_delay_vol_mult"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_VOL_MULT = float(state.get("_swaggy_no_atlas_delay_vol_mult"))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_delay_vol_mult"] = SWAGGY_NO_ATLAS_DELAY_VOL_MULT
+    if isinstance(state.get("_swaggy_no_atlas_delay_vol_ma"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_VOL_MA = max(1, int(state.get("_swaggy_no_atlas_delay_vol_ma")))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_delay_vol_ma"] = SWAGGY_NO_ATLAS_DELAY_VOL_MA
+    if isinstance(state.get("_swaggy_no_atlas_delay_sweep_lookback"), (int, float)):
+        try:
+            SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK = max(1, int(state.get("_swaggy_no_atlas_delay_sweep_lookback")))
+        except Exception:
+            pass
+    else:
+        state["_swaggy_no_atlas_delay_sweep_lookback"] = SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK
     if isinstance(state.get("_swaggy_no_atlas_structure_min_strength"), (int, float)):
         try:
             SWAGGY_NO_ATLAS_STRUCTURE_MIN_STRENGTH = float(state.get("_swaggy_no_atlas_structure_min_strength"))
