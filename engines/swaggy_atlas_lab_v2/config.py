@@ -30,7 +30,7 @@ class SwaggyConfig:
     vol_mult: float = 1.2
     invalid_eps: float = 0.002
     expansion_atr_mult: float = 1.5
-    cooldown_min: int = 20
+    cooldown_min: int = 0
     allow_countertrend: bool = False
     range_short_allowed: bool = False
     tick_size: float = 0.001

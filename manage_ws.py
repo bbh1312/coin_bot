@@ -1265,10 +1265,6 @@ def main():
             tickers = _get_tickers(tickers_cache)
             er._reconcile_long_trades(state, cached_long_ex, tickers)
             er._reconcile_short_trades(state, tickers)
-            try:
-                er._detect_manual_positions(state, er.send_telegram)
-            except Exception:
-                pass
             last_reconcile_ts = now_ts
         for symbol in watch_syms:
             if not isinstance(symbol, str) or "/" not in symbol:
@@ -1289,7 +1285,10 @@ def main():
                 eng_label = _trade_engine_label(open_long)
                 pending_key = "manual_entry_pending_long_ts"
                 alert_key = "manual_entry_alerted_long"
-                if eng_label == "MANUAL" and not st.get(alert_key):
+                if long_amt <= 0:
+                    st.pop(pending_key, None)
+                    state[symbol] = st
+                elif eng_label == "MANUAL" and not st.get(alert_key):
                     if _entry_alerted_in_state(st, "LONG"):
                         st[alert_key] = True
                         st[f"{alert_key}_ts"] = now_ts
@@ -1344,7 +1343,10 @@ def main():
                 eng_label = _trade_engine_label(open_short)
                 pending_key = "manual_entry_pending_short_ts"
                 alert_key = "manual_entry_alerted_short"
-                if eng_label == "MANUAL" and not st.get(alert_key):
+                if short_amt <= 0:
+                    st.pop(pending_key, None)
+                    state[symbol] = st
+                elif eng_label == "MANUAL" and not st.get(alert_key):
                     if _entry_alerted_in_state(st, "SHORT"):
                         st[alert_key] = True
                         st[f"{alert_key}_ts"] = now_ts

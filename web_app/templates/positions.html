@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Follower Positions</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+    <style>
+        :root {
+            --bg: #0b0f14;
+            --panel: #121923;
+            --panel-2: #0f151f;
+            --text: #e8edf2;
+            --muted: #94a3b8;
+            --accent: #f59e0b;
+            --accent-2: #22c55e;
+            --line: rgba(148, 163, 184, 0.2);
+            --danger: #ef4444;
+            --shadow: 0 24px 60px rgba(2, 6, 23, 0.55);
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: "Space Grotesk", "Segoe UI", sans-serif;
+            background: radial-gradient(circle at top, #1d2736 0%, #0b0f14 60%, #07090c 100%);
+            color: var(--text);
+            margin: 0;
+            min-height: 100vh;
+        }
+        .layout {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2.5rem 1.5rem 3.5rem;
+            position: relative;
+        }
+        .top-nav {
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            padding: 0.75rem 1.5rem;
+            background: rgba(9, 12, 17, 0.9);
+            border-bottom: 1px solid var(--line);
+            backdrop-filter: blur(10px);
+        }
+        .top-nav .nav-inner {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+        .top-nav .brand {
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
+        .top-nav .nav-links {
+            display: flex;
+            gap: 0.75rem;
+        }
+        .top-nav .nav-links a {
+            color: var(--text);
+            text-decoration: none;
+            padding: 0.45rem 0.85rem;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: rgba(15, 23, 42, 0.7);
+            font-size: 0.85rem;
+        }
+        .top-nav .nav-links a.active {
+            background: var(--accent);
+            color: #1b1b1b;
+            border-color: transparent;
+        }
+        .glow {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: radial-gradient(circle at 70% 10%, rgba(34,197,94,0.12), transparent 45%),
+                        radial-gradient(circle at 20% 30%, rgba(245,158,11,0.18), transparent 50%);
+        }
+        header {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 1.5rem;
+            margin-bottom: 1.8rem;
+        }
+        h1 {
+            font-size: clamp(2rem, 3vw, 3rem);
+            margin: 0;
+            letter-spacing: -0.02em;
+        }
+        .subtitle {
+            color: var(--muted);
+            margin-top: 0.35rem;
+        }
+        .card {
+            background: linear-gradient(135deg, rgba(18,25,35,0.96), rgba(9,12,17,0.95));
+            border: 1px solid var(--line);
+            border-radius: 1.2rem;
+            padding: 1.5rem;
+            box-shadow: var(--shadow);
+            position: relative;
+            overflow: hidden;
+        }
+        .meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.8rem;
+            margin: 0.5rem 0 1.2rem;
+            font-family: "IBM Plex Mono", monospace;
+            color: var(--muted);
+            font-size: 0.85rem;
+        }
+        .meta span {
+            padding: 0.35rem 0.7rem;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: rgba(15, 23, 42, 0.7);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.88rem;
+        }
+        th, td {
+            text-align: left;
+            padding: 0.6rem 0.55rem;
+            border-bottom: 1px solid var(--line);
+        }
+        th {
+            color: var(--muted);
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.72rem;
+            letter-spacing: 0.08em;
+        }
+        tbody tr:hover {
+            background: rgba(148, 163, 184, 0.06);
+        }
+        .side-long { color: var(--accent-2); }
+        .side-short { color: var(--danger); }
+        .pnl-pos { color: var(--accent-2); }
+        .pnl-neg { color: var(--danger); }
+        .empty {
+            padding: 2rem 0.5rem;
+            color: var(--muted);
+            text-align: center;
+        }
+        .top-actions {
+            display: flex;
+            gap: 0.75rem;
+        }
+        .link-btn {
+            color: var(--text);
+            text-decoration: none;
+            padding: 0.5rem 0.9rem;
+            border-radius: 0.7rem;
+            border: 1px solid var(--line);
+            background: rgba(15, 23, 42, 0.7);
+            font-size: 0.85rem;
+        }
+        .tabs {
+            display: inline-flex;
+            gap: 0.5rem;
+            padding: 0.3rem;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: rgba(15, 23, 42, 0.7);
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.8rem;
+        }
+        .tab-btn {
+            border: none;
+            background: transparent;
+            color: var(--muted);
+            padding: 0.35rem 0.75rem;
+            border-radius: 999px;
+            cursor: pointer;
+        }
+        .tab-btn.active {
+            background: var(--accent);
+            color: #141414;
+        }
+        @media (max-width: 840px) {
+            header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            table {
+                font-size: 0.8rem;
+            }
+            th, td {
+                padding: 0.45rem 0.35rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <nav class="top-nav">
+        <div class="nav-inner">
+            <div class="brand">Binance Control</div>
+            <div class="nav-links">
+                <a href="/">설정</a>
+                <a class="active" href="/positions">포지션</a>
+            </div>
+        </div>
+    </nav>
+    <div class="layout">
+        <div class="glow"></div>
+        <header>
+            <div>
+                <h1>Follower Positions</h1>
+                <div class="subtitle">유저 계정 포지션 현황</div>
+            </div>
+            <div class="top-actions">
+                <a class="link-btn" href="/">Control Deck</a>
+                <a class="link-btn" href="/positions">Refresh</a>
+            </div>
+        </header>
+        <section class="card">
+            <div class="meta">
+                <span>updated: {{ updated_at }}</span>
+                <span>total: {{ total }}</span>
+                <span>admin: {{ admin_total }}</span>
+                <span>users: {{ follower_total }}</span>
+                <div class="tabs" role="tablist">
+                    <button class="tab-btn active" data-filter="all" type="button">ALL</button>
+                    <button class="tab-btn" data-filter="admin" type="button">ADMIN</button>
+                    <button class="tab-btn" data-filter="followers" type="button">USERS</button>
+                </div>
+            </div>
+            {% if items %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Account</th>
+                        <th>Side</th>
+                        <th>Symbol</th>
+                        <th>Qty</th>
+                        <th>Entry</th>
+                        <th>Mark</th>
+                        <th>PnL</th>
+                        <th>ROI%</th>
+                        <th>Lev</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in items %}
+                    <tr data-group="{{ row.group }}">
+                        <td>{{ row.account }}</td>
+                        <td class="{{ 'side-long' if row.side == 'LONG' else 'side-short' }}">{{ row.side }}</td>
+                        <td>{{ row.symbol }}</td>
+                        <td>{{ '%.6g'|format(row.qty) if row.qty is not none else '-' }}</td>
+                        <td>{{ '%.6g'|format(row.entry) if row.entry is not none else '-' }}</td>
+                        <td>{{ '%.6g'|format(row.mark) if row.mark is not none else '-' }}</td>
+                        <td class="{{ 'pnl-pos' if row.pnl is not none and row.pnl >= 0 else 'pnl-neg' }}">
+                            {{ '%.4f'|format(row.pnl) if row.pnl is not none else '-' }}
+                        </td>
+                        <td>{{ '%.2f'|format(row.roi) if row.roi is not none else '-' }}</td>
+                        <td>{{ '%.2f'|format(row.leverage) if row.leverage is not none else '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty">열린 포지션이 없습니다.</div>
+            {% endif %}
+        </section>
+    </div>
+    <script>
+        const tabs = document.querySelectorAll(".tab-btn");
+        const rows = document.querySelectorAll("tbody tr");
+        tabs.forEach((btn) => {
+            btn.addEventListener("click", () => {
+                tabs.forEach((el) => el.classList.remove("active"));
+                btn.classList.add("active");
+                const filter = btn.dataset.filter;
+                rows.forEach((row) => {
+                    if (filter === "all") {
+                        row.style.display = "";
+                        return;
+                    }
+                    const group = row.dataset.group;
+                    row.style.display = group === filter ? "" : "none";
+                });
+            });
+        });
+    </script>
+</body>
+</html>

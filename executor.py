@@ -90,6 +90,7 @@ class ExecutorContext:
         dca_first_pct: float,
         dca_second_pct: float,
         dca_third_pct: float,
+        account_name: Optional[str] = None,
     ) -> None:
         self.exchange = ccxt.binance(
             {
@@ -108,6 +109,7 @@ class ExecutorContext:
         self.dca_first_pct = float(dca_first_pct)
         self.dca_second_pct = float(dca_second_pct)
         self.dca_third_pct = float(dca_third_pct)
+        self.account_name = str(account_name or "")
 
         self.pos_cache = {}
         self.pos_long_cache = {}
@@ -186,6 +188,7 @@ class AccountExecutor:
         dca_first_pct: float,
         dca_second_pct: float,
         dca_third_pct: float,
+        account_name: Optional[str] = None,
     ) -> None:
         self.ctx = ExecutorContext(
             api_key=api_key,
@@ -199,6 +202,7 @@ class AccountExecutor:
             dca_first_pct=dca_first_pct,
             dca_second_pct=dca_second_pct,
             dca_third_pct=dca_third_pct,
+            account_name=account_name,
         )
 
     @contextmanager
@@ -390,6 +394,8 @@ exchange = _DEFAULT_CTX.exchange
 def _db_record_order(action: str, symbol: str, side: str, res: Optional[dict], status_override: Optional[str] = None) -> None:
     if not dbrec or not isinstance(res, dict):
         return
+    ctx = _get_ctx()
+    account_name = getattr(ctx, "account_name", None)
     order = res.get("order") if isinstance(res.get("order"), dict) else {}
     order_id = res.get("order_id") or order.get("id") or (order.get("info") or {}).get("orderId")
     status = order.get("status") or status_override or res.get("status") or "ok"
@@ -413,9 +419,10 @@ def _db_record_order(action: str, symbol: str, side: str, res: Optional[dict], s
             engine=None,
             client_order_id=order.get("clientOrderId") or (order.get("info") or {}).get("clientOrderId"),
             raw=order if order else res,
+            account_name=account_name,
         )
         if order:
-            dbrec.record_fills_from_order(order, symbol=symbol, side=side)
+            dbrec.record_fills_from_order(order, symbol=symbol, side=side, account_name=account_name)
     except Exception:
         return
 

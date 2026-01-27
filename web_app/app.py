@@ -15,6 +15,7 @@ if ROOT not in sys.path:
 
 
 from engine_runner import (
+    _build_account_contexts,
     _build_daily_report,
     _engine_label_from_reason,
     _get_open_trade,
@@ -58,6 +59,9 @@ from engine_runner import (
 import accounts_db
 from executor import AccountExecutor
 
+_FOLLOWER_POS_CACHE = {"ts": 0.0, "items": [], "groups": {}}
+_FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "0"))
+
 COMMAND_DEFS = [
     {"cmd": "/live", "key": "_live_trading", "label": "Live Shorts", "type": "toggle"},
     {"cmd": "/long_live", "key": "_long_live", "label": "Live Longs", "type": "toggle"},
@@ -93,6 +97,54 @@ COMMAND_DEFS = [
 ]
 COMMANDS_BY_CMD = {d["cmd"]: d for d in COMMAND_DEFS}
 COMMANDS_BY_KEY = {d["key"]: d for d in COMMAND_DEFS}
+
+def _sync_admin_settings_from_state(state: dict) -> None:
+    if not isinstance(state, dict):
+        return
+    try:
+        admin_id = accounts_db.get_account_id_by_name("admin")
+    except Exception:
+        admin_id = None
+    if not admin_id:
+        return
+    mapping = {
+        "_entry_usdt": ("entry_pct", float),
+        "_auto_exit": ("auto_exit", int),
+        "_max_open_positions": ("max_positions", int),
+        "_exit_cooldown_hours": ("exit_cooldown_h", float),
+        "_auto_exit_long_tp_pct": ("long_tp_pct", float),
+        "_auto_exit_long_sl_pct": ("long_sl_pct", float),
+        "_auto_exit_short_tp_pct": ("short_tp_pct", float),
+        "_auto_exit_short_sl_pct": ("short_sl_pct", float),
+        "_dca_enabled": ("dca_enabled", int),
+        "_dca_pct": ("dca_pct", float),
+        "_dca_first_pct": ("dca1_pct", float),
+        "_dca_second_pct": ("dca2_pct", float),
+        "_dca_third_pct": ("dca3_pct", float),
+    }
+    for state_key, (db_key, cast) in mapping.items():
+        if state_key not in state:
+            continue
+        val = state.get(state_key)
+        if val is None:
+            continue
+        try:
+            if cast is int:
+                val = int(bool(val)) if isinstance(val, bool) else int(val)
+            else:
+                val = cast(val)
+        except Exception:
+            continue
+        try:
+            accounts_db.update_account_setting(admin_id, db_key, val)
+        except Exception:
+            pass
+    if "_live_trading" in state:
+        try:
+            dry_run_val = 0 if bool(state.get("_live_trading")) else 1
+            accounts_db.update_account_setting(admin_id, "dry_run", int(dry_run_val))
+        except Exception:
+            pass
 
 app = Flask(__name__, template_folder="templates")
 DEFAULTS = {
@@ -130,6 +182,23 @@ DEFAULTS = {
 }
 
 
+@app.route("/positions")
+def follower_positions():
+    items, groups = _build_follower_positions()
+    total = len(items)
+    admin_total = len(groups.get("admin") or [])
+    follower_total = len(groups.get("followers") or [])
+    updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return render_template(
+        "positions.html",
+        items=items,
+        total=total,
+        admin_total=admin_total,
+        follower_total=follower_total,
+        updated_at=updated_at,
+    )
+
+
 def _coerce_bool(val: object) -> bool:
     if isinstance(val, bool):
         return val
@@ -155,6 +224,62 @@ def _load_account_settings(account_id: int) -> dict:
         if key not in settings or settings.get(key) is None:
             settings[key] = value
     return settings
+
+
+def _build_follower_positions() -> tuple[list[dict], dict]:
+    now = time.time()
+    cached = _FOLLOWER_POS_CACHE
+    if _FOLLOWER_POS_TTL_SEC > 0 and (now - float(cached.get("ts") or 0.0)) <= _FOLLOWER_POS_TTL_SEC:
+        return cached.get("items") or [], cached.get("groups") or {}
+    items: list[dict] = []
+    groups: dict = {"admin": [], "followers": []}
+    try:
+        contexts = _build_account_contexts()
+    except Exception:
+        contexts = []
+    for acct in contexts:
+        try:
+            with acct.executor.activate():
+                syms = acct.executor.list_open_position_symbols(force=True)
+                for sym in sorted(syms.get("long") or []):
+                    detail = acct.executor.get_long_position_detail(sym) or {}
+                    row = {
+                        "account": acct.name,
+                        "side": "LONG",
+                        "symbol": sym,
+                        "qty": detail.get("qty"),
+                        "entry": detail.get("entry"),
+                        "mark": detail.get("mark"),
+                        "pnl": detail.get("pnl"),
+                        "roi": detail.get("roi"),
+                        "leverage": detail.get("leverage"),
+                        "group": "admin" if str(acct.name) == "admin" else "followers",
+                    }
+                    items.append(row)
+                    groups[row["group"]].append(row)
+                for sym in sorted(syms.get("short") or []):
+                    detail = acct.executor.get_short_position_detail(sym) or {}
+                    row = {
+                        "account": acct.name,
+                        "side": "SHORT",
+                        "symbol": sym,
+                        "qty": detail.get("qty"),
+                        "entry": detail.get("entry"),
+                        "mark": detail.get("mark"),
+                        "pnl": detail.get("pnl"),
+                        "roi": detail.get("roi"),
+                        "leverage": detail.get("leverage"),
+                        "group": "admin" if str(acct.name) == "admin" else "followers",
+                    }
+                    items.append(row)
+                    groups[row["group"]].append(row)
+        except Exception:
+            continue
+    items.sort(key=lambda x: (x.get("account") or "", x.get("side") or "", x.get("symbol") or ""))
+    _FOLLOWER_POS_CACHE["ts"] = now
+    _FOLLOWER_POS_CACHE["items"] = items
+    _FOLLOWER_POS_CACHE["groups"] = groups
+    return items, groups
 
 
 def _build_executor(account: dict, settings: dict, force_hedge: bool = False) -> AccountExecutor:
@@ -217,6 +342,41 @@ def _open_positions_for_account(executor: AccountExecutor, state: dict) -> list[
     positions = []
     with executor.activate():
         sym_map = executor.list_open_position_symbols(force=True)
+        # Fallback: if positions API returns empty, probe symbols from state.
+        if not (sym_map.get("long") or sym_map.get("short")):
+            cand_long = set()
+            cand_short = set()
+            for tr in _trade_log_entries(state):
+                if tr.get("status") != "open":
+                    continue
+                sym = tr.get("symbol")
+                side = tr.get("side")
+                if not sym or side not in ("LONG", "SHORT"):
+                    continue
+                if side == "LONG":
+                    cand_long.add(sym)
+                else:
+                    cand_short.add(sym)
+            for sym, st in (state or {}).items():
+                if not isinstance(st, dict):
+                    continue
+                if st.get("in_pos_long"):
+                    cand_long.add(sym)
+                if st.get("in_pos_short"):
+                    cand_short.add(sym)
+            sym_map = {"long": set(), "short": set()}
+            for sym in sorted(cand_long):
+                try:
+                    if executor.get_long_position_amount(sym) > 0:
+                        sym_map["long"].add(sym)
+                except Exception:
+                    continue
+            for sym in sorted(cand_short):
+                try:
+                    if executor.get_short_position_amount(sym) > 0:
+                        sym_map["short"].add(sym)
+                except Exception:
+                    continue
         for sym in sorted(sym_map.get("long") or []):
             detail = executor.get_long_position_detail(sym) or {}
             engine_label = "UNKNOWN"
@@ -454,6 +614,28 @@ def command():
                 state[key] = str(value).strip()
         state["_runtime_cfg_ts"] = time.time()
         save_state(state)
+        _sync_admin_settings_from_state(state)
+        if key == "_max_open_positions":
+            try:
+                admin_id = accounts_db.get_account_id_by_name("admin")
+                if admin_id:
+                    accounts_db.update_account_setting(admin_id, "max_positions", int(state.get(key)))
+            except Exception:
+                pass
+        if key == "_entry_usdt":
+            try:
+                admin_id = accounts_db.get_account_id_by_name("admin")
+                if admin_id:
+                    accounts_db.update_account_setting(admin_id, "entry_pct", float(state.get(key)))
+            except Exception:
+                pass
+        if key == "_live_trading":
+            try:
+                admin_id = accounts_db.get_account_id_by_name("admin")
+                if admin_id:
+                    accounts_db.update_account_setting(admin_id, "dry_run", 0 if state.get(key) else 1)
+            except Exception:
+                pass
         _notify_change(item, state.get(key))
         return jsonify({"status": "ok", "key": key, "value": state.get(key)})
     if not cmd:
@@ -466,6 +648,7 @@ def command():
         state[key] = bool(value)
         state["_runtime_cfg_ts"] = time.time()
         save_state(state)
+        _sync_admin_settings_from_state(state)
         item = COMMANDS_BY_CMD.get(verb) or {"label": verb, "type": "toggle"}
         _notify_change(item, state.get(key))
         return jsonify({"status": "ok", "cmd": cmd})
@@ -474,6 +657,21 @@ def command():
         state[num_key] = num_val
         state["_runtime_cfg_ts"] = time.time()
         save_state(state)
+        _sync_admin_settings_from_state(state)
+        if num_key == "_max_open_positions":
+            try:
+                admin_id = accounts_db.get_account_id_by_name("admin")
+                if admin_id:
+                    accounts_db.update_account_setting(admin_id, "max_positions", int(state.get(num_key)))
+            except Exception:
+                pass
+        if num_key == "_entry_usdt":
+            try:
+                admin_id = accounts_db.get_account_id_by_name("admin")
+                if admin_id:
+                    accounts_db.update_account_setting(admin_id, "entry_pct", float(state.get(num_key)))
+            except Exception:
+                pass
         item = COMMANDS_BY_CMD.get(verb) or {"label": verb, "type": "number"}
         _notify_change(item, state.get(num_key))
         return jsonify({"status": "ok", "cmd": cmd})

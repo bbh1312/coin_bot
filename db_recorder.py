@@ -45,6 +45,15 @@ def _get_conn() -> Optional[sqlite3.Connection]:
         return _CONN
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    cols = [row[1] for row in cur.fetchall()]
+    if column in cols:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+    conn.commit()
+
+
 def _init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -83,7 +92,8 @@ def _init_db(conn: sqlite3.Connection) -> None:
             qty REAL,
             engine TEXT,
             client_order_id TEXT,
-            raw_json TEXT
+            raw_json TEXT,
+            account_name TEXT
         );
         CREATE TABLE IF NOT EXISTS fills (
             fill_id TEXT PRIMARY KEY,
@@ -96,7 +106,8 @@ def _init_db(conn: sqlite3.Connection) -> None:
             qty REAL,
             fee REAL,
             fee_asset TEXT,
-            raw_json TEXT
+            raw_json TEXT,
+            account_name TEXT
         );
         CREATE TABLE IF NOT EXISTS positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,6 +164,11 @@ def _init_db(conn: sqlite3.Connection) -> None:
         pass
     try:
         conn.execute("ALTER TABLE income ADD COLUMN created_at TEXT")
+    except Exception:
+        pass
+    try:
+        _ensure_column(conn, "orders", "account_name", "TEXT")
+        _ensure_column(conn, "fills", "account_name", "TEXT")
     except Exception:
         pass
     conn.commit()
@@ -248,6 +264,7 @@ def record_order(
     engine: Optional[str] = None,
     client_order_id: Optional[str] = None,
     raw: Any = None,
+    account_name: Optional[str] = None,
 ) -> None:
     if not order_id:
         return
@@ -258,8 +275,8 @@ def record_order(
     with _LOCK:
         conn.execute(
             """
-            INSERT INTO orders (order_id, created_at, ts, symbol, side, order_type, status, price, qty, engine, client_order_id, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO orders (order_id, created_at, ts, symbol, side, order_type, status, price, qty, engine, client_order_id, raw_json, account_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(order_id) DO UPDATE SET
                 created_at=excluded.created_at,
                 ts=excluded.ts,
@@ -271,7 +288,8 @@ def record_order(
                 qty=excluded.qty,
                 engine=excluded.engine,
                 client_order_id=excluded.client_order_id,
-                raw_json=excluded.raw_json
+                raw_json=excluded.raw_json,
+                account_name=excluded.account_name
             """,
             (
                 str(order_id),
@@ -286,6 +304,7 @@ def record_order(
                 engine,
                 client_order_id,
                 _json(raw),
+                str(account_name or ""),
             ),
         )
         conn.commit()
@@ -302,6 +321,7 @@ def record_fill(
     fee_asset: Optional[str],
     ts: Optional[float] = None,
     raw: Any = None,
+    account_name: Optional[str] = None,
 ) -> None:
     if not fill_id:
         return
@@ -312,8 +332,8 @@ def record_fill(
     with _LOCK:
         conn.execute(
             """
-            INSERT INTO fills (fill_id, created_at, ts, order_id, symbol, side, price, qty, fee, fee_asset, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO fills (fill_id, created_at, ts, order_id, symbol, side, price, qty, fee, fee_asset, raw_json, account_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(fill_id) DO UPDATE SET
                 created_at=excluded.created_at,
                 ts=excluded.ts,
@@ -324,7 +344,8 @@ def record_fill(
                 qty=excluded.qty,
                 fee=excluded.fee,
                 fee_asset=excluded.fee_asset,
-                raw_json=excluded.raw_json
+                raw_json=excluded.raw_json,
+                account_name=excluded.account_name
             """,
             (
                 str(fill_id),
@@ -338,6 +359,7 @@ def record_fill(
                 _to_float(fee),
                 fee_asset,
                 _json(raw),
+                str(account_name or ""),
             ),
         )
         conn.commit()
@@ -446,7 +468,7 @@ def record_income(
         conn.commit()
 
 
-def record_fills_from_order(order: dict, symbol: str, side: Optional[str]) -> None:
+def record_fills_from_order(order: dict, symbol: str, side: Optional[str], account_name: Optional[str] = None) -> None:
     trades = order.get("trades") if isinstance(order.get("trades"), list) else []
     if not trades:
         info = order.get("info") if isinstance(order.get("info"), dict) else {}
@@ -484,4 +506,5 @@ def record_fills_from_order(order: dict, symbol: str, side: Optional[str]) -> No
             fee_asset=fee_asset,
             ts=ts,
             raw=tr,
+            account_name=account_name,
         )

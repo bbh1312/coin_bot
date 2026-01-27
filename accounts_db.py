@@ -196,6 +196,38 @@ def get_account_settings(account_id: int) -> Dict[str, Any]:
         conn.close()
 
 
+def get_account_id_by_name(name: str) -> Optional[int]:
+    init_db()
+    conn = _connect()
+    try:
+        row = _fetch_one(conn, "SELECT id FROM accounts WHERE name = ?", (name,))
+        if row:
+            return int(row["id"])
+        return None
+    finally:
+        conn.close()
+
+
+def update_account_setting(account_id: int, key: str, value: Any) -> bool:
+    init_db()
+    if not account_id or not key:
+        return False
+    allowed = set(DEFAULT_SETTINGS.keys())
+    if key not in allowed:
+        return False
+    conn = _connect()
+    try:
+        now = _now_str()
+        cur = conn.execute(
+            f"UPDATE account_settings SET {key} = ?, updated_at = ? WHERE account_id = ?",
+            (value, now, account_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def get_telegram_bot(account_id: int) -> Dict[str, Any]:
     init_db()
     conn = _connect()
