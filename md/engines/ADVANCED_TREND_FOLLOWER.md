@@ -17,12 +17,14 @@
 - MFI(14) < 80
 - ADX(14) > 20
 - SuperTrend 추세가 LONG
+- 볼린저 과열 필터: 종가 > BB 상단(20,2) 이면 스킵
 
 숏:
 - 15m close < 4h EMA200
 - MFI(14) > 20
 - ADX(14) > 20
 - SuperTrend 추세가 SHORT
+- 볼린저 과열 필터: 종가 < BB 하단(20,2) 이면 스킵
 
 ## 청산 로직 (실매매)
 - SL: 진입 직후 거래소 STOP_MARKET 주문으로 SuperTrend 라인에 스탑 설정

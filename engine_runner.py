@@ -3731,6 +3731,9 @@ def _run_adv_trend_cycle(
         if df_15m.empty or df_4h.empty:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
+        if len(df_15m) < 20:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
         signal = _adv_eval_15m(df_15m, df_4h)
         if not signal:
             time.sleep(PER_SYMBOL_SLEEP)
@@ -3744,6 +3747,12 @@ def _run_adv_trend_cycle(
         atr_val = signal["atr"]
         signal_ts = signal.get("ts")
 
+        close_series = df_15m["close"].iloc[-20:]
+        bb_mid = close_series.mean()
+        bb_std = close_series.std(ddof=0)
+        bb_upper = bb_mid + (2.0 * bb_std)
+        bb_lower = bb_mid - (2.0 * bb_std)
+
         long_ok = (
             close_px > ema200
             and mfi_val < ADV_TREND_MFI_LONG_MAX
@@ -3756,6 +3765,16 @@ def _run_adv_trend_cycle(
             and adx_val > ADV_TREND_ADX_MIN
             and trend_dir == -1
         )
+        if long_ok and isinstance(bb_upper, (int, float)) and close_px > bb_upper:
+            long_ok = False
+            _append_adv_trend_log(
+                f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT side=LONG close={close_px:.6g} bb_upper={bb_upper:.6g}"
+            )
+        if short_ok and isinstance(bb_lower, (int, float)) and close_px < bb_lower:
+            short_ok = False
+            _append_adv_trend_log(
+                f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT side=SHORT close={close_px:.6g} bb_lower={bb_lower:.6g}"
+            )
         if not long_ok and not short_ok:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -3937,7 +3956,10 @@ def _run_adv_trend_cycle(
                 continue
 
         _append_adv_trend_log(
-            f"ADV_TREND_ENTRY sym={symbol} side={side} entry={entry_px:.6g} sl={st_px:.6g} tp1={tp1_px:.6g}"
+            "ADV_TREND_ENTRY "
+            f"sym={symbol} side={side} entry={entry_px:.6g} sl={st_px:.6g} tp1={tp1_px:.6g} "
+            f"close={close_px:.6g} ema200={ema200:.6g} mfi={mfi_val:.4g} adx={adx_val:.4g} "
+            f"st_dir={trend_dir} bb_upper={bb_upper:.6g} bb_lower={bb_lower:.6g}"
         )
         _send_entry_alert(
             send_alert,
