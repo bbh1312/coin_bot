@@ -476,19 +476,6 @@ def main() -> None:
                     else:
                         sym_stats["losses"] += 1
                         sym_stats["sl"] += 1
-                    _bt_log(
-                        "[BACKTEST][EXIT] sym=%s mode=advanced_trend_follower side=%s entry_dt=%s exit_dt=%s "
-                        "entry_px=%.6g exit_px=%.6g reason=%s"
-                        % (
-                            symbol,
-                            pos.side,
-                            _dt_kst(pos.entry_ts),
-                            _dt_kst(pos.exit_ts),
-                            pos.entry_px,
-                            pos.exit_px,
-                            pos.exit_reason or "N/A",
-                        )
-                    )
                     with open(trades_path, "a", newline="", encoding="utf-8") as f:
                         writer = csv.writer(f)
                         writer.writerow([
@@ -518,7 +505,6 @@ def main() -> None:
             bb_lower = float(row["bb_lower"]) if pd.notna(row.get("bb_lower")) else None
             if close_px > float(ema_trend) and mfi < float(args.mfi_long_max) and st_dir > 0:
                 if isinstance(bb_upper, (int, float)) and close_px > bb_upper:
-                    _bt_log("[BACKTEST] %s skip=BB_OVERHEAT side=LONG close=%.6g bb_upper=%.6g" % (symbol, close_px, bb_upper))
                     continue
                 stop_px = st_line_val
                 risk_per_unit = close_px - stop_px
@@ -528,10 +514,6 @@ def main() -> None:
                 atr_med = float(row["atr_median"]) if pd.notna(row["atr_median"]) else None
                 if isinstance(atr_val, (int, float)) and atr_val > 0:
                     if risk_per_unit < float(args.min_stop_atr) * float(atr_val):
-                        _bt_log(
-                            "[BACKTEST] %s skip=MIN_STOP side=LONG risk_per_unit=%.6g atr=%.6g"
-                            % (symbol, risk_per_unit, atr_val)
-                        )
                         continue
                 scale = 1.0
                 if isinstance(atr_val, (int, float)) and atr_val > 0 and isinstance(atr_med, (int, float)) and atr_med > 0:
@@ -573,41 +555,11 @@ def main() -> None:
                     "hold_sum": 0.0,
                 })
                 sym_stats["entries"] += 1
-                _bt_log(
-                    "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                    "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
-                    % (
-                        symbol,
-                        sym_stats["entries"],
-                        sym_stats["exits"],
-                        sym_stats["trades"],
-                        sym_stats["wins"],
-                        sym_stats["losses"],
-                        100.0 * (sym_stats["wins"] / max(1, sym_stats["trades"])),
-                        sym_stats["tp"],
-                        sym_stats["sl"],
-                        (sym_stats["mfe_sum"] / max(1, sym_stats["trades"])),
-                        (sym_stats["mae_sum"] / max(1, sym_stats["trades"])),
-                        (sym_stats["hold_sum"] / max(1, sym_stats["trades"])),
-                    )
-                )
-                _bt_log(
-                    "[BACKTEST][OPEN] sym=%s mode=advanced_trend_follower side=LONG entry_dt=%s exit_dt= "
-                    "entry_px=%.6g last_px=%.6g last_dt=%s unrealized_pct=%.2f%%"
-                    % (
-                        symbol,
-                        _dt_kst(ts),
-                        entry_fill,
-                        close_px,
-                        _dt_kst(ts),
-                        ((close_px - entry_fill) / entry_fill) * 100.0,
-                    )
-                )
+                # per-symbol summaries are printed at the end only
                 continue
 
             if close_px < float(ema_trend) and mfi > float(args.mfi_short_min) and st_dir < 0:
                 if isinstance(bb_lower, (int, float)) and close_px < bb_lower:
-                    _bt_log("[BACKTEST] %s skip=BB_OVERHEAT side=SHORT close=%.6g bb_lower=%.6g" % (symbol, close_px, bb_lower))
                     continue
                 stop_px = st_line_val
                 risk_per_unit = stop_px - close_px
@@ -617,10 +569,6 @@ def main() -> None:
                 atr_med = float(row["atr_median"]) if pd.notna(row["atr_median"]) else None
                 if isinstance(atr_val, (int, float)) and atr_val > 0:
                     if risk_per_unit < float(args.min_stop_atr) * float(atr_val):
-                        _bt_log(
-                            "[BACKTEST] %s skip=MIN_STOP side=SHORT risk_per_unit=%.6g atr=%.6g"
-                            % (symbol, risk_per_unit, atr_val)
-                        )
                         continue
                 scale = 1.0
                 if isinstance(atr_val, (int, float)) and atr_val > 0 and isinstance(atr_med, (int, float)) and atr_med > 0:
@@ -662,36 +610,7 @@ def main() -> None:
                     "hold_sum": 0.0,
                 })
                 sym_stats["entries"] += 1
-                _bt_log(
-                    "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                    "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
-                    % (
-                        symbol,
-                        sym_stats["entries"],
-                        sym_stats["exits"],
-                        sym_stats["trades"],
-                        sym_stats["wins"],
-                        sym_stats["losses"],
-                        100.0 * (sym_stats["wins"] / max(1, sym_stats["trades"])),
-                        sym_stats["tp"],
-                        sym_stats["sl"],
-                        (sym_stats["mfe_sum"] / max(1, sym_stats["trades"])),
-                        (sym_stats["mae_sum"] / max(1, sym_stats["trades"])),
-                        (sym_stats["hold_sum"] / max(1, sym_stats["trades"])),
-                    )
-                )
-                _bt_log(
-                    "[BACKTEST][OPEN] sym=%s mode=advanced_trend_follower side=SHORT entry_dt=%s exit_dt= "
-                    "entry_px=%.6g last_px=%.6g last_dt=%s unrealized_pct=%.2f%%"
-                    % (
-                        symbol,
-                        _dt_kst(ts),
-                        entry_fill,
-                        close_px,
-                        _dt_kst(ts),
-                        ((entry_fill - close_px) / entry_fill) * 100.0,
-                    )
-                )
+                # per-symbol summaries are printed at the end only
         if pos:
             open_positions[symbol] = {
                 "side": pos.side,
@@ -744,25 +663,7 @@ def main() -> None:
             )
         )
 
-    for sym, pos in open_positions.items():
-        unreal = (
-            (pos["last_px"] - pos["entry_px"]) / pos["entry_px"] * 100.0
-            if pos["side"] == "LONG"
-            else (pos["entry_px"] - pos["last_px"]) / pos["entry_px"] * 100.0
-        )
-        _bt_log(
-            "[BACKTEST][OPEN] sym=%s mode=advanced_trend_follower side=%s entry_dt=%s exit_dt= "
-            "entry_px=%.6g last_px=%.6g last_dt=%s unrealized_pct=%.2f%% dca_adds=0 dca_usdt=0.0"
-            % (
-                sym,
-                pos["side"],
-                _dt_kst(pos["entry_ts"]),
-                pos["entry_px"],
-                pos["last_px"],
-                _dt_kst(pos["last_ts"]),
-                unreal,
-            )
-        )
+    # 심볼별 오픈 포지션 로그는 생략 (요약/토탈만 출력)
 
     total_entries = sum(s["entries"] for s in stats_by_symbol.values())
     total_exits = sum(s["exits"] for s in stats_by_symbol.values())

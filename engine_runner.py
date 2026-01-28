@@ -1390,6 +1390,79 @@ def _fmt_entry_price(val: Any) -> str:
     except Exception:
         return "N/A"
 
+def _kst_today_start_ts(now_ts: Optional[float] = None) -> float:
+    base = float(now_ts if now_ts is not None else time.time())
+    kst = base + 9 * 3600
+    day_start_kst = int(kst // 86400) * 86400
+    # Binance 기준: KST 09:00 ~ 다음날 08:59:59
+    return (day_start_kst - 9 * 3600) + 9 * 3600
+
+def _fetch_realized_pnl_since(ex, since_ts: float) -> tuple[Optional[float], int, Optional[str]]:
+    start_ms = int(float(since_ts) * 1000)
+    now_ms = int(time.time() * 1000)
+    total = 0.0
+    count = 0
+    income_types = ("REALIZED_PNL", "FUNDING_FEE", "COMMISSION")
+    try:
+        for income_type in income_types:
+            since = start_ms
+            while True:
+                params = {
+                    "incomeType": income_type,
+                    "startTime": since,
+                    "endTime": now_ms,
+                    "limit": 1000,
+                }
+                if hasattr(ex, "fapiPrivateGetIncome"):
+                    batch = ex.fapiPrivateGetIncome(params)
+                else:
+                    batch = ex.fapiPrivate_get_income(params)
+                if not batch:
+                    break
+                last_ts = None
+                for row in batch:
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("incomeType") != income_type:
+                        continue
+                    asset = row.get("asset")
+                    if asset and str(asset).upper() not in ("USDT",):
+                        continue
+                    income = row.get("income")
+                    try:
+                        val = float(income)
+                    except Exception:
+                        val = None
+                    if val is not None:
+                        total += val
+                        count += 1
+                    ts = row.get("time")
+                    try:
+                        ts_ms = int(float(ts))
+                        if last_ts is None or ts_ms > last_ts:
+                            last_ts = ts_ms
+                    except Exception:
+                        pass
+                if last_ts is None:
+                    break
+                since = last_ts + 1
+                if last_ts >= now_ms:
+                    break
+    except Exception as e:
+        return None, 0, str(e)[:80]
+    return total, count, None
+
+def _fetch_last_price(symbol: str) -> Optional[float]:
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        if isinstance(ticker, dict):
+            last = ticker.get("last") or ticker.get("info", {}).get("lastPrice")
+            if isinstance(last, (int, float)):
+                return float(last)
+    except Exception:
+        return None
+    return None
+
 def _coerce_float(val: Any) -> Optional[float]:
     try:
         if val is None:
@@ -8523,14 +8596,35 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 engine_label = _engine_label_from_reason(
                     (open_tr.get("meta") or {}).get("reason") if open_tr else None
                 )
+                exit_reason = "manual_close"
+                entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
+                tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "LONG")
+                meta = open_tr.get("meta") if isinstance(open_tr, dict) else None
+                sl_price_meta = None
+                if isinstance(meta, dict):
+                    try:
+                        sl_price_meta = float(meta.get("sl_price"))
+                    except Exception:
+                        sl_price_meta = None
+                mark_px = _fetch_last_price(sym)
+                if mark_px is None and isinstance(sl_price_meta, (int, float)):
+                    mark_px = float(sl_price_meta)
+                if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
+                    profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
+                    if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
+                        exit_reason = "auto_exit_tp"
+                    elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
+                        exit_reason = "auto_exit_sl"
+                    elif isinstance(sl_price_meta, (int, float)) and mark_px <= float(sl_price_meta):
+                        exit_reason = "auto_exit_sl"
                 _close_trade(
                     state,
                     side="LONG",
                     symbol=sym,
                     exit_ts=now,
-                    exit_price=None,
+                    exit_price=mark_px if isinstance(mark_px, (int, float)) else None,
                     pnl_usdt=None,
-                    reason="manual_close",
+                    reason=exit_reason,
                 )
                 _append_report_line(sym, "LONG", None, None, engine_label)
                 st = state.get(sym, {}) if isinstance(state, dict) else {}
@@ -8543,11 +8637,13 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 if engine_label != "UNKNOWN" and _trade_has_entry(open_tr) and not _recent_auto_exit(state, sym, now):
                     entry_time = _fmt_entry_time(open_tr)
                     entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+                    exit_tag = "SL" if exit_reason == "auto_exit_sl" else "TP" if exit_reason == "auto_exit_tp" else "MANUAL"
+                    icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
                     send_telegram(
-                        f"{EXIT_ICON} <b>롱 청산</b>\n"
+                        f"{icon} <b>롱 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
-                        f"사유: MANUAL\n"
+                        f"사유: {exit_tag}\n"
                         f"{entry_line}".rstrip()
                     )
                 time.sleep(0.1)
@@ -10100,6 +10196,32 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     resp = f"ℹ️ accounts\n{summary}\ndb={db_path}"
                     ok = _reply(resp)
                     print(f"[telegram] accounts cmd 처리 send={'ok' if ok else 'fail'}")
+                    responded = True
+
+                if cmd in ("/pnl_today", "pnl_today", "/today_pnl", "today_pnl") and not responded:
+                    _maybe_refresh_accounts(reason="pnl_today")
+                    contexts = ACCOUNT_CONTEXTS or ([ADMIN_ACCOUNT_CONTEXT] if ADMIN_ACCOUNT_CONTEXT else [])
+                    if not contexts:
+                        resp = "⛔ 계정을 찾을 수 없습니다."
+                    else:
+                        start_ts = _kst_today_start_ts()
+                        date_kst = time.strftime("%Y-%m-%d", time.gmtime(start_ts + 9 * 3600))
+                        lines = [f"📊 오늘 실현손익 (KST {date_kst})"]
+                        for acct in contexts:
+                            if not acct:
+                                continue
+                            try:
+                                with acct.executor.activate():
+                                    total, cnt, err = _fetch_realized_pnl_since(exchange, start_ts)
+                            except Exception as e:
+                                total, cnt, err = None, 0, str(e)[:80]
+                            if err:
+                                lines.append(f"- {acct.name}: N/A (err={err})")
+                            else:
+                                lines.append(f"- {acct.name}: {total:+.4f} USDT (trades={cnt})")
+                        resp = "\n".join(lines)
+                    ok = _reply(resp)
+                    print(f"[telegram] pnl_today cmd 처리 send={'ok' if ok else 'fail'}")
                     responded = True
 
                 if cmd in ("/live", "live"):

@@ -125,6 +125,41 @@
         .live-card .toggle {
             padding: 0.55rem 0;
         }
+        .pnl-card {
+            margin-top: 1rem;
+            padding: 0.9rem 1rem;
+            border-radius: 0.9rem;
+            border: 1px solid var(--line);
+            background: rgba(10, 14, 20, 0.7);
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.85rem;
+        }
+        .pnl-card h3 {
+            margin: 0 0 0.6rem;
+            font-size: 0.95rem;
+            letter-spacing: 0.02em;
+        }
+        .pnl-list {
+            display: grid;
+            gap: 0.45rem;
+        }
+        .pnl-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.5rem;
+            padding-bottom: 0.35rem;
+            border-bottom: 1px dashed rgba(148, 163, 184, 0.2);
+        }
+        .pnl-row:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+        .pnl-name {
+            color: var(--muted);
+        }
+        .pnl-value.pos { color: var(--accent-2); }
+        .pnl-value.neg { color: var(--danger); }
         .engines-card,
         .risk-card {
             padding: 1.7rem;
@@ -291,6 +326,15 @@
                 <h2>Live Execution</h2>
                 <div class="hint">실주문 모드와 자동 청산을 빠르게 전환합니다.</div>
                 <div id="live-controls"></div>
+                <div class="pnl-card" id="pnl-today">
+                    <h3>오늘 순이익</h3>
+                    <div class="pnl-list">
+                        <div class="pnl-row">
+                            <span class="pnl-name">Loading...</span>
+                            <span class="pnl-value">--</span>
+                        </div>
+                    </div>
+                </div>
             </div>
             <div class="card engines-card">
                 <h2>Engines</h2>
@@ -318,6 +362,7 @@
         const COMMANDS = {{ commands | tojson }};
         const statusPill = document.getElementById("status-pill");
         const liveControls = document.getElementById("live-controls");
+        const pnlTodayBox = document.getElementById("pnl-today");
         const engineControls = document.getElementById("engine-controls");
         const riskControls = document.getElementById("risk-controls");
         const commandByKey = new Map(COMMANDS.map((item) => [item.key, item]));
@@ -501,6 +546,30 @@
                     riskControls.appendChild(buildNumberRow(item, current));
                 }
             });
+            const pnlList = pnlTodayBox.querySelector(".pnl-list");
+            const pnlItems = data.pnl_today || [];
+            pnlList.innerHTML = "";
+            if (!pnlItems.length) {
+                const row = document.createElement("div");
+                row.className = "pnl-row";
+                row.innerHTML = `<span class="pnl-name">no data</span><span class="pnl-value">--</span>`;
+                pnlList.appendChild(row);
+            } else {
+                pnlItems.forEach((item) => {
+                    const row = document.createElement("div");
+                    row.className = "pnl-row";
+                    const name = item.name || "unknown";
+                    if (item.error) {
+                        row.innerHTML = `<span class="pnl-name">${name}</span><span class="pnl-value">N/A</span>`;
+                    } else {
+                        const pnlVal = item.pnl;
+                        const pnlText = typeof pnlVal === "number" ? `${pnlVal >= 0 ? "+" : ""}${pnlVal.toFixed(4)} USDT` : "N/A";
+                        const cls = typeof pnlVal === "number" ? (pnlVal >= 0 ? "pnl-value pos" : "pnl-value neg") : "pnl-value";
+                        row.innerHTML = `<span class="pnl-name">${name}</span><span class="${cls}">${pnlText}</span>`;
+                    }
+                    pnlList.appendChild(row);
+                });
+            }
         }
 
         function _fmtDate(d) {

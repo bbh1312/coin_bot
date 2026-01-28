@@ -825,6 +825,69 @@ def _trade_log_entries(state: dict) -> list[dict]:
     return [tr for tr in items if isinstance(tr, dict)]
 
 
+def _kst_today_start_ts(now_ts: float | None = None) -> float:
+    base = float(now_ts if now_ts is not None else time.time())
+    kst = base + 9 * 3600
+    day_start_kst = int(kst // 86400) * 86400
+    # Binance 기준: KST 09:00 ~ 다음날 08:59:59
+    return (day_start_kst - 9 * 3600) + 9 * 3600
+
+
+def _fetch_realized_pnl_since(ex, since_ts: float) -> tuple[float | None, int, str | None]:
+    start_ms = int(float(since_ts) * 1000)
+    now_ms = int(time.time() * 1000)
+    total = 0.0
+    count = 0
+    income_types = ("REALIZED_PNL", "FUNDING_FEE", "COMMISSION")
+    try:
+        for income_type in income_types:
+            since = start_ms
+            while True:
+                params = {
+                    "incomeType": income_type,
+                    "startTime": since,
+                    "endTime": now_ms,
+                    "limit": 1000,
+                }
+                if hasattr(ex, "fapiPrivateGetIncome"):
+                    batch = ex.fapiPrivateGetIncome(params)
+                else:
+                    batch = ex.fapiPrivate_get_income(params)
+                if not batch:
+                    break
+                last_ts = None
+                for row in batch:
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("incomeType") != income_type:
+                        continue
+                    asset = row.get("asset")
+                    if asset and str(asset).upper() not in ("USDT",):
+                        continue
+                    try:
+                        val = float(row.get("income"))
+                    except Exception:
+                        val = None
+                    if val is not None:
+                        total += val
+                        count += 1
+                    ts = row.get("time")
+                    try:
+                        ts_ms = int(float(ts))
+                        if last_ts is None or ts_ms > last_ts:
+                            last_ts = ts_ms
+                    except Exception:
+                        pass
+                if last_ts is None:
+                    break
+                since = last_ts + 1
+                if last_ts >= now_ms:
+                    break
+    except Exception as e:
+        return None, 0, str(e)[:80]
+    return total, count, None
+
+
 @app.route("/")
 def index():
     state = load_state()
@@ -864,6 +927,9 @@ def status():
             value = DEFAULTS[key]
         payload[key] = value
     accounts_payload = []
+    pnl_today_payload = []
+    pnl_start_ts = _kst_today_start_ts()
+    pnl_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_start_ts + 9 * 3600))
     for acct in _list_accounts():
         account_id = int(acct["id"])
         settings = _load_account_settings(account_id)
@@ -872,10 +938,14 @@ def status():
         executor = _build_executor(acct, settings, force_hedge=True)
         futures_usdt = None
         entry_usdt_available = 0.0
+        pnl_val = None
+        pnl_trades = 0
+        pnl_err = None
         try:
             with executor.activate():
                 futures_usdt = executor.get_available_usdt()
                 entry_usdt_available = _entry_usdt_available(executor, float(settings.get("entry_pct") or 0.0))
+                pnl_val, pnl_trades, pnl_err = _fetch_realized_pnl_since(executor.ctx.exchange, pnl_start_ts)
         except Exception:
             futures_usdt = None
         admin_follow_enabled = acct_state.get("_admin_follow_enabled")
@@ -895,7 +965,18 @@ def status():
                 "manual_entry_enabled": bool(manual_entry_enabled),
             }
         )
+        pnl_today_payload.append(
+            {
+                "account_id": account_id,
+                "name": str(acct.get("name") or account_id),
+                "pnl": pnl_val,
+                "trades": pnl_trades,
+                "error": pnl_err,
+                "date": pnl_date_kst,
+            }
+        )
     payload["accounts"] = accounts_payload
+    payload["pnl_today"] = pnl_today_payload
     return jsonify(payload)
 
 
