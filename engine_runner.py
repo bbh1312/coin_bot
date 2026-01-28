@@ -148,6 +148,10 @@ from executor import (
     long_market,
     close_short_market,
     close_long_market,
+    close_long_market_qty,
+    close_short_market_qty,
+    place_long_sl_px,
+    place_short_sl_px,
     cancel_open_orders,
     cancel_stop_orders,
     cancel_conditional_by_side,
@@ -171,6 +175,10 @@ _EXEC_SHORT_LIMIT = short_limit
 _EXEC_LONG_MARKET = long_market
 _EXEC_CLOSE_SHORT_MARKET = close_short_market
 _EXEC_CLOSE_LONG_MARKET = close_long_market
+_EXEC_CLOSE_LONG_MARKET_QTY = close_long_market_qty
+_EXEC_CLOSE_SHORT_MARKET_QTY = close_short_market_qty
+_EXEC_PLACE_LONG_SL_PX = place_long_sl_px
+_EXEC_PLACE_SHORT_SL_PX = place_short_sl_px
 _EXEC_CANCEL_OPEN_ORDERS = cancel_open_orders
 _EXEC_CANCEL_STOP_ORDERS = cancel_stop_orders
 _EXEC_CANCEL_CONDITIONAL_BY_SIDE = cancel_conditional_by_side
@@ -549,6 +557,9 @@ def _resolve_entry_usdt_for_executor(executor: AccountExecutor, pct: Optional[fl
     return val
 
 def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = LEVERAGE, margin_mode: str = "isolated") -> dict:
+    if not _admin_is_active():
+        _set_last_entry_broadcast(symbol, "SHORT", "skip", False, [])
+        return {"status": "skip", "reason": "admin_inactive", "symbol": symbol}
     try:
         res = _EXEC_SHORT_MARKET(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
     except Exception:
@@ -562,7 +573,11 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
         return res
     use_pct = _calc_effective_entry_pct(usdt_amount)
     follower_calls = []
+    active_names = _active_account_names()
     for acct in followers:
+        if active_names and str(acct.name) not in active_names:
+            follower_calls.append({"acct": acct, "skip": "inactive"})
+            continue
         follower_usdt = usdt_amount
         if use_pct is not None:
             follower_usdt = _resolve_entry_usdt_for_executor(acct.executor, use_pct)
@@ -592,7 +607,11 @@ def short_limit(*args, **kwargs) -> dict:
         usdt_amount = args[2]
     use_pct = _calc_effective_entry_pct(usdt_amount)
     follower_calls = []
+    active_names = _active_account_names()
     for acct in followers:
+        if active_names and str(acct.name) not in active_names:
+            follower_calls.append({"acct": acct, "skip": "inactive"})
+            continue
         follower_usdt = usdt_amount
         if use_pct is not None:
             follower_usdt = _resolve_entry_usdt_for_executor(acct.executor, use_pct)
@@ -612,6 +631,9 @@ def short_limit(*args, **kwargs) -> dict:
     return res
 
 def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = LEVERAGE, margin_mode: str = "isolated") -> dict:
+    if not _admin_is_active():
+        _set_last_entry_broadcast(symbol, "LONG", "skip", False, [])
+        return {"status": "skip", "reason": "admin_inactive", "symbol": symbol}
     try:
         res = _EXEC_LONG_MARKET(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
     except Exception:
@@ -625,7 +647,11 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
         return res
     use_pct = _calc_effective_entry_pct(usdt_amount)
     follower_calls = []
+    active_names = _active_account_names()
     for acct in followers:
+        if active_names and str(acct.name) not in active_names:
+            follower_calls.append({"acct": acct, "skip": "inactive"})
+            continue
         follower_usdt = usdt_amount
         if use_pct is not None:
             follower_usdt = _resolve_entry_usdt_for_executor(acct.executor, use_pct)
@@ -687,6 +713,102 @@ def close_long_market(symbol: str) -> dict:
     _broadcast_followers("close_long_market", follower_calls, {"symbol": symbol})
     return res
 
+def close_long_market_qty(symbol: str, qty: float) -> dict:
+    res = _EXEC_CLOSE_LONG_MARKET_QTY(symbol, qty)
+    followers = FOLLOWER_CONTEXTS
+    if not followers:
+        return res
+    follower_calls = []
+    for acct in followers:
+        try:
+            amt = acct.executor.get_long_position_amount(symbol)
+            if isinstance(amt, (int, float)) and amt <= 0:
+                try:
+                    acct.executor.refresh_positions_cache(force=True)
+                    amt = acct.executor.get_long_position_amount(symbol)
+                except Exception:
+                    amt = amt
+            if isinstance(amt, (int, float)) and amt <= 0:
+                follower_calls.append({"acct": acct, "skip": "no_pos"})
+                continue
+        except Exception:
+            pass
+        follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_long_market_qty(symbol, qty)})
+    _broadcast_followers("close_long_market_qty", follower_calls, {"symbol": symbol})
+    return res
+
+def close_short_market_qty(symbol: str, qty: float) -> dict:
+    res = _EXEC_CLOSE_SHORT_MARKET_QTY(symbol, qty)
+    followers = FOLLOWER_CONTEXTS
+    if not followers:
+        return res
+    follower_calls = []
+    for acct in followers:
+        try:
+            amt = acct.executor.get_short_position_amount(symbol)
+            if isinstance(amt, (int, float)) and amt <= 0:
+                try:
+                    acct.executor.refresh_positions_cache(force=True)
+                    amt = acct.executor.get_short_position_amount(symbol)
+                except Exception:
+                    amt = amt
+            if isinstance(amt, (int, float)) and amt <= 0:
+                follower_calls.append({"acct": acct, "skip": "no_pos"})
+                continue
+        except Exception:
+            pass
+        follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_short_market_qty(symbol, qty)})
+    _broadcast_followers("close_short_market_qty", follower_calls, {"symbol": symbol})
+    return res
+
+def place_long_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None) -> dict:
+    res = _EXEC_PLACE_LONG_SL_PX(symbol, stop_price, qty=qty)
+    followers = FOLLOWER_CONTEXTS
+    if not followers:
+        return res
+    follower_calls = []
+    for acct in followers:
+        try:
+            amt = acct.executor.get_long_position_amount(symbol)
+            if isinstance(amt, (int, float)) and amt <= 0:
+                try:
+                    acct.executor.refresh_positions_cache(force=True)
+                    amt = acct.executor.get_long_position_amount(symbol)
+                except Exception:
+                    amt = amt
+            if isinstance(amt, (int, float)) and amt <= 0:
+                follower_calls.append({"acct": acct, "skip": "no_pos"})
+                continue
+        except Exception:
+            pass
+        follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.place_long_sl_px(symbol, stop_price, qty=qty)})
+    _broadcast_followers("place_long_sl_px", follower_calls, {"symbol": symbol})
+    return res
+
+def place_short_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None) -> dict:
+    res = _EXEC_PLACE_SHORT_SL_PX(symbol, stop_price, qty=qty)
+    followers = FOLLOWER_CONTEXTS
+    if not followers:
+        return res
+    follower_calls = []
+    for acct in followers:
+        try:
+            amt = acct.executor.get_short_position_amount(symbol)
+            if isinstance(amt, (int, float)) and amt <= 0:
+                try:
+                    acct.executor.refresh_positions_cache(force=True)
+                    amt = acct.executor.get_short_position_amount(symbol)
+                except Exception:
+                    amt = amt
+            if isinstance(amt, (int, float)) and amt <= 0:
+                follower_calls.append({"acct": acct, "skip": "no_pos"})
+                continue
+        except Exception:
+            pass
+        follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.place_short_sl_px(symbol, stop_price, qty=qty)})
+    _broadcast_followers("place_short_sl_px", follower_calls, {"symbol": symbol})
+    return res
+
 def cancel_open_orders(symbol: str) -> dict:
     return _broadcast_exec("cancel_open_orders", _EXEC_CANCEL_OPEN_ORDERS, symbol)
 
@@ -730,6 +852,22 @@ SWAGGY_NO_ATLAS_DELAY_VOL_MULT = float(os.getenv("SWAGGY_NO_ATLAS_DELAY_VOL_MULT
 SWAGGY_NO_ATLAS_DELAY_VOL_MA = int(os.getenv("SWAGGY_NO_ATLAS_DELAY_VOL_MA", "20"))
 SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK = int(os.getenv("SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK", "3"))
 SWAGGY_NO_ATLAS_DEBUG_SYMBOLS = os.getenv("SWAGGY_NO_ATLAS_DEBUG_SYMBOLS", "").strip()
+ADV_TREND_ENABLED = os.getenv("ADV_TREND_ENABLED", "0") == "1"
+ADV_TREND_MIN_QV = float(os.getenv("ADV_TREND_MIN_QV", "30000000"))
+ADV_TREND_UNIVERSE_TOP_N = int(os.getenv("ADV_TREND_UNIVERSE_TOP_N", "50"))
+ADV_TREND_RISK_PCT = float(os.getenv("ADV_TREND_RISK_PCT", "1.0"))
+ADV_TREND_MAX_NOTIONAL_MULT = float(os.getenv("ADV_TREND_MAX_NOTIONAL_MULT", "10.0"))
+ADV_TREND_MIN_STOP_ATR = float(os.getenv("ADV_TREND_MIN_STOP_ATR", "0.5"))
+ADV_TREND_ADX_MIN = float(os.getenv("ADV_TREND_ADX_MIN", "25"))
+ADV_TREND_MFI_LONG_MAX = float(os.getenv("ADV_TREND_MFI_LONG_MAX", "80"))
+ADV_TREND_MFI_SHORT_MIN = float(os.getenv("ADV_TREND_MFI_SHORT_MIN", "20"))
+ADV_TREND_ADX_LEN = int(os.getenv("ADV_TREND_ADX_LEN", "14"))
+ADV_TREND_MFI_LEN = int(os.getenv("ADV_TREND_MFI_LEN", "14"))
+ADV_TREND_EMA_LEN = int(os.getenv("ADV_TREND_EMA_LEN", "200"))
+ADV_TREND_SUPER_ATR_LEN = int(os.getenv("ADV_TREND_SUPER_ATR_LEN", "10"))
+ADV_TREND_SUPER_MULT = float(os.getenv("ADV_TREND_SUPER_MULT", "3.0"))
+ADV_TREND_TP1_R_MULT = float(os.getenv("ADV_TREND_TP1_R_MULT", "1.5"))
+ADV_TREND_TP1_FRACTION = float(os.getenv("ADV_TREND_TP1_FRACTION", "0.5"))
 LOSS_HEDGE_ENGINE_ENABLED = False
 LOSS_HEDGE_INTERVAL_MIN = 15
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
@@ -826,6 +964,40 @@ _STATE_FILE_OVERRIDE = None
 _ENTRY_LOCK_MUTEX = threading.Lock()
 _LAST_CYCLE_TS_MEM = 0
 _ENTRY_SEEN_MUTEX = threading.Lock()
+_ACCOUNT_ACTIVE_CACHE = {"ts": 0.0, "admin_active": True}
+
+def _admin_is_active(ttl_sec: float = 5.0) -> bool:
+    now = time.time()
+    cached = _ACCOUNT_ACTIVE_CACHE
+    if (now - float(cached.get("ts") or 0.0)) <= ttl_sec:
+        return bool(cached.get("admin_active", True))
+    active = True
+    try:
+        accounts = accounts_db.list_active_accounts()
+        active = any(str(a.get("name")) == "admin" for a in (accounts or []))
+    except Exception:
+        active = True
+    cached["ts"] = now
+    cached["admin_active"] = bool(active)
+    return bool(active)
+
+def _active_account_names(ttl_sec: float = 5.0) -> set:
+    now = time.time()
+    cached = _ACCOUNT_ACTIVE_CACHE
+    last = float(cached.get("names_ts") or 0.0)
+    if (now - last) <= ttl_sec and isinstance(cached.get("names"), set):
+        return cached.get("names")
+    names = set()
+    try:
+        accounts = accounts_db.list_active_accounts()
+        for a in accounts or []:
+            if a.get("name"):
+                names.add(str(a.get("name")))
+    except Exception:
+        names = set()
+    cached["names"] = names
+    cached["names_ts"] = now
+    return names
 
 def _log_error(msg: str) -> None:
     try:
@@ -1562,6 +1734,12 @@ def _append_swaggy_no_atlas_log(line: str) -> None:
     date_tag = time.strftime("%Y-%m-%d")
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("swaggy_no_atlas", f"swaggy_no_atlas-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
+def _append_adv_trend_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("advanced_trend_follower", f"advanced_trend_follower-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
 def _iso_kst(ts: Optional[float] = None) -> str:
@@ -3381,6 +3559,314 @@ def _run_swaggy_no_atlas_cycle(
         time.sleep(PER_SYMBOL_SLEEP)
     return result
 
+def _run_adv_trend_cycle(
+    adv_universe,
+    cached_ex,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"long_hits": 0, "short_hits": 0}
+    if not ADV_TREND_ENABLED or not adv_universe:
+        return result
+    try:
+        refresh_positions_cache(force=True)
+    except Exception:
+        pass
+    open_total = count_open_positions(force=True)
+    if not isinstance(open_total, int):
+        open_total = _count_open_positions_state(state)
+
+    now_ts = time.time()
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        _append_adv_trend_log("ADV_TREND_SKIP reason=SATURDAY_OFF")
+        return result
+
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
+
+    ltf_limit = max(ADV_TREND_EMA_LEN, 200)
+    htf_limit = max(ADV_TREND_EMA_LEN, 220)
+
+    for symbol in adv_universe:
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if _both_sides_open(st) and not hedge_mode:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            long_amt = get_long_position_amount(symbol)
+        except Exception:
+            long_amt = 0.0
+        try:
+            short_amt = get_short_position_amount(symbol)
+        except Exception:
+            short_amt = 0.0
+        if (long_amt > 0) or (short_amt > 0):
+            st["in_pos_long"] = bool(long_amt > 0)
+            st["in_pos_short"] = bool(short_amt > 0)
+            st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
+            now_seen = time.time()
+            if long_amt > 0:
+                _set_last_entry_state(st, "LONG", now_seen)
+            if short_amt > 0:
+                _set_last_entry_state(st, "SHORT", now_seen)
+            state[symbol] = st
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        if isinstance(open_total, int) and open_total >= MAX_OPEN_POSITIONS:
+            _append_adv_trend_log(
+                f"ADV_TREND_SKIP sym={symbol} reason=MAX_POS open={open_total} max={MAX_OPEN_POSITIONS}"
+            )
+            break
+
+        df_15m = cycle_cache.get_df(symbol, "15m", limit=ltf_limit)
+        df_4h = cycle_cache.get_df(symbol, "4h", limit=htf_limit)
+        if df_15m.empty or df_4h.empty:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if len(df_15m) < max(ADV_TREND_SUPER_ATR_LEN + 5, ADV_TREND_ADX_LEN + 5, ADV_TREND_MFI_LEN + 5):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if len(df_4h) < ADV_TREND_EMA_LEN:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        try:
+            ema200 = ema(df_4h["close"], ADV_TREND_EMA_LEN).iloc[-1]
+            mfi_val = _adv_mfi(df_15m, ADV_TREND_MFI_LEN).iloc[-1]
+            adx_val = _adv_adx(df_15m, ADV_TREND_ADX_LEN).iloc[-1]
+            st_line, st_trend = _adv_supertrend(df_15m, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
+            st_px = float(st_line.iloc[-1])
+            trend_dir = int(st_trend.iloc[-1])
+            close_px = float(df_15m["close"].iloc[-1])
+            atr_val = float(_adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN).iloc[-1])
+        except Exception as e:
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=INDICATOR_ERR err={e}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        long_ok = (
+            close_px > ema200
+            and mfi_val < ADV_TREND_MFI_LONG_MAX
+            and adx_val > ADV_TREND_ADX_MIN
+            and trend_dir == 1
+        )
+        short_ok = (
+            close_px < ema200
+            and mfi_val > ADV_TREND_MFI_SHORT_MIN
+            and adx_val > ADV_TREND_ADX_MIN
+            and trend_dir == -1
+        )
+        if not long_ok and not short_ok:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if long_ok and short_ok:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        side = "LONG" if long_ok else "SHORT"
+        if _exit_cooldown_blocked(state, symbol, "advanced_trend_follower", side):
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=EXIT_COOLDOWN side={side}")
+            _append_entry_gate_log("advanced_trend_follower", symbol, "exit_cooldown", side=side)
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if not _entry_guard_acquire(state, symbol, ttl_sec=5.0, key=f"adv_trend:{symbol}", engine="advanced_trend_follower", side=side):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        risk_per_unit = abs(close_px - st_px)
+        if risk_per_unit <= 0 or atr_val <= 0:
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=BAD_STOP side={side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if risk_per_unit < (atr_val * ADV_TREND_MIN_STOP_ATR):
+            _append_adv_trend_log(
+                f"ADV_TREND_SKIP sym={symbol} reason=MIN_STOP side={side} dist={risk_per_unit:.6g} atr={atr_val:.6g}"
+            )
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if side == "LONG" and st_px >= close_px:
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=STOP_ABOVE side={side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if side == "SHORT" and st_px <= close_px:
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=STOP_BELOW side={side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        avail = get_available_usdt()
+        if not isinstance(avail, (int, float)) or avail <= 0:
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=NO_BALANCE side={side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        risk_usdt = float(avail) * (ADV_TREND_RISK_PCT / 100.0)
+        qty = risk_usdt / risk_per_unit
+        if qty <= 0:
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=QTY_ZERO side={side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        notional = qty * close_px
+        entry_pct = None
+        try:
+            entry_pct = float(USDT_PER_TRADE)
+        except Exception:
+            entry_pct = None
+        if isinstance(entry_pct, (int, float)) and entry_pct > 0:
+            entry_cap = float(avail) * (entry_pct / 100.0)
+            if entry_cap > 0:
+                notional = min(notional, entry_cap)
+        max_notional = float(avail) * float(ADV_TREND_MAX_NOTIONAL_MULT)
+        if max_notional > 0 and notional > max_notional:
+            notional = max_notional
+            qty = notional / close_px
+        if notional <= 0:
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=NOTIONAL_ZERO side={side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        if not _admin_is_active():
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=ADMIN_INACTIVE side={side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if side == "LONG":
+            res = _EXEC_LONG_MARKET(symbol, usdt_amount=notional, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+        else:
+            res = _EXEC_SHORT_MARKET(symbol, usdt_amount=notional, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+
+        admin_status = _extract_status(res)
+        admin_ok = admin_status in ("ok", "dry_run", "skip")
+        if not admin_ok:
+            _append_adv_trend_log(f"ADV_TREND_ENTRY_FAIL sym={symbol} side={side} status={admin_status}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        entry_order_id = _order_id_from_res(res)
+        entry_px = res.get("last")
+        if entry_px is None:
+            order = res.get("order") if isinstance(res.get("order"), dict) else {}
+            entry_px = order.get("average") or order.get("price")
+        if not isinstance(entry_px, (int, float)) or entry_px <= 0:
+            entry_px = close_px
+
+        if side == "LONG":
+            sl_res = _EXEC_PLACE_LONG_SL_PX(symbol, st_px)
+        else:
+            sl_res = _EXEC_PLACE_SHORT_SL_PX(symbol, st_px)
+        sl_order_id = _order_id_from_res(sl_res) if isinstance(sl_res, dict) else None
+
+        tp1_px = None
+        if side == "LONG":
+            tp1_px = entry_px + (ADV_TREND_TP1_R_MULT * (entry_px - st_px))
+        else:
+            tp1_px = entry_px - (ADV_TREND_TP1_R_MULT * (st_px - entry_px))
+
+        meta = {
+            "reason": "advanced_trend_follower",
+            "engine": "ADVANCED_TREND_FOLLOWER",
+            "sl_price": st_px,
+            "tp1_price": tp1_px,
+            "tp2_mode": "SUPER_TREND",
+            "tp1_done": False,
+            "sl_order_id": sl_order_id,
+        }
+        qty_fill = res.get("amount") or (res.get("order") or {}).get("amount") if isinstance(res, dict) else None
+        _log_trade_entry(
+            state,
+            side=side,
+            symbol=symbol,
+            entry_ts=time.time(),
+            entry_price=entry_px,
+            qty=qty_fill if isinstance(qty_fill, (int, float)) else None,
+            usdt=notional,
+            entry_order_id=entry_order_id,
+            meta=meta,
+        )
+        if isinstance(open_total, int):
+            open_total += 1
+
+        follower_calls = []
+        for acct in FOLLOWER_CONTEXTS:
+            try:
+                avail_f = acct.executor.get_available_usdt()
+            except Exception:
+                avail_f = None
+            if not isinstance(avail_f, (int, float)) or avail_f <= 0:
+                follower_calls.append({"acct": acct, "skip": "no_balance"})
+                continue
+            risk_usdt_f = float(avail_f) * (ADV_TREND_RISK_PCT / 100.0)
+            qty_f = risk_usdt_f / risk_per_unit
+            if qty_f <= 0:
+                follower_calls.append({"acct": acct, "skip": "qty_zero"})
+                continue
+            notional_f = qty_f * close_px
+            entry_pct_f = None
+            try:
+                entry_pct_f = float(getattr(acct.settings, "entry_pct", USDT_PER_TRADE))
+            except Exception:
+                entry_pct_f = None
+            if isinstance(entry_pct_f, (int, float)) and entry_pct_f > 0:
+                entry_cap_f = float(avail_f) * (entry_pct_f / 100.0)
+                if entry_cap_f > 0:
+                    notional_f = min(notional_f, entry_cap_f)
+            max_notional_f = float(avail_f) * float(ADV_TREND_MAX_NOTIONAL_MULT)
+            if max_notional_f > 0 and notional_f > max_notional_f:
+                notional_f = max_notional_f
+            if notional_f <= 0:
+                follower_calls.append({"acct": acct, "skip": "notional_zero"})
+                continue
+            if side == "LONG":
+                follower_calls.append({
+                    "acct": acct,
+                    "fn": lambda a=acct, u=notional_f: a.executor.long_market(symbol, usdt_amount=u, leverage=LEVERAGE, margin_mode=MARGIN_MODE),
+                })
+            else:
+                follower_calls.append({
+                    "acct": acct,
+                    "fn": lambda a=acct, u=notional_f: a.executor.short_market(symbol, usdt_amount=u, leverage=LEVERAGE, margin_mode=MARGIN_MODE),
+                })
+        action_name = "long_market" if side == "LONG" else "short_market"
+        results = _broadcast_followers(action_name, follower_calls, {"symbol": symbol})
+        _set_last_entry_broadcast(symbol, side, admin_status, admin_ok, results)
+
+        for acct in FOLLOWER_CONTEXTS:
+            try:
+                if side == "LONG":
+                    acct.executor.place_long_sl_px(symbol, st_px)
+                else:
+                    acct.executor.place_short_sl_px(symbol, st_px)
+            except Exception:
+                continue
+
+        _append_adv_trend_log(
+            f"ADV_TREND_ENTRY sym={symbol} side={side} entry={entry_px:.6g} sl={st_px:.6g} tp1={tp1_px:.6g}"
+        )
+        _send_entry_alert(
+            send_alert,
+            side=side,
+            symbol=symbol,
+            engine="ADVANCED_TREND_FOLLOWER",
+            entry_price=entry_px,
+            usdt=notional,
+            reason=_display_engine_label("ADVANCED_TREND_FOLLOWER"),
+            sl=f"{st_px:.6g}",
+            tp=f"{tp1_px:.6g}",
+            entry_order_id=entry_order_id,
+            extras=["기준: SL=SuperTrend, TP1=1.5R"],
+            state=state,
+        )
+
+        if side == "LONG":
+            result["long_hits"] += 1
+        else:
+            result["short_hits"] += 1
+
+        time.sleep(PER_SYMBOL_SLEEP)
+    return result
+
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
     cycle_ts = state.get("_current_cycle_ts")
     side = (side or "").upper()
@@ -4229,6 +4715,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "MANUAL_ADMIN"
     if key in ("관리자수동진입", "admin_manual_entry"):
         return "관리자수동진입"
+    if key in ("advanced_trend_follower", "adv_trend"):
+        return "ADVANCED_TREND_FOLLOWER"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -4253,6 +4741,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "long_entry"
     if label == "MANUAL":
         return "manual_entry"
+    if label == "ADVANCED_TREND_FOLLOWER":
+        return "advanced_trend_follower"
     return None
 
 def _display_engine_label(label: Optional[str]) -> str:
@@ -4263,6 +4753,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "SWAGGY_ATLAS_LAB_V2": "스웨기랩v2",
         "SWAGGY_NO_ATLAS": "스웨기 단독",
         "LOSS_HEDGE_ENGINE": "손실방지엔진",
+        "ADVANCED_TREND_FOLLOWER": "트리플체크",
     }
     return overrides.get(name, name)
 
@@ -4282,6 +4773,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return DTFX_ENABLED
     if key == "ATLAS_RS_FAIL_SHORT":
         return ATLAS_RS_FAIL_SHORT_ENABLED
+    if key == "ADVANCED_TREND_FOLLOWER":
+        return ADV_TREND_ENABLED
     if key in ("RSI", "SCALP"):
         return RSI_ENABLED
     if key in ("MANUAL", "UNKNOWN", ""):
@@ -7137,6 +7630,7 @@ def _detect_position_events(state: dict, send_telegram) -> None:
                     )
         elif prev_qty is not None and qty is None:
             source = managed_engine or ("AUTO" if managed else "MANUAL")
+            cancel_stop_orders(symbol)
             _record_position_event(symbol, side, "EXIT", source, prev_qty, prev_entry, mark, {"source": "pos_snapshot"})
             changed = True
         if isinstance(snap, dict):
@@ -7402,6 +7896,207 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
     return True
 
 
+def _adv_place_be_stop_all(symbol: str, side: str, entry_px: float) -> None:
+    cancel_stop_orders(symbol)
+    if side == "LONG":
+        detail = get_long_position_detail(symbol) or {}
+        be_px = detail.get("entry") if isinstance(detail.get("entry"), (int, float)) else entry_px
+        _EXEC_PLACE_LONG_SL_PX(symbol, be_px)
+        for acct in FOLLOWER_CONTEXTS:
+            try:
+                detail_f = acct.executor.get_long_position_detail(symbol) or {}
+                be_px_f = detail_f.get("entry") if isinstance(detail_f.get("entry"), (int, float)) else be_px
+                acct.executor.place_long_sl_px(symbol, be_px_f)
+            except Exception:
+                continue
+    else:
+        detail = get_short_position_detail(symbol) or {}
+        be_px = detail.get("entry") if isinstance(detail.get("entry"), (int, float)) else entry_px
+        _EXEC_PLACE_SHORT_SL_PX(symbol, be_px)
+        for acct in FOLLOWER_CONTEXTS:
+            try:
+                detail_f = acct.executor.get_short_position_detail(symbol) or {}
+                be_px_f = detail_f.get("entry") if isinstance(detail_f.get("entry"), (int, float)) else be_px
+                acct.executor.place_short_sl_px(symbol, be_px_f)
+            except Exception:
+                continue
+
+
+def _adv_partial_close(symbol: str, side: str, fraction: float) -> None:
+    try:
+        fraction = float(fraction)
+    except Exception:
+        return
+    if fraction <= 0:
+        return
+    if side == "LONG":
+        amt = get_long_position_amount(symbol)
+        if isinstance(amt, (int, float)) and amt > 0:
+            _EXEC_CLOSE_LONG_MARKET_QTY(symbol, amt * fraction)
+        follower_calls = []
+        for acct in FOLLOWER_CONTEXTS:
+            try:
+                amt_f = acct.executor.get_long_position_amount(symbol)
+            except Exception:
+                amt_f = None
+            if not isinstance(amt_f, (int, float)) or amt_f <= 0:
+                follower_calls.append({"acct": acct, "skip": "no_pos"})
+                continue
+            follower_calls.append({
+                "acct": acct,
+                "fn": lambda a=acct, q=amt_f * fraction: a.executor.close_long_market_qty(symbol, q),
+            })
+        _broadcast_followers("close_long_market_qty", follower_calls, {"symbol": symbol})
+    else:
+        amt = get_short_position_amount(symbol)
+        if isinstance(amt, (int, float)) and amt > 0:
+            _EXEC_CLOSE_SHORT_MARKET_QTY(symbol, amt * fraction)
+        follower_calls = []
+        for acct in FOLLOWER_CONTEXTS:
+            try:
+                amt_f = acct.executor.get_short_position_amount(symbol)
+            except Exception:
+                amt_f = None
+            if not isinstance(amt_f, (int, float)) or amt_f <= 0:
+                follower_calls.append({"acct": acct, "skip": "no_pos"})
+                continue
+            follower_calls.append({
+                "acct": acct,
+                "fn": lambda a=acct, q=amt_f * fraction: a.executor.close_short_market_qty(symbol, q),
+            })
+        _broadcast_followers("close_short_market_qty", follower_calls, {"symbol": symbol})
+
+
+def _adv_latest_supertrend(symbol: str) -> Optional[tuple]:
+    df = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 200))
+    if df.empty or len(df) < ADV_TREND_SUPER_ATR_LEN + 5:
+        return None
+    try:
+        st_line, st_trend = _adv_supertrend(df, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
+        last_ts = int(df["ts"].iloc[-1])
+        return float(st_line.iloc[-1]), int(st_trend.iloc[-1]), last_ts
+    except Exception:
+        return None
+
+
+def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
+    open_trades = [
+        tr
+        for tr in (_get_trade_log(state) or [])
+        if tr.get("status") == "open"
+        and _engine_label_from_reason((tr.get("meta") or {}).get("reason")) == "ADVANCED_TREND_FOLLOWER"
+    ]
+    if not open_trades:
+        return
+    now = time.time()
+    for tr in open_trades:
+        symbol = tr.get("symbol")
+        side = tr.get("side")
+        if not symbol or side not in ("LONG", "SHORT"):
+            continue
+        meta = tr.get("meta") if isinstance(tr.get("meta"), dict) else {}
+        entry_px = tr.get("entry_price")
+        tp1_px = meta.get("tp1_price")
+        tp1_done = bool(meta.get("tp1_done"))
+        amt = None
+        detail = None
+        if side == "LONG":
+            try:
+                detail = get_long_position_detail(symbol)
+                amt = detail.get("qty") if isinstance(detail, dict) else None
+            except Exception:
+                detail = None
+            if not isinstance(amt, (int, float)):
+                try:
+                    amt = get_long_position_amount(symbol)
+                except Exception:
+                    amt = None
+        else:
+            try:
+                detail = get_short_position_detail(symbol)
+                amt = detail.get("qty") if isinstance(detail, dict) else None
+            except Exception:
+                detail = None
+            if not isinstance(amt, (int, float)):
+                try:
+                    amt = get_short_position_amount(symbol)
+                except Exception:
+                    amt = None
+        if not isinstance(amt, (int, float)) or amt <= 0:
+            cancel_stop_orders(symbol)
+            engine_label = "ADVANCED_TREND_FOLLOWER"
+            _close_trade(
+                state,
+                side=side,
+                symbol=symbol,
+                exit_ts=now,
+                exit_price=None,
+                pnl_usdt=None,
+                reason="auto_exit_sl",
+            )
+            _append_report_line(symbol, side, None, None, engine_label)
+            icon = EXIT_SL_ICON
+            send_telegram(
+                f"{icon} <b>{'롱' if side == 'LONG' else '숏'} 청산</b>\n"
+                f"<b>{symbol}</b>\n"
+                f"엔진: {_display_engine_label(engine_label)}\n"
+                f"사유: {_display_engine_label(engine_label)}"
+            )
+            continue
+
+        mark_px = None
+        if isinstance(detail, dict):
+            mark_px = detail.get("mark")
+        if not isinstance(mark_px, (int, float)):
+            mark_px = None
+
+        if not tp1_done and isinstance(tp1_px, (int, float)) and isinstance(mark_px, (int, float)):
+            tp1_hit = (mark_px >= tp1_px) if side == "LONG" else (mark_px <= tp1_px)
+            if tp1_hit:
+                _adv_partial_close(symbol, side, ADV_TREND_TP1_FRACTION)
+                meta["tp1_done"] = True
+                meta["tp1_ts"] = now
+                tr["meta"] = meta
+                if isinstance(entry_px, (int, float)):
+                    _adv_place_be_stop_all(symbol, side, entry_px)
+                _append_adv_trend_log(f"ADV_TREND_TP1 sym={symbol} side={side} px={tp1_px:.6g}")
+
+        st_info = _adv_latest_supertrend(symbol)
+        if st_info:
+            _st_px, trend_dir, last_ts = st_info
+            st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+            last_seen = st.get("adv_trend_last_st_ts")
+            if last_seen != last_ts:
+                st["adv_trend_last_st_ts"] = last_ts
+                state[symbol] = st
+                if (side == "LONG" and trend_dir == -1) or (side == "SHORT" and trend_dir == 1):
+                    if side == "LONG":
+                        res = close_long_market(symbol)
+                    else:
+                        res = close_short_market(symbol)
+                    exit_order_id = _order_id_from_res(res)
+                    cancel_stop_orders(symbol)
+                    engine_label = "ADVANCED_TREND_FOLLOWER"
+                    _close_trade(
+                        state,
+                        side=side,
+                        symbol=symbol,
+                        exit_ts=now,
+                        exit_price=mark_px,
+                        pnl_usdt=detail.get("pnl") if isinstance(detail, dict) else None,
+                        reason="tp2_supertrend",
+                        exit_order_id=exit_order_id,
+                    )
+                    _append_report_line(symbol, side, None, detail.get("pnl") if isinstance(detail, dict) else None, engine_label)
+                    send_telegram(
+                        f"{EXIT_ICON} <b>{'롱' if side == 'LONG' else '숏'} 청산</b>\n"
+                        f"<b>{symbol}</b>\n"
+                        f"엔진: {_display_engine_label(engine_label)}\n"
+                        f"사유: {_display_engine_label(engine_label)}"
+                    )
+                    continue
+
+
 def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> None:
     now = time.time()
     if DB_RECONCILE_ENABLED and dbrecon and dbrec and dbrec.ENABLED:
@@ -7446,6 +8141,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
 
     _process_manage_queue(state, send_telegram)
     _detect_position_events(state, send_telegram)
+    _manage_adv_trend_positions(state, send_telegram)
 
     exit_force_refreshed = False
     for sym, st in list(state.items()):
@@ -7553,6 +8249,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         engine_label = _engine_label_from_reason(
             (open_tr.get("meta") or {}).get("reason") if open_tr else None
         )
+        if engine_label == "ADVANCED_TREND_FOLLOWER":
+            continue
 
         if AUTO_EXIT_ENABLED:
             last_exit = float(st.get("manage_exit_ts", 0.0) or 0.0)
@@ -7823,6 +8521,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             (open_tr.get("meta") or {}).get("reason") if open_tr else None
         )
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
+        if engine_label == "ADVANCED_TREND_FOLLOWER":
+            continue
         closed = False
         tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "LONG")
         if AUTO_EXIT_ENABLED and profit_unlev >= tp_pct:
@@ -8007,6 +8707,9 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global SWAGGY_NO_ATLAS_DELAY_WAIT_BARS, SWAGGY_NO_ATLAS_DELAY_CLOSE_PCT
     global SWAGGY_NO_ATLAS_DELAY_VOL_MULT, SWAGGY_NO_ATLAS_DELAY_VOL_MA, SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
+    global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
+    global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
+    global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -8059,6 +8762,15 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_swaggy_no_atlas_delay_vol_mult",
         "_swaggy_no_atlas_delay_vol_ma",
         "_swaggy_no_atlas_delay_sweep_lookback",
+        "_adv_trend_enabled",
+        "_adv_trend_min_qv",
+        "_adv_trend_universe_top_n",
+        "_adv_trend_risk_pct",
+        "_adv_trend_max_notional_mult",
+        "_adv_trend_min_stop_atr",
+        "_adv_trend_adx_min",
+        "_adv_trend_mfi_long_max",
+        "_adv_trend_mfi_short_min",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
         "_rsi_enabled",
@@ -8149,6 +8861,27 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         SWAGGY_ATLAS_LAB_V2_ENABLED = bool(state.get("_swaggy_atlas_lab_v2_enabled"))
     if (not skip_keys or "_swaggy_no_atlas_enabled" not in skip_keys) and isinstance(state.get("_swaggy_no_atlas_enabled"), bool):
         SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
+    if (not skip_keys or "_adv_trend_enabled" not in skip_keys) and isinstance(state.get("_adv_trend_enabled"), bool):
+        ADV_TREND_ENABLED = bool(state.get("_adv_trend_enabled"))
+    if (not skip_keys or "_adv_trend_min_qv" not in skip_keys) and isinstance(state.get("_adv_trend_min_qv"), (int, float)):
+        ADV_TREND_MIN_QV = float(state.get("_adv_trend_min_qv"))
+    if (not skip_keys or "_adv_trend_universe_top_n" not in skip_keys) and isinstance(state.get("_adv_trend_universe_top_n"), (int, float)):
+        try:
+            ADV_TREND_UNIVERSE_TOP_N = int(state.get("_adv_trend_universe_top_n"))
+        except Exception:
+            pass
+    if (not skip_keys or "_adv_trend_risk_pct" not in skip_keys) and isinstance(state.get("_adv_trend_risk_pct"), (int, float)):
+        ADV_TREND_RISK_PCT = float(state.get("_adv_trend_risk_pct"))
+    if (not skip_keys or "_adv_trend_max_notional_mult" not in skip_keys) and isinstance(state.get("_adv_trend_max_notional_mult"), (int, float)):
+        ADV_TREND_MAX_NOTIONAL_MULT = float(state.get("_adv_trend_max_notional_mult"))
+    if (not skip_keys or "_adv_trend_min_stop_atr" not in skip_keys) and isinstance(state.get("_adv_trend_min_stop_atr"), (int, float)):
+        ADV_TREND_MIN_STOP_ATR = float(state.get("_adv_trend_min_stop_atr"))
+    if (not skip_keys or "_adv_trend_adx_min" not in skip_keys) and isinstance(state.get("_adv_trend_adx_min"), (int, float)):
+        ADV_TREND_ADX_MIN = float(state.get("_adv_trend_adx_min"))
+    if (not skip_keys or "_adv_trend_mfi_long_max" not in skip_keys) and isinstance(state.get("_adv_trend_mfi_long_max"), (int, float)):
+        ADV_TREND_MFI_LONG_MAX = float(state.get("_adv_trend_mfi_long_max"))
+    if (not skip_keys or "_adv_trend_mfi_short_min" not in skip_keys) and isinstance(state.get("_adv_trend_mfi_short_min"), (int, float)):
+        ADV_TREND_MFI_SHORT_MIN = float(state.get("_adv_trend_mfi_short_min"))
     if (not skip_keys or "_loss_hedge_engine_enabled" not in skip_keys) and isinstance(state.get("_loss_hedge_engine_enabled"), bool):
         LOSS_HEDGE_ENGINE_ENABLED = bool(state.get("_loss_hedge_engine_enabled"))
     if (not skip_keys or "_loss_hedge_interval_min" not in skip_keys) and isinstance(state.get("_loss_hedge_interval_min"), (int, float)):
@@ -8848,7 +9581,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -9403,6 +10136,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"엔진요약: swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
                             f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                             f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
+                            f"adv_trend={'ON' if ADV_TREND_ENABLED else 'OFF'} "
                             f"loss_hedge={'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'} "
                             f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -9412,6 +10146,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                             f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
+                            f"/adv_trend(추가진입): {'ON' if ADV_TREND_ENABLED else 'OFF'}\n"
                             f"/loss_hedge_engine(손실방지): {'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -9890,6 +10625,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] swaggy_no_atlas cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/adv_trend", "adv_trend")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        ADV_TREND_ENABLED = True
+                        state["_adv_trend_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ adv_trend ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        ADV_TREND_ENABLED = False
+                        state["_adv_trend_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ adv_trend OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ adv_trend 상태: {'ON' if ADV_TREND_ENABLED else 'OFF'}\n"
+                            "사용법: /adv_trend on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] adv_trend cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/loss_hedge_engine", "loss_hedge_engine")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -10150,6 +10908,78 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
+
+def _adv_atr(df: pd.DataFrame, length: int) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / length, adjust=False).mean()
+
+def _adv_mfi(df: pd.DataFrame, length: int) -> pd.Series:
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    mf = tp * df["volume"]
+    tp_diff = tp.diff()
+    pos_mf = mf.where(tp_diff > 0, 0.0)
+    neg_mf = mf.where(tp_diff < 0, 0.0).abs()
+    pos_sum = pos_mf.rolling(length).sum()
+    neg_sum = neg_mf.rolling(length).sum()
+    ratio = pos_sum / neg_sum.replace(0, float("nan"))
+    mfi = 100 - (100 / (1 + ratio))
+    return mfi.fillna(0.0)
+
+def _adv_adx(df: pd.DataFrame, length: int) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr.replace(0, float("nan")))
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr.replace(0, float("nan")))
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, float("nan"))) * 100
+    adx = dx.ewm(alpha=1 / length, adjust=False).mean()
+    return adx.fillna(0.0)
+
+def _adv_supertrend(df: pd.DataFrame, atr_len: int, mult: float) -> tuple[pd.Series, pd.Series]:
+    atr = _adv_atr(df, atr_len)
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper = hl2 + (mult * atr)
+    lower = hl2 - (mult * atr)
+    final_upper = upper.copy()
+    final_lower = lower.copy()
+    trend = pd.Series(index=df.index, dtype="int")
+    for i in range(len(df)):
+        if i == 0:
+            trend.iloc[i] = 1
+            continue
+        if upper.iloc[i] < final_upper.iloc[i - 1] or df["close"].iloc[i - 1] > final_upper.iloc[i - 1]:
+            final_upper.iloc[i] = upper.iloc[i]
+        else:
+            final_upper.iloc[i] = final_upper.iloc[i - 1]
+        if lower.iloc[i] > final_lower.iloc[i - 1] or df["close"].iloc[i - 1] < final_lower.iloc[i - 1]:
+            final_lower.iloc[i] = lower.iloc[i]
+        else:
+            final_lower.iloc[i] = final_lower.iloc[i - 1]
+        if trend.iloc[i - 1] == 1:
+            trend.iloc[i] = -1 if df["close"].iloc[i] < final_lower.iloc[i] else 1
+        else:
+            trend.iloc[i] = 1 if df["close"].iloc[i] > final_upper.iloc[i] else -1
+    st_line = pd.Series(index=df.index, dtype="float")
+    for i in range(len(df)):
+        st_line.iloc[i] = final_lower.iloc[i] if trend.iloc[i] == 1 else final_upper.iloc[i]
+    return st_line, trend
 
 def _compute_atlas_swaggy_gate(state: Dict[str, Any]) -> Dict[str, Any]:
     if not atlas_engine or not atlas_swaggy_cfg:
@@ -11007,7 +11837,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /adv_trend on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -11265,7 +12095,7 @@ def run():
                         shared_min_qv = rsi_cfg.min_quote_volume_usdt if rsi_cfg else 30_000_000.0
                     shared_top_n = cfg_vals.get("universe_top_n")
                     if not isinstance(shared_top_n, int):
-                        shared_top_n = rsi_cfg.universe_top_n if rsi_cfg else 40
+                        shared_top_n = rsi_cfg.universe_top_n if rsi_cfg else 50
                     for s in symbols:
                         t = tickers.get(s)
                         if not t:
@@ -11317,6 +12147,7 @@ def run():
                     div15m_short_universe = list(shared_universe)
                     div15m_short_universe_len = len(div15m_short_universe)
                     swaggy_universe = []
+                    adv_trend_universe = []
                     swaggy_cfg = None
                     swaggy_atlas_lab_cfg = None
                     swaggy_atlas_lab_atlas_cfg = None
@@ -11362,6 +12193,10 @@ def run():
                         swaggy_atlas_lab_v2_cfg = SwaggyAtlasLabV2Config()
                         swaggy_atlas_lab_v2_atlas_cfg = SwaggyAtlasLabV2AtlasConfig()
 
+                    if ADV_TREND_ENABLED:
+                        adv_trend_universe = list(shared_universe)
+                        state["_adv_trend_universe"] = adv_trend_universe
+
                         structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
                         if STRUCTURE_TOP_N:
                             structure_candidates = structure_candidates[:STRUCTURE_TOP_N]
@@ -11406,6 +12241,7 @@ def run():
                                 universe_momentum
                                 + universe_structure
                                 + (swaggy_universe or [])
+                                + (adv_trend_universe or [])
                                 + (dtfx_universe or [])
                                 + (atlas_rs_fail_short_universe or [])
                             )
@@ -11416,6 +12252,7 @@ def run():
                                 universe_momentum
                                 + universe_structure
                                 + (swaggy_universe or [])
+                                + (adv_trend_universe or [])
                                 + (dtfx_universe or [])
                                 + (atlas_rs_fail_short_universe or [])
                             )
@@ -11428,6 +12265,7 @@ def run():
                     swaggy_universe_len = len(swaggy_universe) if swaggy_universe else 0
                     swaggy_atlas_lab_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_ENABLED else 0
                     swaggy_atlas_lab_v2_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_V2_ENABLED else 0
+                    adv_trend_universe_len = len(adv_trend_universe) if adv_trend_universe else 0
                     dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
                     atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
                     universe_structure_len = len(universe_structure)
@@ -11452,6 +12290,7 @@ def run():
                         and swaggy_atlas_lab_v2_engine
                         and swaggy_universe
                     )
+                    adv_trend_ran = bool(heavy_scan and ADV_TREND_ENABLED and adv_trend_universe)
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
                     atlas_rs_fail_short_ran = bool(
                         ATLAS_RS_FAIL_SHORT_ENABLED
@@ -11489,6 +12328,9 @@ def run():
                     for s in swaggy_universe or []:
                         if s not in slow_symbols_ordered:
                             slow_symbols_ordered.append(s)
+                    for s in adv_trend_universe or []:
+                        if s not in slow_symbols_ordered:
+                            slow_symbols_ordered.append(s)
                     for s in atlas_rs_fail_short_universe or []:
                         if s not in slow_symbols_ordered:
                             slow_symbols_ordered.append(s)
@@ -11515,6 +12357,8 @@ def run():
                     if swaggy_atlas_lab_v2_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
                         mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_atlas_lab_v2_cfg.vp_lookback_1h))
+                    if ADV_TREND_ENABLED:
+                        mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
                     if atlas_rs_fail_short_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
                     if atlas_cfg:
@@ -11532,6 +12376,8 @@ def run():
                         slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
                     if swaggy_atlas_lab_v2_cfg:
                         slow_plan["4h"] = max(slow_plan.get("4h", 0), 200)
+                    if ADV_TREND_ENABLED:
+                        slow_plan["4h"] = max(slow_plan.get("4h", 0), 220)
                     if "4h" in slow_plan:
                         slow_plan["4h"] = min(slow_plan.get("4h", 0), SLOW_LIMIT_CAP)
                     if "1d" in slow_plan:
@@ -11703,6 +12549,8 @@ def run():
                     swaggy_atlas_lab_v2_thread = None
                     swaggy_no_atlas_result = {}
                     swaggy_no_atlas_thread = None
+                    adv_trend_result = {}
+                    adv_trend_thread = None
                     dtfx_result = {}
                     dtfx_thread = None
                     atlas_rs_fail_short_result = {}
@@ -11773,6 +12621,19 @@ def run():
                             daemon=True,
                         )
                         swaggy_no_atlas_thread.start()
+                    if ADV_TREND_ENABLED:
+                        adv_trend_thread = threading.Thread(
+                            target=lambda: adv_trend_result.update(
+                                _run_adv_trend_cycle(
+                                    adv_trend_universe,
+                                    cached_ex,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        adv_trend_thread.start()
                     if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
                         dtfx_thread = threading.Thread(
                             target=lambda: dtfx_result.update(
@@ -12424,6 +13285,8 @@ def run():
                         swaggy_atlas_lab_v2_thread.join()
                     if swaggy_no_atlas_thread:
                         swaggy_no_atlas_thread.join()
+                    if adv_trend_thread:
+                        adv_trend_thread.join()
                     if dtfx_thread:
                         dtfx_thread.join()
                     if atlas_rs_fail_short_thread:
@@ -12455,12 +13318,12 @@ def run():
                     print(
                         f"[universe] rule=qVol>={int(shared_min_qv):,} sort=abs(pct) topN={shared_top_n} anchors={anchors_disp} "
                         f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
-                        f"dtfx={dtfx_universe_len} "
+                        f"adv_trend={adv_trend_universe_len} dtfx={dtfx_universe_len} "
                         f"arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
                     )
                     print(
                         "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) "
-                        "swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
+                        "adv_trend=%s(%d) swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
                         % (
                             "ON" if rsi_ran else "OFF",
                             rsi_universe_len,
@@ -12468,6 +13331,8 @@ def run():
                             div15m_universe_len,
                             "ON" if div15m_short_ran else "OFF",
                             div15m_short_universe_len,
+                            "ON" if adv_trend_ran else "OFF",
+                            adv_trend_universe_len,
                             "ON" if swaggy_atlas_lab_ran else "OFF",
                             swaggy_atlas_lab_universe_len,
                             "ON" if swaggy_atlas_lab_v2_ran else "OFF",

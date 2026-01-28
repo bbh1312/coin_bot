@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta
 import time
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 import sys
@@ -33,6 +34,7 @@ from engine_runner import (
     SWAGGY_ATLAS_LAB_ENABLED,
     SWAGGY_ATLAS_LAB_V2_ENABLED,
     SWAGGY_NO_ATLAS_ENABLED,
+    ADV_TREND_ENABLED,
     SWAGGY_ATLAS_LAB_OFF_WINDOWS,
     SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS,
     SWAGGY_NO_ATLAS_OFF_WINDOWS,
@@ -62,6 +64,22 @@ from executor import AccountExecutor
 
 _FOLLOWER_POS_CACHE = {"ts": 0.0, "items": [], "groups": {}}
 _FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "0"))
+_WEB_MAX_WORKERS = int(os.getenv("WEB_MAX_WORKERS", "8"))
+
+def _run_parallel_tasks(tasks: list) -> list:
+    if not tasks:
+        return []
+    max_workers = min(len(tasks), max(1, _WEB_MAX_WORKERS))
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {ex.submit(fn): meta for fn, meta in tasks}
+        for fut in as_completed(future_map):
+            meta = future_map.get(fut) or {}
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                results.append({"status": "fail", "error": str(e), **meta})
+    return results
 
 COMMAND_DEFS = [
     {"cmd": "/live", "key": "_live_trading", "label": "Live Shorts", "type": "toggle"},
@@ -71,6 +89,7 @@ COMMAND_DEFS = [
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas", "key": "_swaggy_no_atlas_enabled", "label": "Swaggy No Atlas", "type": "toggle"},
+    {"cmd": "/adv_trend", "key": "_adv_trend_enabled", "label": "Triple-Check Engine", "type": "toggle"},
     {"cmd": "/loss_hedge_engine", "key": "_loss_hedge_engine_enabled", "label": "손실방지엔진", "type": "toggle"},
     {"cmd": "/loss_hedge_interval", "key": "_loss_hedge_interval_min", "label": "손실방지 체크 주기(분)", "type": "int", "step": 1},
     {"cmd": "/swaggy_atlas_lab_off", "key": "_swaggy_atlas_lab_off_windows", "label": "Swaggy Lab Off Windows", "type": "text"},
@@ -158,6 +177,7 @@ DEFAULTS = {
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
     "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
     "_swaggy_no_atlas_enabled": SWAGGY_NO_ATLAS_ENABLED,
+    "_adv_trend_enabled": ADV_TREND_ENABLED,
     "_loss_hedge_engine_enabled": LOSS_HEDGE_ENGINE_ENABLED,
     "_loss_hedge_interval_min": 15,
     "_swaggy_atlas_lab_off_windows": SWAGGY_ATLAS_LAB_OFF_WINDOWS,
@@ -246,10 +266,7 @@ def manual_entry_submit():
     if selected_accounts and "ALL" not in selected_accounts:
         contexts = [c for c in contexts if str(c.name) in set(selected_accounts)]
 
-    ok = 0
-    fail = 0
-    results = []
-    for acct in contexts:
+    def _entry_task(acct: AccountContext) -> dict:
         try:
             settings = _load_account_settings(int(acct.account_id))
         except Exception:
@@ -257,15 +274,23 @@ def manual_entry_submit():
         executor = acct.executor
         usdt_amount = _entry_usdt_available(executor, entry_pct)
         if usdt_amount <= 0:
-            fail += 1
-            results.append(f"{acct.name}: no_usdt")
-            continue
+            return {"account": acct.name, "status": "skip", "reason": "no_usdt"}
         try:
             with executor.activate():
                 if side == "LONG":
-                    res = executor.long_market(symbol, usdt_amount=usdt_amount, leverage=int(settings.get("leverage") or 10), margin_mode=str(settings.get("margin_mode") or "cross"))
+                    res = executor.long_market(
+                        symbol,
+                        usdt_amount=usdt_amount,
+                        leverage=int(settings.get("leverage") or 10),
+                        margin_mode=str(settings.get("margin_mode") or "cross"),
+                    )
                 else:
-                    res = executor.short_market(symbol, usdt_amount=usdt_amount, leverage=int(settings.get("leverage") or 10), margin_mode=str(settings.get("margin_mode") or "cross"))
+                    res = executor.short_market(
+                        symbol,
+                        usdt_amount=usdt_amount,
+                        leverage=int(settings.get("leverage") or 10),
+                        margin_mode=str(settings.get("margin_mode") or "cross"),
+                    )
             entry_price, qty = _extract_fill(res)
             entry_order_id = _order_id_from_res(res)
             state_path = _state_path_for_account(acct.meta.get("db") or {"id": acct.account_id, "name": acct.name})
@@ -282,11 +307,24 @@ def manual_entry_submit():
                 meta={"reason": "관리자수동진입", "engine": "관리자수동진입"},
             )
             save_state_to(state, state_path)
-            ok += 1
-            results.append(f"{acct.name}: ok")
+            return {"account": acct.name, "status": "ok"}
         except Exception as e:
-            fail += 1
-            results.append(f"{acct.name}: fail({str(e)[:80]})")
+            return {"account": acct.name, "status": "fail", "error": str(e)[:80]}
+
+    tasks = [(_entry_task, {"account": c.name}) for c in contexts]
+    results_raw = _run_parallel_tasks(tasks)
+    ok = sum(1 for r in results_raw if r.get("status") == "ok")
+    fail = sum(1 for r in results_raw if r.get("status") == "fail")
+    results = []
+    for r in results_raw:
+        acct_name = r.get("account") or r.get("acct") or "unknown"
+        status = r.get("status")
+        if status == "ok":
+            results.append(f"{acct_name}: ok")
+        elif status == "skip":
+            results.append(f"{acct_name}: skip({r.get('reason')})")
+        else:
+            results.append(f"{acct_name}: fail({r.get('error')})")
 
     msg = f"관리자수동진입 {symbol} {side} pct={entry_pct:.2f}% ok={ok} fail={fail}"
     try:
@@ -307,27 +345,27 @@ def close_positions():
         contexts = _build_account_contexts()
     except Exception:
         contexts = []
-    ok = 0
-    fail = 0
-    skipped = 0
-    for acct in contexts:
+    def _close_task(acct: AccountContext) -> dict:
         try:
             with acct.executor.activate():
                 if side == "LONG":
                     amt = acct.executor.get_long_position_amount(symbol)
                     if not isinstance(amt, (int, float)) or amt <= 0:
-                        skipped += 1
-                        continue
+                        return {"account": acct.name, "status": "skip"}
                     acct.executor.close_long_market(symbol)
                 else:
                     amt = acct.executor.get_short_position_amount(symbol)
                     if not isinstance(amt, (int, float)) or amt <= 0:
-                        skipped += 1
-                        continue
+                        return {"account": acct.name, "status": "skip"}
                     acct.executor.close_short_market(symbol)
-            ok += 1
-        except Exception:
-            fail += 1
+            return {"account": acct.name, "status": "ok"}
+        except Exception as e:
+            return {"account": acct.name, "status": "fail", "error": str(e)[:80]}
+    tasks = [(_close_task, {"account": c.name}) for c in contexts]
+    results_raw = _run_parallel_tasks(tasks)
+    ok = sum(1 for r in results_raw if r.get("status") == "ok")
+    fail = sum(1 for r in results_raw if r.get("status") == "fail")
+    skipped = sum(1 for r in results_raw if r.get("status") == "skip")
     msg = f"{symbol} {side} 청산: ok={ok} fail={fail} skip={skipped}"
     return redirect(url_for("follower_positions", notice=msg))
 
@@ -903,18 +941,11 @@ def admin_entry():
     if not isinstance(account_ids, list) or not account_ids:
         return jsonify({"status": "missing account_ids"}), 400
     accounts = {int(a["id"]): a for a in _list_accounts()}
-    results = []
     now_ts = time.time()
-    for acct_id in account_ids:
-        try:
-            account_id = int(acct_id)
-        except Exception:
-            results.append({"account_id": acct_id, "status": "invalid_account_id"})
-            continue
+    def _entry_task(account_id: int) -> dict:
         acct = accounts.get(account_id)
         if not acct:
-            results.append({"account_id": account_id, "status": "unknown_account"})
-            continue
+            return {"account_id": account_id, "status": "unknown_account"}
         state_path = _state_path_for_account(acct)
         acct_state = load_state_from(state_path)
         admin_follow_enabled = acct_state.get("_admin_follow_enabled")
@@ -924,17 +955,14 @@ def admin_entry():
         if manual_entry_enabled is None:
             manual_entry_enabled = True
         if not admin_follow_enabled:
-            results.append({"account_id": account_id, "status": "skip", "reason": "admin_follow_disabled"})
-            continue
+            return {"account_id": account_id, "status": "skip", "reason": "admin_follow_disabled"}
         if not manual_entry_enabled:
-            results.append({"account_id": account_id, "status": "skip", "reason": "manual_entry_disabled"})
-            continue
+            return {"account_id": account_id, "status": "skip", "reason": "manual_entry_disabled"}
         settings = _load_account_settings(account_id)
         executor = _build_executor(acct, settings, force_hedge=True)
         usdt_amount = _entry_usdt_available(executor, float(settings.get("entry_pct") or 0.0))
         if usdt_amount <= 0:
-            results.append({"account_id": account_id, "status": "skip", "reason": "entry_usdt_unavailable"})
-            continue
+            return {"account_id": account_id, "status": "skip", "reason": "entry_usdt_unavailable"}
         leverage = int(settings.get("leverage") or 10)
         margin_mode = str(settings.get("margin_mode") or "cross")
         with executor.activate():
@@ -960,7 +988,17 @@ def admin_entry():
                 meta=meta,
             )
             save_state_to(acct_state, state_path)
-        results.append({"account_id": account_id, "status": status, "result": res})
+        return {"account_id": account_id, "status": status, "result": res}
+
+    tasks = []
+    for acct_id in account_ids:
+        try:
+            account_id = int(acct_id)
+        except Exception:
+            tasks.append((lambda acct_id=acct_id: {"account_id": acct_id, "status": "invalid_account_id"}, {"account_id": acct_id}))
+            continue
+        tasks.append((lambda account_id=account_id: _entry_task(account_id), {"account_id": account_id}))
+    results = _run_parallel_tasks(tasks)
     return jsonify({"status": "ok", "symbol": symbol, "side": side, "results": results})
 
 

@@ -250,6 +250,22 @@ class AccountExecutor:
         with self.activate():
             return get_long_position_detail(symbol)
 
+    def close_long_market_qty(self, symbol: str, qty: float) -> dict:
+        with self.activate():
+            return close_long_market_qty(symbol, qty)
+
+    def close_short_market_qty(self, symbol: str, qty: float) -> dict:
+        with self.activate():
+            return close_short_market_qty(symbol, qty)
+
+    def place_long_sl_px(self, symbol: str, stop_price: float, qty: Optional[float] = None) -> dict:
+        with self.activate():
+            return place_long_sl_px(symbol, stop_price, qty=qty)
+
+    def place_short_sl_px(self, symbol: str, stop_price: float, qty: Optional[float] = None) -> dict:
+        with self.activate():
+            return place_short_sl_px(symbol, stop_price, qty=qty)
+
     def short_market(self, symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int = DEFAULT_LEVERAGE, margin_mode: str = "isolated") -> dict:
         with self.activate():
             return short_market(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
@@ -1234,6 +1250,200 @@ def close_long_market(symbol: str) -> dict:
     res = {"status": "ok", "action": "close_long_market", "order": order, "order_id": order_id, "amount": amount}
     _db_record_order("close_long_market", symbol, "LONG", res)
     return res
+
+def close_long_market_qty(symbol: str, qty: float) -> dict:
+    ctx = _get_ctx()
+    ensure_ready()
+    try:
+        amount = float(qty)
+    except Exception:
+        return {"status": "skip", "reason": "bad_qty", "symbol": symbol}
+    if amount <= 0:
+        return {"status": "skip", "reason": "qty_non_positive", "symbol": symbol}
+    amount = float(ctx.exchange.amount_to_precision(symbol, amount))
+    if amount <= 0:
+        return {"status": "skip", "reason": "qty_precision_zero", "symbol": symbol}
+    if ctx.dry_run:
+        res = {"status": "dry_run", "action": "close_long_market_qty", "symbol": symbol, "amount": amount, "order_id": None}
+        _db_record_order("close_long_market_qty", symbol, "LONG", res, status_override="dry_run")
+        return res
+    hedge = False
+    try:
+        hedge = is_hedge_mode()
+    except Exception:
+        hedge = False
+    params = {"positionSide": "LONG"} if hedge else {"reduceOnly": True}
+    order = ctx.exchange.create_market_sell_order(symbol, amount, params=params)
+    order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+    res = {"status": "ok", "action": "close_long_market_qty", "order": order, "order_id": order_id, "amount": amount}
+    _db_record_order("close_long_market_qty", symbol, "LONG", res)
+    return res
+
+def close_short_market_qty(symbol: str, qty: float) -> dict:
+    ctx = _get_ctx()
+    ensure_ready()
+    try:
+        amount = float(qty)
+    except Exception:
+        return {"status": "skip", "reason": "bad_qty", "symbol": symbol}
+    if amount <= 0:
+        return {"status": "skip", "reason": "qty_non_positive", "symbol": symbol}
+    amount = float(ctx.exchange.amount_to_precision(symbol, amount))
+    if amount <= 0:
+        return {"status": "skip", "reason": "qty_precision_zero", "symbol": symbol}
+    if ctx.dry_run:
+        res = {"status": "dry_run", "action": "close_short_market_qty", "symbol": symbol, "amount": amount, "order_id": None}
+        _db_record_order("close_short_market_qty", symbol, "SHORT", res, status_override="dry_run")
+        return res
+    hedge = False
+    try:
+        hedge = is_hedge_mode()
+    except Exception:
+        hedge = False
+    params = {"positionSide": "SHORT"} if hedge else {"reduceOnly": True}
+    order = ctx.exchange.create_market_buy_order(symbol, amount, params=params)
+    order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+    res = {"status": "ok", "action": "close_short_market_qty", "order": order, "order_id": order_id, "amount": amount}
+    _db_record_order("close_short_market_qty", symbol, "SHORT", res)
+    return res
+
+def place_long_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None) -> dict:
+    ctx = _get_ctx()
+    ensure_ready()
+    try:
+        sl_px = float(stop_price)
+    except Exception:
+        return {"status": "skip", "reason": "bad_stop_price", "symbol": symbol}
+    if sl_px <= 0:
+        return {"status": "skip", "reason": "stop_price_non_positive", "symbol": symbol}
+    amt = None
+    if isinstance(qty, (int, float)) and qty > 0:
+        amt = float(qty)
+    if not isinstance(amt, (int, float)) or amt <= 0:
+        refresh_positions_cache(force=True)
+        for _ in range(8):
+            try:
+                amt = get_long_position_amount(symbol)
+            except Exception:
+                amt = None
+            if isinstance(amt, (int, float)) and amt > 0:
+                break
+            time.sleep(0.25)
+    if not isinstance(amt, (int, float)) or amt <= 0:
+        return {"status": "skip", "reason": "qty_unavailable", "symbol": symbol, "stop_price": sl_px}
+    amt = float(ctx.exchange.amount_to_precision(symbol, amt))
+    if amt <= 0:
+        return {"status": "skip", "reason": "qty_precision_zero", "symbol": symbol, "stop_price": sl_px}
+    if ctx.dry_run:
+        res = {
+            "status": "dry_run",
+            "action": "place_long_sl_px",
+            "symbol": symbol,
+            "stop_price": sl_px,
+            "amount": amt,
+            "order_id": None,
+        }
+        _db_record_order("place_long_sl_px", symbol, "LONG", res, status_override="dry_run")
+        return res
+    params = {"stopPrice": float(ctx.exchange.price_to_precision(symbol, sl_px)), "workingType": "MARK_PRICE"}
+    try:
+        if is_hedge_mode():
+            params["positionSide"] = "LONG"
+        order = ctx.exchange.create_order(symbol, "STOP_MARKET", "sell", amt, None, params)
+        order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+        res = {"status": "ok", "action": "place_long_sl_px", "order": order, "order_id": order_id, "amount": amt}
+        _db_record_order("place_long_sl_px", symbol, "LONG", res)
+        return res
+    except Exception:
+        pass
+    params["closePosition"] = True
+    try:
+        order = ctx.exchange.create_order(symbol, "STOP_MARKET", "sell", amt, None, params)
+        order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+        res = {"status": "ok", "action": "place_long_sl_px", "order": order, "order_id": order_id, "amount": amt}
+        _db_record_order("place_long_sl_px", symbol, "LONG", res)
+        return res
+    except Exception:
+        pass
+    params.pop("closePosition", None)
+    params["reduceOnly"] = True
+    try:
+        order = ctx.exchange.create_order(symbol, "STOP_MARKET", "sell", amt, None, params)
+        order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+        res = {"status": "ok", "action": "place_long_sl_px", "order": order, "order_id": order_id, "amount": amt}
+        _db_record_order("place_long_sl_px", symbol, "LONG", res)
+        return res
+    except Exception as e:
+        return {"status": "skip", "reason": "order_failed", "symbol": symbol, "error": str(e)}
+
+def place_short_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None) -> dict:
+    ctx = _get_ctx()
+    ensure_ready()
+    try:
+        sl_px = float(stop_price)
+    except Exception:
+        return {"status": "skip", "reason": "bad_stop_price", "symbol": symbol}
+    if sl_px <= 0:
+        return {"status": "skip", "reason": "stop_price_non_positive", "symbol": symbol}
+    amt = None
+    if isinstance(qty, (int, float)) and qty > 0:
+        amt = float(qty)
+    if not isinstance(amt, (int, float)) or amt <= 0:
+        refresh_positions_cache(force=True)
+        for _ in range(8):
+            try:
+                amt = get_short_position_amount(symbol)
+            except Exception:
+                amt = None
+            if isinstance(amt, (int, float)) and amt > 0:
+                break
+            time.sleep(0.25)
+    if not isinstance(amt, (int, float)) or amt <= 0:
+        return {"status": "skip", "reason": "qty_unavailable", "symbol": symbol, "stop_price": sl_px}
+    amt = float(ctx.exchange.amount_to_precision(symbol, amt))
+    if amt <= 0:
+        return {"status": "skip", "reason": "qty_precision_zero", "symbol": symbol, "stop_price": sl_px}
+    if ctx.dry_run:
+        res = {
+            "status": "dry_run",
+            "action": "place_short_sl_px",
+            "symbol": symbol,
+            "stop_price": sl_px,
+            "amount": amt,
+            "order_id": None,
+        }
+        _db_record_order("place_short_sl_px", symbol, "SHORT", res, status_override="dry_run")
+        return res
+    params = {"stopPrice": float(ctx.exchange.price_to_precision(symbol, sl_px)), "workingType": "MARK_PRICE"}
+    try:
+        if is_hedge_mode():
+            params["positionSide"] = "SHORT"
+        order = ctx.exchange.create_order(symbol, "STOP_MARKET", "buy", amt, None, params)
+        order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+        res = {"status": "ok", "action": "place_short_sl_px", "order": order, "order_id": order_id, "amount": amt}
+        _db_record_order("place_short_sl_px", symbol, "SHORT", res)
+        return res
+    except Exception:
+        pass
+    params["closePosition"] = True
+    try:
+        order = ctx.exchange.create_order(symbol, "STOP_MARKET", "buy", amt, None, params)
+        order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+        res = {"status": "ok", "action": "place_short_sl_px", "order": order, "order_id": order_id, "amount": amt}
+        _db_record_order("place_short_sl_px", symbol, "SHORT", res)
+        return res
+    except Exception:
+        pass
+    params.pop("closePosition", None)
+    params["reduceOnly"] = True
+    try:
+        order = ctx.exchange.create_order(symbol, "STOP_MARKET", "buy", amt, None, params)
+        order_id = order.get("id") or (order.get("info") or {}).get("orderId")
+        res = {"status": "ok", "action": "place_short_sl_px", "order": order, "order_id": order_id, "amount": amt}
+        _db_record_order("place_short_sl_px", symbol, "SHORT", res)
+        return res
+    except Exception as e:
+        return {"status": "skip", "reason": "order_failed", "symbol": symbol, "error": str(e)}
 
 def cancel_open_orders(symbol: str) -> dict:
     ctx = _get_ctx()
