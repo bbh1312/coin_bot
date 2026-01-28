@@ -7167,6 +7167,7 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
                 print(f"[long-exit] {symbol} cancel_conditional_by_side failed: {e}")
         try:
             cancel_stop_orders(symbol)
+            cancel_open_orders(symbol)
         except Exception as e:
             if LOG_LONG_EXIT:
                 print(f"[long-exit] {symbol} cancel_stop_orders failed: {e}")
@@ -8112,6 +8113,7 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
                         res = close_short_market(symbol)
                     exit_order_id = _order_id_from_res(res)
                     cancel_stop_orders(symbol)
+                    cancel_open_orders(symbol)
                     engine_label = "ADVANCED_TREND_FOLLOWER"
                     _close_trade(
                         state,
@@ -8333,6 +8335,10 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     res = close_short_market(sym)
                     exit_order_id = _order_id_from_res(res)
                     cancel_stop_orders(sym)
+                    if engine_label == "ADVANCED_TREND_FOLLOWER":
+                        cancel_open_orders(sym)
+                    if engine_label == "ADVANCED_TREND_FOLLOWER":
+                        cancel_open_orders(sym)
                     last_entry_val = float(st.get("last_entry", 0))
                     state[sym] = {
                         "in_pos": False,
@@ -8395,6 +8401,10 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     res = close_short_market(sym)
                     exit_order_id = _order_id_from_res(res)
                     cancel_stop_orders(sym)
+                    if engine_label == "ADVANCED_TREND_FOLLOWER":
+                        cancel_open_orders(sym)
+                    if engine_label == "ADVANCED_TREND_FOLLOWER":
+                        cancel_open_orders(sym)
                     last_entry_val = float(st.get("last_entry", 0))
                     state[sym] = {
                         "in_pos": False,

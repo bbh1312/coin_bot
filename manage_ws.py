@@ -690,14 +690,25 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
     # WS 감지 기반 수동 청산은 최근 확인 여부와 무관하게 알림
     exit_reason = "manual_close"
     entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
+    meta = open_tr.get("meta") if isinstance(open_tr, dict) else None
+    sl_price_meta = None
+    if isinstance(meta, dict):
+        try:
+            sl_price_meta = float(meta.get("sl_price"))
+        except Exception:
+            sl_price_meta = None
     tp_pct, sl_pct = er._get_engine_exit_thresholds(_trade_engine_label(open_tr), "LONG")
     if mark_px is None:
         mark_px = _fallback_last_price(symbol)
+    if mark_px is None and isinstance(sl_price_meta, (int, float)):
+        mark_px = float(sl_price_meta)
     if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
         if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
             exit_reason = "auto_exit_tp"
         elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
+            exit_reason = "auto_exit_sl"
+        elif isinstance(sl_price_meta, (int, float)) and mark_px <= float(sl_price_meta):
             exit_reason = "auto_exit_sl"
     last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
     last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
@@ -778,14 +789,25 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
     # WS 감지 기반 수동 청산은 최근 확인 여부와 무관하게 알림
     exit_reason = "manual_close"
     entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
+    meta = open_tr.get("meta") if isinstance(open_tr, dict) else None
+    sl_price_meta = None
+    if isinstance(meta, dict):
+        try:
+            sl_price_meta = float(meta.get("sl_price"))
+        except Exception:
+            sl_price_meta = None
     tp_pct, sl_pct = er._get_engine_exit_thresholds(_trade_engine_label(open_tr), "SHORT")
     if mark_px is None:
         mark_px = _fallback_last_price(symbol)
+    if mark_px is None and isinstance(sl_price_meta, (int, float)):
+        mark_px = float(sl_price_meta)
     if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
         profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
         if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
             exit_reason = "auto_exit_tp"
         elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
+            exit_reason = "auto_exit_sl"
+        elif isinstance(sl_price_meta, (int, float)) and mark_px >= float(sl_price_meta):
             exit_reason = "auto_exit_sl"
     last_exit_ts = st.get("last_exit_ts") if isinstance(st, dict) else None
     last_exit_reason = st.get("last_exit_reason") if isinstance(st, dict) else None
