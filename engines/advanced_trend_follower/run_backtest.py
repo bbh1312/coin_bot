@@ -359,10 +359,12 @@ def main() -> None:
 
         df["mfi"] = _mfi(df, 14)
         df["adx"] = _adx(df, 14)
+        df["rsi"] = _rsi(df["close"], 14)
         st_line, st_trend = _supertrend(df, args.st_atr, args.st_mult)
         df["st_line"] = st_line
         df["st_trend"] = st_trend
         df["atr"] = _atr(df, args.st_atr)
+        df["atr14"] = _atr(df, 14)
         df["atr_median"] = df["atr"].rolling(int(args.atr_scale_lookback)).median()
         bb_len = 20
         bb_std = 2.0
@@ -387,6 +389,7 @@ def main() -> None:
             ema_trend = float(ema_val) if pd.notna(ema_val) else None
             mfi = float(row["mfi"]) if pd.notna(row["mfi"]) else None
             adx = float(row["adx"]) if pd.notna(row["adx"]) else None
+            rsi = float(row["rsi"]) if pd.notna(row["rsi"]) else None
 
             if pos:
                 high_now = float(row["high"])
@@ -506,6 +509,12 @@ def main() -> None:
             if close_px > float(ema_trend) and mfi < float(args.mfi_long_max) and st_dir > 0:
                 if isinstance(bb_upper, (int, float)) and close_px > bb_upper:
                     continue
+                if isinstance(rsi, (int, float)) and rsi >= 70:
+                    continue
+                atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else None
+                if isinstance(atr14, (int, float)) and atr14 > 0:
+                    if abs(close_px - st_line_val) > (atr14 * 2.5):
+                        continue
                 stop_px = st_line_val
                 risk_per_unit = close_px - stop_px
                 if risk_per_unit <= 0:
@@ -561,6 +570,12 @@ def main() -> None:
             if close_px < float(ema_trend) and mfi > float(args.mfi_short_min) and st_dir < 0:
                 if isinstance(bb_lower, (int, float)) and close_px < bb_lower:
                     continue
+                if isinstance(rsi, (int, float)) and rsi <= 30:
+                    continue
+                atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else None
+                if isinstance(atr14, (int, float)) and atr14 > 0:
+                    if abs(close_px - st_line_val) > (atr14 * 2.5):
+                        continue
                 stop_px = st_line_val
                 risk_per_unit = stop_px - close_px
                 if risk_per_unit <= 0:

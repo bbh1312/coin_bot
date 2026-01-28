@@ -3746,6 +3746,14 @@ def _run_adv_trend_cycle(
         close_px = signal["close_px"]
         atr_val = signal["atr"]
         signal_ts = signal.get("ts")
+        try:
+            rsi_val = float(_adv_rsi(df_15m["close"], 14).iloc[-1])
+        except Exception:
+            rsi_val = None
+        try:
+            atr14 = float(_adv_atr(df_15m, 14).iloc[-1])
+        except Exception:
+            atr14 = None
 
         close_series = df_15m["close"].iloc[-20:]
         bb_mid = close_series.mean()
@@ -3765,6 +3773,21 @@ def _run_adv_trend_cycle(
             and adx_val > ADV_TREND_ADX_MIN
             and trend_dir == -1
         )
+        if long_ok and isinstance(rsi_val, (int, float)) and rsi_val >= 70:
+            long_ok = False
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=LONG rsi={rsi_val:.2f}")
+        if short_ok and isinstance(rsi_val, (int, float)) and rsi_val <= 30:
+            short_ok = False
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=SHORT rsi={rsi_val:.2f}")
+        if (long_ok or short_ok) and isinstance(atr14, (int, float)) and atr14 > 0:
+            dist = abs(close_px - st_px)
+            if dist > (atr14 * 2.5):
+                _append_adv_trend_log(
+                    f"ADV_TREND_SKIP sym={symbol} reason=ATR_DIST side={'LONG' if long_ok else 'SHORT'} "
+                    f"dist={dist:.6g} atr14={atr14:.6g}"
+                )
+                long_ok = False
+                short_ok = False
         if long_ok and isinstance(bb_upper, (int, float)) and close_px > bb_upper:
             long_ok = False
             _append_adv_trend_log(

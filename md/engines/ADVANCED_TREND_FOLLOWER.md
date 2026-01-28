@@ -18,6 +18,8 @@
 - ADX(14) > 20
 - SuperTrend 추세가 LONG
 - 볼린저 과열 필터: 종가 > BB 상단(20,2) 이면 스킵
+- RSI 필터: RSI(14) >= 70 이면 스킵
+- ATR 이격: |close - ST| > ATR(14) * 2.5 이면 스킵
 
 숏:
 - 15m close < 4h EMA200
@@ -25,6 +27,8 @@
 - ADX(14) > 20
 - SuperTrend 추세가 SHORT
 - 볼린저 과열 필터: 종가 < BB 하단(20,2) 이면 스킵
+- RSI 필터: RSI(14) <= 30 이면 스킵
+- ATR 이격: |close - ST| > ATR(14) * 2.5 이면 스킵
 
 ## 청산 로직 (실매매)
 - SL: 진입 직후 거래소 STOP_MARKET 주문으로 SuperTrend 라인에 스탑 설정
