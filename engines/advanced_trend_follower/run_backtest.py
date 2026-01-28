@@ -394,6 +394,8 @@ def main() -> None:
             rsi = float(row["rsi"]) if pd.notna(row["rsi"]) else None
             ema7 = float(row["ema7"]) if pd.notna(row["ema7"]) else None
             ema20 = float(row["ema20"]) if pd.notna(row["ema20"]) else None
+            vol_now = float(row["volume"]) if pd.notna(row["volume"]) else None
+            vol_prev = float(df["volume"].iloc[i - 1]) if i >= 1 and pd.notna(df["volume"].iloc[i - 1]) else None
 
             if pos:
                 high_now = float(row["high"])
@@ -517,6 +519,10 @@ def main() -> None:
                     continue
                 if isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
                     if ema7 > (ema20 * 1.03):
+                        continue
+                if all(isinstance(v, (int, float)) for v in (vol_now, vol_prev)):
+                    upper_wick = float(row["high"]) - max(float(row["open"]), close_px)
+                    if vol_prev and vol_now >= (vol_prev * 2.0) and upper_wick > 0:
                         continue
                 atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else None
                 if isinstance(atr14, (int, float)) and atr14 > 0:

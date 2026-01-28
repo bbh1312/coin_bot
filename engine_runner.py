@@ -3760,6 +3760,16 @@ def _run_adv_trend_cycle(
         except Exception:
             ema7 = None
             ema20 = None
+        try:
+            open_px = float(df_15m["open"].iloc[-1])
+            high_px = float(df_15m["high"].iloc[-1])
+            vol_now = float(df_15m["volume"].iloc[-1])
+            vol_prev = float(df_15m["volume"].iloc[-2]) if len(df_15m) >= 2 else None
+        except Exception:
+            open_px = None
+            high_px = None
+            vol_now = None
+            vol_prev = None
 
         close_series = df_15m["close"].iloc[-20:]
         bb_mid = close_series.mean()
@@ -3796,6 +3806,13 @@ def _run_adv_trend_cycle(
                 short_ok = False
                 _append_adv_trend_log(
                     f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=SHORT ema7={ema7:.6g} ema20={ema20:.6g}"
+                )
+        if long_ok and all(isinstance(v, (int, float)) for v in (open_px, high_px, close_px, vol_now, vol_prev)):
+            upper_wick = high_px - max(open_px, close_px)
+            if vol_prev and vol_now >= (vol_prev * 2.0) and upper_wick > 0:
+                long_ok = False
+                _append_adv_trend_log(
+                    f"ADV_TREND_SKIP sym={symbol} reason=VOLUME_WICK side=LONG vol={vol_now:.6g} prev={vol_prev:.6g} wick={upper_wick:.6g}"
                 )
         if (long_ok or short_ok) and isinstance(atr14, (int, float)) and atr14 > 0:
             dist = abs(close_px - st_px)
@@ -7495,11 +7512,33 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
         qty = tr.get("qty")
         if isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and isinstance(exit_price, (int, float)):
             pnl = (entry_price - exit_price) * qty
+        engine_label = _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
         exit_reason = "manual_close"
+        meta = None
         if isinstance(open_tr, dict):
             meta = open_tr.get("meta") or {}
-            if meta.get("sl_order_id"):
-                exit_reason = "auto_exit_sl"
+        elif isinstance(tr, dict):
+            meta = tr.get("meta") or {}
+        if isinstance(meta, dict) and meta.get("sl_order_id"):
+            exit_reason = "auto_exit_sl"
+        sl_price_meta = None
+        if isinstance(meta, dict):
+            try:
+                sl_price_meta = float(meta.get("sl_price"))
+            except Exception:
+                sl_price_meta = None
+        if exit_price is None:
+            exit_price = _fetch_last_price(symbol)
+        if exit_reason == "manual_close":
+            tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "SHORT")
+            if isinstance(entry_price, (int, float)) and isinstance(exit_price, (int, float)) and entry_price > 0:
+                profit_unlev = (float(entry_price) - float(exit_price)) / float(entry_price) * 100.0
+                if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
+                    exit_reason = "auto_exit_tp"
+                elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
+                    exit_reason = "auto_exit_sl"
+                elif isinstance(sl_price_meta, (int, float)) and exit_price >= float(sl_price_meta):
+                    exit_reason = "auto_exit_sl"
         _close_trade(
             state,
             side="SHORT",
@@ -7509,7 +7548,7 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
             pnl_usdt=pnl,
             reason=exit_reason,
         )
-        engine_label = _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
+        engine_label = engine_label or _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
         if exit_reason == "auto_exit_sl" and engine_label == "SWAGGY":
             st = state.get(symbol, {})
             if isinstance(st, dict):
