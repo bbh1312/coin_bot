@@ -1390,6 +1390,29 @@ def _fmt_entry_price(val: Any) -> str:
     except Exception:
         return "N/A"
 
+def _coerce_float(val: Any) -> Optional[float]:
+    try:
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        return float(str(val).strip())
+    except Exception:
+        return None
+
+def _fmt_exit_pct(entry_price: Any, target_price: Any, side: str, kind: str) -> str:
+    entry = _coerce_float(entry_price)
+    target = _coerce_float(target_price)
+    if entry is None or target is None or entry <= 0:
+        return "n/a"
+    side_key = (side or "").upper()
+    kind_key = (kind or "").upper()
+    if side_key == "SHORT":
+        pct = (entry - target) / entry * 100.0 if kind_key == "TP" else (target - entry) / entry * 100.0
+    else:
+        pct = (target - entry) / entry * 100.0
+    return f"{pct:+.2f}%"
+
 def _format_order_id_block(entry_order_id: Optional[str], exit_order_id: Optional[str] = None) -> str:
     lines = []
     if entry_order_id:
@@ -1457,7 +1480,9 @@ def _send_entry_alert(
         sl_disp = "N/A"
     if not tp_disp:
         tp_disp = "N/A"
-    lines.append(f"손절가={sl_disp} 익절가={tp_disp}")
+    sl_pct_disp = _fmt_exit_pct(entry_price, sl_disp, side_key, "SL")
+    tp_pct_disp = _fmt_exit_pct(entry_price, tp_disp, side_key, "TP")
+    lines.append(f"손절가={sl_disp} ({sl_pct_disp}) 익절가={tp_disp} ({tp_pct_disp})")
     lines.append(f"엔진: {_display_engine_label(engine)}")
     reason_disp = reason if (reason and str(reason).strip()) else "N/A"
     lines.append(f"사유: {reason_disp}")
@@ -7595,6 +7620,9 @@ def _detect_position_events(state: dict, send_telegram) -> None:
                         meta={"reason": reason, "engine": engine_label} if reason else {"engine": engine_label},
                     )
                     return
+                backfilled = _get_open_trade_or_backfill(state, symbol, side, now_ts=now)
+                if isinstance(backfilled, dict):
+                    return
                 _record_position_event(symbol, side, "ENTRY", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
                 changed = True
                 _send_entry_alert(
@@ -8046,6 +8074,18 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
             mark_px = detail.get("mark")
         if not isinstance(mark_px, (int, float)):
             mark_px = None
+
+        if not isinstance(tp1_px, (int, float)) and isinstance(entry_px, (int, float)):
+            st_info = _adv_latest_supertrend(symbol)
+            if st_info:
+                st_px = float(st_info[0])
+                if side == "LONG":
+                    tp1_px = entry_px + (ADV_TREND_TP1_R_MULT * (entry_px - st_px))
+                else:
+                    tp1_px = entry_px - (ADV_TREND_TP1_R_MULT * (st_px - entry_px))
+                meta["tp1_price"] = tp1_px
+                meta.setdefault("sl_price", st_px)
+                tr["meta"] = meta
 
         if not be_done and isinstance(tp1_px, (int, float)) and isinstance(mark_px, (int, float)):
             tp1_hit = (mark_px >= tp1_px) if side == "LONG" else (mark_px <= tp1_px)
