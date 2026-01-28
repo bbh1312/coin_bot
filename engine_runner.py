@@ -3727,6 +3727,7 @@ def _run_adv_trend_cycle(
             break
 
         df_15m = cycle_cache.get_df(symbol, "15m", limit=ltf_limit)
+        df_1h = cycle_cache.get_df(symbol, "1h", limit=80)
         df_4h = cycle_cache.get_df(symbol, "4h", limit=htf_limit)
         if df_15m.empty or df_4h.empty:
             time.sleep(PER_SYMBOL_SLEEP)
@@ -3829,12 +3830,12 @@ def _run_adv_trend_cycle(
         if long_ok and isinstance(bb_upper, (int, float)) and close_px > bb_upper:
             long_ok = False
             _append_adv_trend_log(
-                f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT side=LONG close={close_px:.6g} bb_upper={bb_upper:.6g}"
+                f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT_15M side=LONG close={close_px:.6g} bb_upper={bb_upper:.6g}"
             )
         if short_ok and isinstance(bb_lower, (int, float)) and close_px < bb_lower:
             short_ok = False
             _append_adv_trend_log(
-                f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT side=SHORT close={close_px:.6g} bb_lower={bb_lower:.6g}"
+                f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT_15M side=SHORT close={close_px:.6g} bb_lower={bb_lower:.6g}"
             )
         if not long_ok and not short_ok:
             time.sleep(PER_SYMBOL_SLEEP)
