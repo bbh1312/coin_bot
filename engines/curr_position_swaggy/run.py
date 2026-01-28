@@ -341,7 +341,7 @@ def main() -> None:
     swaggy_engine = SwaggyAtlasLabV2Engine(swaggy_cfg)
     atlas_cfg = SwaggyAtlasLabV2AtlasConfig()
     # Match SwaggyLab v2 live engine exception_min_score
-    atlas_cfg.exception_min_score = 2
+    atlas_cfg.exception_min_score = 3
     ltf_limit = max(int(swaggy_cfg.ltf_limit), 120)
     mtf_limit = 200
     htf_limit = max(int(swaggy_cfg.vp_lookback_1h), 120)
