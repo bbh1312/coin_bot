@@ -342,7 +342,7 @@ def manual_entry_submit():
 
     selected_accounts = request.form.getlist("accounts")
     try:
-        contexts = _build_account_contexts()
+        contexts = _build_account_contexts_web(include_inactive=True)
     except Exception:
         contexts = []
     if selected_accounts and "ALL" not in selected_accounts:
@@ -393,7 +393,10 @@ def manual_entry_submit():
         except Exception as e:
             return {"account": acct.name, "status": "fail", "error": str(e)[:80]}
 
-    tasks = [(_entry_task, {"account": c.name}) for c in contexts]
+    def _task_for(acct: AccountContext):
+        return lambda: _entry_task(acct)
+
+    tasks = [(_task_for(c), {"account": c.name}) for c in contexts]
     results_raw = _run_parallel_tasks(tasks)
     ok = sum(1 for r in results_raw if r.get("status") == "ok")
     fail = sum(1 for r in results_raw if r.get("status") == "fail")

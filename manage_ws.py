@@ -1189,6 +1189,10 @@ def main():
     while True:
         _drain_entry_events(state)
         try:
+            er._maybe_refresh_accounts(reason="manage_ws_periodic")
+        except Exception:
+            pass
+        try:
             er._process_manage_queue(state, er.send_telegram)
         except Exception:
             pass
