@@ -392,10 +392,6 @@ def main() -> None:
                         pos.stop_px = st_line_val
                     if not pos.took_tp1 and close_px >= pos.tp1_px:
                         pos.took_tp1 = True
-                        take_size = pos.remaining * 0.5
-                        pos.remaining -= take_size
-                        tp_fill = pos.tp1_px * (1.0 - float(args.slip_pct))
-                        pos.realized_pnl += (tp_fill - pos.entry_px) * take_size
                         pos.stop_px = pos.entry_px
                     if float(row["low"]) <= pos.stop_px:
                         pos.exit_ts = ts
@@ -410,10 +406,6 @@ def main() -> None:
                         pos.stop_px = st_line_val
                     if not pos.took_tp1 and close_px <= pos.tp1_px:
                         pos.took_tp1 = True
-                        take_size = pos.remaining * 0.5
-                        pos.remaining -= take_size
-                        tp_fill = pos.tp1_px * (1.0 + float(args.slip_pct))
-                        pos.realized_pnl += (pos.entry_px - tp_fill) * take_size
                         pos.stop_px = pos.entry_px
                     if float(row["high"]) >= pos.stop_px:
                         pos.exit_ts = ts

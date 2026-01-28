@@ -7994,7 +7994,7 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
         meta = tr.get("meta") if isinstance(tr.get("meta"), dict) else {}
         entry_px = tr.get("entry_price")
         tp1_px = meta.get("tp1_price")
-        tp1_done = bool(meta.get("tp1_done"))
+        be_done = bool(meta.get("be_done"))
         amt = None
         detail = None
         if side == "LONG":
@@ -8047,16 +8047,15 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
         if not isinstance(mark_px, (int, float)):
             mark_px = None
 
-        if not tp1_done and isinstance(tp1_px, (int, float)) and isinstance(mark_px, (int, float)):
+        if not be_done and isinstance(tp1_px, (int, float)) and isinstance(mark_px, (int, float)):
             tp1_hit = (mark_px >= tp1_px) if side == "LONG" else (mark_px <= tp1_px)
             if tp1_hit:
-                _adv_partial_close(symbol, side, ADV_TREND_TP1_FRACTION)
-                meta["tp1_done"] = True
-                meta["tp1_ts"] = now
-                tr["meta"] = meta
                 if isinstance(entry_px, (int, float)):
                     _adv_place_be_stop_all(symbol, side, entry_px)
-                _append_adv_trend_log(f"ADV_TREND_TP1 sym={symbol} side={side} px={tp1_px:.6g}")
+                meta["be_done"] = True
+                meta["be_ts"] = now
+                tr["meta"] = meta
+                _append_adv_trend_log(f"ADV_TREND_BE_MOVE sym={symbol} side={side} px={tp1_px:.6g}")
 
         st_info = _adv_latest_supertrend(symbol)
         if st_info:
