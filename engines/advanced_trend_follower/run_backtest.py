@@ -364,6 +364,12 @@ def main() -> None:
         df["st_trend"] = st_trend
         df["atr"] = _atr(df, args.st_atr)
         df["atr_median"] = df["atr"].rolling(int(args.atr_scale_lookback)).median()
+        bb_len = 20
+        bb_std = 2.0
+        bb_mid = df["close"].rolling(bb_len).mean()
+        bb_dev = df["close"].rolling(bb_len).std(ddof=0)
+        df["bb_upper"] = bb_mid + (bb_std * bb_dev)
+        df["bb_lower"] = bb_mid - (bb_std * bb_dev)
 
         pos: Optional[Position] = None
         for i in range(220, len(df)):
@@ -508,7 +514,12 @@ def main() -> None:
             if adx <= float(args.adx_min):
                 continue
 
+            bb_upper = float(row["bb_upper"]) if pd.notna(row.get("bb_upper")) else None
+            bb_lower = float(row["bb_lower"]) if pd.notna(row.get("bb_lower")) else None
             if close_px > float(ema_trend) and mfi < float(args.mfi_long_max) and st_dir > 0:
+                if isinstance(bb_upper, (int, float)) and close_px > bb_upper:
+                    _bt_log("[BACKTEST] %s skip=BB_OVERHEAT side=LONG close=%.6g bb_upper=%.6g" % (symbol, close_px, bb_upper))
+                    continue
                 stop_px = st_line_val
                 risk_per_unit = close_px - stop_px
                 if risk_per_unit <= 0:
@@ -595,6 +606,9 @@ def main() -> None:
                 continue
 
             if close_px < float(ema_trend) and mfi > float(args.mfi_short_min) and st_dir < 0:
+                if isinstance(bb_lower, (int, float)) and close_px < bb_lower:
+                    _bt_log("[BACKTEST] %s skip=BB_OVERHEAT side=SHORT close=%.6g bb_lower=%.6g" % (symbol, close_px, bb_lower))
+                    continue
                 stop_px = st_line_val
                 risk_per_unit = stop_px - close_px
                 if risk_per_unit <= 0:

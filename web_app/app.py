@@ -281,6 +281,15 @@ def follower_positions():
     total = len(items)
     admin_total = len(groups.get("admin") or [])
     follower_total = len(groups.get("followers") or [])
+    user_filters = []
+    seen = set()
+    for row in items:
+        name = row.get("account")
+        if not name or name in seen or str(name) == "admin":
+            continue
+        seen.add(name)
+        user_filters.append(str(name))
+    user_filters.sort()
     updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     notice = request.args.get("notice")
     return render_template(
@@ -289,6 +298,7 @@ def follower_positions():
         total=total,
         admin_total=admin_total,
         follower_total=follower_total,
+        user_filters=user_filters,
         updated_at=updated_at,
         notice=notice,
     )
