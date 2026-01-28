@@ -26,6 +26,15 @@ _ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_BY_SYMBOL_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_TTL_SEC = 5.0
 
+
+def _ensure_broadcast_contexts() -> None:
+    try:
+        if er.FOLLOWER_CONTEXTS:
+            return
+        er._reload_account_contexts(reason="manage_ws")
+    except Exception:
+        pass
+
 def _is_startup_position(state: dict, symbol: str) -> bool:
     if not symbol or not isinstance(state, dict):
         return False
@@ -846,8 +855,9 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
         executor_mod.set_dry_run(False if er.LONG_LIVE_TRADING else True)
     except Exception:
         pass
-    res = executor_mod.close_long_market(symbol)
-    executor_mod.cancel_stop_orders(symbol)
+    _ensure_broadcast_contexts()
+    res = er.close_long_market(symbol)
+    er.cancel_stop_orders(symbol)
     exit_order_id = None
     if isinstance(res, dict):
         exit_order_id = res.get("order_id") or er._extract_order_id(res.get("order"))
@@ -907,8 +917,9 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts) -> bool:
         executor_mod.set_dry_run(False if er.LIVE_TRADING else True)
     except Exception:
         pass
-    res = executor_mod.close_short_market(symbol)
-    executor_mod.cancel_stop_orders(symbol)
+    _ensure_broadcast_contexts()
+    res = er.close_short_market(symbol)
+    er.cancel_stop_orders(symbol)
     exit_order_id = None
     if isinstance(res, dict):
         exit_order_id = res.get("order_id") or er._extract_order_id(res.get("order"))
@@ -968,8 +979,9 @@ def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
         executor_mod.set_dry_run(False if er.LONG_LIVE_TRADING else True)
     except Exception:
         pass
-    res = executor_mod.close_long_market(symbol)
-    executor_mod.cancel_stop_orders(symbol)
+    _ensure_broadcast_contexts()
+    res = er.close_long_market(symbol)
+    er.cancel_stop_orders(symbol)
     exit_order_id = None
     if isinstance(res, dict):
         exit_order_id = res.get("order_id") or er._extract_order_id(res.get("order"))
@@ -1027,8 +1039,9 @@ def _handle_short_sl(state, symbol, detail, mark_px, now_ts) -> bool:
         executor_mod.set_dry_run(False if er.LIVE_TRADING else True)
     except Exception:
         pass
-    res = executor_mod.close_short_market(symbol)
-    executor_mod.cancel_stop_orders(symbol)
+    _ensure_broadcast_contexts()
+    res = er.close_short_market(symbol)
+    er.cancel_stop_orders(symbol)
     exit_order_id = None
     if isinstance(res, dict):
         exit_order_id = res.get("order_id") or er._extract_order_id(res.get("order"))
