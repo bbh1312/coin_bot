@@ -206,6 +206,7 @@
             <div class="nav-links">
                 <a href="/">설정</a>
                 <a class="active" href="/positions">포지션</a>
+                <a href="/manual_entry">포지션 진입</a>
             </div>
         </div>
     </nav>
@@ -227,6 +228,9 @@
                 <span>total: {{ total }}</span>
                 <span>admin: {{ admin_total }}</span>
                 <span>users: {{ follower_total }}</span>
+                {% if notice %}
+                <span style="border-color: rgba(245,158,11,0.6); color: var(--accent);">{{ notice }}</span>
+                {% endif %}
                 <div class="tabs" role="tablist">
                     <button class="tab-btn active" data-filter="all" type="button">ALL</button>
                     <button class="tab-btn" data-filter="admin" type="button">ADMIN</button>
@@ -243,9 +247,11 @@
                         <th>Qty</th>
                         <th>Entry</th>
                         <th>Mark</th>
+                        <th>Notional</th>
                         <th>PnL</th>
                         <th>ROI%</th>
                         <th>Lev</th>
+                        <th>Action</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -257,11 +263,32 @@
                         <td>{{ '%.6g'|format(row.qty) if row.qty is not none else '-' }}</td>
                         <td>{{ '%.6g'|format(row.entry) if row.entry is not none else '-' }}</td>
                         <td>{{ '%.6g'|format(row.mark) if row.mark is not none else '-' }}</td>
+                        <td>{{ '%.2f'|format(row.notional) if row.notional is not none else '-' }}</td>
                         <td class="{{ 'pnl-pos' if row.pnl is not none and row.pnl >= 0 else 'pnl-neg' }}">
                             {{ '%.4f'|format(row.pnl) if row.pnl is not none else '-' }}
                         </td>
                         <td>{{ '%.2f'|format(row.roi) if row.roi is not none else '-' }}</td>
                         <td>{{ '%.2f'|format(row.leverage) if row.leverage is not none else '-' }}</td>
+                        <td>
+                            {% if row.group == 'admin' %}
+                            <form method="post" action="/positions/close" onsubmit="return confirm('모든 계정 청산 진행할까요?');">
+                                <input type="hidden" name="symbol" value="{{ row.symbol }}" />
+                                <input type="hidden" name="side" value="{{ row.side }}" />
+                                <button type="submit" class="link-btn" style="border-color: rgba(239,68,68,0.6); color: var(--danger);">
+                                    전체 청산
+                                </button>
+                            </form>
+                            {% else %}
+                            <form method="post" action="/positions/close_single" onsubmit="return confirm('해당 유저 포지션만 청산할까요?');">
+                                <input type="hidden" name="symbol" value="{{ row.symbol }}" />
+                                <input type="hidden" name="side" value="{{ row.side }}" />
+                                <input type="hidden" name="account" value="{{ row.account }}" />
+                                <button type="submit" class="link-btn" style="border-color: rgba(239,68,68,0.6); color: var(--danger);">
+                                    청산
+                                </button>
+                            </form>
+                            {% endif %}
+                        </td>
                     </tr>
                     {% endfor %}
                 </tbody>

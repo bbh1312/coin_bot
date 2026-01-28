@@ -560,10 +560,7 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
         admin_ok = admin_status in ("ok", "dry_run", "skip")
         _set_last_entry_broadcast(symbol, "SHORT", admin_status, admin_ok, [])
         return res
-    use_pct = _LAST_ENTRY_PCT_USED if _LAST_ENTRY_USDT_USED == usdt_amount else None
-    if use_pct is None and _LAST_ENTRY_PCT_USED is not None:
-        if (time.time() - float(_LAST_ENTRY_PCT_TS or 0.0)) <= 5.0:
-            use_pct = _LAST_ENTRY_PCT_USED
+    use_pct = _calc_effective_entry_pct(usdt_amount)
     follower_calls = []
     for acct in followers:
         follower_usdt = usdt_amount
@@ -589,15 +586,11 @@ def short_limit(*args, **kwargs) -> dict:
     followers = FOLLOWER_CONTEXTS
     if not followers:
         return res
-    use_pct = None
     sym = args[0] if len(args) >= 1 else kwargs.get("symbol")
     usdt_amount = kwargs.get("usdt_amount")
     if usdt_amount is None and len(args) >= 3:
         usdt_amount = args[2]
-    if _LAST_ENTRY_USDT_USED == usdt_amount:
-        use_pct = _LAST_ENTRY_PCT_USED
-    elif _LAST_ENTRY_PCT_USED is not None and (time.time() - float(_LAST_ENTRY_PCT_TS or 0.0)) <= 5.0:
-        use_pct = _LAST_ENTRY_PCT_USED
+    use_pct = _calc_effective_entry_pct(usdt_amount)
     follower_calls = []
     for acct in followers:
         follower_usdt = usdt_amount
@@ -630,10 +623,7 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
         admin_ok = admin_status in ("ok", "dry_run", "skip")
         _set_last_entry_broadcast(symbol, "LONG", admin_status, admin_ok, [])
         return res
-    use_pct = _LAST_ENTRY_PCT_USED if _LAST_ENTRY_USDT_USED == usdt_amount else None
-    if use_pct is None and _LAST_ENTRY_PCT_USED is not None:
-        if (time.time() - float(_LAST_ENTRY_PCT_TS or 0.0)) <= 5.0:
-            use_pct = _LAST_ENTRY_PCT_USED
+    use_pct = _calc_effective_entry_pct(usdt_amount)
     follower_calls = []
     for acct in followers:
         follower_usdt = usdt_amount
@@ -659,6 +649,12 @@ def close_short_market(symbol: str) -> dict:
         try:
             amt = acct.executor.get_short_position_amount(symbol)
             if isinstance(amt, (int, float)) and amt <= 0:
+                try:
+                    acct.executor.refresh_positions_cache(force=True)
+                    amt = acct.executor.get_short_position_amount(symbol)
+                except Exception:
+                    amt = amt
+            if isinstance(amt, (int, float)) and amt <= 0:
                 follower_calls.append({"acct": acct, "skip": "no_pos"})
                 continue
         except Exception:
@@ -676,6 +672,12 @@ def close_long_market(symbol: str) -> dict:
     for acct in followers:
         try:
             amt = acct.executor.get_long_position_amount(symbol)
+            if isinstance(amt, (int, float)) and amt <= 0:
+                try:
+                    acct.executor.refresh_positions_cache(force=True)
+                    amt = acct.executor.get_long_position_amount(symbol)
+                except Exception:
+                    amt = amt
             if isinstance(amt, (int, float)) and amt <= 0:
                 follower_calls.append({"acct": acct, "skip": "no_pos"})
                 continue
@@ -1011,6 +1013,31 @@ def _resolve_entry_usdt(pct: Optional[float] = None) -> float:
     _LAST_ENTRY_USDT_USED = usdt_val
     _LAST_ENTRY_PCT_TS = time.time()
     return usdt_val
+
+
+def _calc_effective_entry_pct(usdt_amount: Optional[float]) -> Optional[float]:
+    try:
+        usdt_val = float(usdt_amount)
+    except Exception:
+        usdt_val = None
+    try:
+        avail = get_available_usdt()
+    except Exception:
+        avail = None
+    if isinstance(usdt_val, (int, float)) and usdt_val > 0 and isinstance(avail, (int, float)) and avail > 0:
+        pct = (float(usdt_val) / float(avail)) * 100.0
+        if pct > 0:
+            return pct
+    if _LAST_ENTRY_PCT_USED is not None:
+        if (time.time() - float(_LAST_ENTRY_PCT_TS or 0.0)) <= 5.0:
+            return float(_LAST_ENTRY_PCT_USED)
+    try:
+        val = float(USDT_PER_TRADE)
+    except Exception:
+        val = None
+    if isinstance(val, (int, float)) and val > 0:
+        return val
+    return None
 
 
 def _log_entry_usdt_debug(symbol: str, engine: str, usdt: float) -> None:
@@ -4200,6 +4227,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "MANUAL"
     if key in ("manual_admin", "admin_manual"):
         return "MANUAL_ADMIN"
+    if key in ("관리자수동진입", "admin_manual_entry"):
+        return "관리자수동진입"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:

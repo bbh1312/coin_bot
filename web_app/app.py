@@ -20,6 +20,7 @@ from engine_runner import (
     _engine_label_from_reason,
     _get_open_trade,
     _log_trade_entry,
+    _order_id_from_res,
     load_state,
     load_state_from,
     save_state,
@@ -189,6 +190,7 @@ def follower_positions():
     admin_total = len(groups.get("admin") or [])
     follower_total = len(groups.get("followers") or [])
     updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    notice = request.args.get("notice")
     return render_template(
         "positions.html",
         items=items,
@@ -196,7 +198,169 @@ def follower_positions():
         admin_total=admin_total,
         follower_total=follower_total,
         updated_at=updated_at,
+        notice=notice,
     )
+
+
+@app.route("/manual_entry", methods=["GET"])
+def manual_entry():
+    notice = request.args.get("notice")
+    try:
+        accounts = _list_accounts()
+    except Exception:
+        accounts = []
+    return render_template("manual_entry.html", notice=notice, accounts=accounts)
+
+
+def _extract_fill(res: dict) -> tuple[object, object]:
+    if not isinstance(res, dict):
+        return None, None
+    fill_price = res.get("last")
+    qty = res.get("amount")
+    order = res.get("order") if isinstance(res.get("order"), dict) else {}
+    if fill_price is None:
+        fill_price = order.get("average") or order.get("price")
+    if qty is None:
+        qty = order.get("amount")
+    return fill_price, qty
+
+
+@app.post("/manual_entry")
+def manual_entry_submit():
+    symbol = _normalize_symbol(request.form.get("symbol") or "")
+    side = (request.form.get("side") or "").strip().upper()
+    try:
+        entry_pct = float(request.form.get("entry_pct") or 0)
+    except Exception:
+        entry_pct = 0.0
+    if not symbol or side not in ("LONG", "SHORT") or entry_pct <= 0:
+        return redirect(url_for("manual_entry", notice="입력값을 확인해주세요."))
+    if entry_pct > 100:
+        entry_pct = 100.0
+
+    selected_accounts = request.form.getlist("accounts")
+    try:
+        contexts = _build_account_contexts()
+    except Exception:
+        contexts = []
+    if selected_accounts and "ALL" not in selected_accounts:
+        contexts = [c for c in contexts if str(c.name) in set(selected_accounts)]
+
+    ok = 0
+    fail = 0
+    results = []
+    for acct in contexts:
+        try:
+            settings = _load_account_settings(int(acct.account_id))
+        except Exception:
+            settings = accounts_db.DEFAULT_SETTINGS
+        executor = acct.executor
+        usdt_amount = _entry_usdt_available(executor, entry_pct)
+        if usdt_amount <= 0:
+            fail += 1
+            results.append(f"{acct.name}: no_usdt")
+            continue
+        try:
+            with executor.activate():
+                if side == "LONG":
+                    res = executor.long_market(symbol, usdt_amount=usdt_amount, leverage=int(settings.get("leverage") or 10), margin_mode=str(settings.get("margin_mode") or "cross"))
+                else:
+                    res = executor.short_market(symbol, usdt_amount=usdt_amount, leverage=int(settings.get("leverage") or 10), margin_mode=str(settings.get("margin_mode") or "cross"))
+            entry_price, qty = _extract_fill(res)
+            entry_order_id = _order_id_from_res(res)
+            state_path = _state_path_for_account(acct.meta.get("db") or {"id": acct.account_id, "name": acct.name})
+            state = load_state_from(state_path)
+            _log_trade_entry(
+                state,
+                side=side,
+                symbol=symbol,
+                entry_ts=time.time(),
+                entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+                qty=qty if isinstance(qty, (int, float)) else None,
+                usdt=usdt_amount,
+                entry_order_id=entry_order_id,
+                meta={"reason": "관리자수동진입", "engine": "관리자수동진입"},
+            )
+            save_state_to(state, state_path)
+            ok += 1
+            results.append(f"{acct.name}: ok")
+        except Exception as e:
+            fail += 1
+            results.append(f"{acct.name}: fail({str(e)[:80]})")
+
+    msg = f"관리자수동진입 {symbol} {side} pct={entry_pct:.2f}% ok={ok} fail={fail}"
+    try:
+        send_telegram(msg, allow_early=True)
+    except Exception:
+        pass
+    notice = msg + " | " + ", ".join(results[:6]) + ("..." if len(results) > 6 else "")
+    return redirect(url_for("manual_entry", notice=notice))
+
+
+@app.post("/positions/close")
+def close_positions():
+    symbol = _normalize_symbol(request.form.get("symbol") or "")
+    side = (request.form.get("side") or "").strip().upper()
+    if not symbol or side not in ("LONG", "SHORT"):
+        return redirect(url_for("follower_positions", notice="잘못된 요청"))
+    try:
+        contexts = _build_account_contexts()
+    except Exception:
+        contexts = []
+    ok = 0
+    fail = 0
+    skipped = 0
+    for acct in contexts:
+        try:
+            with acct.executor.activate():
+                if side == "LONG":
+                    amt = acct.executor.get_long_position_amount(symbol)
+                    if not isinstance(amt, (int, float)) or amt <= 0:
+                        skipped += 1
+                        continue
+                    acct.executor.close_long_market(symbol)
+                else:
+                    amt = acct.executor.get_short_position_amount(symbol)
+                    if not isinstance(amt, (int, float)) or amt <= 0:
+                        skipped += 1
+                        continue
+                    acct.executor.close_short_market(symbol)
+            ok += 1
+        except Exception:
+            fail += 1
+    msg = f"{symbol} {side} 청산: ok={ok} fail={fail} skip={skipped}"
+    return redirect(url_for("follower_positions", notice=msg))
+
+
+@app.post("/positions/close_single")
+def close_single_position():
+    symbol = _normalize_symbol(request.form.get("symbol") or "")
+    side = (request.form.get("side") or "").strip().upper()
+    account_name = (request.form.get("account") or "").strip()
+    if not symbol or side not in ("LONG", "SHORT") or not account_name:
+        return redirect(url_for("follower_positions", notice="잘못된 요청"))
+    try:
+        contexts = _build_account_contexts()
+    except Exception:
+        contexts = []
+    target = next((c for c in contexts if str(c.name) == account_name), None)
+    if not target:
+        return redirect(url_for("follower_positions", notice="계정을 찾을 수 없습니다."))
+    try:
+        with target.executor.activate():
+            if side == "LONG":
+                amt = target.executor.get_long_position_amount(symbol)
+                if not isinstance(amt, (int, float)) or amt <= 0:
+                    return redirect(url_for("follower_positions", notice="해당 포지션 없음"))
+                target.executor.close_long_market(symbol)
+            else:
+                amt = target.executor.get_short_position_amount(symbol)
+                if not isinstance(amt, (int, float)) or amt <= 0:
+                    return redirect(url_for("follower_positions", notice="해당 포지션 없음"))
+                target.executor.close_short_market(symbol)
+    except Exception as e:
+        return redirect(url_for("follower_positions", notice=f"청산 실패: {str(e)[:80]}"))
+    return redirect(url_for("follower_positions", notice=f"{account_name} {symbol} {side} 청산 완료"))
 
 
 def _coerce_bool(val: object) -> bool:
@@ -244,12 +408,14 @@ def _build_follower_positions() -> tuple[list[dict], dict]:
                 for sym in sorted(syms.get("long") or []):
                     detail = acct.executor.get_long_position_detail(sym) or {}
                     row = {
+                        "account_id": acct.account_id,
                         "account": acct.name,
                         "side": "LONG",
                         "symbol": sym,
                         "qty": detail.get("qty"),
                         "entry": detail.get("entry"),
                         "mark": detail.get("mark"),
+                        "notional": detail.get("notional"),
                         "pnl": detail.get("pnl"),
                         "roi": detail.get("roi"),
                         "leverage": detail.get("leverage"),
@@ -260,12 +426,14 @@ def _build_follower_positions() -> tuple[list[dict], dict]:
                 for sym in sorted(syms.get("short") or []):
                     detail = acct.executor.get_short_position_detail(sym) or {}
                     row = {
+                        "account_id": acct.account_id,
                         "account": acct.name,
                         "side": "SHORT",
                         "symbol": sym,
                         "qty": detail.get("qty"),
                         "entry": detail.get("entry"),
                         "mark": detail.get("mark"),
+                        "notional": detail.get("notional"),
                         "pnl": detail.get("pnl"),
                         "roi": detail.get("roi"),
                         "leverage": detail.get("leverage"),
