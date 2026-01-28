@@ -3746,9 +3746,12 @@ def _run_adv_trend_cycle(
         close_px = signal["close_px"]
         atr_val = signal["atr"]
         signal_ts = signal.get("ts")
+        rsi_series = None
         try:
-            rsi_val = float(_adv_rsi(df_15m["close"], 14).iloc[-1])
+            rsi_series = _adv_rsi(df_15m["close"], 14)
+            rsi_val = float(rsi_series.iloc[-1])
         except Exception:
+            rsi_series = None
             rsi_val = None
         try:
             atr14 = float(_adv_atr(df_15m, 14).iloc[-1])

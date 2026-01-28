@@ -432,26 +432,45 @@ def close_positions():
         contexts = []
     def _close_task(acct: AccountContext) -> dict:
         try:
+            is_active = bool((acct.meta.get("db") or {}).get("is_active", 1))
+            if not is_active:
+                return {"account": acct.name, "status": "skip", "reason": "inactive"}
             with acct.executor.activate():
                 if side == "LONG":
                     amt = acct.executor.get_long_position_amount(symbol)
                     if not isinstance(amt, (int, float)) or amt <= 0:
                         return {"account": acct.name, "status": "skip"}
                     acct.executor.close_long_market(symbol)
+                    acct.executor.cancel_stop_orders(symbol)
+                    acct.executor.cancel_conditional_by_side(symbol, "LONG")
                 else:
                     amt = acct.executor.get_short_position_amount(symbol)
                     if not isinstance(amt, (int, float)) or amt <= 0:
                         return {"account": acct.name, "status": "skip"}
                     acct.executor.close_short_market(symbol)
+                    acct.executor.cancel_stop_orders(symbol)
+                    acct.executor.cancel_conditional_by_side(symbol, "SHORT")
             return {"account": acct.name, "status": "ok"}
         except Exception as e:
             return {"account": acct.name, "status": "fail", "error": str(e)[:80]}
-    tasks = [(_close_task, {"account": c.name}) for c in contexts]
+    def _task_for(acct: AccountContext):
+        return lambda: _close_task(acct)
+
+    tasks = [(_task_for(c), {"account": c.name}) for c in contexts]
     results_raw = _run_parallel_tasks(tasks)
     ok = sum(1 for r in results_raw if r.get("status") == "ok")
     fail = sum(1 for r in results_raw if r.get("status") == "fail")
     skipped = sum(1 for r in results_raw if r.get("status") == "skip")
-    msg = f"{symbol} {side} 청산: ok={ok} fail={fail} skip={skipped}"
+    errors = []
+    for r in results_raw:
+        if r.get("status") == "fail":
+            acct_name = r.get("account") or "unknown"
+            err = r.get("error") or "error"
+            errors.append(f"{acct_name}:{err}")
+    extra = ""
+    if errors:
+        extra = " | " + ", ".join(errors[:4]) + ("..." if len(errors) > 4 else "")
+    msg = f"{symbol} {side} 청산: ok={ok} fail={fail} skip={skipped}{extra}"
     return redirect(url_for("follower_positions", notice=msg))
 
 
