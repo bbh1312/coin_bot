@@ -134,6 +134,51 @@
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 1rem;
         }
+        .group-select {
+            display: flex;
+            gap: 0.6rem;
+            flex-wrap: wrap;
+            margin-top: 0.4rem;
+        }
+        .group-btn {
+            border: 1px solid var(--line);
+            background: rgba(15, 23, 42, 0.7);
+            color: var(--text);
+            padding: 0.35rem 0.8rem;
+            border-radius: 999px;
+            font-size: 0.85rem;
+            cursor: pointer;
+        }
+        .group-btn.active {
+            background: var(--accent);
+            color: #1b1b1b;
+            border-color: transparent;
+        }
+        .account-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 0.6rem;
+            margin-top: 0.6rem;
+        }
+        .acct-card {
+            display: flex;
+            gap: 0.6rem;
+            align-items: center;
+            padding: 0.5rem 0.6rem;
+            border-radius: 0.7rem;
+            border: 1px solid var(--line);
+            background: rgba(15, 23, 42, 0.65);
+            color: var(--text);
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.82rem;
+        }
+        .acct-card .tag {
+            padding: 0.1rem 0.45rem;
+            border-radius: 999px;
+            font-size: 0.7rem;
+            border: 1px solid var(--line);
+            color: var(--muted);
+        }
         .btn {
             padding: 0.75rem 1rem;
             border-radius: 0.8rem;
@@ -189,19 +234,19 @@
                 </div>
                 <div>
                     <label>대상 계정</label>
-                    <div style="display:grid; gap:0.5rem; margin-top:0.4rem;">
-                        <label style="display:flex; gap:0.5rem; align-items:center; color: var(--text);">
-                            <input type="checkbox" name="accounts" value="ALL" id="select-all" checked />
-                            전체
+                    <div class="group-select">
+                        <button class="group-btn active" type="button" data-group="all">전체</button>
+                        <button class="group-btn" type="button" data-group="admin">관리자</button>
+                        <button class="group-btn" type="button" data-group="followers">유저</button>
+                    </div>
+                    <div class="account-grid">
+                        {% for acct in accounts %}
+                        <label class="acct-card" data-group="{{ 'admin' if acct.name == 'admin' else 'followers' }}">
+                            <input type="checkbox" name="accounts" value="{{ acct.name }}" class="acct-box" checked />
+                            <span>{{ acct.name }}</span>
+                            <span class="tag">{{ 'ADMIN' if acct.name == 'admin' else 'USER' }}</span>
                         </label>
-                        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap:0.5rem;">
-                            {% for acct in accounts %}
-                            <label style="display:flex; gap:0.5rem; align-items:center; color: var(--muted);">
-                                <input type="checkbox" name="accounts" value="{{ acct.name }}" class="acct-box" checked />
-                                {{ acct.name }}
-                            </label>
-                            {% endfor %}
-                        </div>
+                        {% endfor %}
                     </div>
                 </div>
                 <button class="btn" type="submit" onclick="return confirm('모든 계정에 진입을 실행할까요?');">진입</button>
@@ -209,19 +254,35 @@
         </section>
     </div>
     <script>
-        const selectAll = document.getElementById("select-all");
+        const groupButtons = Array.from(document.querySelectorAll(".group-btn"));
         const boxes = Array.from(document.querySelectorAll(".acct-box"));
-        selectAll?.addEventListener("change", () => {
-            const checked = selectAll.checked;
-            boxes.forEach((b) => { b.checked = checked; });
-        });
-        boxes.forEach((b) => {
-            b.addEventListener("change", () => {
-                if (!b.checked) {
-                    selectAll.checked = false;
-                } else if (boxes.every((x) => x.checked)) {
-                    selectAll.checked = true;
+        const cards = Array.from(document.querySelectorAll(".acct-card"));
+
+        function setGroup(group) {
+            groupButtons.forEach((btn) => {
+                btn.classList.toggle("active", btn.dataset.group === group);
+            });
+            boxes.forEach((box) => {
+                const card = box.closest(".acct-card");
+                const g = card?.dataset.group || "followers";
+                if (group === "all") {
+                    box.checked = true;
+                } else {
+                    box.checked = g === group;
                 }
+            });
+        }
+
+        groupButtons.forEach((btn) => {
+            btn.addEventListener("click", () => setGroup(btn.dataset.group));
+        });
+
+        cards.forEach((card) => {
+            card.addEventListener("click", (e) => {
+                if (e.target.tagName.toLowerCase() === "input") return;
+                const input = card.querySelector("input");
+                if (input) input.checked = !input.checked;
+                groupButtons.forEach((btn) => btn.classList.remove("active"));
             });
         });
     </script>
