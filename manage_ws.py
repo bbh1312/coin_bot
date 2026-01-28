@@ -233,6 +233,18 @@ def _last_ws_close(symbol: str):
         return None
 
 
+def _fallback_last_price(symbol: str) -> Optional[float]:
+    try:
+        ticker = executor_mod.exchange.fetch_ticker(symbol)
+        if isinstance(ticker, dict):
+            last = ticker.get("last") or ticker.get("info", {}).get("lastPrice")
+            if isinstance(last, (int, float)):
+                return float(last)
+    except Exception:
+        return None
+    return None
+
+
 def _update_watch_symbols() -> list:
     try:
         symbols = executor_mod.list_open_position_symbols(force=True)
@@ -679,6 +691,8 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
     exit_reason = "manual_close"
     entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
     tp_pct, sl_pct = er._get_engine_exit_thresholds(_trade_engine_label(open_tr), "LONG")
+    if mark_px is None:
+        mark_px = _fallback_last_price(symbol)
     if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
         if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
@@ -765,6 +779,8 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
     exit_reason = "manual_close"
     entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
     tp_pct, sl_pct = er._get_engine_exit_thresholds(_trade_engine_label(open_tr), "SHORT")
+    if mark_px is None:
+        mark_px = _fallback_last_price(symbol)
     if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
         profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
         if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):

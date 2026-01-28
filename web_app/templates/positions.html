@@ -185,6 +185,20 @@
             background: var(--accent);
             color: #141414;
         }
+        .badge-inactive {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.1rem 0.45rem;
+            border-radius: 999px;
+            border: 1px solid rgba(239, 68, 68, 0.55);
+            color: #fecaca;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            background: rgba(127, 29, 29, 0.35);
+        }
         @media (max-width: 840px) {
             header {
                 flex-direction: column;
@@ -257,7 +271,12 @@
                 <tbody>
                     {% for row in items %}
                     <tr data-group="{{ row.group }}">
-                        <td>{{ row.account }}</td>
+                        <td>
+                            {{ row.account }}
+                            {% if row.is_active is not none and not row.is_active %}
+                            <span class="badge-inactive">INACTIVE</span>
+                            {% endif %}
+                        </td>
                         <td class="{{ 'side-long' if row.side == 'LONG' else 'side-short' }}">{{ row.side }}</td>
                         <td>{{ row.symbol }}</td>
                         <td>{{ '%.6g'|format(row.qty) if row.qty is not none else '-' }}</td>

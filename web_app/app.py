@@ -31,6 +31,7 @@ from engine_runner import (
     AUTO_EXIT_ENABLED,
     MAX_OPEN_POSITIONS,
     USDT_PER_TRADE,
+    BASE_ENTRY_USDT,
     SWAGGY_ATLAS_LAB_ENABLED,
     SWAGGY_ATLAS_LAB_V2_ENABLED,
     SWAGGY_NO_ATLAS_ENABLED,
@@ -61,6 +62,7 @@ from engine_runner import (
 )
 import accounts_db
 from executor import AccountExecutor
+from account_context import AccountContext, AccountSettings
 
 _FOLLOWER_POS_CACHE = {"ts": 0.0, "items": [], "groups": {}}
 _FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "0"))
@@ -117,6 +119,76 @@ COMMAND_DEFS = [
 ]
 COMMANDS_BY_CMD = {d["cmd"]: d for d in COMMAND_DEFS}
 COMMANDS_BY_KEY = {d["key"]: d for d in COMMAND_DEFS}
+
+
+def _build_account_contexts_web(include_inactive: bool = False) -> list[AccountContext]:
+    accounts_db.ensure_default_account("admin")
+    accounts = accounts_db.list_all_accounts() if include_inactive else accounts_db.list_active_accounts()
+    contexts: list[AccountContext] = []
+    position_mode = os.getenv("POSITION_MODE", "hedge").lower().strip()
+    admin_account_id = None
+    for acct in accounts:
+        if str(acct.get("name")) == "admin":
+            admin_account_id = int(acct["id"])
+            break
+    admin_settings_raw = accounts_db.get_account_settings(admin_account_id) if admin_account_id else {}
+    defaults = accounts_db.DEFAULT_SETTINGS
+    for acct in accounts:
+        account_id = int(acct["id"])
+        settings_raw = admin_settings_raw
+
+        def _get_setting(key: str, default_val: object) -> object:
+            if key in settings_raw and settings_raw.get(key) is not None:
+                return settings_raw.get(key)
+            return default_val
+
+        settings = AccountSettings(
+            entry_pct=float(_get_setting("entry_pct", defaults["entry_pct"])),
+            dry_run=_coerce_bool(_get_setting("dry_run", defaults["dry_run"])),
+            auto_exit=_coerce_bool(_get_setting("auto_exit", defaults["auto_exit"])),
+            max_positions=int(_get_setting("max_positions", defaults["max_positions"])),
+            leverage=int(_get_setting("leverage", defaults["leverage"])),
+            margin_mode=str(_get_setting("margin_mode", defaults["margin_mode"])),
+            exit_cooldown_h=float(_get_setting("exit_cooldown_h", defaults["exit_cooldown_h"])),
+            long_tp_pct=float(_get_setting("long_tp_pct", defaults["long_tp_pct"])),
+            long_sl_pct=float(_get_setting("long_sl_pct", defaults["long_sl_pct"])),
+            short_tp_pct=float(_get_setting("short_tp_pct", defaults["short_tp_pct"])),
+            short_sl_pct=float(_get_setting("short_sl_pct", defaults["short_sl_pct"])),
+            dca_enabled=_coerce_bool(_get_setting("dca_enabled", defaults["dca_enabled"])),
+            dca_pct=float(_get_setting("dca_pct", defaults["dca_pct"])),
+            dca1_pct=float(_get_setting("dca1_pct", defaults["dca1_pct"])),
+            dca2_pct=float(_get_setting("dca2_pct", defaults["dca2_pct"])),
+            dca3_pct=float(_get_setting("dca3_pct", defaults["dca3_pct"])),
+        )
+        state_path = "state.json" if str(acct.get("name")) == "admin" else f"state_{account_id}.json"
+        executor = AccountExecutor(
+            api_key=str(acct.get("api_key") or ""),
+            api_secret=str(acct.get("api_secret") or ""),
+            dry_run=settings.dry_run,
+            position_mode=position_mode,
+            default_leverage=settings.leverage,
+            base_entry_usdt=BASE_ENTRY_USDT,
+            dca_enabled=settings.dca_enabled,
+            dca_pct=settings.dca_pct,
+            dca_first_pct=settings.dca1_pct,
+            dca_second_pct=settings.dca2_pct,
+            dca_third_pct=settings.dca3_pct,
+            account_name=str(acct.get("name") or account_id),
+        )
+        contexts.append(
+            AccountContext(
+                account_id=account_id,
+                name=str(acct.get("name") or account_id),
+                api_key=str(acct.get("api_key") or ""),
+                api_secret=str(acct.get("api_secret") or ""),
+                settings=settings,
+                executor=executor,
+                telegram=None,
+                state_path=state_path,
+                meta={"db": acct},
+            )
+        )
+    return contexts
 
 def _sync_admin_settings_from_state(state: dict) -> None:
     if not isinstance(state, dict):
@@ -342,7 +414,7 @@ def close_positions():
     if not symbol or side not in ("LONG", "SHORT"):
         return redirect(url_for("follower_positions", notice="잘못된 요청"))
     try:
-        contexts = _build_account_contexts()
+        contexts = _build_account_contexts_web(include_inactive=True)
     except Exception:
         contexts = []
     def _close_task(acct: AccountContext) -> dict:
@@ -378,7 +450,7 @@ def close_single_position():
     if not symbol or side not in ("LONG", "SHORT") or not account_name:
         return redirect(url_for("follower_positions", notice="잘못된 요청"))
     try:
-        contexts = _build_account_contexts()
+        contexts = _build_account_contexts_web(include_inactive=True)
     except Exception:
         contexts = []
     target = next((c for c in contexts if str(c.name) == account_name), None)
@@ -436,18 +508,66 @@ def _build_follower_positions() -> tuple[list[dict], dict]:
     items: list[dict] = []
     groups: dict = {"admin": [], "followers": []}
     try:
-        contexts = _build_account_contexts()
+        contexts = _build_account_contexts_web(include_inactive=True)
     except Exception:
         contexts = []
+    def _rows_from_state(acct_ctx: AccountContext, state: dict) -> list[dict]:
+        is_active = bool((acct_ctx.meta.get("db") or {}).get("is_active", 1))
+        rows: list[dict] = []
+        for tr in _trade_log_entries(state):
+            if tr.get("status") != "open":
+                continue
+            side = tr.get("side")
+            if side not in ("LONG", "SHORT"):
+                continue
+            sym = tr.get("symbol")
+            if not sym:
+                continue
+            qty = tr.get("qty")
+            entry = tr.get("entry_price")
+            notional = None
+            if isinstance(qty, (int, float)) and isinstance(entry, (int, float)):
+                notional = float(qty) * float(entry)
+            row = {
+                "account_id": acct_ctx.account_id,
+                "account": acct_ctx.name,
+                "is_active": is_active,
+                "side": side,
+                "symbol": sym,
+                "qty": qty,
+                "entry": entry,
+                "mark": None,
+                "notional": notional,
+                "pnl": None,
+                "roi": None,
+                "leverage": tr.get("leverage"),
+                "group": "admin" if str(acct_ctx.name) == "admin" else "followers",
+            }
+            rows.append(row)
+        return rows
+
     for acct in contexts:
+        state = None
+        try:
+            state_path = _state_path_for_account(acct.meta.get("db") or {"id": acct.account_id, "name": acct.name})
+            state = load_state_from(state_path)
+        except Exception:
+            state = {}
+        is_active = bool((acct.meta.get("db") or {}).get("is_active", 1))
         try:
             with acct.executor.activate():
                 syms = acct.executor.list_open_position_symbols(force=True)
+                if not (syms.get("long") or syms.get("short")) and state:
+                    for row in _rows_from_state(acct, state):
+                        items.append(row)
+                        groups[row["group"]].append(row)
+                    continue
                 for sym in sorted(syms.get("long") or []):
                     detail = acct.executor.get_long_position_detail(sym) or {}
                     row = {
                         "account_id": acct.account_id,
                         "account": acct.name,
+                        "is_active": is_active,
                         "side": "LONG",
                         "symbol": sym,
                         "qty": detail.get("qty"),
@@ -466,6 +586,7 @@ def _build_follower_positions() -> tuple[list[dict], dict]:
                     row = {
                         "account_id": acct.account_id,
                         "account": acct.name,
+                        "is_active": is_active,
                         "side": "SHORT",
                         "symbol": sym,
                         "qty": detail.get("qty"),
@@ -480,6 +601,10 @@ def _build_follower_positions() -> tuple[list[dict], dict]:
                     items.append(row)
                     groups[row["group"]].append(row)
         except Exception:
+            if state:
+                for row in _rows_from_state(acct, state):
+                    items.append(row)
+                    groups[row["group"]].append(row)
             continue
     items.sort(key=lambda x: (x.get("account") or "", x.get("side") or "", x.get("symbol") or ""))
     _FOLLOWER_POS_CACHE["ts"] = now

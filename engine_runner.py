@@ -868,6 +868,10 @@ ADV_TREND_SUPER_ATR_LEN = int(os.getenv("ADV_TREND_SUPER_ATR_LEN", "10"))
 ADV_TREND_SUPER_MULT = float(os.getenv("ADV_TREND_SUPER_MULT", "3.0"))
 ADV_TREND_TP1_R_MULT = float(os.getenv("ADV_TREND_TP1_R_MULT", "1.5"))
 ADV_TREND_TP1_FRACTION = float(os.getenv("ADV_TREND_TP1_FRACTION", "0.5"))
+ADV_TREND_PULLBACK_RSI_LONG = float(os.getenv("ADV_TREND_PULLBACK_RSI_LONG", "45"))
+ADV_TREND_PULLBACK_RSI_SHORT = float(os.getenv("ADV_TREND_PULLBACK_RSI_SHORT", "55"))
+ADV_TREND_PULLBACK_WAIT_BARS = int(os.getenv("ADV_TREND_PULLBACK_WAIT_BARS", "4"))
+ADV_TREND_PULLBACK_PIVOT = int(os.getenv("ADV_TREND_PULLBACK_PIVOT", "3"))
 LOSS_HEDGE_ENGINE_ENABLED = False
 LOSS_HEDGE_INTERVAL_MIN = 15
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
@@ -3613,6 +3617,7 @@ def _run_adv_trend_cycle(
                 _set_last_entry_state(st, "LONG", now_seen)
             if short_amt > 0:
                 _set_last_entry_state(st, "SHORT", now_seen)
+            st.pop("adv_trend_pending", None)
             state[symbol] = st
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -3628,26 +3633,18 @@ def _run_adv_trend_cycle(
         if df_15m.empty or df_4h.empty:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-        if len(df_15m) < max(ADV_TREND_SUPER_ATR_LEN + 5, ADV_TREND_ADX_LEN + 5, ADV_TREND_MFI_LEN + 5):
+        signal = _adv_eval_15m(df_15m, df_4h)
+        if not signal:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-        if len(df_4h) < ADV_TREND_EMA_LEN:
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        try:
-            ema200 = ema(df_4h["close"], ADV_TREND_EMA_LEN).iloc[-1]
-            mfi_val = _adv_mfi(df_15m, ADV_TREND_MFI_LEN).iloc[-1]
-            adx_val = _adv_adx(df_15m, ADV_TREND_ADX_LEN).iloc[-1]
-            st_line, st_trend = _adv_supertrend(df_15m, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
-            st_px = float(st_line.iloc[-1])
-            trend_dir = int(st_trend.iloc[-1])
-            close_px = float(df_15m["close"].iloc[-1])
-            atr_val = float(_adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN).iloc[-1])
-        except Exception as e:
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=INDICATOR_ERR err={e}")
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
+        ema200 = signal["ema200"]
+        mfi_val = signal["mfi"]
+        adx_val = signal["adx"]
+        st_px = signal["st_px"]
+        trend_dir = signal["trend_dir"]
+        close_px = signal["close_px"]
+        atr_val = signal["atr"]
+        signal_ts = signal.get("ts")
 
         long_ok = (
             close_px > ema200
@@ -3667,8 +3664,8 @@ def _run_adv_trend_cycle(
         if long_ok and short_ok:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-
         side = "LONG" if long_ok else "SHORT"
+
         if _exit_cooldown_blocked(state, symbol, "advanced_trend_follower", side):
             _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=EXIT_COOLDOWN side={side}")
             _append_entry_gate_log("advanced_trend_follower", symbol, "exit_cooldown", side=side)
@@ -10981,6 +10978,83 @@ def _adv_supertrend(df: pd.DataFrame, atr_len: int, mult: float) -> tuple[pd.Ser
         st_line.iloc[i] = final_lower.iloc[i] if trend.iloc[i] == 1 else final_upper.iloc[i]
     return st_line, trend
 
+def _adv_rsi(series: pd.Series, length: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(0.0)
+
+def _adv_find_pivots(series: pd.Series, lookback: int, mode: str) -> list:
+    if series.empty or lookback <= 0:
+        return []
+    pivots = []
+    n = len(series)
+    end = n - lookback
+    for i in range(lookback, end):
+        window = series.iloc[i - lookback : i + lookback + 1]
+        if window.empty:
+            continue
+        val = series.iloc[i]
+        if mode == "low":
+            if val == window.min():
+                pivots.append(i)
+        else:
+            if val == window.max():
+                pivots.append(i)
+    return pivots
+
+def _adv_divergence(df: pd.DataFrame, rsi_series: pd.Series, side: str, lookback: int) -> bool:
+    if df.empty or rsi_series.empty:
+        return False
+    side_key = (side or "").upper()
+    if side_key == "LONG":
+        pivots = _adv_find_pivots(df["low"], lookback, "low")
+    else:
+        pivots = _adv_find_pivots(df["high"], lookback, "high")
+    if len(pivots) < 2:
+        return False
+    i1, i2 = pivots[-2], pivots[-1]
+    if side_key == "LONG":
+        price_ok = df["low"].iloc[i2] < df["low"].iloc[i1]
+        rsi_ok = rsi_series.iloc[i2] > rsi_series.iloc[i1]
+    else:
+        price_ok = df["high"].iloc[i2] > df["high"].iloc[i1]
+        rsi_ok = rsi_series.iloc[i2] < rsi_series.iloc[i1]
+    return bool(price_ok and rsi_ok)
+
+def _adv_eval_15m(df_15m: pd.DataFrame, df_4h: pd.DataFrame) -> Optional[dict]:
+    if df_15m.empty or df_4h.empty:
+        return None
+    if len(df_15m) < max(ADV_TREND_SUPER_ATR_LEN + 5, ADV_TREND_ADX_LEN + 5, ADV_TREND_MFI_LEN + 5):
+        return None
+    if len(df_4h) < ADV_TREND_EMA_LEN:
+        return None
+    try:
+        ema200 = ema(df_4h["close"], ADV_TREND_EMA_LEN).iloc[-1]
+        mfi_val = _adv_mfi(df_15m, ADV_TREND_MFI_LEN).iloc[-1]
+        adx_val = _adv_adx(df_15m, ADV_TREND_ADX_LEN).iloc[-1]
+        st_line, st_trend = _adv_supertrend(df_15m, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
+        st_px = float(st_line.iloc[-1])
+        trend_dir = int(st_trend.iloc[-1])
+        close_px = float(df_15m["close"].iloc[-1])
+        atr_val = float(_adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN).iloc[-1])
+    except Exception:
+        return None
+    return {
+        "ema200": float(ema200),
+        "mfi": float(mfi_val),
+        "adx": float(adx_val),
+        "st_px": st_px,
+        "trend_dir": trend_dir,
+        "close_px": close_px,
+        "atr": atr_val,
+        "ts": int(df_15m["ts"].iloc[-1]) if "ts" in df_15m.columns else None,
+    }
+
 def _compute_atlas_swaggy_gate(state: Dict[str, Any]) -> Dict[str, Any]:
     if not atlas_engine or not atlas_swaggy_cfg:
         return {}
@@ -11545,7 +11619,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS, SWAGGY_NO_ATLAS_USE_WICK_BREAK
     global SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG, SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK

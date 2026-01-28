@@ -157,6 +157,57 @@ def _supertrend(df: pd.DataFrame, atr_len: int, mult: float) -> Tuple[pd.Series,
     return st_line, trend
 
 
+def _rsi(series: pd.Series, length: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(0.0)
+
+
+def _find_pivots(series: pd.Series, lookback: int, mode: str) -> list:
+    if series.empty or lookback <= 0:
+        return []
+    pivots = []
+    n = len(series)
+    end = n - lookback
+    for i in range(lookback, end):
+        window = series.iloc[i - lookback : i + lookback + 1]
+        if window.empty:
+            continue
+        val = series.iloc[i]
+        if mode == "low":
+            if val == window.min():
+                pivots.append(i)
+        else:
+            if val == window.max():
+                pivots.append(i)
+    return pivots
+
+
+def _divergence(df: pd.DataFrame, rsi_series: pd.Series, side: str, lookback: int) -> bool:
+    if df.empty or rsi_series.empty:
+        return False
+    side_key = (side or "").upper()
+    if side_key == "LONG":
+        pivots = _find_pivots(df["low"], lookback, "low")
+    else:
+        pivots = _find_pivots(df["high"], lookback, "high")
+    if len(pivots) < 2:
+        return False
+    i1, i2 = pivots[-2], pivots[-1]
+    if side_key == "LONG":
+        price_ok = df["low"].iloc[i2] < df["low"].iloc[i1]
+        rsi_ok = rsi_series.iloc[i2] > rsi_series.iloc[i1]
+    else:
+        price_ok = df["high"].iloc[i2] > df["high"].iloc[i1]
+        rsi_ok = rsi_series.iloc[i2] < rsi_series.iloc[i1]
+    return bool(price_ok and rsi_ok)
+
+
 @dataclass
 class Position:
     side: str
@@ -519,6 +570,36 @@ def main() -> None:
                     "hold_sum": 0.0,
                 })
                 sym_stats["entries"] += 1
+                _bt_log(
+                    "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                    "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                    % (
+                        symbol,
+                        sym_stats["entries"],
+                        sym_stats["exits"],
+                        sym_stats["trades"],
+                        sym_stats["wins"],
+                        sym_stats["losses"],
+                        100.0 * (sym_stats["wins"] / max(1, sym_stats["trades"])),
+                        sym_stats["tp"],
+                        sym_stats["sl"],
+                        (sym_stats["mfe_sum"] / max(1, sym_stats["trades"])),
+                        (sym_stats["mae_sum"] / max(1, sym_stats["trades"])),
+                        (sym_stats["hold_sum"] / max(1, sym_stats["trades"])),
+                    )
+                )
+                _bt_log(
+                    "[BACKTEST][OPEN] sym=%s mode=advanced_trend_follower side=LONG entry_dt=%s exit_dt= "
+                    "entry_px=%.6g last_px=%.6g last_dt=%s unrealized_pct=%.2f%%"
+                    % (
+                        symbol,
+                        _dt_kst(ts),
+                        entry_fill,
+                        close_px,
+                        _dt_kst(ts),
+                        ((close_px - entry_fill) / entry_fill) * 100.0,
+                    )
+                )
                 continue
 
             if close_px < float(ema_trend) and mfi > float(args.mfi_short_min) and st_dir < 0:
@@ -575,7 +656,36 @@ def main() -> None:
                     "hold_sum": 0.0,
                 })
                 sym_stats["entries"] += 1
-
+                _bt_log(
+                    "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+                    "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f"
+                    % (
+                        symbol,
+                        sym_stats["entries"],
+                        sym_stats["exits"],
+                        sym_stats["trades"],
+                        sym_stats["wins"],
+                        sym_stats["losses"],
+                        100.0 * (sym_stats["wins"] / max(1, sym_stats["trades"])),
+                        sym_stats["tp"],
+                        sym_stats["sl"],
+                        (sym_stats["mfe_sum"] / max(1, sym_stats["trades"])),
+                        (sym_stats["mae_sum"] / max(1, sym_stats["trades"])),
+                        (sym_stats["hold_sum"] / max(1, sym_stats["trades"])),
+                    )
+                )
+                _bt_log(
+                    "[BACKTEST][OPEN] sym=%s mode=advanced_trend_follower side=SHORT entry_dt=%s exit_dt= "
+                    "entry_px=%.6g last_px=%.6g last_dt=%s unrealized_pct=%.2f%%"
+                    % (
+                        symbol,
+                        _dt_kst(ts),
+                        entry_fill,
+                        close_px,
+                        _dt_kst(ts),
+                        ((entry_fill - close_px) / entry_fill) * 100.0,
+                    )
+                )
         if pos:
             open_positions[symbol] = {
                 "side": pos.side,

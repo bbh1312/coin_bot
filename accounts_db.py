@@ -180,6 +180,16 @@ def list_active_accounts() -> List[Dict[str, Any]]:
         conn.close()
 
 
+def list_all_accounts() -> List[Dict[str, Any]]:
+    init_db()
+    conn = _connect()
+    try:
+        rows = _fetch_all(conn, "SELECT * FROM accounts ORDER BY id ASC", ())
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_account_settings(account_id: int) -> Dict[str, Any]:
     init_db()
     conn = _connect()
