@@ -360,6 +360,8 @@ def main() -> None:
         df["mfi"] = _mfi(df, 14)
         df["adx"] = _adx(df, 14)
         df["rsi"] = _rsi(df["close"], 14)
+        df["ema7"] = _ema(df["close"], 7)
+        df["ema20"] = _ema(df["close"], 20)
         st_line, st_trend = _supertrend(df, args.st_atr, args.st_mult)
         df["st_line"] = st_line
         df["st_trend"] = st_trend
@@ -390,6 +392,8 @@ def main() -> None:
             mfi = float(row["mfi"]) if pd.notna(row["mfi"]) else None
             adx = float(row["adx"]) if pd.notna(row["adx"]) else None
             rsi = float(row["rsi"]) if pd.notna(row["rsi"]) else None
+            ema7 = float(row["ema7"]) if pd.notna(row["ema7"]) else None
+            ema20 = float(row["ema20"]) if pd.notna(row["ema20"]) else None
 
             if pos:
                 high_now = float(row["high"])
@@ -511,6 +515,9 @@ def main() -> None:
                     continue
                 if isinstance(rsi, (int, float)) and rsi >= 70:
                     continue
+                if isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
+                    if ema7 > (ema20 * 1.03):
+                        continue
                 atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else None
                 if isinstance(atr14, (int, float)) and atr14 > 0:
                     if abs(close_px - st_line_val) > (atr14 * 2.5):
@@ -572,6 +579,9 @@ def main() -> None:
                     continue
                 if isinstance(rsi, (int, float)) and rsi <= 30:
                     continue
+                if isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
+                    if ema7 < (ema20 * 0.97):
+                        continue
                 atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else None
                 if isinstance(atr14, (int, float)) and atr14 > 0:
                     if abs(close_px - st_line_val) > (atr14 * 2.5):

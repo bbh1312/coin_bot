@@ -3754,6 +3754,12 @@ def _run_adv_trend_cycle(
             atr14 = float(_adv_atr(df_15m, 14).iloc[-1])
         except Exception:
             atr14 = None
+        try:
+            ema7 = float(ema(df_15m["close"], 7).iloc[-1])
+            ema20 = float(ema(df_15m["close"], 20).iloc[-1])
+        except Exception:
+            ema7 = None
+            ema20 = None
 
         close_series = df_15m["close"].iloc[-20:]
         bb_mid = close_series.mean()
@@ -3779,6 +3785,18 @@ def _run_adv_trend_cycle(
         if short_ok and isinstance(rsi_val, (int, float)) and rsi_val <= 30:
             short_ok = False
             _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=SHORT rsi={rsi_val:.2f}")
+        if long_ok and isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
+            if ema7 > (ema20 * 1.03):
+                long_ok = False
+                _append_adv_trend_log(
+                    f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=LONG ema7={ema7:.6g} ema20={ema20:.6g}"
+                )
+        if short_ok and isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
+            if ema7 < (ema20 * 0.97):
+                short_ok = False
+                _append_adv_trend_log(
+                    f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=SHORT ema7={ema7:.6g} ema20={ema20:.6g}"
+                )
         if (long_ok or short_ok) and isinstance(atr14, (int, float)) and atr14 > 0:
             dist = abs(close_px - st_px)
             if dist > (atr14 * 2.5):
