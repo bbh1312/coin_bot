@@ -3746,6 +3746,8 @@ def _run_adv_trend_cycle(
         trend_dir = signal["trend_dir"]
         close_px = signal["close_px"]
         atr_val = signal["atr"]
+        st_score = signal.get("st_score")
+        st_score_prev = signal.get("st_score_prev")
         signal_ts = signal.get("ts")
         rsi_series = None
         try:
@@ -3805,12 +3807,34 @@ def _run_adv_trend_cycle(
                 _append_adv_trend_log(
                     f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=LONG ema7={ema7:.6g} ema20={ema20:.6g}"
                 )
+        if long_ok and isinstance(st_score, (int, float)) and isinstance(st_score_prev, (int, float)):
+            if st_score <= st_score_prev:
+                long_ok = False
+                _append_adv_trend_log(
+                    f"ADV_TREND_SKIP sym={symbol} reason=ST_SCORE_MOM side=LONG score={st_score:.4f} prev={st_score_prev:.4f}"
+                )
+        if long_ok and isinstance(st_score, (int, float)) and abs(st_score) >= 4.0:
+            long_ok = False
+            _append_adv_trend_log(
+                f"ADV_TREND_SKIP sym={symbol} reason=ST_SCORE_OVEREXT side=LONG score={st_score:.4f}"
+            )
         if short_ok and isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
             if ema7 < (ema20 * 0.97):
                 short_ok = False
                 _append_adv_trend_log(
                     f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=SHORT ema7={ema7:.6g} ema20={ema20:.6g}"
                 )
+        if short_ok and isinstance(st_score, (int, float)) and isinstance(st_score_prev, (int, float)):
+            if st_score >= st_score_prev:
+                short_ok = False
+                _append_adv_trend_log(
+                    f"ADV_TREND_SKIP sym={symbol} reason=ST_SCORE_MOM side=SHORT score={st_score:.4f} prev={st_score_prev:.4f}"
+                )
+        if short_ok and isinstance(st_score, (int, float)) and abs(st_score) >= 4.0:
+            short_ok = False
+            _append_adv_trend_log(
+                f"ADV_TREND_SKIP sym={symbol} reason=ST_SCORE_OVEREXT side=SHORT score={st_score:.4f}"
+            )
         if long_ok and all(isinstance(v, (int, float)) for v in (open_px, high_px, close_px, vol_now, vol_prev)):
             upper_wick = high_px - max(open_px, close_px)
             if vol_prev and vol_now >= (vol_prev * 2.0) and upper_wick > 0:
@@ -11318,7 +11342,16 @@ def _adv_eval_15m(df_15m: pd.DataFrame, df_4h: pd.DataFrame) -> Optional[dict]:
         st_px = float(st_line.iloc[-1])
         trend_dir = int(st_trend.iloc[-1])
         close_px = float(df_15m["close"].iloc[-1])
-        atr_val = float(_adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN).iloc[-1])
+        atr_series = _adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN)
+        atr_val = float(atr_series.iloc[-1])
+        st_score = None
+        st_score_prev = None
+        if atr_val > 0:
+            st_score = (close_px - st_px) / atr_val
+        if len(df_15m) >= 2:
+            prev_atr = float(atr_series.iloc[-2]) if len(atr_series) >= 2 else None
+            if prev_atr and prev_atr > 0:
+                st_score_prev = (float(df_15m["close"].iloc[-2]) - float(st_line.iloc[-2])) / prev_atr
     except Exception:
         return None
     return {
@@ -11329,6 +11362,8 @@ def _adv_eval_15m(df_15m: pd.DataFrame, df_4h: pd.DataFrame) -> Optional[dict]:
         "trend_dir": trend_dir,
         "close_px": close_px,
         "atr": atr_val,
+        "st_score": st_score,
+        "st_score_prev": st_score_prev,
         "ts": int(df_15m["ts"].iloc[-1]) if "ts" in df_15m.columns else None,
     }
 

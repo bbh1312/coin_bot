@@ -381,6 +381,8 @@ def main() -> None:
             ts = int(row["ts"])
             close_px = float(row["close"])
             st_line_val = float(row["st_line"]) if pd.notna(row["st_line"]) else None
+            st_score = None
+            st_score_prev = None
             st_dir = int(row["st_trend"]) if pd.notna(row["st_trend"]) else 0
             ema_val = row.get("ema200_trend")
             if isinstance(ema_val, pd.Series):
@@ -509,10 +511,21 @@ def main() -> None:
                 continue
             if adx <= float(args.adx_min):
                 continue
+            if st_line_val is not None and pd.notna(row.get("atr")) and float(row.get("atr")) > 0:
+                st_score = (close_px - st_line_val) / float(row.get("atr"))
+            if i > 0:
+                prev = df.iloc[i - 1]
+                if pd.notna(prev.get("st_line")) and pd.notna(prev.get("atr")) and float(prev.get("atr")) > 0:
+                    st_score_prev = (float(prev["close"]) - float(prev["st_line"])) / float(prev.get("atr"))
 
             bb_upper = float(row["bb_upper"]) if pd.notna(row.get("bb_upper")) else None
             bb_lower = float(row["bb_lower"]) if pd.notna(row.get("bb_lower")) else None
             if close_px > float(ema_trend) and mfi < float(args.mfi_long_max) and st_dir > 0:
+                if isinstance(st_score, (int, float)) and isinstance(st_score_prev, (int, float)):
+                    if st_score <= st_score_prev:
+                        continue
+                if isinstance(st_score, (int, float)) and abs(st_score) >= 4.0:
+                    continue
                 if isinstance(bb_upper, (int, float)) and close_px > bb_upper:
                     continue
                 if isinstance(rsi, (int, float)) and rsi >= 70:
@@ -581,6 +594,11 @@ def main() -> None:
                 continue
 
             if close_px < float(ema_trend) and mfi > float(args.mfi_short_min) and st_dir < 0:
+                if isinstance(st_score, (int, float)) and isinstance(st_score_prev, (int, float)):
+                    if st_score >= st_score_prev:
+                        continue
+                if isinstance(st_score, (int, float)) and abs(st_score) >= 4.0:
+                    continue
                 if isinstance(bb_lower, (int, float)) and close_px < bb_lower:
                     continue
                 if isinstance(rsi, (int, float)) and rsi <= 30:
