@@ -7337,6 +7337,27 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
             pnl = None
         if isinstance(entry_price, (int, float)) and isinstance(qty, (int, float)) and isinstance(exit_price, (int, float)):
             pnl = (exit_price - entry_price) * qty if pnl is None else pnl
+        exit_reason = "manual_close"
+        if isinstance(meta, dict) and meta.get("sl_order_id"):
+            exit_reason = "auto_exit_sl"
+        sl_price_meta = None
+        if isinstance(meta, dict):
+            try:
+                sl_price_meta = float(meta.get("sl_price"))
+            except Exception:
+                sl_price_meta = None
+        if exit_price is None:
+            exit_price = _fetch_last_price(symbol)
+        if exit_reason == "manual_close":
+            tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "LONG")
+            if isinstance(entry_price, (int, float)) and isinstance(exit_price, (int, float)) and entry_price > 0:
+                profit_unlev = (float(exit_price) - float(entry_price)) / float(entry_price) * 100.0
+                if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
+                    exit_reason = "auto_exit_tp"
+                elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
+                    exit_reason = "auto_exit_sl"
+                elif isinstance(sl_price_meta, (int, float)) and exit_price <= float(sl_price_meta):
+                    exit_reason = "auto_exit_sl"
         _close_trade(
             state,
             side="LONG",
@@ -7344,7 +7365,7 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
             exit_ts=exit_ts,
             exit_price=exit_price,
             pnl_usdt=pnl,
-            reason="position_closed_detected",
+            reason=exit_reason,
         )
         engine_label = _engine_label_from_reason((meta or {}).get("reason"))
         if meta.get("sl_order_id") and engine_label == "SWAGGY":
@@ -7365,10 +7386,13 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
             price_str = f"{exit_price:.6g}" if isinstance(exit_price, (int, float)) else "N/A"
             entry_time = _fmt_entry_time(tr)
             entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+            exit_tag = "SL" if exit_reason == "auto_exit_sl" else "MANUAL"
+            icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
             send_telegram(
-                f"{EXIT_ICON} <b>롱 청산</b>\n"
+                f"{icon} <b>롱 청산</b>\n"
                 f"<b>{symbol}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
+                f"사유: {exit_tag}\n"
                 f"{entry_line}"
                 f"청산가={price_str}\n"
                 f"손익={pnl_str}"
@@ -8221,7 +8245,9 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
                 except Exception:
                     amt = None
         if not isinstance(amt, (int, float)) or amt <= 0:
+            cancel_conditional_by_side(symbol, side)
             cancel_stop_orders(symbol)
+            cancel_open_orders(symbol)
             engine_label = "ADVANCED_TREND_FOLLOWER"
             _close_trade(
                 state,
@@ -8284,6 +8310,7 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
                     else:
                         res = close_short_market(symbol)
                     exit_order_id = _order_id_from_res(res)
+                    cancel_conditional_by_side(symbol, side)
                     cancel_stop_orders(symbol)
                     cancel_open_orders(symbol)
                     engine_label = "ADVANCED_TREND_FOLLOWER"
