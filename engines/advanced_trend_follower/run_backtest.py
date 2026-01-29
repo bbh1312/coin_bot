@@ -532,7 +532,7 @@ def main() -> None:
                 risk_usdt = base_equity * (float(args.risk_pct) / 100.0) * scale
                 size = risk_usdt / risk_per_unit
                 entry_fill = close_px * (1.0 + float(args.slip_pct))
-                tp1_px = entry_fill + risk_per_unit * 1.5
+                tp1_px = entry_fill + risk_per_unit * 1.4
                 max_notional = base_equity * float(args.max_notional_mult)
                 notional = size * entry_fill
                 if max_notional > 0 and notional > max_notional:
@@ -588,7 +588,7 @@ def main() -> None:
                 risk_usdt = base_equity * (float(args.risk_pct) / 100.0) * scale
                 size = risk_usdt / risk_per_unit
                 entry_fill = close_px * (1.0 - float(args.slip_pct))
-                tp1_px = entry_fill - risk_per_unit * 1.5
+                tp1_px = entry_fill - risk_per_unit * 1.4
                 max_notional = base_equity * float(args.max_notional_mult)
                 notional = size * entry_fill
                 if max_notional > 0 and notional > max_notional:

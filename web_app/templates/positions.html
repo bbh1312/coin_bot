@@ -247,11 +247,13 @@
                 <span style="border-color: rgba(245,158,11,0.6); color: var(--accent);">{{ notice }}</span>
                 {% endif %}
                 <div class="tabs" role="tablist">
-                    <button class="tab-btn active" data-filter="all" type="button">ALL</button>
-                    <button class="tab-btn" data-filter="admin" type="button">ADMIN</button>
-                    <button class="tab-btn" data-filter="followers" type="button">USERS</button>
+                    <button class="tab-btn active" data-filter="all" type="button">ALL ({{ total }})</button>
+                    <button class="tab-btn" data-filter="admin" type="button">ADMIN ({{ admin_total }})</button>
+                    <button class="tab-btn" data-filter="followers" type="button">USERS ({{ follower_total }})</button>
                     {% for uname in user_filters %}
-                    <button class="tab-btn" data-filter="user-{{ uname }}" type="button">{{ uname }}</button>
+                    <button class="tab-btn" data-filter="user-{{ uname }}" type="button">
+                        {{ uname }} ({{ user_counts.get(uname, 0) }})
+                    </button>
                     {% endfor %}
                 </div>
             </div>
