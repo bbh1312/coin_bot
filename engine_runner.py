@@ -3705,7 +3705,7 @@ def _run_adv_trend_cycle(
     except Exception:
         hedge_mode = False
 
-    ltf_limit = max(ADV_TREND_EMA_LEN, 200)
+    ltf_limit = max(ADV_TREND_EMA_LEN, 500)
     htf_limit = max(ADV_TREND_EMA_LEN, 220)
 
     for symbol in adv_universe:
@@ -8191,7 +8191,7 @@ def _adv_partial_close(symbol: str, side: str, fraction: float) -> None:
 
 
 def _adv_latest_supertrend(symbol: str) -> Optional[tuple]:
-    df = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 200))
+    df = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 500))
     if df.empty or len(df) < ADV_TREND_SUPER_ATR_LEN + 5:
         return None
     try:
@@ -8358,7 +8358,7 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
                         continue
                     atr_val = None
                     try:
-                        df_15m = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 200))
+                        df_15m = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 500))
                         if not df_15m.empty:
                             atr_val = float(_adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN).iloc[-1])
                     except Exception:
@@ -12929,7 +12929,7 @@ def run():
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
                         mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_atlas_lab_v2_cfg.vp_lookback_1h))
                     if ADV_TREND_ENABLED:
-                        mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
+                        mid_plan["15m"] = max(mid_plan.get("15m", 0), 500)
                     if atlas_rs_fail_short_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
                     if atlas_cfg:

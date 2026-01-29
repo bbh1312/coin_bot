@@ -207,9 +207,9 @@ def _adv_adx(df: pd.DataFrame, length: int) -> pd.Series:
 
 def _adv_supertrend(df: pd.DataFrame, atr_len: int, mult: float) -> tuple[pd.Series, pd.Series]:
     atr = _adv_atr(df, atr_len)
-    hl2 = (df["high"] + df["low"]) / 2.0
-    upper = hl2 + (mult * atr)
-    lower = hl2 - (mult * atr)
+    src = df["close"]
+    upper = src + (mult * atr)
+    lower = src - (mult * atr)
     final_upper = upper.copy()
     final_lower = lower.copy()
     trend = pd.Series(index=df.index, dtype="int")
@@ -299,14 +299,14 @@ def _build_alert_message(symbol: str, side: str, signal: dict) -> str:
 
 def main() -> None:
     load_env()
-    token = os.environ.get("TELEGRAM_BOT_TOKEN_VP1H", "").strip()
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID_VP1H", "").strip()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN_SUPER_TREND", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID_SUPER_TREND", "").strip()
     if not token or not chat_id:
-        _log_kst("[adv-trend-alert] missing TELEGRAM_BOT_TOKEN_VP1H or TELEGRAM_CHAT_ID_VP1H")
+        _log_kst("[adv-trend-alert] missing TELEGRAM_BOT_TOKEN_SUPER_TREND or TELEGRAM_CHAT_ID_SUPER_TREND")
         return
 
     exchange.load_markets()
-    ltf_limit = max(ADV_TREND_EMA_LEN, 200)
+    ltf_limit = max(ADV_TREND_EMA_LEN, 500)
     htf_limit = max(ADV_TREND_EMA_LEN, 220)
 
     _log_kst("[adv-trend-alert] start")
