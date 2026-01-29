@@ -3745,7 +3745,7 @@ def _run_adv_trend_cycle(
         df_15m = cycle_cache.get_df(symbol, "15m", limit=ltf_limit)
         df_1h = cycle_cache.get_df(symbol, "1h", limit=80)
         df_4h = cycle_cache.get_df(symbol, "4h", limit=htf_limit)
-        if df_15m.empty or df_4h.empty:
+        if df_15m.empty:
             no_data += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -3820,62 +3820,8 @@ def _run_adv_trend_cycle(
 
         flip_long = trend_dir == 1 and prev_trend_dir <= 0
         flip_short = trend_dir == -1 and prev_trend_dir >= 0
-        long_ok = (
-            close_px > ema200
-            and mfi_val < ADV_TREND_MFI_LONG_MAX
-            and adx_val > ADV_TREND_ADX_MIN
-            and flip_long
-        )
-        short_ok = (
-            close_px < ema200
-            and mfi_val > ADV_TREND_MFI_SHORT_MIN
-            and adx_val > ADV_TREND_ADX_MIN
-            and flip_short
-        )
-        if long_ok and isinstance(rsi_val, (int, float)) and rsi_val >= 70:
-            long_ok = False
-            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=LONG rsi={rsi_val:.2f}")
-        if short_ok and isinstance(rsi_val, (int, float)) and rsi_val <= 30:
-            short_ok = False
-            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=SHORT rsi={rsi_val:.2f}")
-        if long_ok and isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
-            if ema7 > (ema20 * 1.03):
-                long_ok = False
-                _adv_skip(
-                    f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=LONG ema7={ema7:.6g} ema20={ema20:.6g}"
-                )
-        if short_ok and isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
-            if ema7 < (ema20 * 0.97):
-                short_ok = False
-                _adv_skip(
-                    f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=SHORT ema7={ema7:.6g} ema20={ema20:.6g}"
-                )
-        if long_ok and all(isinstance(v, (int, float)) for v in (open_px, high_px, close_px, vol_now, vol_prev)):
-            upper_wick = high_px - max(open_px, close_px)
-            if vol_prev and vol_now >= (vol_prev * 2.0) and upper_wick > 0:
-                long_ok = False
-                _adv_skip(
-                    f"ADV_TREND_SKIP sym={symbol} reason=VOLUME_WICK side=LONG vol={vol_now:.6g} prev={vol_prev:.6g} wick={upper_wick:.6g}"
-                )
-        if (long_ok or short_ok) and isinstance(atr14, (int, float)) and atr14 > 0:
-            dist = abs(close_px - st_px)
-            if dist > (atr14 * 2.5):
-                _adv_skip(
-                    f"ADV_TREND_SKIP sym={symbol} reason=ATR_DIST side={'LONG' if long_ok else 'SHORT'} "
-                    f"dist={dist:.6g} atr14={atr14:.6g}"
-                )
-                long_ok = False
-                short_ok = False
-        if long_ok and isinstance(bb_upper, (int, float)) and close_px > bb_upper:
-            long_ok = False
-            _adv_skip(
-                f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT_15M side=LONG close={close_px:.6g} bb_upper={bb_upper:.6g}"
-            )
-        if short_ok and isinstance(bb_lower, (int, float)) and close_px < bb_lower:
-            short_ok = False
-            _adv_skip(
-                f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT_15M side=SHORT close={close_px:.6g} bb_lower={bb_lower:.6g}"
-            )
+        long_ok = flip_long
+        short_ok = flip_short
         if not long_ok and not short_ok:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
@@ -11350,15 +11296,15 @@ def _adv_divergence(df: pd.DataFrame, rsi_series: pd.Series, side: str, lookback
         rsi_ok = rsi_series.iloc[i2] < rsi_series.iloc[i1]
     return bool(price_ok and rsi_ok)
 
-def _adv_eval_15m(df_15m: pd.DataFrame, df_4h: pd.DataFrame) -> Optional[dict]:
-    if df_15m.empty or df_4h.empty:
+def _adv_eval_15m(df_15m: pd.DataFrame, df_4h: Optional[pd.DataFrame] = None) -> Optional[dict]:
+    if df_15m.empty:
         return None
     if len(df_15m) < max(ADV_TREND_SUPER_ATR_LEN + 5, ADV_TREND_ADX_LEN + 5, ADV_TREND_MFI_LEN + 5):
         return None
-    if len(df_4h) < ADV_TREND_EMA_LEN:
-        return None
     try:
-        ema200 = ema(df_4h["close"], ADV_TREND_EMA_LEN).iloc[-1]
+        ema200 = float("nan")
+        if df_4h is not None and not df_4h.empty and len(df_4h) >= ADV_TREND_EMA_LEN:
+            ema200 = ema(df_4h["close"], ADV_TREND_EMA_LEN).iloc[-1]
         mfi_val = _adv_mfi(df_15m, ADV_TREND_MFI_LEN).iloc[-1]
         adx_val = _adv_adx(df_15m, ADV_TREND_ADX_LEN).iloc[-1]
         st_line, st_trend = _adv_supertrend(df_15m, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
