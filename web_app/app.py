@@ -441,6 +441,7 @@ def close_positions():
                     if not isinstance(amt, (int, float)) or amt <= 0:
                         return {"account": acct.name, "status": "skip"}
                     acct.executor.close_long_market(symbol)
+                    acct.executor.cancel_open_orders(symbol)
                     acct.executor.cancel_stop_orders(symbol)
                     acct.executor.cancel_conditional_by_side(symbol, "LONG")
                 else:
@@ -448,6 +449,7 @@ def close_positions():
                     if not isinstance(amt, (int, float)) or amt <= 0:
                         return {"account": acct.name, "status": "skip"}
                     acct.executor.close_short_market(symbol)
+                    acct.executor.cancel_open_orders(symbol)
                     acct.executor.cancel_stop_orders(symbol)
                     acct.executor.cancel_conditional_by_side(symbol, "SHORT")
             return {"account": acct.name, "status": "ok"}
@@ -495,11 +497,17 @@ def close_single_position():
                 if not isinstance(amt, (int, float)) or amt <= 0:
                     return redirect(url_for("follower_positions", notice="해당 포지션 없음"))
                 target.executor.close_long_market(symbol)
+                target.executor.cancel_open_orders(symbol)
+                target.executor.cancel_stop_orders(symbol)
+                target.executor.cancel_conditional_by_side(symbol, "LONG")
             else:
                 amt = target.executor.get_short_position_amount(symbol)
                 if not isinstance(amt, (int, float)) or amt <= 0:
                     return redirect(url_for("follower_positions", notice="해당 포지션 없음"))
                 target.executor.close_short_market(symbol)
+                target.executor.cancel_open_orders(symbol)
+                target.executor.cancel_stop_orders(symbol)
+                target.executor.cancel_conditional_by_side(symbol, "SHORT")
     except Exception as e:
         return redirect(url_for("follower_positions", notice=f"청산 실패: {str(e)[:80]}"))
     return redirect(url_for("follower_positions", notice=f"{account_name} {symbol} {side} 청산 완료"))

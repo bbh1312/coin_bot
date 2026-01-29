@@ -382,6 +382,7 @@ def main() -> None:
             close_px = float(row["close"])
             st_line_val = float(row["st_line"]) if pd.notna(row["st_line"]) else None
             st_dir = int(row["st_trend"]) if pd.notna(row["st_trend"]) else 0
+            prev_st_dir = int(df["st_trend"].iloc[i - 1]) if i >= 1 and pd.notna(df["st_trend"].iloc[i - 1]) else 0
             ema_val = row.get("ema200_trend")
             if isinstance(ema_val, pd.Series):
                 try:
@@ -505,31 +506,17 @@ def main() -> None:
                     pos = None
                 continue
 
-            if ema_trend is None or mfi is None or adx is None or st_line_val is None:
-                continue
-            if adx <= float(args.adx_min):
+            if st_line_val is None:
                 continue
 
-            bb_upper = float(row["bb_upper"]) if pd.notna(row.get("bb_upper")) else None
-            bb_lower = float(row["bb_lower"]) if pd.notna(row.get("bb_lower")) else None
-            if close_px > float(ema_trend) and mfi < float(args.mfi_long_max) and st_dir > 0:
-                if isinstance(bb_upper, (int, float)) and close_px > bb_upper:
-                    continue
-                if isinstance(rsi, (int, float)) and rsi >= 70:
-                    continue
-                if isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
-                    if ema7 > (ema20 * 1.03):
-                        continue
-                if all(isinstance(v, (int, float)) for v in (vol_now, vol_prev)):
-                    upper_wick = float(row["high"]) - max(float(row["open"]), close_px)
-                    if vol_prev and vol_now >= (vol_prev * 2.0) and upper_wick > 0:
-                        continue
-                atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else None
-                if isinstance(atr14, (int, float)) and atr14 > 0:
-                    if abs(close_px - st_line_val) > (atr14 * 2.5):
-                        continue
+            flip_long = st_dir == 1 and prev_st_dir <= 0
+            flip_short = st_dir == -1 and prev_st_dir >= 0
+            if flip_long:
+                entry_ts = ts
+                entry_px = close_px
+                entry_idx = i
                 stop_px = st_line_val
-                risk_per_unit = close_px - stop_px
+                risk_per_unit = entry_px - stop_px
                 if risk_per_unit <= 0:
                     continue
                 atr_val = float(row["atr"]) if pd.notna(row["atr"]) else None
@@ -580,20 +567,12 @@ def main() -> None:
                 # per-symbol summaries are printed at the end only
                 continue
 
-            if close_px < float(ema_trend) and mfi > float(args.mfi_short_min) and st_dir < 0:
-                if isinstance(bb_lower, (int, float)) and close_px < bb_lower:
-                    continue
-                if isinstance(rsi, (int, float)) and rsi <= 30:
-                    continue
-                if isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
-                    if ema7 < (ema20 * 0.97):
-                        continue
-                atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else None
-                if isinstance(atr14, (int, float)) and atr14 > 0:
-                    if abs(close_px - st_line_val) > (atr14 * 2.5):
-                        continue
+            if flip_short:
+                entry_ts = ts
+                entry_px = close_px
+                entry_idx = i
                 stop_px = st_line_val
-                risk_per_unit = stop_px - close_px
+                risk_per_unit = stop_px - entry_px
                 if risk_per_unit <= 0:
                     continue
                 atr_val = float(row["atr"]) if pd.notna(row["atr"]) else None

@@ -853,8 +853,8 @@ SWAGGY_NO_ATLAS_DELAY_VOL_MA = int(os.getenv("SWAGGY_NO_ATLAS_DELAY_VOL_MA", "20
 SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK = int(os.getenv("SWAGGY_NO_ATLAS_DELAY_SWEEP_LOOKBACK", "3"))
 SWAGGY_NO_ATLAS_DEBUG_SYMBOLS = os.getenv("SWAGGY_NO_ATLAS_DEBUG_SYMBOLS", "").strip()
 ADV_TREND_ENABLED = os.getenv("ADV_TREND_ENABLED", "0") == "1"
-ADV_TREND_MIN_QV = float(os.getenv("ADV_TREND_MIN_QV", "30000000"))
-ADV_TREND_UNIVERSE_TOP_N = int(os.getenv("ADV_TREND_UNIVERSE_TOP_N", "50"))
+ADV_TREND_MIN_QV = float(os.getenv("ADV_TREND_MIN_QV", "5000000"))
+ADV_TREND_UNIVERSE_TOP_N = int(os.getenv("ADV_TREND_UNIVERSE_TOP_N", "30"))
 ADV_TREND_RISK_PCT = float(os.getenv("ADV_TREND_RISK_PCT", "1.0"))
 ADV_TREND_MAX_NOTIONAL_MULT = float(os.getenv("ADV_TREND_MAX_NOTIONAL_MULT", "10.0"))
 ADV_TREND_MIN_STOP_ATR = float(os.getenv("ADV_TREND_MIN_STOP_ATR", "0.5"))
@@ -3671,6 +3671,21 @@ def _run_adv_trend_cycle(
     result = {"long_hits": 0, "short_hits": 0}
     if not ADV_TREND_ENABLED or not adv_universe:
         return result
+    start_ts = time.time()
+    checked = 0
+    entries = 0
+    skips = 0
+    no_signal = 0
+    no_data = 0
+    sample_lines = []
+    def _adv_skip(msg: str) -> None:
+        nonlocal skips
+        skips += 1
+        _append_adv_trend_log(msg)
+    _append_adv_trend_log(
+        f"ADV_TREND_CYCLE_START cycle_id={cycle_id} universe={len(adv_universe)}"
+    )
+    print(f"[adv_trend] cycle_start universe={len(adv_universe)}")
     try:
         refresh_positions_cache(force=True)
     except Exception:
@@ -3681,7 +3696,7 @@ def _run_adv_trend_cycle(
 
     now_ts = time.time()
     if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
-        _append_adv_trend_log("ADV_TREND_SKIP reason=SATURDAY_OFF")
+        _adv_skip("ADV_TREND_SKIP reason=SATURDAY_OFF")
         return result
 
     hedge_mode = False
@@ -3694,6 +3709,7 @@ def _run_adv_trend_cycle(
     htf_limit = max(ADV_TREND_EMA_LEN, 220)
 
     for symbol in adv_universe:
+        checked += 1
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
         if _both_sides_open(st) and not hedge_mode:
             time.sleep(PER_SYMBOL_SLEEP)
@@ -3721,7 +3737,7 @@ def _run_adv_trend_cycle(
             continue
 
         if isinstance(open_total, int) and open_total >= MAX_OPEN_POSITIONS:
-            _append_adv_trend_log(
+            _adv_skip(
                 f"ADV_TREND_SKIP sym={symbol} reason=MAX_POS open={open_total} max={MAX_OPEN_POSITIONS}"
             )
             break
@@ -3730,13 +3746,16 @@ def _run_adv_trend_cycle(
         df_1h = cycle_cache.get_df(symbol, "1h", limit=80)
         df_4h = cycle_cache.get_df(symbol, "4h", limit=htf_limit)
         if df_15m.empty or df_4h.empty:
+            no_data += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         if len(df_15m) < 20:
+            no_data += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         signal = _adv_eval_15m(df_15m, df_4h)
         if not signal:
+            no_signal += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         ema200 = signal["ema200"]
@@ -3744,9 +3763,27 @@ def _run_adv_trend_cycle(
         adx_val = signal["adx"]
         st_px = signal["st_px"]
         trend_dir = signal["trend_dir"]
+        prev_trend_dir = signal.get("prev_trend_dir", 0)
         close_px = signal["close_px"]
         atr_val = signal["atr"]
         signal_ts = signal.get("ts")
+        if len(sample_lines) < 3:
+            try:
+                st_line_s, st_trend_s = _adv_supertrend(df_15m, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
+                trend_dir_s = int(st_trend_s.iloc[-1])
+                bar_n = 1
+                for v in reversed(st_trend_s.iloc[:-1]):
+                    if int(v) == trend_dir_s:
+                        bar_n += 1
+                    else:
+                        break
+                side_s = "LONG" if trend_dir_s == 1 else "SHORT"
+                sample_lines.append(f"ADV_TREND_SAMPLE sym={symbol} side={side_s} bar_n={bar_n}")
+            except Exception as e:
+                side_s = "LONG" if trend_dir == 1 else "SHORT"
+                sample_lines.append(f"ADV_TREND_SAMPLE sym={symbol} side={side_s} bar_n=NA")
+                if len(sample_lines) == 1:
+                    _append_adv_trend_log(f"ADV_TREND_SAMPLE_ERR sym={symbol} err={e}")
         rsi_series = None
         try:
             rsi_series = _adv_rsi(df_15m["close"], 14)
@@ -3781,47 +3818,49 @@ def _run_adv_trend_cycle(
         bb_upper = bb_mid + (2.0 * bb_std)
         bb_lower = bb_mid - (2.0 * bb_std)
 
+        flip_long = trend_dir == 1 and prev_trend_dir <= 0
+        flip_short = trend_dir == -1 and prev_trend_dir >= 0
         long_ok = (
             close_px > ema200
             and mfi_val < ADV_TREND_MFI_LONG_MAX
             and adx_val > ADV_TREND_ADX_MIN
-            and trend_dir == 1
+            and flip_long
         )
         short_ok = (
             close_px < ema200
             and mfi_val > ADV_TREND_MFI_SHORT_MIN
             and adx_val > ADV_TREND_ADX_MIN
-            and trend_dir == -1
+            and flip_short
         )
         if long_ok and isinstance(rsi_val, (int, float)) and rsi_val >= 70:
             long_ok = False
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=LONG rsi={rsi_val:.2f}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=LONG rsi={rsi_val:.2f}")
         if short_ok and isinstance(rsi_val, (int, float)) and rsi_val <= 30:
             short_ok = False
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=SHORT rsi={rsi_val:.2f}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=SHORT rsi={rsi_val:.2f}")
         if long_ok and isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
             if ema7 > (ema20 * 1.03):
                 long_ok = False
-                _append_adv_trend_log(
+                _adv_skip(
                     f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=LONG ema7={ema7:.6g} ema20={ema20:.6g}"
                 )
         if short_ok and isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
             if ema7 < (ema20 * 0.97):
                 short_ok = False
-                _append_adv_trend_log(
+                _adv_skip(
                     f"ADV_TREND_SKIP sym={symbol} reason=EMA_GAP side=SHORT ema7={ema7:.6g} ema20={ema20:.6g}"
                 )
         if long_ok and all(isinstance(v, (int, float)) for v in (open_px, high_px, close_px, vol_now, vol_prev)):
             upper_wick = high_px - max(open_px, close_px)
             if vol_prev and vol_now >= (vol_prev * 2.0) and upper_wick > 0:
                 long_ok = False
-                _append_adv_trend_log(
+                _adv_skip(
                     f"ADV_TREND_SKIP sym={symbol} reason=VOLUME_WICK side=LONG vol={vol_now:.6g} prev={vol_prev:.6g} wick={upper_wick:.6g}"
                 )
         if (long_ok or short_ok) and isinstance(atr14, (int, float)) and atr14 > 0:
             dist = abs(close_px - st_px)
             if dist > (atr14 * 2.5):
-                _append_adv_trend_log(
+                _adv_skip(
                     f"ADV_TREND_SKIP sym={symbol} reason=ATR_DIST side={'LONG' if long_ok else 'SHORT'} "
                     f"dist={dist:.6g} atr14={atr14:.6g}"
                 )
@@ -3829,12 +3868,12 @@ def _run_adv_trend_cycle(
                 short_ok = False
         if long_ok and isinstance(bb_upper, (int, float)) and close_px > bb_upper:
             long_ok = False
-            _append_adv_trend_log(
+            _adv_skip(
                 f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT_15M side=LONG close={close_px:.6g} bb_upper={bb_upper:.6g}"
             )
         if short_ok and isinstance(bb_lower, (int, float)) and close_px < bb_lower:
             short_ok = False
-            _append_adv_trend_log(
+            _adv_skip(
                 f"ADV_TREND_SKIP sym={symbol} reason=BB_OVERHEAT_15M side=SHORT close={close_px:.6g} bb_lower={bb_lower:.6g}"
             )
         if not long_ok and not short_ok:
@@ -3846,43 +3885,43 @@ def _run_adv_trend_cycle(
         side = "LONG" if long_ok else "SHORT"
 
         if _exit_cooldown_blocked(state, symbol, "advanced_trend_follower", side):
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=EXIT_COOLDOWN side={side}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=EXIT_COOLDOWN side={side}")
             _append_entry_gate_log("advanced_trend_follower", symbol, "exit_cooldown", side=side)
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         if not _entry_guard_acquire(state, symbol, ttl_sec=5.0, key=f"adv_trend:{symbol}", engine="advanced_trend_follower", side=side):
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-
+        entry_px = close_px
         risk_per_unit = abs(close_px - st_px)
         if risk_per_unit <= 0 or atr_val <= 0:
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=BAD_STOP side={side}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=BAD_STOP side={side}")
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         if risk_per_unit < (atr_val * ADV_TREND_MIN_STOP_ATR):
-            _append_adv_trend_log(
+            _adv_skip(
                 f"ADV_TREND_SKIP sym={symbol} reason=MIN_STOP side={side} dist={risk_per_unit:.6g} atr={atr_val:.6g}"
             )
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         if side == "LONG" and st_px >= close_px:
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=STOP_ABOVE side={side}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=STOP_ABOVE side={side}")
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         if side == "SHORT" and st_px <= close_px:
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=STOP_BELOW side={side}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=STOP_BELOW side={side}")
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
         avail = get_available_usdt()
         if not isinstance(avail, (int, float)) or avail <= 0:
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=NO_BALANCE side={side}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=NO_BALANCE side={side}")
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         risk_usdt = float(avail) * (ADV_TREND_RISK_PCT / 100.0)
         qty = risk_usdt / risk_per_unit
         if qty <= 0:
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=QTY_ZERO side={side}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=QTY_ZERO side={side}")
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         notional = qty * close_px
@@ -3900,12 +3939,12 @@ def _run_adv_trend_cycle(
             notional = max_notional
             qty = notional / close_px
         if notional <= 0:
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=NOTIONAL_ZERO side={side}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=NOTIONAL_ZERO side={side}")
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
         if not _admin_is_active():
-            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=ADMIN_INACTIVE side={side}")
+            _adv_skip(f"ADV_TREND_SKIP sym={symbol} reason=ADMIN_INACTIVE side={side}")
             time.sleep(PER_SYMBOL_SLEEP)
             continue
         if side == "LONG":
@@ -4023,6 +4062,7 @@ def _run_adv_trend_cycle(
             f"close={close_px:.6g} ema200={ema200:.6g} mfi={mfi_val:.4g} adx={adx_val:.4g} "
             f"st_dir={trend_dir} bb_upper={bb_upper:.6g} bb_lower={bb_lower:.6g}"
         )
+        entries += 1
         _send_entry_alert(
             send_alert,
             side=side,
@@ -4044,6 +4084,13 @@ def _run_adv_trend_cycle(
             result["short_hits"] += 1
 
         time.sleep(PER_SYMBOL_SLEEP)
+    for line in sample_lines[:3]:
+        _append_adv_trend_log(line)
+    elapsed = time.time() - start_ts
+    _append_adv_trend_log(
+        f"ADV_TREND_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={entries} "
+        f"skips={skips} no_signal={no_signal} no_data={no_data}"
+    )
     return result
 
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
@@ -11317,6 +11364,7 @@ def _adv_eval_15m(df_15m: pd.DataFrame, df_4h: pd.DataFrame) -> Optional[dict]:
         st_line, st_trend = _adv_supertrend(df_15m, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
         st_px = float(st_line.iloc[-1])
         trend_dir = int(st_trend.iloc[-1])
+        prev_trend_dir = int(st_trend.iloc[-2]) if len(st_trend) >= 2 else 0
         close_px = float(df_15m["close"].iloc[-1])
         atr_val = float(_adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN).iloc[-1])
     except Exception:
@@ -11327,6 +11375,7 @@ def _adv_eval_15m(df_15m: pd.DataFrame, df_4h: pd.DataFrame) -> Optional[dict]:
         "adx": float(adx_val),
         "st_px": st_px,
         "trend_dir": trend_dir,
+        "prev_trend_dir": prev_trend_dir,
         "close_px": close_px,
         "atr": atr_val,
         "ts": int(df_15m["ts"].iloc[-1]) if "ts" in df_15m.columns else None,
@@ -12545,7 +12594,27 @@ def run():
                         swaggy_atlas_lab_v2_atlas_cfg = SwaggyAtlasLabV2AtlasConfig()
 
                     if ADV_TREND_ENABLED:
-                        adv_trend_universe = list(shared_universe)
+                        # Advanced trend engine: shared universe + low-volatility universe
+                        adv_candidates = []
+                        for sym in symbols or []:
+                            t = tickers.get(sym) if isinstance(tickers, dict) else None
+                            if not t:
+                                continue
+                            pct = t.get("percentage")
+                            qv = t.get("quoteVolume")
+                            if pct is None or qv is None:
+                                continue
+                            try:
+                                pct = float(pct)
+                                qv = float(qv)
+                            except Exception:
+                                continue
+                            if qv < ADV_TREND_MIN_QV:
+                                continue
+                            adv_candidates.append((sym, abs(pct)))
+                        adv_candidates.sort(key=lambda x: x[1])  # low volatility first
+                        low_vol = [sym for sym, _ in adv_candidates[:ADV_TREND_UNIVERSE_TOP_N]]
+                        adv_trend_universe = list(dict.fromkeys(list(shared_universe) + low_vol))
                         state["_adv_trend_universe"] = adv_trend_universe
 
                         structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
