@@ -3739,6 +3739,9 @@ def _run_adv_trend_cycle(
         if not signal:
             time.sleep(PER_SYMBOL_SLEEP)
             continue
+        atlas_gate = _compute_atlas_swaggy_gate(state)
+        atlas_allow_long = int(atlas_gate.get("allow_long", 1)) if isinstance(atlas_gate, dict) else 1
+        atlas_allow_short = int(atlas_gate.get("allow_short", 1)) if isinstance(atlas_gate, dict) else 1
         ema200 = signal["ema200"]
         mfi_val = signal["mfi"]
         adx_val = signal["adx"]
@@ -3801,6 +3804,12 @@ def _run_adv_trend_cycle(
         if short_ok and isinstance(rsi_val, (int, float)) and rsi_val <= 30:
             short_ok = False
             _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=RSI_OVERHEAT side=SHORT rsi={rsi_val:.2f}")
+        if long_ok and not atlas_allow_long:
+            long_ok = False
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=ATLAS_DIR side=LONG")
+        if short_ok and not atlas_allow_short:
+            short_ok = False
+            _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=ATLAS_DIR side=SHORT")
         if long_ok and isinstance(ema7, (int, float)) and isinstance(ema20, (int, float)) and ema20 > 0:
             if ema7 > (ema20 * 1.03):
                 long_ok = False

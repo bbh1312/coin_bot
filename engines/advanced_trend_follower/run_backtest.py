@@ -17,6 +17,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from engines.universe import build_universe_from_tickers
+from engines.atlas.atlas_engine import AtlasSwaggyConfig
 
 
 def _ensure_dir(path: str) -> None:
@@ -104,6 +105,55 @@ def _mfi(df: pd.DataFrame, length: int) -> pd.Series:
     ratio = pos_sum / neg_sum.replace(0, float("nan"))
     mfi = 100 - (100 / (1 + ratio))
     return mfi.fillna(0.0)
+
+
+def _atlas_dir_flags(df_ref: pd.DataFrame, cfg: AtlasSwaggyConfig) -> pd.DataFrame:
+    if df_ref.empty:
+        return pd.DataFrame()
+    df_ref = df_ref.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+    ema20 = _ema(df_ref["close"], 20)
+    ema60 = _ema(df_ref["close"], 60)
+    atr14 = _atr(df_ref, 14)
+    atr_sma = atr14.rolling(20).mean()
+    trend_raw = ema20 - ema60
+    denom = atr14.where(atr14 > 0)
+    denom = denom.fillna(df_ref["close"].where(df_ref["close"] > 0, 1.0))
+    trend_norm = trend_raw / denom
+    allow_long = []
+    allow_short = []
+    for i in range(len(df_ref)):
+        tl = False
+        ts = False
+        l20 = ema20.iloc[i]
+        l60 = ema60.iloc[i]
+        tn = trend_norm.iloc[i]
+        atr_now = atr14.iloc[i] if pd.notna(atr14.iloc[i]) else None
+        atr_mean = atr_sma.iloc[i] if pd.notna(atr_sma.iloc[i]) else None
+        atr_ratio = (atr_now / atr_mean) if (atr_now and atr_mean and atr_mean > 0) else None
+        if pd.isna(l20) or pd.isna(l60) or pd.isna(tn):
+            allow_long.append(0)
+            allow_short.append(0)
+            continue
+        if l20 > l60 and tn >= cfg.trend_norm_bull:
+            tl = True
+            ts = False
+        elif l20 < l60 and tn <= cfg.trend_norm_bear:
+            tl = False
+            ts = True
+        else:
+            if abs(float(tn)) <= cfg.trend_norm_flat and (atr_ratio is not None and atr_ratio < cfg.chaos_atr_low):
+                tl = False
+                ts = False
+            else:
+                tl = True
+                ts = True
+        allow_long.append(1 if tl else 0)
+        allow_short.append(1 if ts else 0)
+    return pd.DataFrame({
+        "ts": df_ref["ts"],
+        "atlas_allow_long": allow_long,
+        "atlas_allow_short": allow_short,
+    })
 
 
 def _adx(df: pd.DataFrame, length: int) -> pd.Series:
@@ -283,6 +333,7 @@ def main() -> None:
     parser.add_argument("--st-mult", type=float, default=3.0)
     parser.add_argument("--tf-main", default="15m")
     parser.add_argument("--tf-trend", default="4h")
+    parser.add_argument("--atlas-dir", default="on")
     args = parser.parse_args()
 
     exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
@@ -335,10 +386,18 @@ def main() -> None:
     stats_by_symbol: Dict[str, dict] = {}
     open_positions: Dict[str, dict] = {}
 
+    atlas_dir_on = str(args.atlas_dir).strip().lower() in {"on", "true", "1", "yes", "y"}
     _bt_log(
-        "[run] mode=advanced_trend_follower days=%d start_ms=%d end_ms=%d slip=%.4f"
-        % (args.days, start_ms, end_ms, float(args.slip_pct))
+        "[run] mode=advanced_trend_follower days=%d start_ms=%d end_ms=%d slip=%.4f atlas_dir=%s"
+        % (args.days, start_ms, end_ms, float(args.slip_pct), "on" if atlas_dir_on else "off")
     )
+
+    atlas_df = None
+    if atlas_dir_on:
+        atlas_cfg = AtlasSwaggyConfig()
+        rows_ref = _fetch_ohlcv_all(exchange, atlas_cfg.ref_symbol, args.tf_main, start_ms, end_ms)
+        df_ref = _to_df(rows_ref)
+        atlas_df = _atlas_dir_flags(df_ref, atlas_cfg)
 
     for symbol in symbols:
         rows_main = _fetch_ohlcv_all(exchange, symbol, args.tf_main, start_ms, end_ms)
@@ -356,6 +415,8 @@ def main() -> None:
         df = df.sort_values("ts")
         df = pd.merge_asof(df, df_trend, on="ts", direction="backward")
         df.rename(columns={"ema200": "ema200_trend"}, inplace=True)
+        if atlas_dir_on and isinstance(atlas_df, pd.DataFrame) and not atlas_df.empty:
+            df = pd.merge_asof(df, atlas_df, on="ts", direction="backward")
 
         df["mfi"] = _mfi(df, 14)
         df["adx"] = _adx(df, 14)
@@ -396,6 +457,8 @@ def main() -> None:
             rsi = float(row["rsi"]) if pd.notna(row["rsi"]) else None
             ema7 = float(row["ema7"]) if pd.notna(row["ema7"]) else None
             ema20 = float(row["ema20"]) if pd.notna(row["ema20"]) else None
+            atlas_allow_long = int(row["atlas_allow_long"]) if pd.notna(row.get("atlas_allow_long")) else 0
+            atlas_allow_short = int(row["atlas_allow_short"]) if pd.notna(row.get("atlas_allow_short")) else 0
             vol_now = float(row["volume"]) if pd.notna(row["volume"]) else None
             vol_prev = float(df["volume"].iloc[i - 1]) if i >= 1 and pd.notna(df["volume"].iloc[i - 1]) else None
 
@@ -521,6 +584,8 @@ def main() -> None:
             bb_upper = float(row["bb_upper"]) if pd.notna(row.get("bb_upper")) else None
             bb_lower = float(row["bb_lower"]) if pd.notna(row.get("bb_lower")) else None
             if close_px > float(ema_trend) and mfi < float(args.mfi_long_max) and st_dir > 0:
+                if atlas_dir_on and not atlas_allow_long:
+                    continue
                 if isinstance(st_score, (int, float)) and isinstance(st_score_prev, (int, float)):
                     if st_score <= st_score_prev:
                         continue
@@ -594,6 +659,8 @@ def main() -> None:
                 continue
 
             if close_px < float(ema_trend) and mfi > float(args.mfi_short_min) and st_dir < 0:
+                if atlas_dir_on and not atlas_allow_short:
+                    continue
                 if isinstance(st_score, (int, float)) and isinstance(st_score_prev, (int, float)):
                     if st_score >= st_score_prev:
                         continue
