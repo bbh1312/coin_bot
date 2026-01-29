@@ -267,7 +267,7 @@ def main() -> None:
     parser.add_argument("--universe", default="top50")
     parser.add_argument("--min-qv", type=float, default=30_000_000.0)
     parser.add_argument("--initial-usdt", type=float, default=1000.0)
-    parser.add_argument("--risk-pct", type=float, default=2.0)
+    parser.add_argument("--risk-pct", type=float, default=0.1)
     parser.add_argument("--risk-base", default="equity", choices=["equity", "fixed"])
     parser.add_argument("--fixed-equity", type=float, default=1000.0)
     parser.add_argument("--slip-pct", type=float, default=0.0005)

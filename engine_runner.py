@@ -855,7 +855,7 @@ SWAGGY_NO_ATLAS_DEBUG_SYMBOLS = os.getenv("SWAGGY_NO_ATLAS_DEBUG_SYMBOLS", "").s
 ADV_TREND_ENABLED = os.getenv("ADV_TREND_ENABLED", "0") == "1"
 ADV_TREND_MIN_QV = float(os.getenv("ADV_TREND_MIN_QV", "5000000"))
 ADV_TREND_UNIVERSE_TOP_N = int(os.getenv("ADV_TREND_UNIVERSE_TOP_N", "30"))
-ADV_TREND_RISK_PCT = float(os.getenv("ADV_TREND_RISK_PCT", "1.0"))
+ADV_TREND_RISK_PCT = float(os.getenv("ADV_TREND_RISK_PCT", "0.1"))
 ADV_TREND_MAX_NOTIONAL_MULT = float(os.getenv("ADV_TREND_MAX_NOTIONAL_MULT", "10.0"))
 ADV_TREND_MIN_STOP_ATR = float(os.getenv("ADV_TREND_MIN_STOP_ATR", "0.5"))
 ADV_TREND_ADX_MIN = float(os.getenv("ADV_TREND_ADX_MIN", "25"))
@@ -3979,6 +3979,7 @@ def _run_adv_trend_cycle(
             if notional_f <= 0:
                 follower_calls.append({"acct": acct, "skip": "notional_zero"})
                 continue
+            qty_f = notional_f / close_px
             if side == "LONG":
                 follower_calls.append({
                     "acct": acct,
@@ -4925,7 +4926,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "SWAGGY_ATLAS_LAB_V2": "스웨기랩v2",
         "SWAGGY_NO_ATLAS": "스웨기 단독",
         "LOSS_HEDGE_ENGINE": "손실방지엔진",
-        "ADVANCED_TREND_FOLLOWER": "트리플체크",
+        "ADVANCED_TREND_FOLLOWER": "슈퍼트랜드 반전",
     }
     return overrides.get(name, name)
 
@@ -8330,6 +8331,181 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
                         f"<b>{symbol}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {_display_engine_label(engine_label)}"
+                    )
+                    # Immediate reverse entry on ST flip
+                    try:
+                        cur_total = count_open_positions(force=True)
+                    except Exception:
+                        cur_total = None
+                    if not isinstance(cur_total, int):
+                        cur_total = _count_open_positions_state(state)
+                    if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+                        _append_adv_trend_log(
+                            f"ADV_TREND_SKIP sym={symbol} reason=MAX_POS_REVERSE open={cur_total} max={MAX_OPEN_POSITIONS}"
+                        )
+                        continue
+                    if not _admin_is_active():
+                        _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=ADMIN_INACTIVE_REVERSE side={'LONG' if trend_dir == 1 else 'SHORT'}")
+                        continue
+                    reverse_side = "LONG" if trend_dir == 1 else "SHORT"
+                    entry_px = mark_px if isinstance(mark_px, (int, float)) else _fetch_last_price(symbol)
+                    if not isinstance(entry_px, (int, float)) or entry_px <= 0:
+                        continue
+                    st_px = float(_st_px)
+                    risk_per_unit = abs(entry_px - st_px)
+                    if risk_per_unit <= 0:
+                        _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=BAD_STOP_REVERSE side={reverse_side}")
+                        continue
+                    atr_val = None
+                    try:
+                        df_15m = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 200))
+                        if not df_15m.empty:
+                            atr_val = float(_adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN).iloc[-1])
+                    except Exception:
+                        atr_val = None
+                    if isinstance(atr_val, (int, float)) and atr_val > 0:
+                        if risk_per_unit < (atr_val * ADV_TREND_MIN_STOP_ATR):
+                            _append_adv_trend_log(
+                                f"ADV_TREND_SKIP sym={symbol} reason=MIN_STOP_REVERSE side={reverse_side} dist={risk_per_unit:.6g} atr={atr_val:.6g}"
+                            )
+                            continue
+                    avail = get_available_usdt()
+                    if not isinstance(avail, (int, float)) or avail <= 0:
+                        _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=NO_BALANCE_REVERSE side={reverse_side}")
+                        continue
+                    risk_usdt = float(avail) * (ADV_TREND_RISK_PCT / 100.0)
+                    qty = risk_usdt / risk_per_unit
+                    if qty <= 0:
+                        _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=QTY_ZERO_REVERSE side={reverse_side}")
+                        continue
+                    notional = qty * entry_px
+                    entry_pct = None
+                    try:
+                        entry_pct = float(USDT_PER_TRADE)
+                    except Exception:
+                        entry_pct = None
+                    if isinstance(entry_pct, (int, float)) and entry_pct > 0:
+                        entry_cap = float(avail) * (entry_pct / 100.0)
+                        if entry_cap > 0:
+                            notional = min(notional, entry_cap)
+                    max_notional = float(avail) * float(ADV_TREND_MAX_NOTIONAL_MULT)
+                    if max_notional > 0 and notional > max_notional:
+                        notional = max_notional
+                        qty = notional / entry_px
+                    if notional <= 0:
+                        _append_adv_trend_log(f"ADV_TREND_SKIP sym={symbol} reason=NOTIONAL_ZERO_REVERSE side={reverse_side}")
+                        continue
+                    if reverse_side == "LONG":
+                        res = _EXEC_LONG_MARKET(symbol, usdt_amount=notional, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                    else:
+                        res = _EXEC_SHORT_MARKET(symbol, usdt_amount=notional, leverage=LEVERAGE, margin_mode=MARGIN_MODE)
+                    admin_status = _extract_status(res)
+                    admin_ok = admin_status in ("ok", "dry_run", "skip")
+                    if not admin_ok:
+                        _append_adv_trend_log(f"ADV_TREND_ENTRY_FAIL sym={symbol} side={reverse_side} status={admin_status}")
+                        continue
+                    entry_order_id = _order_id_from_res(res)
+                    entry_fill = res.get("last")
+                    if entry_fill is None:
+                        order = res.get("order") if isinstance(res.get("order"), dict) else {}
+                        entry_fill = order.get("average") or order.get("price")
+                    if not isinstance(entry_fill, (int, float)) or entry_fill <= 0:
+                        entry_fill = entry_px
+                    if reverse_side == "LONG":
+                        sl_res = _EXEC_PLACE_LONG_SL_PX(symbol, st_px)
+                    else:
+                        sl_res = _EXEC_PLACE_SHORT_SL_PX(symbol, st_px)
+                    sl_order_id = _order_id_from_res(sl_res) if isinstance(sl_res, dict) else None
+                    tp1_px = entry_fill + (ADV_TREND_TP1_R_MULT * (entry_fill - st_px)) if reverse_side == "LONG" else entry_fill - (ADV_TREND_TP1_R_MULT * (st_px - entry_fill))
+                    meta = {
+                        "reason": "advanced_trend_follower",
+                        "engine": "ADVANCED_TREND_FOLLOWER",
+                        "sl_price": st_px,
+                        "tp1_price": tp1_px,
+                        "tp2_mode": "SUPER_TREND",
+                        "tp1_done": False,
+                        "sl_order_id": sl_order_id,
+                    }
+                    qty_fill = res.get("amount") or (res.get("order") or {}).get("amount") if isinstance(res, dict) else None
+                    _log_trade_entry(
+                        state,
+                        side=reverse_side,
+                        symbol=symbol,
+                        entry_ts=time.time(),
+                        entry_price=entry_fill,
+                        qty=qty_fill if isinstance(qty_fill, (int, float)) else None,
+                        usdt=notional,
+                        entry_order_id=entry_order_id,
+                        meta=meta,
+                    )
+                    follower_calls = []
+                    for acct in FOLLOWER_CONTEXTS:
+                        try:
+                            avail_f = acct.executor.get_available_usdt()
+                        except Exception:
+                            avail_f = None
+                        if not isinstance(avail_f, (int, float)) or avail_f <= 0:
+                            follower_calls.append({"acct": acct, "skip": "no_balance"})
+                            continue
+                        risk_usdt_f = float(avail_f) * (ADV_TREND_RISK_PCT / 100.0)
+                        qty_f = risk_usdt_f / risk_per_unit
+                        if qty_f <= 0:
+                            follower_calls.append({"acct": acct, "skip": "qty_zero"})
+                            continue
+                        notional_f = qty_f * entry_px
+                        entry_pct_f = None
+                        try:
+                            entry_pct_f = float(getattr(acct.settings, "entry_pct", USDT_PER_TRADE))
+                        except Exception:
+                            entry_pct_f = None
+                        if isinstance(entry_pct_f, (int, float)) and entry_pct_f > 0:
+                            entry_cap_f = float(avail_f) * (entry_pct_f / 100.0)
+                            if entry_cap_f > 0:
+                                notional_f = min(notional_f, entry_cap_f)
+                        max_notional_f = float(avail_f) * float(ADV_TREND_MAX_NOTIONAL_MULT)
+                        if max_notional_f > 0 and notional_f > max_notional_f:
+                            notional_f = max_notional_f
+                        if notional_f <= 0:
+                            follower_calls.append({"acct": acct, "skip": "notional_zero"})
+                            continue
+                        qty_f = notional_f / entry_px
+                        if reverse_side == "LONG":
+                            follower_calls.append({
+                                "acct": acct,
+                                "fn": lambda a=acct, u=notional_f: a.executor.long_market(symbol, usdt_amount=u, leverage=LEVERAGE, margin_mode=MARGIN_MODE),
+                            })
+                        else:
+                            follower_calls.append({
+                                "acct": acct,
+                                "fn": lambda a=acct, u=notional_f: a.executor.short_market(symbol, usdt_amount=u, leverage=LEVERAGE, margin_mode=MARGIN_MODE),
+                            })
+                    action_name = "long_market" if reverse_side == "LONG" else "short_market"
+                    results = _broadcast_followers(action_name, follower_calls, {"symbol": symbol})
+                    _set_last_entry_broadcast(symbol, reverse_side, admin_status, admin_ok, results)
+                    for acct in FOLLOWER_CONTEXTS:
+                        try:
+                            if reverse_side == "LONG":
+                                acct.executor.place_long_sl_px(symbol, st_px)
+                            else:
+                                acct.executor.place_short_sl_px(symbol, st_px)
+                        except Exception:
+                            continue
+                    _append_adv_trend_log(
+                        f"ADV_TREND_REVERSE_ENTRY sym={symbol} side={reverse_side} entry={entry_fill:.6g} sl={st_px:.6g} tp1={tp1_px:.6g}"
+                    )
+                    _send_entry_alert(
+                        send_telegram,
+                        side=reverse_side,
+                        symbol=symbol,
+                        engine="ADVANCED_TREND_FOLLOWER",
+                        entry_price=entry_fill,
+                        usdt=notional,
+                        reason=_display_engine_label("ADVANCED_TREND_FOLLOWER"),
+                        sl=f"{st_px:.6g}",
+                        tp=f"{tp1_px:.6g}",
+                        entry_order_id=entry_order_id,
+                        extras=["기준: SL=SuperTrend, TP1=1.4R", "즉시 반전 진입"],
+                        state=state,
                     )
                     continue
 
