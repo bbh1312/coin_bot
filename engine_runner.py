@@ -8533,11 +8533,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         pass
                     res = close_short_market(sym)
                     exit_order_id = _order_id_from_res(res)
+                    cancel_conditional_by_side(sym, "SHORT")
                     cancel_stop_orders(sym)
-                    if engine_label == "ADVANCED_TREND_FOLLOWER":
-                        cancel_open_orders(sym)
-                    if engine_label == "ADVANCED_TREND_FOLLOWER":
-                        cancel_open_orders(sym)
+                    cancel_open_orders(sym)
                     last_entry_val = float(st.get("last_entry", 0))
                     state[sym] = {
                         "in_pos": False,
@@ -8599,11 +8597,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         pass
                     res = close_short_market(sym)
                     exit_order_id = _order_id_from_res(res)
+                    cancel_conditional_by_side(sym, "SHORT")
                     cancel_stop_orders(sym)
-                    if engine_label == "ADVANCED_TREND_FOLLOWER":
-                        cancel_open_orders(sym)
-                    if engine_label == "ADVANCED_TREND_FOLLOWER":
-                        cancel_open_orders(sym)
+                    cancel_open_orders(sym)
                     last_entry_val = float(st.get("last_entry", 0))
                     state[sym] = {
                         "in_pos": False,
@@ -8718,7 +8714,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             except Exception:
                 amt = 0.0
             if amt <= 0 and open_tr:
+                cancel_conditional_by_side(sym, "LONG")
                 cancel_stop_orders(sym)
+                cancel_open_orders(sym)
                 engine_label = _engine_label_from_reason(
                     (open_tr.get("meta") or {}).get("reason") if open_tr else None
                 )
@@ -8803,7 +8801,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 pass
             res = close_long_market(sym)
             exit_order_id = _order_id_from_res(res)
+            cancel_conditional_by_side(sym, "LONG")
             cancel_stop_orders(sym)
+            cancel_open_orders(sym)
             avg_price = (
                 res.get("order", {}).get("average")
                 or res.get("order", {}).get("price")
@@ -8852,7 +8852,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 pass
             res = close_long_market(sym)
             exit_order_id = _order_id_from_res(res)
+            cancel_conditional_by_side(sym, "LONG")
             cancel_stop_orders(sym)
+            cancel_open_orders(sym)
             avg_price = (
                 res.get("order", {}).get("average")
                 or res.get("order", {}).get("price")
