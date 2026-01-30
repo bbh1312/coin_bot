@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+import glob
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +24,44 @@ def _ensure_dir(path: str) -> None:
     if not path:
         return
     os.makedirs(path, exist_ok=True)
+
+
+def _sanitize_symbol(symbol: str) -> str:
+    return symbol.replace("/", "_").replace(":", "_")
+
+
+def _ohlcv_cache_path(root_dir: str, symbol: str, timeframe: str, start_ms: int, end_ms: int) -> str:
+    safe = _sanitize_symbol(symbol)
+    return os.path.join(
+        root_dir,
+        "logs",
+        "srp_st_regime_pullback_v1",
+        "ohlcv_cache",
+        f"{safe}_{timeframe}_{start_ms}_{end_ms}.csv",
+    )
+
+
+def _read_ohlcv_cache(path: str) -> List[list]:
+    if not os.path.exists(path):
+        return []
+    try:
+        df = pd.read_csv(path)
+        if df.empty:
+            return []
+        return df[["ts", "open", "high", "low", "close", "volume"]].values.tolist()
+    except Exception:
+        return []
+
+
+def _write_ohlcv_cache(path: str, rows: List[list]) -> None:
+    if not rows:
+        return
+    _ensure_dir(os.path.dirname(path))
+    try:
+        df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+        df.to_csv(path, index=False)
+    except Exception:
+        return
 
 
 def _utc_ms(dt: datetime) -> int:
@@ -46,6 +85,10 @@ def _fetch_ohlcv_all(
     end_ms: int,
     limit: int = 1500,
 ) -> List[list]:
+    cache_path = _ohlcv_cache_path(ROOT_DIR, symbol, timeframe, start_ms, end_ms)
+    cached = _read_ohlcv_cache(cache_path)
+    if cached:
+        return cached
     out: List[list] = []
     since = start_ms
     tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
@@ -69,6 +112,7 @@ def _fetch_ohlcv_all(
         time.sleep(exchange.rateLimit / 1000.0)
     if out:
         out = out[:-1]
+    _write_ohlcv_cache(cache_path, out)
     return out
 
 
@@ -176,25 +220,96 @@ def _timeframe_minutes(tf: str) -> Optional[int]:
     return None
 
 
+def _read_common_universe_file(path: str) -> List[str]:
+    if not path or not os.path.exists(path):
+        return []
+    symbols: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                if raw.startswith("COMMON_UNIVERSE"):
+                    continue
+                if raw.startswith("#"):
+                    continue
+                symbols.append(raw)
+    except Exception:
+        return []
+    return symbols
+
+
+def _latest_common_universe_file(root_dir: str) -> str:
+    pattern = os.path.join(root_dir, "logs", "common_universe", "common_universe_*.log")
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return ""
+    try:
+        return max(candidates, key=os.path.getmtime)
+    except Exception:
+        return ""
+
+
+def _read_symbol_cache(path: str) -> List[str]:
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [s for s in data if isinstance(s, str) and s]
+    except Exception:
+        return []
+    return []
+
+
+def _write_symbol_cache(path: str, symbols: List[str]) -> None:
+    if not path or not symbols:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(symbols, f)
+    except Exception:
+        return
+
+
 def _select_symbols(
     exchange: ccxt.Exchange,
     symbols_arg: str,
     symbols_file: str,
     universe_arg: str,
     min_qv: float,
+    common_universe_file: str,
+    use_common_universe_latest: bool,
+    common_universe_cache: str,
 ) -> List[str]:
     if symbols_file:
         with open(symbols_file, "r", encoding="utf-8") as f:
             return [s.strip() for s in f.read().split(",") if s.strip()]
     if symbols_arg:
         return [s.strip() for s in symbols_arg.split(",") if s.strip()]
+    cached = _read_symbol_cache(common_universe_cache)
+    if cached:
+        return cached
+    common_path = common_universe_file
+    if not common_path and use_common_universe_latest:
+        common_path = _latest_common_universe_file(ROOT_DIR)
+    if common_path:
+        common_syms = _read_common_universe_file(common_path)
+        if common_syms:
+            _write_symbol_cache(common_universe_cache, common_syms)
+            return common_syms
     top_n = _parse_universe_arg(universe_arg) or 50
     tickers = exchange.fetch_tickers()
-    return build_universe_from_tickers(
+    symbols = build_universe_from_tickers(
         tickers,
         min_quote_volume_usdt=min_qv,
         top_n=top_n,
     )
+    _write_symbol_cache(common_universe_cache, symbols)
+    return symbols
 
 
 @dataclass
@@ -218,6 +333,13 @@ def main() -> None:
     parser.add_argument("--symbols-file", default="")
     parser.add_argument("--universe", default="top50")
     parser.add_argument("--min-qv", type=float, default=30_000_000.0)
+    parser.add_argument("--common-universe-file", default="", help="use common universe log file")
+    parser.add_argument("--common-universe-latest", action="store_true", help="use latest common universe log")
+    parser.add_argument(
+        "--common-universe-cache",
+        default=os.path.join("logs", "srp_st_regime_pullback_v1", "common_universe_cache.json"),
+        help="cache resolved universe symbols",
+    )
     parser.add_argument("--initial-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-pct", type=float, default=1.0)
     parser.add_argument("--entry-base", default="equity", choices=["equity", "fixed"])
@@ -236,6 +358,7 @@ def main() -> None:
     parser.add_argument("--st-mult", type=float, default=3.0)
     parser.add_argument("--tf-ltf", default="5m")
     parser.add_argument("--tf-htf", default="1h")
+    parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -277,6 +400,9 @@ def main() -> None:
         args.symbols_file,
         args.universe,
         args.min_qv,
+        args.common_universe_file,
+        args.common_universe_latest,
+        args.common_universe_cache,
     )
 
     end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -330,9 +456,13 @@ def main() -> None:
         tf_minutes = _timeframe_minutes(args.tf_ltf) or 5
         cooldown_bars = max(1, int(round(float(args.cooldown_minutes) / float(tf_minutes))))
 
-        for i in range(1, len(df_5m) - 1):
+        sig_offset = 1 if args.use_confirmed else 0
+        start_i = 1 + sig_offset
+        for i in range(start_i, len(df_5m) - 1):
             row = df_5m.iloc[i]
-            ts = int(row["ts"])
+            sig_idx = i - sig_offset
+            sig_row = df_5m.iloc[sig_idx]
+            ts = int(sig_row["ts"]) if args.use_confirmed else int(row["ts"])
 
             idx_1h = int(df_1h["ts"].searchsorted(ts, side="right") - 1)
             if idx_1h < 0:
@@ -463,14 +593,14 @@ def main() -> None:
                     _bt_log("SRP_REGIME sym=%s dir=%s flip_cd=1" % (symbol, "LONG" if htf_dir == 1 else "SHORT"))
                 continue
 
-            ema20 = float(row["ema20"]) if pd.notna(row["ema20"]) else None
-            ema50 = float(row["ema50"]) if pd.notna(row["ema50"]) else None
-            rsi14 = float(row["rsi14"]) if pd.notna(row["rsi14"]) else None
-            atr14 = float(row["atr14"]) if pd.notna(row["atr14"]) else None
-            st_line = float(row["st_line"]) if pd.notna(row["st_line"]) else None
-            vol_sma = float(row["vol_sma20"]) if pd.notna(row["vol_sma20"]) else None
-            close_px = float(row["close"])
-            volume = float(row["volume"])
+            ema20 = float(sig_row["ema20"]) if pd.notna(sig_row["ema20"]) else None
+            ema50 = float(sig_row["ema50"]) if pd.notna(sig_row["ema50"]) else None
+            rsi14 = float(sig_row["rsi14"]) if pd.notna(sig_row["rsi14"]) else None
+            atr14 = float(sig_row["atr14"]) if pd.notna(sig_row["atr14"]) else None
+            st_line = float(sig_row["st_line"]) if pd.notna(sig_row["st_line"]) else None
+            vol_sma = float(sig_row["vol_sma20"]) if pd.notna(sig_row["vol_sma20"]) else None
+            close_px = float(sig_row["close"])
+            volume = float(sig_row["volume"])
 
             if not isinstance(ema20, (int, float)) or not isinstance(ema50, (int, float)):
                 continue
@@ -479,14 +609,14 @@ def main() -> None:
             if not isinstance(st_line, (int, float)) or not isinstance(vol_sma, (int, float)):
                 continue
 
-            start_idx = max(0, i - int(args.pb_lookback))
+            start_idx = max(0, sig_idx - int(args.pb_lookback))
             if htf_dir == 1:
-                pb_zone = (df_5m["close"].iloc[start_idx : i + 1] <= df_5m["ema20"].iloc[start_idx : i + 1]) & (
-                    df_5m["close"].iloc[start_idx : i + 1] >= df_5m["ema50"].iloc[start_idx : i + 1]
+                pb_zone = (df_5m["close"].iloc[start_idx : sig_idx + 1] <= df_5m["ema20"].iloc[start_idx : sig_idx + 1]) & (
+                    df_5m["close"].iloc[start_idx : sig_idx + 1] >= df_5m["ema50"].iloc[start_idx : sig_idx + 1]
                 )
             else:
-                pb_zone = (df_5m["close"].iloc[start_idx : i + 1] >= df_5m["ema20"].iloc[start_idx : i + 1]) & (
-                    df_5m["close"].iloc[start_idx : i + 1] <= df_5m["ema50"].iloc[start_idx : i + 1]
+                pb_zone = (df_5m["close"].iloc[start_idx : sig_idx + 1] >= df_5m["ema20"].iloc[start_idx : sig_idx + 1]) & (
+                    df_5m["close"].iloc[start_idx : sig_idx + 1] <= df_5m["ema50"].iloc[start_idx : sig_idx + 1]
                 )
             pb_seen = bool(pb_zone.any())
 
@@ -499,7 +629,7 @@ def main() -> None:
             if not pb_seen:
                 continue
 
-            prev = df_5m.iloc[i - 1]
+            prev = df_5m.iloc[sig_idx - 1]
             prev_close = float(prev["close"])
             prev_ema20 = float(prev["ema20"]) if pd.notna(prev["ema20"]) else None
             if not isinstance(prev_ema20, (int, float)):
@@ -546,10 +676,11 @@ def main() -> None:
                     continue
                 entry_side = "SHORT"
 
-            if i + 1 >= len(df_5m):
+            entry_idx = i if args.use_confirmed else i + 1
+            if entry_idx >= len(df_5m):
                 continue
 
-            entry_row = df_5m.iloc[i + 1]
+            entry_row = df_5m.iloc[entry_idx]
             entry_px = float(entry_row["open"])
             if args.slip_pct:
                 if entry_side == "LONG":
@@ -575,7 +706,7 @@ def main() -> None:
 
             open_position = Position(
                 side=entry_side,
-                entry_idx=i + 1,
+                entry_idx=entry_idx,
                 entry_ts=int(entry_row["ts"]),
                 entry_px=entry_px,
                 stop_px=sl_price,
