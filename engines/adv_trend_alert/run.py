@@ -306,7 +306,7 @@ def main() -> None:
         return
 
     exchange.load_markets()
-    ltf_limit = max(ADV_TREND_EMA_LEN, 500)
+    ltf_limit = max(ADV_TREND_EMA_LEN, 672)
     htf_limit = max(ADV_TREND_EMA_LEN, 220)
 
     _log_kst("[adv-trend-alert] start")

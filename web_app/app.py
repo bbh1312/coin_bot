@@ -480,6 +480,10 @@ def close_positions():
     if errors:
         extra = " | " + ", ".join(errors[:4]) + ("..." if len(errors) > 4 else "")
     msg = f"{symbol} {side} 청산: ok={ok} fail={fail} skip={skipped}{extra}"
+    try:
+        send_telegram(msg, allow_early=True)
+    except Exception:
+        pass
     return redirect(url_for("follower_positions", notice=msg))
 
 
@@ -517,7 +521,12 @@ def close_single_position():
                 target.executor.cancel_conditional_by_side(symbol, "SHORT")
     except Exception as e:
         return redirect(url_for("follower_positions", notice=f"청산 실패: {str(e)[:80]}"))
-    return redirect(url_for("follower_positions", notice=f"{account_name} {symbol} {side} 청산 완료"))
+    msg = f"{account_name} {symbol} {side} 청산 완료"
+    try:
+        send_telegram(msg, allow_early=True)
+    except Exception:
+        pass
+    return redirect(url_for("follower_positions", notice=msg))
 
 
 def _coerce_bool(val: object) -> bool:

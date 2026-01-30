@@ -1139,6 +1139,8 @@ def _report_day_str(ts: float) -> str:
 def _get_trade_log(state: Dict[str, dict]) -> list:
     log = state.get("_trade_log")
     if not isinstance(log, list):
+        if isinstance(log, dict) and log:
+            state["_trade_log_backup"] = log
         log = []
         state["_trade_log"] = log
     return log
@@ -3705,7 +3707,7 @@ def _run_adv_trend_cycle(
     except Exception:
         hedge_mode = False
 
-    ltf_limit = max(ADV_TREND_EMA_LEN, 500)
+    ltf_limit = max(ADV_TREND_EMA_LEN, 672)
     htf_limit = max(ADV_TREND_EMA_LEN, 220)
 
     for symbol in adv_universe:
@@ -7311,6 +7313,7 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
         if LOG_LONG_EXIT:
             print(f"[long-exit] {symbol} position closed detected, canceling open orders")
         meta = tr.get("meta") or {}
+        engine_label = _engine_label_from_reason((meta or {}).get("reason"))
         try:
             cancel_conditional_by_side(symbol, "LONG")
         except Exception as e:
@@ -7368,7 +7371,6 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
             pnl_usdt=pnl,
             reason=exit_reason,
         )
-        engine_label = _engine_label_from_reason((meta or {}).get("reason"))
         if meta.get("sl_order_id") and engine_label == "SWAGGY":
             st = state.get(symbol, {})
             if isinstance(st, dict):
@@ -7856,6 +7858,45 @@ def _detect_position_events(state: dict, send_telegram) -> None:
             cancel_stop_orders(symbol)
             _record_position_event(symbol, side, "EXIT", source, prev_qty, prev_entry, mark, {"source": "pos_snapshot"})
             changed = True
+            if send_telegram:
+                entry_price = None
+                if isinstance(open_tr, dict):
+                    entry_price = open_tr.get("entry_price")
+                if not isinstance(entry_price, (int, float)):
+                    entry_price = prev_entry if isinstance(prev_entry, (int, float)) else None
+                exit_price = mark if isinstance(mark, (int, float)) else _fetch_last_price(symbol)
+                engine_label = managed_engine or "MANUAL"
+                exit_reason = "manual_close"
+                sl_price_meta = None
+                if isinstance(open_tr, dict):
+                    meta = open_tr.get("meta") or {}
+                    try:
+                        sl_price_meta = float(meta.get("sl_price"))
+                    except Exception:
+                        sl_price_meta = None
+                if isinstance(entry_price, (int, float)) and isinstance(exit_price, (int, float)) and entry_price > 0:
+                    if side == "LONG":
+                        profit_unlev = (float(exit_price) - float(entry_price)) / float(entry_price) * 100.0
+                    else:
+                        profit_unlev = (float(entry_price) - float(exit_price)) / float(entry_price) * 100.0
+                    tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, side)
+                    if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
+                        exit_reason = "auto_exit_tp"
+                    elif isinstance(sl_pct, (int, float)) and float(sl_pct) > 0 and profit_unlev <= -float(sl_pct):
+                        exit_reason = "auto_exit_sl"
+                    elif isinstance(sl_price_meta, (int, float)):
+                        if side == "LONG" and exit_price <= float(sl_price_meta):
+                            exit_reason = "auto_exit_sl"
+                        if side == "SHORT" and exit_price >= float(sl_price_meta):
+                            exit_reason = "auto_exit_sl"
+                exit_tag = "SL" if exit_reason == "auto_exit_sl" else "TP" if exit_reason == "auto_exit_tp" else "MANUAL"
+                icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
+                send_telegram(
+                    f"{icon} <b>{'롱' if side == 'LONG' else '숏'} 청산</b>\n"
+                    f"<b>{symbol}</b>\n"
+                    f"엔진: {_display_engine_label(engine_label)}\n"
+                    f"사유: {exit_tag}"
+                )
         if isinstance(snap, dict):
             if qty is not None:
                 snap[key] = {"qty": qty, "entry": avg_entry, "ts": now}
@@ -8191,7 +8232,7 @@ def _adv_partial_close(symbol: str, side: str, fraction: float) -> None:
 
 
 def _adv_latest_supertrend(symbol: str) -> Optional[tuple]:
-    df = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 500))
+    df = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 672))
     if df.empty or len(df) < ADV_TREND_SUPER_ATR_LEN + 5:
         return None
     try:
@@ -8358,7 +8399,7 @@ def _manage_adv_trend_positions(state: dict, send_telegram) -> None:
                         continue
                     atr_val = None
                     try:
-                        df_15m = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 500))
+                        df_15m = cycle_cache.get_df(symbol, "15m", limit=max(ADV_TREND_EMA_LEN, 672))
                         if not df_15m.empty:
                             atr_val = float(_adv_atr(df_15m, ADV_TREND_SUPER_ATR_LEN).iloc[-1])
                     except Exception:
@@ -12929,7 +12970,7 @@ def run():
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
                         mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_atlas_lab_v2_cfg.vp_lookback_1h))
                     if ADV_TREND_ENABLED:
-                        mid_plan["15m"] = max(mid_plan.get("15m", 0), 500)
+                        mid_plan["15m"] = max(mid_plan.get("15m", 0), 672)
                     if atlas_rs_fail_short_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
                     if atlas_cfg:

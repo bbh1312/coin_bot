@@ -343,17 +343,21 @@ def main() -> None:
     for symbol in symbols:
         rows_main = _fetch_ohlcv_all(exchange, symbol, args.tf_main, start_ms, end_ms)
         rows_trend = _fetch_ohlcv_all(exchange, symbol, args.tf_trend, start_ms, end_ms)
+        rows_exit = _fetch_ohlcv_all(exchange, symbol, "1m", start_ms, end_ms)
         df = _to_df(rows_main)
         df_trend = _to_df(rows_trend)
+        df_exit = _to_df(rows_exit)
         if df.empty or df_trend.empty:
             continue
         df = df.drop_duplicates("ts").reset_index(drop=True)
         df_trend = df_trend.drop_duplicates("ts").reset_index(drop=True)
+        df_exit = df_exit.drop_duplicates("ts").reset_index(drop=True)
 
         df_trend["ema200"] = _ema(df_trend["close"], 200)
         df_trend = df_trend[["ts", "ema200"]].dropna()
         df_trend = df_trend.sort_values("ts")
         df = df.sort_values("ts")
+        df_exit = df_exit.sort_values("ts")
         df = pd.merge_asof(df, df_trend, on="ts", direction="backward")
         df.rename(columns={"ema200": "ema200_trend"}, inplace=True)
 
@@ -376,6 +380,8 @@ def main() -> None:
         df["bb_lower"] = bb_mid - (bb_std * bb_dev)
 
         pos: Optional[Position] = None
+        exit_idx = 0
+        exit_ts_vals = df_exit["ts"].tolist() if not df_exit.empty else []
         for i in range(220, len(df)):
             row = df.iloc[i]
             ts = int(row["ts"])
@@ -403,34 +409,72 @@ def main() -> None:
                 low_now = float(row["low"])
                 pos.high_max = max(pos.high_max, high_now)
                 pos.low_min = min(pos.low_min, low_now)
-                if pos.side == "LONG":
-                    if st_line_val is not None:
-                        pos.stop_px = st_line_val
-                    if not pos.took_tp1 and close_px >= pos.tp1_px:
-                        pos.took_tp1 = True
-                        pos.stop_px = pos.entry_px
-                    if float(row["low"]) <= pos.stop_px:
-                        pos.exit_ts = ts
-                        pos.exit_px = pos.stop_px * (1.0 - float(args.slip_pct))
-                        pos.exit_reason = "SL"
-                    elif st_dir < 0:
-                        pos.exit_ts = ts
-                        pos.exit_px = close_px * (1.0 - float(args.slip_pct))
-                        pos.exit_reason = "ST_FLIP"
-                else:
-                    if st_line_val is not None:
-                        pos.stop_px = st_line_val
-                    if not pos.took_tp1 and close_px <= pos.tp1_px:
-                        pos.took_tp1 = True
-                        pos.stop_px = pos.entry_px
-                    if float(row["high"]) >= pos.stop_px:
-                        pos.exit_ts = ts
-                        pos.exit_px = pos.stop_px * (1.0 + float(args.slip_pct))
-                        pos.exit_reason = "SL"
-                    elif st_dir > 0:
-                        pos.exit_ts = ts
-                        pos.exit_px = close_px * (1.0 + float(args.slip_pct))
-                        pos.exit_reason = "ST_FLIP"
+
+                # 1m-based SL/TP checks within this 15m bar window
+                if not df_exit.empty and exit_ts_vals:
+                    prev_ts = int(df.iloc[i - 1]["ts"]) if i >= 1 else ts
+                    window_start = max(prev_ts, int(pos.entry_ts) if pos.entry_ts else prev_ts)
+                    while exit_idx < len(exit_ts_vals) and exit_ts_vals[exit_idx] <= window_start:
+                        exit_idx += 1
+                    while exit_idx < len(exit_ts_vals) and exit_ts_vals[exit_idx] <= ts:
+                        ex = df_exit.iloc[exit_idx]
+                        ex_high = float(ex["high"])
+                        ex_low = float(ex["low"])
+                        ex_close = float(ex["close"])
+                        ex_ts = int(ex["ts"])
+                        pos.high_max = max(pos.high_max, ex_high)
+                        pos.low_min = min(pos.low_min, ex_low)
+                        if pos.side == "LONG":
+                            if st_line_val is not None:
+                                pos.stop_px = st_line_val
+                            if ex_low <= pos.stop_px:
+                                pos.exit_ts = ex_ts
+                                pos.exit_px = pos.stop_px * (1.0 - float(args.slip_pct))
+                                pos.exit_reason = "SL"
+                                exit_idx += 1
+                                break
+                            if (not pos.took_tp1) and ex_high >= pos.tp1_px:
+                                pos.took_tp1 = True
+                                pos.stop_px = pos.entry_px
+                        else:
+                            if st_line_val is not None:
+                                pos.stop_px = st_line_val
+                            if ex_high >= pos.stop_px:
+                                pos.exit_ts = ex_ts
+                                pos.exit_px = pos.stop_px * (1.0 + float(args.slip_pct))
+                                pos.exit_reason = "SL"
+                                exit_idx += 1
+                                break
+                            if (not pos.took_tp1) and ex_low <= pos.tp1_px:
+                                pos.took_tp1 = True
+                                pos.stop_px = pos.entry_px
+                        exit_idx += 1
+
+                if pos.exit_ts is None:
+                    if pos.side == "LONG":
+                        if not pos.took_tp1 and close_px >= pos.tp1_px:
+                            pos.took_tp1 = True
+                            pos.stop_px = pos.entry_px
+                        if float(row["low"]) <= pos.stop_px:
+                            pos.exit_ts = ts
+                            pos.exit_px = pos.stop_px * (1.0 - float(args.slip_pct))
+                            pos.exit_reason = "SL"
+                        elif st_dir < 0:
+                            pos.exit_ts = ts
+                            pos.exit_px = close_px * (1.0 - float(args.slip_pct))
+                            pos.exit_reason = "ST_FLIP"
+                    else:
+                        if not pos.took_tp1 and close_px <= pos.tp1_px:
+                            pos.took_tp1 = True
+                            pos.stop_px = pos.entry_px
+                        if float(row["high"]) >= pos.stop_px:
+                            pos.exit_ts = ts
+                            pos.exit_px = pos.stop_px * (1.0 + float(args.slip_pct))
+                            pos.exit_reason = "SL"
+                        elif st_dir > 0:
+                            pos.exit_ts = ts
+                            pos.exit_px = close_px * (1.0 + float(args.slip_pct))
+                            pos.exit_reason = "ST_FLIP"
 
                 if pos.exit_ts is not None:
                     remaining_pnl = (
