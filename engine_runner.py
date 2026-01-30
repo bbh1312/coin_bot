@@ -20,6 +20,7 @@ import calendar
 import json
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 import builtins
 import sys
@@ -3787,11 +3788,14 @@ def _run_adv_trend_cycle(
             no_data += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-        if len(df_15m) < 20:
+        if len(df_15m) < 21:
             no_data += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-        signal = _adv_eval_15m(df_15m, df_4h)
+        # use only confirmed candles for signal (drop latest bar)
+        df_15m_sig = df_15m.iloc[:-1]
+        df_4h_sig = df_4h.iloc[:-1] if df_4h is not None and not df_4h.empty else df_4h
+        signal = _adv_eval_15m(df_15m_sig, df_4h_sig)
         if not signal:
             no_signal += 1
             time.sleep(PER_SYMBOL_SLEEP)
@@ -3807,7 +3811,7 @@ def _run_adv_trend_cycle(
         signal_ts = signal.get("ts")
         if len(sample_lines) < 3:
             try:
-                st_line_s, st_trend_s = _adv_supertrend(df_15m, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
+                st_line_s, st_trend_s = _adv_supertrend(df_15m_sig, ADV_TREND_SUPER_ATR_LEN, ADV_TREND_SUPER_MULT)
                 trend_dir_s = int(st_trend_s.iloc[-1])
                 bar_n = 1
                 for v in reversed(st_trend_s.iloc[:-1]):
@@ -3824,33 +3828,33 @@ def _run_adv_trend_cycle(
                     _append_adv_trend_log(f"ADV_TREND_SAMPLE_ERR sym={symbol} err={e}")
         rsi_series = None
         try:
-            rsi_series = _adv_rsi(df_15m["close"], 14)
+            rsi_series = _adv_rsi(df_15m_sig["close"], 14)
             rsi_val = float(rsi_series.iloc[-1])
         except Exception:
             rsi_series = None
             rsi_val = None
         try:
-            atr14 = float(_adv_atr(df_15m, 14).iloc[-1])
+            atr14 = float(_adv_atr(df_15m_sig, 14).iloc[-1])
         except Exception:
             atr14 = None
         try:
-            ema7 = float(ema(df_15m["close"], 7).iloc[-1])
-            ema20 = float(ema(df_15m["close"], 20).iloc[-1])
+            ema7 = float(ema(df_15m_sig["close"], 7).iloc[-1])
+            ema20 = float(ema(df_15m_sig["close"], 20).iloc[-1])
         except Exception:
             ema7 = None
             ema20 = None
         try:
-            open_px = float(df_15m["open"].iloc[-1])
-            high_px = float(df_15m["high"].iloc[-1])
-            vol_now = float(df_15m["volume"].iloc[-1])
-            vol_prev = float(df_15m["volume"].iloc[-2]) if len(df_15m) >= 2 else None
+            open_px = float(df_15m_sig["open"].iloc[-1])
+            high_px = float(df_15m_sig["high"].iloc[-1])
+            vol_now = float(df_15m_sig["volume"].iloc[-1])
+            vol_prev = float(df_15m_sig["volume"].iloc[-2]) if len(df_15m_sig) >= 2 else None
         except Exception:
             open_px = None
             high_px = None
             vol_now = None
             vol_prev = None
 
-        close_series = df_15m["close"].iloc[-20:]
+        close_series = df_15m_sig["close"].iloc[-20:]
         bb_mid = close_series.mean()
         bb_std = close_series.std(ddof=0)
         bb_upper = bb_mid + (2.0 * bb_std)
@@ -4130,8 +4134,158 @@ def _run_anti_alpha_cycle(
         hedge_mode = False
 
     ltf_limit = max(ANTI_ALPHA_EMA_LEN, 260)
-    for symbol in anti_universe:
+    min_len = max(ANTI_ALPHA_EMA_LEN, ANTI_ALPHA_RSI_LEN, ANTI_ALPHA_VOL_SMA_LEN) + ANTI_ALPHA_STREAK_N + 3
+
+    def _compute_signal(symbol: str) -> dict:
+        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+        if df_1m.empty:
+            return {"symbol": symbol, "status": "no_data"}
+        if len(df_1m) < min_len:
+            return {"symbol": symbol, "status": "no_data"}
+        df_sig = df_1m.iloc[:-1]
+        if df_sig.empty or len(df_sig) < min_len - 1:
+            return {"symbol": symbol, "status": "no_data"}
+
+        close_series = df_sig["close"]
+        ema200 = float(ema(close_series, ANTI_ALPHA_EMA_LEN).iloc[-1])
+        rsi_series = _adv_rsi(close_series, ANTI_ALPHA_RSI_LEN)
+        if len(rsi_series) < 2:
+            return {"symbol": symbol, "status": "no_data"}
+        rsi_val = float(rsi_series.iloc[-1])
+        rsi_prev = float(rsi_series.iloc[-2])
+        vol_sma = df_sig["volume"].rolling(ANTI_ALPHA_VOL_SMA_LEN).mean().iloc[-1]
+
+        row = df_sig.iloc[-1]
+        close_px = float(row["close"])
+        open_px = float(row["open"])
+        high_px = float(row["high"])
+        low_px = float(row["low"])
+        vol_now = float(row["volume"])
+        if close_px == ema200:
+            return {
+                "symbol": symbol,
+                "status": "no_signal",
+                "fails": ["ema_eq"],
+                "close": close_px,
+                "ema": ema200,
+                "rsi": rsi_val,
+                "rsi_prev": rsi_prev,
+                "vol": vol_now,
+                "vol_sma": float(vol_sma or 0.0),
+                "body": 0.0,
+                "ema_dist": 0.0,
+            }
+
+        up_streak = True
+        down_streak = True
+        for j in range(int(ANTI_ALPHA_STREAK_N)):
+            c = df_sig.iloc[-1 - j]
+            if float(c["close"]) <= float(c["open"]):
+                up_streak = False
+            if float(c["close"]) >= float(c["open"]):
+                down_streak = False
+
+        vol_spike = vol_now >= float(vol_sma or 0) * float(ANTI_ALPHA_VOL_SPIKE_MULT)
+        body_pct = abs(close_px - open_px) / close_px if close_px else 0.0
+        ema_dist = abs(close_px - ema200) / ema200 if ema200 else 0.0
+        if ema_dist < ANTI_ALPHA_EMA_DIST_MIN:
+            return {
+                "symbol": symbol,
+                "status": "no_signal",
+                "fails": ["ema_dist"],
+                "close": close_px,
+                "ema": ema200,
+                "rsi": rsi_val,
+                "rsi_prev": rsi_prev,
+                "vol": vol_now,
+                "vol_sma": float(vol_sma or 0.0),
+                "body": body_pct,
+                "ema_dist": ema_dist,
+                "up_streak": up_streak,
+                "down_streak": down_streak,
+            }
+
+        entry_side = None
+        fails = []
+        if close_px > ema200:
+            if not up_streak:
+                fails.append("streak")
+            if not vol_spike:
+                fails.append("vol_spike")
+            if not (rsi_val >= ANTI_ALPHA_SHORT_RSI_MIN):
+                fails.append("rsi")
+            if not (rsi_val >= rsi_prev):
+                fails.append("momentum")
+            if not (body_pct >= ANTI_ALPHA_BODY_PCT_MIN):
+                fails.append("body")
+            if not (close_px > float(df_sig["high"].iloc[-2])):
+                fails.append("break")
+            if (
+                rsi_val >= ANTI_ALPHA_SHORT_RSI_MIN
+                and up_streak
+                and vol_spike
+                and rsi_val >= rsi_prev
+                and close_px > float(df_sig["high"].iloc[-2])
+                and body_pct >= ANTI_ALPHA_BODY_PCT_MIN
+            ):
+                entry_side = "SHORT"
+        elif close_px < ema200:
+            if not down_streak:
+                fails.append("streak")
+            if not vol_spike:
+                fails.append("vol_spike")
+            if not (rsi_val <= ANTI_ALPHA_LONG_RSI_MAX):
+                fails.append("rsi")
+            if not (rsi_val <= rsi_prev):
+                fails.append("momentum")
+            if not (body_pct >= ANTI_ALPHA_BODY_PCT_MIN):
+                fails.append("body")
+            if not (close_px < float(df_sig["low"].iloc[-2])):
+                fails.append("break")
+            if (
+                rsi_val <= ANTI_ALPHA_LONG_RSI_MAX
+                and down_streak
+                and vol_spike
+                and rsi_val <= rsi_prev
+                and close_px < float(df_sig["low"].iloc[-2])
+                and body_pct >= ANTI_ALPHA_BODY_PCT_MIN
+            ):
+                entry_side = "LONG"
+
+        return {
+            "symbol": symbol,
+            "status": "ok",
+            "entry_side": entry_side,
+            "fails": fails,
+            "close": close_px,
+            "ema": ema200,
+            "rsi": rsi_val,
+            "rsi_prev": rsi_prev,
+            "vol": vol_now,
+            "vol_sma": float(vol_sma or 0.0),
+            "body": body_pct,
+            "ema_dist": ema_dist,
+            "up_streak": up_streak,
+            "down_streak": down_streak,
+            "vol_spike": vol_spike,
+        }
+
+    symbols = list(anti_universe or [])
+    results_map: Dict[str, dict] = {}
+    if symbols:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            future_map = {ex.submit(_compute_signal, sym): sym for sym in symbols}
+            for fut in as_completed(future_map):
+                try:
+                    res = fut.result()
+                except Exception:
+                    continue
+                if isinstance(res, dict) and res.get("symbol"):
+                    results_map[res["symbol"]] = res
+
+    for symbol in symbols:
         checked += 1
+        sig = results_map.get(symbol, {"status": "no_data"})
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
         if _both_sides_open(st) and not hedge_mode:
             time.sleep(PER_SYMBOL_SLEEP)
@@ -4161,116 +4315,33 @@ def _run_anti_alpha_cycle(
             )
             break
 
-        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
-        if df_1m.empty:
+        if sig.get("status") == "no_data":
             no_data += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
-        if len(df_1m) < max(ANTI_ALPHA_EMA_LEN, ANTI_ALPHA_RSI_LEN, ANTI_ALPHA_VOL_SMA_LEN) + ANTI_ALPHA_STREAK_N + 3:
-            no_data += 1
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        # use only confirmed candles: drop the latest (possibly still forming) bar
-        df_sig = df_1m.iloc[:-1]
-        close_series = df_sig["close"]
-        ema200 = float(ema(close_series, ANTI_ALPHA_EMA_LEN).iloc[-1])
-        rsi_series = _adv_rsi(close_series, ANTI_ALPHA_RSI_LEN)
-        rsi_val = float(rsi_series.iloc[-1])
-        rsi_prev = float(rsi_series.iloc[-2])
-        vol_sma = df_sig["volume"].rolling(ANTI_ALPHA_VOL_SMA_LEN).mean().iloc[-1]
-
-        row = df_sig.iloc[-1]
-        close_px = float(row["close"])
-        open_px = float(row["open"])
-        high_px = float(row["high"])
-        low_px = float(row["low"])
-        vol_now = float(row["volume"])
-        if close_px == ema200:
+        fails = sig.get("fails") or []
+        if sig.get("status") != "ok":
             no_signal += 1
+            if "ema_dist" in fails:
+                gate_stats["ema_dist"] += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
 
-        up_streak = True
-        down_streak = True
-        for j in range(int(ANTI_ALPHA_STREAK_N)):
-            c = df_sig.iloc[-1 - j]
-            if float(c["close"]) <= float(c["open"]):
-                up_streak = False
-            if float(c["close"]) >= float(c["open"]):
-                down_streak = False
-
-        vol_spike = vol_now >= float(vol_sma or 0) * float(ANTI_ALPHA_VOL_SPIKE_MULT)
-        body_pct = abs(close_px - open_px) / close_px if close_px else 0.0
-        ema_dist = abs(close_px - ema200) / ema200 if ema200 else 0.0
-        if ema_dist < ANTI_ALPHA_EMA_DIST_MIN:
-            gate_stats["ema_dist"] += 1
-            no_signal += 1
-            time.sleep(PER_SYMBOL_SLEEP)
-            continue
-
-        entry_side = None
-        fails = []
-        if close_px > ema200:
-            if not up_streak:
-                gate_stats["streak"] += 1
-                fails.append("streak")
-            if not vol_spike:
-                gate_stats["vol_spike"] += 1
-                fails.append("vol_spike")
-            if not (rsi_val >= ANTI_ALPHA_SHORT_RSI_MIN):
-                gate_stats["rsi"] += 1
-                fails.append("rsi")
-            if not (rsi_val >= rsi_prev):
-                gate_stats["momentum"] += 1
-                fails.append("momentum")
-            if not (body_pct >= ANTI_ALPHA_BODY_PCT_MIN):
-                gate_stats["body"] += 1
-                fails.append("body")
-            if not (close_px > float(df_sig["high"].iloc[-2])):
-                gate_stats["break"] += 1
-                fails.append("break")
-            if (
-                rsi_val >= ANTI_ALPHA_SHORT_RSI_MIN
-                and up_streak
-                and vol_spike
-                and rsi_val >= rsi_prev
-                and close_px > float(df_sig["high"].iloc[-2])
-                and body_pct >= ANTI_ALPHA_BODY_PCT_MIN
-            ):
-                entry_side = "SHORT"
-        elif close_px < ema200:
-            if not down_streak:
-                gate_stats["streak"] += 1
-                fails.append("streak")
-            if not vol_spike:
-                gate_stats["vol_spike"] += 1
-                fails.append("vol_spike")
-            if not (rsi_val <= ANTI_ALPHA_LONG_RSI_MAX):
-                gate_stats["rsi"] += 1
-                fails.append("rsi")
-            if not (rsi_val <= rsi_prev):
-                gate_stats["momentum"] += 1
-                fails.append("momentum")
-            if not (body_pct >= ANTI_ALPHA_BODY_PCT_MIN):
-                gate_stats["body"] += 1
-                fails.append("body")
-            if not (close_px < float(df_sig["low"].iloc[-2])):
-                gate_stats["break"] += 1
-                fails.append("break")
-            if (
-                rsi_val <= ANTI_ALPHA_LONG_RSI_MAX
-                and down_streak
-                and vol_spike
-                and rsi_val <= rsi_prev
-                and close_px < float(df_sig["low"].iloc[-2])
-                and body_pct >= ANTI_ALPHA_BODY_PCT_MIN
-            ):
-                entry_side = "LONG"
-
+        entry_side = sig.get("entry_side")
         if not entry_side:
+            for f in fails:
+                if f in gate_stats:
+                    gate_stats[f] += 1
             if debug_logged < 3:
                 debug_logged += 1
+                close_px = float(sig.get("close") or 0.0)
+                ema200 = float(sig.get("ema") or 0.0)
+                ema_dist = float(sig.get("ema_dist") or 0.0)
+                rsi_val = float(sig.get("rsi") or 0.0)
+                rsi_prev = float(sig.get("rsi_prev") or 0.0)
+                vol_now = float(sig.get("vol") or 0.0)
+                vol_sma = float(sig.get("vol_sma") or 0.0)
+                body_pct = float(sig.get("body") or 0.0)
                 regime = "above_ema" if close_px > ema200 else "below_ema"
                 _append_anti_alpha_log(
                     "ANTI_ALPHA_DEBUG sym=%s regime=%s close=%.6g ema=%.6g ema_dist=%.4f "
@@ -4284,7 +4355,7 @@ def _run_anti_alpha_cycle(
                         rsi_val,
                         rsi_prev,
                         vol_now,
-                        float(vol_sma or 0),
+                        vol_sma,
                         body_pct,
                         ",".join(fails) if fails else "none",
                     )
@@ -4292,6 +4363,18 @@ def _run_anti_alpha_cycle(
             no_signal += 1
             time.sleep(PER_SYMBOL_SLEEP)
             continue
+
+        close_px = float(sig.get("close") or 0.0)
+        ema200 = float(sig.get("ema") or 0.0)
+        ema_dist = float(sig.get("ema_dist") or 0.0)
+        rsi_val = float(sig.get("rsi") or 0.0)
+        rsi_prev = float(sig.get("rsi_prev") or 0.0)
+        vol_now = float(sig.get("vol") or 0.0)
+        vol_sma = float(sig.get("vol_sma") or 0.0)
+        body_pct = float(sig.get("body") or 0.0)
+        up_streak = bool(sig.get("up_streak"))
+        down_streak = bool(sig.get("down_streak"))
+        vol_spike = bool(sig.get("vol_spike"))
 
         base_side = entry_side
         # anti-alpha: invert the final decision (do not recompute signals by side)
@@ -4398,6 +4481,7 @@ def _run_noise_reverse_v1_cycle(
         "break": 0,
         "nan": 0,
     }
+    debug_logged = 0
 
     def _nr_skip(msg: str) -> None:
         nonlocal skips
@@ -4433,8 +4517,77 @@ def _run_noise_reverse_v1_cycle(
     ltf_limit = max(min_len + 5, 140)
 
     sleep_sec = 3.0
-    for symbol in noise_universe:
+    symbols = list(noise_universe or [])
+
+    def _compute_signal(symbol: str) -> dict:
+        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+        if df_1m.empty:
+            return {"symbol": symbol, "status": "no_data"}
+        if len(df_1m) < min_len:
+            return {"symbol": symbol, "status": "no_data"}
+        df_sig = df_1m.iloc[:-1]
+        if len(df_sig) < min_len - 1:
+            return {"symbol": symbol, "status": "no_data"}
+
+        ma20 = df_sig["close"].rolling(ma_len).mean()
+        vol_sma = df_sig["volume"].rolling(vol_len).mean()
+        hi100 = df_sig["high"].rolling(lookback).max().shift(1)
+        lo100 = df_sig["low"].rolling(lookback).min().shift(1)
+
+        row = df_sig.iloc[-1]
+        close_px = float(row["close"])
+        high_px = float(row["high"])
+        low_px = float(row["low"])
+        vol_now = float(row["volume"])
+        ma20_val = float(ma20.iloc[-1]) if pd.notna(ma20.iloc[-1]) else None
+        vol_sma_val = float(vol_sma.iloc[-1]) if pd.notna(vol_sma.iloc[-1]) else None
+        hi100_val = float(hi100.iloc[-1]) if pd.notna(hi100.iloc[-1]) else None
+        lo100_val = float(lo100.iloc[-1]) if pd.notna(lo100.iloc[-1]) else None
+
+        if (
+            not isinstance(ma20_val, (int, float))
+            or not isinstance(vol_sma_val, (int, float))
+            or not isinstance(hi100_val, (int, float))
+            or not isinstance(lo100_val, (int, float))
+        ):
+            return {"symbol": symbol, "status": "nan"}
+
+        vol_spike = vol_sma_val > 0 and vol_now >= vol_sma_val * float(NOISE_REVERSE_VOL_SPIKE_MULT)
+        entry_side = None
+        if vol_spike:
+            if high_px > hi100_val and close_px > ma20_val * (1.0 + float(NOISE_REVERSE_DISPARITY_PCT)):
+                entry_side = "LONG"
+            elif low_px < lo100_val and close_px < ma20_val * (1.0 - float(NOISE_REVERSE_DISPARITY_PCT)):
+                entry_side = "SHORT"
+
+        return {
+            "symbol": symbol,
+            "status": "ok",
+            "entry_side": entry_side,
+            "vol_spike": bool(vol_spike),
+            "close": close_px,
+            "ma20": ma20_val,
+            "hi100": hi100_val,
+            "lo100": lo100_val,
+            "vol_now": vol_now,
+            "vol_sma": vol_sma_val,
+        }
+
+    results_map: Dict[str, dict] = {}
+    if symbols:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            future_map = {ex.submit(_compute_signal, sym): sym for sym in symbols}
+            for fut in as_completed(future_map):
+                try:
+                    res = fut.result()
+                except Exception:
+                    continue
+                if isinstance(res, dict) and res.get("symbol"):
+                    results_map[res["symbol"]] = res
+
+    for symbol in symbols:
         checked += 1
+        sig = results_map.get(symbol, {"status": "no_data"})
         st = state.get(symbol, {"in_pos": False, "last_entry": 0})
         if _both_sides_open(st) and not hedge_mode:
             time.sleep(sleep_sec)
@@ -4463,61 +4616,49 @@ def _run_noise_reverse_v1_cycle(
             )
             break
 
-        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
-        if df_1m.empty:
+        if sig.get("status") == "no_data":
             no_data += 1
             time.sleep(sleep_sec)
             continue
-        if len(df_1m) < min_len:
-            no_data += 1
-            time.sleep(sleep_sec)
-            continue
-
-        # use confirmed candles only
-        df_sig = df_1m.iloc[:-1]
-        if len(df_sig) < min_len - 1:
-            no_data += 1
-            time.sleep(sleep_sec)
-            continue
-
-        ma20 = df_sig["close"].rolling(ma_len).mean()
-        vol_sma = df_sig["volume"].rolling(vol_len).mean()
-        hi100 = df_sig["high"].rolling(lookback).max().shift(1)
-        lo100 = df_sig["low"].rolling(lookback).min().shift(1)
-
-        row = df_sig.iloc[-1]
-        close_px = float(row["close"])
-        high_px = float(row["high"])
-        low_px = float(row["low"])
-        vol_now = float(row["volume"])
-        ma20_val = float(ma20.iloc[-1]) if pd.notna(ma20.iloc[-1]) else None
-        vol_sma_val = float(vol_sma.iloc[-1]) if pd.notna(vol_sma.iloc[-1]) else None
-        hi100_val = float(hi100.iloc[-1]) if pd.notna(hi100.iloc[-1]) else None
-        lo100_val = float(lo100.iloc[-1]) if pd.notna(lo100.iloc[-1]) else None
-
-        if (
-            not isinstance(ma20_val, (int, float))
-            or not isinstance(vol_sma_val, (int, float))
-            or not isinstance(hi100_val, (int, float))
-            or not isinstance(lo100_val, (int, float))
-        ):
+        if sig.get("status") == "nan":
             gate_stats["nan"] += 1
             no_signal += 1
             time.sleep(sleep_sec)
             continue
-
-        vol_spike = vol_sma_val > 0 and vol_now >= vol_sma_val * float(NOISE_REVERSE_VOL_SPIKE_MULT)
-        entry_side = None
-        if vol_spike:
-            if high_px > hi100_val and close_px > ma20_val * (1.0 + float(NOISE_REVERSE_DISPARITY_PCT)):
-                entry_side = "LONG"
-            elif low_px < lo100_val and close_px < ma20_val * (1.0 - float(NOISE_REVERSE_DISPARITY_PCT)):
-                entry_side = "SHORT"
-
-        if not vol_spike:
+        entry_side = sig.get("entry_side")
+        if not sig.get("vol_spike"):
             gate_stats["vol_spike"] += 1
         if entry_side is None:
             no_signal += 1
+            if debug_logged < 3:
+                debug_logged += 1
+                close_px = float(sig.get("close") or 0.0)
+                ma20_val = float(sig.get("ma20") or 0.0)
+                hi100_val = float(sig.get("hi100") or 0.0)
+                lo100_val = float(sig.get("lo100") or 0.0)
+                vol_now = float(sig.get("vol_now") or 0.0)
+                vol_sma_val = float(sig.get("vol_sma") or 0.0)
+                fail_parts = []
+                if not sig.get("vol_spike"):
+                    fail_parts.append("vol_spike")
+                if close_px >= ma20_val * (1.0 - float(NOISE_REVERSE_DISPARITY_PCT)) and close_px <= ma20_val * (1.0 + float(NOISE_REVERSE_DISPARITY_PCT)):
+                    fail_parts.append("disparity")
+                if not (float(sig.get("close") or 0.0) > 0 and (float(sig.get("hi100") or 0.0) > 0 or float(sig.get("lo100") or 0.0) > 0)):
+                    fail_parts.append("break")
+                _append_noise_reverse_log(
+                    "NOISE_REVERSE_DEBUG sym=%s close=%.6g ma20=%.6g hi100=%.6g lo100=%.6g "
+                    "vol=%.4g vol_ma=%.4g fails=%s"
+                    % (
+                        symbol,
+                        close_px,
+                        ma20_val,
+                        hi100_val,
+                        lo100_val,
+                        vol_now,
+                        vol_sma_val,
+                        ",".join(fail_parts) if fail_parts else "none",
+                    )
+                )
             time.sleep(sleep_sec)
             continue
 
@@ -4575,10 +4716,16 @@ def _run_noise_reverse_v1_cycle(
             time.sleep(sleep_sec)
             continue
 
+        close_px = float(sig.get("close") or 0.0)
+        ma20_val = float(sig.get("ma20") or 0.0)
+        hi100_val = float(sig.get("hi100") or 0.0)
+        lo100_val = float(sig.get("lo100") or 0.0)
+        vol_now = float(sig.get("vol_now") or 0.0)
+        vol_sma_val = float(sig.get("vol_sma") or 0.0)
         _append_noise_reverse_log(
             f"NOISE_REVERSE_ENTRY sym={symbol} side={entry_side} close={close_px:.6g} "
             f"ma20={ma20_val:.6g} hi100={hi100_val:.6g} lo100={lo100_val:.6g} "
-            f"vol={vol_now:.4g} vol_ma={vol_sma_val:.4g} spike={int(bool(vol_spike))}"
+            f"vol={vol_now:.4g} vol_ma={vol_sma_val:.4g} spike={int(bool(sig.get('vol_spike')))}"
         )
         if entry_side == "LONG":
             result["long_hits"] += 1
@@ -13370,7 +13517,7 @@ def run():
                     if not isinstance(shared_top_n, int):
                         shared_top_n = rsi_cfg.universe_top_n if rsi_cfg else 50
                     if isinstance(shared_top_n, int):
-                        shared_top_n = min(shared_top_n, 20)
+                        shared_top_n = min(shared_top_n, 30)
                     for s in symbols:
                         t = tickers.get(s)
                         if not t:
@@ -13403,8 +13550,8 @@ def run():
                         shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
                         if shared_top_n:
                             shared_universe = shared_universe[:shared_top_n]
-                    if isinstance(shared_universe, list) and len(shared_universe) > 20:
-                        shared_universe = shared_universe[:20]
+                    if isinstance(shared_universe, list) and len(shared_universe) > 30:
+                        shared_universe = shared_universe[:30]
                     state["_universe"] = list(shared_universe)
                     if rsi_engine:
                         ctx = EngineContext(
@@ -13492,8 +13639,8 @@ def run():
                         adv_candidates.sort(key=lambda x: x[1])  # low volatility first
                         low_vol = [sym for sym, _ in adv_candidates[:ADV_TREND_UNIVERSE_TOP_N]]
                         adv_trend_universe = list(dict.fromkeys(list(shared_universe) + low_vol))
-                        if len(adv_trend_universe) > 20:
-                            adv_trend_universe = adv_trend_universe[:20]
+                        if len(adv_trend_universe) > 30:
+                            adv_trend_universe = adv_trend_universe[:30]
                         state["_adv_trend_universe"] = adv_trend_universe
 
                         structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
@@ -13565,7 +13712,7 @@ def run():
                     swaggy_atlas_lab_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_ENABLED else 0
                     swaggy_atlas_lab_v2_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_V2_ENABLED else 0
                     adv_trend_universe_len = len(adv_trend_universe) if adv_trend_universe else 0
-                    noise_reverse_universe = adv_trend_universe[:20] if adv_trend_universe else []
+                    noise_reverse_universe = adv_trend_universe[:30] if adv_trend_universe else []
                     noise_reverse_universe_len = len(noise_reverse_universe)
                     dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
                     atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0

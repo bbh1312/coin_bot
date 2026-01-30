@@ -358,6 +358,7 @@ def main() -> None:
                             "mae_sum": 0.0,
                             "hold_sum": 0.0,
                             "max_loss_streak": 0,
+                            "pnl_sum": 0.0,
                         },
                     )
                     sym_stats["exits"] += 1
@@ -365,6 +366,7 @@ def main() -> None:
                     sym_stats["mfe_sum"] += float(trades[-1]["mfe"])
                     sym_stats["mae_sum"] += float(trades[-1]["mae"])
                     sym_stats["hold_sum"] += float(hold_bars)
+                    sym_stats["pnl_sum"] += float(pnl_usdt)
                     if pnl_usdt > 0:
                         sym_stats["wins"] += 1
                         loss_streak = 0
@@ -451,6 +453,7 @@ def main() -> None:
                     "mae_sum": 0.0,
                     "hold_sum": 0.0,
                     "max_loss_streak": 0,
+                    "pnl_sum": 0.0,
                 },
             )
             sym_stats["entries"] += 1
@@ -476,21 +479,30 @@ def main() -> None:
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=True, indent=2)
 
-    # Summary table per symbol
-    _bt_log("[RESULT] SYMBOL WINRATE AVG_HOLD TOTAL_TRADES MAX_CONSEC_LOSS")
     for sym, stats in stats_by_symbol.items():
         if stats["trades"] <= 0:
             continue
         winrate_sym = (stats["wins"] / max(1, stats["trades"])) * 100.0
         avg_hold = stats["hold_sum"] / max(1, stats["trades"])
+        avg_mfe = stats["mfe_sum"] / max(1, stats["trades"])
+        avg_mae = stats["mae_sum"] / max(1, stats["trades"])
         _bt_log(
-            "[RESULT] %s %.2f%% %.2f %d %d"
+            "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+            "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f net_sum=%.3f"
             % (
                 sym,
-                winrate_sym,
-                avg_hold,
+                stats["entries"],
+                stats["exits"],
                 stats["trades"],
-                stats["max_loss_streak"],
+                stats["wins"],
+                stats["losses"],
+                winrate_sym,
+                stats["tp"],
+                stats["sl"],
+                avg_mfe,
+                avg_mae,
+                avg_hold,
+                stats["pnl_sum"],
             )
         )
 
@@ -499,13 +511,16 @@ def main() -> None:
     total_trades = sum(s["trades"] for s in stats_by_symbol.values())
     total_wins = sum(s["wins"] for s in stats_by_symbol.values())
     total_losses = sum(s["losses"] for s in stats_by_symbol.values())
+    total_tp = sum(s["tp"] for s in stats_by_symbol.values())
+    total_sl = sum(s["sl"] for s in stats_by_symbol.values())
     total_winrate = (total_wins / max(1, total_trades)) * 100.0
     total_mfe = sum(s["mfe_sum"] for s in stats_by_symbol.values()) / max(1, total_trades)
     total_mae = sum(s["mae_sum"] for s in stats_by_symbol.values()) / max(1, total_trades)
     total_hold = sum(s["hold_sum"] for s in stats_by_symbol.values()) / max(1, total_trades)
-    max_loss_overall = max((s["max_loss_streak"] for s in stats_by_symbol.values()), default=0)
+    total_pnl = sum(s["pnl_sum"] for s in stats_by_symbol.values())
     _bt_log(
-        "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% avg_mfe=%.4f avg_mae=%.4f avg_hold=%.2f max_consec_loss=%d"
+        "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
+        "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f net_sum=%.3f"
         % (
             total_entries,
             total_exits,
@@ -513,10 +528,12 @@ def main() -> None:
             total_wins,
             total_losses,
             total_winrate,
+            total_tp,
+            total_sl,
             total_mfe,
             total_mae,
             total_hold,
-            max_loss_overall,
+            total_pnl,
         )
     )
 
