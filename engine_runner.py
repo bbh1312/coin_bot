@@ -4951,7 +4951,7 @@ def _exit_cooldown_blocked(
             _set_last_exit_state(st, side, float(db_ts), "db_exit")
             state[symbol] = st
             last_exit_ts = float(db_ts)
-    if MANAGE_WS_MODE:
+    if MANAGE_WS_MODE or (isinstance(state, dict) and state.get("_manage_ws_mode")):
         now_disk = time.time()
         cache = _DISK_STATE_CACHE
         data = cache.get("data") if isinstance(cache.get("data"), dict) else {}

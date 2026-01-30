@@ -29,6 +29,19 @@ def _utc_ms(dt: datetime) -> int:
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
+def _parse_utc_dt(text: str) -> Optional[datetime]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
 def _dt_kst(ts_ms: int) -> str:
     try:
         return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).astimezone(
@@ -170,6 +183,8 @@ class Position:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--start", default="", help="UTC start, format: YYYY-MM-DD or YYYY-MM-DD HH:MM")
+    parser.add_argument("--end", default="", help="UTC end, format: YYYY-MM-DD or YYYY-MM-DD HH:MM")
     parser.add_argument("--symbols", default="")
     parser.add_argument("--symbols-file", default="")
     parser.add_argument("--universe", default="top50")
@@ -241,8 +256,16 @@ def main() -> None:
         args.adv_top_n,
     )
 
-    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=args.days)
+    if args.start or args.end:
+        start_dt = _parse_utc_dt(args.start)
+        end_dt = _parse_utc_dt(args.end)
+        if end_dt is None:
+            end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        if start_dt is None:
+            start_dt = end_dt - timedelta(days=args.days)
+    else:
+        end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        start_dt = end_dt - timedelta(days=args.days)
     start_ms = _utc_ms(start_dt)
     end_ms = _utc_ms(end_dt)
 
