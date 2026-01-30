@@ -113,6 +113,9 @@ def _select_symbols(
     symbols_file: str,
     universe_arg: str,
     min_qv: float,
+    universe_mode: str,
+    adv_min_qv: float,
+    adv_top_n: int,
 ) -> List[str]:
     if symbols_file:
         with open(symbols_file, "r", encoding="utf-8") as f:
@@ -121,11 +124,34 @@ def _select_symbols(
         return [s.strip() for s in symbols_arg.split(",") if s.strip()]
     top_n = _parse_universe_arg(universe_arg) or 50
     tickers = exchange.fetch_tickers()
-    return build_universe_from_tickers(
+    anchors = ("BTC/USDT:USDT", "ETH/USDT:USDT")
+    shared_universe = build_universe_from_tickers(
         tickers,
         min_quote_volume_usdt=min_qv,
         top_n=top_n,
+        anchors=anchors,
     )
+    if (universe_mode or "").lower() != "adv_trend":
+        return shared_universe
+    adv_candidates = []
+    for sym, t in (tickers or {}).items():
+        if not isinstance(t, dict):
+            continue
+        pct = t.get("percentage")
+        qv = t.get("quoteVolume")
+        if pct is None or qv is None:
+            continue
+        try:
+            pct = float(pct)
+            qv = float(qv)
+        except Exception:
+            continue
+        if qv < float(adv_min_qv):
+            continue
+        adv_candidates.append((sym, abs(pct)))
+    adv_candidates.sort(key=lambda x: x[1])  # low volatility first
+    low_vol = [sym for sym, _ in adv_candidates[: int(adv_top_n)]]
+    return list(dict.fromkeys(list(shared_universe) + low_vol))
 
 
 @dataclass
@@ -148,6 +174,9 @@ def main() -> None:
     parser.add_argument("--symbols-file", default="")
     parser.add_argument("--universe", default="top50")
     parser.add_argument("--min-qv", type=float, default=30_000_000.0)
+    parser.add_argument("--universe-mode", default="adv_trend", choices=["adv_trend", "simple"])
+    parser.add_argument("--adv-min-qv", type=float, default=float(os.getenv("ADV_TREND_MIN_QV", "5000000")))
+    parser.add_argument("--adv-top-n", type=int, default=int(os.getenv("ADV_TREND_UNIVERSE_TOP_N", "30")))
     parser.add_argument("--initial-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-pct", type=float, default=1.0)
     parser.add_argument("--entry-base", default="equity", choices=["equity", "fixed"])
@@ -157,10 +186,10 @@ def main() -> None:
     parser.add_argument("--rsi-len", type=int, default=14)
     parser.add_argument("--vol-sma-len", type=int, default=20)
     parser.add_argument("--streak-n", type=int, default=2)
-    parser.add_argument("--vol-spike-mult", type=float, default=2.2)
+    parser.add_argument("--vol-spike-mult", type=float, default=1.5)
     parser.add_argument("--body-pct-min", type=float, default=0.008)
     parser.add_argument("--short-rsi-min", type=float, default=80.0)
-    parser.add_argument("--long-rsi-max", type=float, default=20.0)
+    parser.add_argument("--long-rsi-max", type=float, default=30.0)
     parser.add_argument("--ema-dist-min", type=float, default=0.003)
     parser.add_argument("--tp-pct", type=float, default=0.02)
     parser.add_argument("--sl-pct", type=float, default=0.02)
@@ -207,6 +236,9 @@ def main() -> None:
         args.symbols_file,
         args.universe,
         args.min_qv,
+        args.universe_mode,
+        args.adv_min_qv,
+        args.adv_top_n,
     )
 
     end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -232,7 +264,8 @@ def main() -> None:
         df["rsi14"] = _rsi(df["close"], int(args.rsi_len))
         df["vol_sma20"] = _vol_sma(df["volume"], int(args.vol_sma_len))
 
-        open_position: Optional[Position] = None
+        open_long: Optional[Position] = None
+        open_short: Optional[Position] = None
         cooldown_left = 0
 
         for i in range(max(args.streak_n, 1), len(df) - 1):
@@ -243,118 +276,125 @@ def main() -> None:
                 cooldown_left -= 1
                 continue
 
-            if open_position:
+            if open_long or open_short:
                 high_px = float(row["high"])
                 low_px = float(row["low"])
                 close_px = float(row["close"])
-                exit_reason = None
-                exit_px = None
-                if open_position.side == "LONG":
-                    open_position.max_favorable = max(open_position.max_favorable, (high_px - open_position.entry_px) / open_position.entry_px)
-                    open_position.max_adverse = max(open_position.max_adverse, (open_position.entry_px - low_px) / open_position.entry_px)
-                    sl_hit = low_px <= open_position.stop_px
-                    tp_hit = high_px >= open_position.tp_px
-                    if sl_hit:
-                        exit_reason = "SL"
-                        exit_px = open_position.stop_px
-                    elif tp_hit:
-                        exit_reason = "TP"
-                        exit_px = open_position.tp_px
-                else:
-                    open_position.max_favorable = max(open_position.max_favorable, (open_position.entry_px - low_px) / open_position.entry_px)
-                    open_position.max_adverse = max(open_position.max_adverse, (high_px - open_position.entry_px) / open_position.entry_px)
-                    sl_hit = high_px >= open_position.stop_px
-                    tp_hit = low_px <= open_position.tp_px
-                    if sl_hit:
-                        exit_reason = "SL"
-                        exit_px = open_position.stop_px
-                    elif tp_hit:
-                        exit_reason = "TP"
-                        exit_px = open_position.tp_px
-
-                hold_bars = i - open_position.entry_idx
-
-                if exit_reason:
-                    pnl_per_unit = (exit_px - open_position.entry_px) if open_position.side == "LONG" else (open_position.entry_px - exit_px)
-                    pnl_usdt = pnl_per_unit * open_position.size
-                    pnl_pct = pnl_per_unit / open_position.entry_px
-
-                    trades.append(
-                        {
-                            "symbol": symbol,
-                            "side": open_position.side,
-                            "entry_ts": open_position.entry_ts,
-                            "exit_ts": ts,
-                            "entry_px": open_position.entry_px,
-                            "exit_px": exit_px,
-                            "pnl_usdt": pnl_usdt,
-                            "pnl_pct": pnl_pct,
-                            "exit_reason": exit_reason,
-                            "hold_bars": hold_bars,
-                            "mfe": open_position.max_favorable,
-                            "mae": open_position.max_adverse,
-                        }
-                    )
-                    with open(trades_path, "a", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f)
-                        writer.writerow(
-                            [
-                                symbol,
-                                open_position.side,
-                                _dt_kst(open_position.entry_ts),
-                                _dt_kst(ts),
-                                open_position.entry_px,
-                                exit_px,
-                                pnl_usdt,
-                                pnl_pct,
-                                exit_reason,
-                                hold_bars,
-                                open_position.max_favorable,
-                                open_position.max_adverse,
-                            ]
-                        )
-
-                    sym_stats = stats_by_symbol.setdefault(
-                        symbol,
-                        {
-                            "entries": 0,
-                            "exits": 0,
-                            "trades": 0,
-                            "wins": 0,
-                            "losses": 0,
-                            "tp": 0,
-                            "sl": 0,
-                            "mfe_sum": 0.0,
-                            "mae_sum": 0.0,
-                            "hold_sum": 0.0,
-                        },
-                    )
-                    sym_stats["exits"] += 1
-                    sym_stats["trades"] += 1
-                    sym_stats["mfe_sum"] += float(open_position.max_favorable)
-                    sym_stats["mae_sum"] += float(open_position.max_adverse)
-                    sym_stats["hold_sum"] += float(hold_bars)
-                    if pnl_usdt > 0:
-                        sym_stats["wins"] += 1
+                for pos_side, pos in (("LONG", open_long), ("SHORT", open_short)):
+                    if not pos:
+                        continue
+                    exit_reason = None
+                    exit_px = None
+                    if pos.side == "LONG":
+                        pos.max_favorable = max(pos.max_favorable, (high_px - pos.entry_px) / pos.entry_px)
+                        pos.max_adverse = max(pos.max_adverse, (pos.entry_px - low_px) / pos.entry_px)
+                        sl_hit = low_px <= pos.stop_px
+                        tp_hit = high_px >= pos.tp_px
+                        if sl_hit:
+                            exit_reason = "SL"
+                            exit_px = pos.stop_px
+                        elif tp_hit:
+                            exit_reason = "TP"
+                            exit_px = pos.tp_px
                     else:
-                        sym_stats["losses"] += 1
-                    if exit_reason == "TP":
-                        sym_stats["tp"] += 1
-                    elif exit_reason == "SL":
-                        sym_stats["sl"] += 1
+                        pos.max_favorable = max(pos.max_favorable, (pos.entry_px - low_px) / pos.entry_px)
+                        pos.max_adverse = max(pos.max_adverse, (high_px - pos.entry_px) / pos.entry_px)
+                        sl_hit = high_px >= pos.stop_px
+                        tp_hit = low_px <= pos.tp_px
+                        if sl_hit:
+                            exit_reason = "SL"
+                            exit_px = pos.stop_px
+                        elif tp_hit:
+                            exit_reason = "TP"
+                            exit_px = pos.tp_px
 
-                    equity += pnl_usdt
-                    if args.entry_base == "equity":
-                        equity = max(0.0, equity)
+                    hold_bars = i - pos.entry_idx
 
-                    if args.verbose:
-                        _bt_log(
-                            "ANTI_EXIT sym=%s side=%s reason=%s pnl=%.4f"
-                            % (symbol, open_position.side, exit_reason, pnl_usdt)
+                    if exit_reason:
+                        pnl_per_unit = (exit_px - pos.entry_px) if pos.side == "LONG" else (pos.entry_px - exit_px)
+                        pnl_usdt = pnl_per_unit * pos.size
+                        pnl_pct = pnl_per_unit / pos.entry_px
+
+                        trades.append(
+                            {
+                                "symbol": symbol,
+                                "side": pos.side,
+                                "entry_ts": pos.entry_ts,
+                                "exit_ts": ts,
+                                "entry_px": pos.entry_px,
+                                "exit_px": exit_px,
+                                "pnl_usdt": pnl_usdt,
+                                "pnl_pct": pnl_pct,
+                                "exit_reason": exit_reason,
+                                "hold_bars": hold_bars,
+                                "mfe": pos.max_favorable,
+                                "mae": pos.max_adverse,
+                            }
                         )
-                    open_position = None
-                    cooldown_left = int(args.cooldown_bars)
-                continue
+                        with open(trades_path, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(
+                                [
+                                    symbol,
+                                    pos.side,
+                                    _dt_kst(pos.entry_ts),
+                                    _dt_kst(ts),
+                                    pos.entry_px,
+                                    exit_px,
+                                    pnl_usdt,
+                                    pnl_pct,
+                                    exit_reason,
+                                    hold_bars,
+                                    pos.max_favorable,
+                                    pos.max_adverse,
+                                ]
+                            )
+
+                        sym_stats = stats_by_symbol.setdefault(
+                            symbol,
+                            {
+                                "entries": 0,
+                                "exits": 0,
+                                "trades": 0,
+                                "wins": 0,
+                                "losses": 0,
+                                "tp": 0,
+                                "sl": 0,
+                                "mfe_sum": 0.0,
+                                "mae_sum": 0.0,
+                                "hold_sum": 0.0,
+                            },
+                        )
+                        sym_stats["exits"] += 1
+                        sym_stats["trades"] += 1
+                        sym_stats["mfe_sum"] += float(pos.max_favorable)
+                        sym_stats["mae_sum"] += float(pos.max_adverse)
+                        sym_stats["hold_sum"] += float(hold_bars)
+                        if pnl_usdt > 0:
+                            sym_stats["wins"] += 1
+                        else:
+                            sym_stats["losses"] += 1
+                        if exit_reason == "TP":
+                            sym_stats["tp"] += 1
+                        elif exit_reason == "SL":
+                            sym_stats["sl"] += 1
+
+                        equity += pnl_usdt
+                        if args.entry_base == "equity":
+                            equity = max(0.0, equity)
+
+                        if args.verbose:
+                            _bt_log(
+                                "ANTI_EXIT sym=%s side=%s reason=%s pnl=%.4f"
+                                % (symbol, pos.side, exit_reason, pnl_usdt)
+                            )
+                        if pos_side == "LONG":
+                            open_long = None
+                        else:
+                            open_short = None
+                        cooldown_left = int(args.cooldown_bars)
+                if open_long or open_short:
+                    continue
 
             ema20 = float(row["ema20"]) if pd.notna(row["ema20"]) else None
             rsi14 = float(row["rsi14"]) if pd.notna(row["rsi14"]) else None
@@ -428,6 +468,11 @@ def main() -> None:
                 entry_side = "SHORT" if base_side == "LONG" else "LONG"
             else:
                 entry_side = base_side
+
+            if entry_side == "LONG" and open_long:
+                continue
+            if entry_side == "SHORT" and open_short:
+                continue
             if args.slip_pct:
                 if entry_side == "LONG":
                     entry_px *= 1.0 + float(args.slip_pct)
@@ -454,6 +499,10 @@ def main() -> None:
                 tp_px=tp_px,
                 size=size,
             )
+            if entry_side == "LONG":
+                open_long = open_position
+            else:
+                open_short = open_position
 
             sym_stats = stats_by_symbol.setdefault(
                 symbol,
@@ -475,8 +524,10 @@ def main() -> None:
             if args.verbose:
                 _bt_log("ANTI_ENTRY sym=%s side=%s entry=%.6g sl=%.6g tp=%.6g" % (symbol, entry_side, entry_px, sl_px, tp_px))
 
-        if open_position:
-            open_position = None
+        if open_long:
+            open_long = None
+        if open_short:
+            open_short = None
 
     wins = sum(1 for t in trades if t["pnl_pct"] > 0)
     losses = sum(1 for t in trades if t["pnl_pct"] <= 0)

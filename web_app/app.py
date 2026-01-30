@@ -32,10 +32,12 @@ from engine_runner import (
     MAX_OPEN_POSITIONS,
     USDT_PER_TRADE,
     BASE_ENTRY_USDT,
+    REALTIME_ONLY_ENABLED,
     SWAGGY_ATLAS_LAB_ENABLED,
     SWAGGY_ATLAS_LAB_V2_ENABLED,
     SWAGGY_NO_ATLAS_ENABLED,
     ADV_TREND_ENABLED,
+    ANTI_ALPHA_V1_ENABLED,
     SWAGGY_ATLAS_LAB_OFF_WINDOWS,
     SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS,
     SWAGGY_NO_ATLAS_OFF_WINDOWS,
@@ -88,10 +90,12 @@ COMMAND_DEFS = [
     {"cmd": "/long_live", "key": "_long_live", "label": "Live Longs", "type": "toggle"},
     {"cmd": "/auto_exit", "key": "_auto_exit", "label": "Auto Exit", "type": "toggle"},
     {"cmd": "/sat_trade", "key": "_sat_trade", "label": "토요일 진입", "type": "toggle"},
+    {"cmd": "/realtime_only", "key": "_realtime_only", "label": "Realtime Only (헤비스캔 OFF)", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
     {"cmd": "/swaggy_no_atlas", "key": "_swaggy_no_atlas_enabled", "label": "Swaggy No Atlas", "type": "toggle"},
     {"cmd": "/adv_trend", "key": "_adv_trend_enabled", "label": "Triple-Check Engine", "type": "toggle"},
+    {"cmd": "/anti_alpha_v1", "key": "_anti_alpha_v1_enabled", "label": "Anti Alpha V1", "type": "toggle"},
     {"cmd": "/loss_hedge_engine", "key": "_loss_hedge_engine_enabled", "label": "손실방지엔진", "type": "toggle"},
     {"cmd": "/loss_hedge_interval", "key": "_loss_hedge_interval_min", "label": "손실방지 체크 주기(분)", "type": "int", "step": 1},
     {"cmd": "/swaggy_atlas_lab_off", "key": "_swaggy_atlas_lab_off_windows", "label": "Swaggy Lab Off Windows", "type": "text"},
@@ -244,12 +248,14 @@ DEFAULTS = {
     "_long_live": LONG_LIVE_TRADING,
     "_auto_exit": AUTO_EXIT_ENABLED,
     "_sat_trade": SATURDAY_TRADE_ENABLED,
+    "_realtime_only": REALTIME_ONLY_ENABLED,
     "_max_open_positions": MAX_OPEN_POSITIONS,
     "_entry_usdt": USDT_PER_TRADE,
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
     "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
     "_swaggy_no_atlas_enabled": SWAGGY_NO_ATLAS_ENABLED,
     "_adv_trend_enabled": ADV_TREND_ENABLED,
+    "_anti_alpha_v1_enabled": ANTI_ALPHA_V1_ENABLED,
     "_loss_hedge_engine_enabled": LOSS_HEDGE_ENGINE_ENABLED,
     "_loss_hedge_interval_min": 15,
     "_swaggy_atlas_lab_off_windows": SWAGGY_ATLAS_LAB_OFF_WINDOWS,
@@ -803,6 +809,11 @@ def _list_accounts() -> list[dict]:
     accounts_db.ensure_default_account("admin")
     return accounts_db.list_active_accounts()
 
+
+def _list_accounts_all() -> list[dict]:
+    accounts_db.ensure_default_account("admin")
+    return accounts_db.list_all_accounts()
+
 def parse_toggle(cmd: str, arg: str | None) -> tuple[str | None, bool | None]:
     item = COMMANDS_BY_CMD.get(cmd)
     if not item or item.get("type") != "toggle":
@@ -973,7 +984,7 @@ def status():
     pnl_today_payload = []
     pnl_start_ts = _kst_today_start_ts()
     pnl_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_start_ts + 9 * 3600))
-    for acct in _list_accounts():
+    for acct in _list_accounts_all():
         account_id = int(acct["id"])
         settings = _load_account_settings(account_id)
         state_path = _state_path_for_account(acct)
@@ -1006,6 +1017,7 @@ def status():
                 "entry_usdt_available": entry_usdt_available,
                 "admin_follow_enabled": bool(admin_follow_enabled),
                 "manual_entry_enabled": bool(manual_entry_enabled),
+                "is_active": bool(acct.get("is_active", 1)),
             }
         )
         pnl_today_payload.append(
@@ -1016,6 +1028,7 @@ def status():
                 "trades": pnl_trades,
                 "error": pnl_err,
                 "date": pnl_date_kst,
+                "is_active": bool(acct.get("is_active", 1)),
             }
         )
     payload["accounts"] = accounts_payload
@@ -1150,7 +1163,7 @@ def command():
 def admin_accounts():
     if request.method == "GET":
         items = []
-        for acct in _list_accounts():
+        for acct in _list_accounts_all():
             account_id = int(acct["id"])
             state_path = _state_path_for_account(acct)
             acct_state = load_state_from(state_path)
@@ -1175,12 +1188,17 @@ def admin_accounts():
     if account_id is None:
         return jsonify({"status": "missing account_id"}), 400
     account_id = int(account_id)
-    accounts = {int(a["id"]): a for a in _list_accounts()}
+    accounts = {int(a["id"]): a for a in _list_accounts_all()}
     acct = accounts.get(account_id)
     if not acct:
         return jsonify({"status": "unknown account", "account_id": account_id}), 404
     state_path = _state_path_for_account(acct)
     acct_state = load_state_from(state_path)
+    if "is_active" in payload:
+        try:
+            accounts_db.update_account_active(account_id, bool(payload.get("is_active")))
+        except Exception:
+            pass
     if "admin_follow_enabled" in payload:
         acct_state["_admin_follow_enabled"] = bool(payload.get("admin_follow_enabled"))
     if "manual_entry_enabled" in payload:

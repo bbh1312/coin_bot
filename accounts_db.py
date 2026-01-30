@@ -238,6 +238,23 @@ def update_account_setting(account_id: int, key: str, value: Any) -> bool:
         conn.close()
 
 
+def update_account_active(account_id: int, is_active: bool) -> bool:
+    init_db()
+    if not account_id:
+        return False
+    conn = _connect()
+    try:
+        now = _now_str()
+        cur = conn.execute(
+            "UPDATE accounts SET is_active = ?, updated_at = ? WHERE id = ?",
+            (1 if is_active else 0, now, account_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def get_telegram_bot(account_id: int) -> Dict[str, Any]:
     init_db()
     conn = _connect()

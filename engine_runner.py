@@ -519,11 +519,15 @@ def _consume_entry_broadcast_line(symbol: str, side: str) -> Optional[str]:
 
 def _realtime_only_required() -> bool:
     # realtime-only에서 의미 있는 엔진들만 체크
+    if REALTIME_ONLY_ENABLED:
+        return True
     if LOSS_HEDGE_ENGINE_ENABLED:
         return True
     if RSI_ENABLED:
         return True
     if DTFX_ENABLED:
+        return True
+    if ANTI_ALPHA_V1_ENABLED:
         return True
     if DIV15M_LONG_ENABLED or DIV15M_SHORT_ENABLED or ONLY_DIV15M_SHORT:
         return True
@@ -872,6 +876,17 @@ ADV_TREND_PULLBACK_RSI_LONG = float(os.getenv("ADV_TREND_PULLBACK_RSI_LONG", "45
 ADV_TREND_PULLBACK_RSI_SHORT = float(os.getenv("ADV_TREND_PULLBACK_RSI_SHORT", "55"))
 ADV_TREND_PULLBACK_WAIT_BARS = int(os.getenv("ADV_TREND_PULLBACK_WAIT_BARS", "4"))
 ADV_TREND_PULLBACK_PIVOT = int(os.getenv("ADV_TREND_PULLBACK_PIVOT", "3"))
+
+ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
+ANTI_ALPHA_EMA_LEN = int(os.getenv("ANTI_ALPHA_EMA_LEN", "200"))
+ANTI_ALPHA_RSI_LEN = int(os.getenv("ANTI_ALPHA_RSI_LEN", "14"))
+ANTI_ALPHA_VOL_SMA_LEN = int(os.getenv("ANTI_ALPHA_VOL_SMA_LEN", "20"))
+ANTI_ALPHA_STREAK_N = int(os.getenv("ANTI_ALPHA_STREAK_N", "2"))
+ANTI_ALPHA_VOL_SPIKE_MULT = float(os.getenv("ANTI_ALPHA_VOL_SPIKE_MULT", "1.5"))
+ANTI_ALPHA_SHORT_RSI_MIN = float(os.getenv("ANTI_ALPHA_SHORT_RSI_MIN", "80"))
+ANTI_ALPHA_LONG_RSI_MAX = float(os.getenv("ANTI_ALPHA_LONG_RSI_MAX", "30"))
+ANTI_ALPHA_EMA_DIST_MIN = float(os.getenv("ANTI_ALPHA_EMA_DIST_MIN", "0.003"))
+ANTI_ALPHA_BODY_PCT_MIN = float(os.getenv("ANTI_ALPHA_BODY_PCT_MIN", "0.008"))
 LOSS_HEDGE_ENGINE_ENABLED = False
 LOSS_HEDGE_INTERVAL_MIN = 15
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
@@ -930,7 +945,8 @@ FUNDING_TTL_SEC = 300
 STRUCTURE_TOP_N = 30
 PER_SYMBOL_SLEEP = 0.05
 CYCLE_SLEEP = float(os.getenv("CYCLE_SLEEP", "1.0"))
-REALTIME_CYCLE_SLEEP = float(os.getenv("REALTIME_CYCLE_SLEEP", "300"))
+REALTIME_CYCLE_SLEEP = float(os.getenv("REALTIME_CYCLE_SLEEP", "60"))
+REALTIME_ONLY_ENABLED = os.getenv("REALTIME_ONLY_ENABLED", "0") == "1"
 CURRENT_CYCLE_STATS: Dict[str, dict] = {}
 FUNDING_TTL_CACHE: Dict[str, tuple] = {}
 TF_TTL_SECS = {"3m": 60, "5m": 120, "15m": 240, "1h": 300}
@@ -1844,6 +1860,12 @@ def _append_adv_trend_log(line: str) -> None:
     date_tag = time.strftime("%Y-%m-%d")
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("advanced_trend_follower", f"advanced_trend_follower-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
+def _append_anti_alpha_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("anti_alpha_v1", f"anti_alpha_v1-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
 def _iso_kst(ts: Optional[float] = None) -> str:
@@ -4042,6 +4064,305 @@ def _run_adv_trend_cycle(
     )
     return result
 
+def _run_anti_alpha_cycle(
+    anti_universe,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"long_hits": 0, "short_hits": 0}
+    if not ANTI_ALPHA_V1_ENABLED or not anti_universe:
+        return result
+    start_ts = time.time()
+    checked = 0
+    entries = 0
+    skips = 0
+    no_signal = 0
+    no_data = 0
+    gate_stats = {
+        "ema_dist": 0,
+        "streak": 0,
+        "vol_spike": 0,
+        "rsi": 0,
+        "momentum": 0,
+        "body": 0,
+        "break": 0,
+    }
+    debug_logged = 0
+    def _aa_skip(msg: str) -> None:
+        nonlocal skips
+        skips += 1
+        _append_anti_alpha_log(msg)
+    _append_anti_alpha_log(
+        f"ANTI_ALPHA_CYCLE_START cycle_id={cycle_id} universe={len(anti_universe)}"
+    )
+    try:
+        refresh_positions_cache(force=True)
+    except Exception:
+        pass
+    open_total = count_open_positions(force=True)
+    if not isinstance(open_total, int):
+        open_total = _count_open_positions_state(state)
+
+    now_ts = time.time()
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        _aa_skip("ANTI_ALPHA_SKIP reason=SATURDAY_OFF")
+        return result
+
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
+
+    ltf_limit = max(ANTI_ALPHA_EMA_LEN, 260)
+    for symbol in anti_universe:
+        checked += 1
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if _both_sides_open(st) and not hedge_mode:
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        try:
+            long_amt = get_long_position_amount(symbol)
+        except Exception:
+            long_amt = 0.0
+        try:
+            short_amt = get_short_position_amount(symbol)
+        except Exception:
+            short_amt = 0.0
+        # track in-pos state, but do not block both sides here
+        st["in_pos_long"] = bool(long_amt > 0)
+        st["in_pos_short"] = bool(short_amt > 0)
+        st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
+        now_seen = time.time()
+        if long_amt > 0:
+            _set_last_entry_state(st, "LONG", now_seen)
+        if short_amt > 0:
+            _set_last_entry_state(st, "SHORT", now_seen)
+        state[symbol] = st
+
+        if isinstance(open_total, int) and open_total >= MAX_OPEN_POSITIONS:
+            _aa_skip(
+                f"ANTI_ALPHA_SKIP sym={symbol} reason=MAX_POS open={open_total} max={MAX_OPEN_POSITIONS}"
+            )
+            break
+
+        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+        if df_1m.empty:
+            no_data += 1
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if len(df_1m) < max(ANTI_ALPHA_EMA_LEN, ANTI_ALPHA_RSI_LEN, ANTI_ALPHA_VOL_SMA_LEN) + ANTI_ALPHA_STREAK_N + 3:
+            no_data += 1
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        # use only confirmed candles: drop the latest (possibly still forming) bar
+        df_sig = df_1m.iloc[:-1]
+        close_series = df_sig["close"]
+        ema200 = float(ema(close_series, ANTI_ALPHA_EMA_LEN).iloc[-1])
+        rsi_series = _adv_rsi(close_series, ANTI_ALPHA_RSI_LEN)
+        rsi_val = float(rsi_series.iloc[-1])
+        rsi_prev = float(rsi_series.iloc[-2])
+        vol_sma = df_sig["volume"].rolling(ANTI_ALPHA_VOL_SMA_LEN).mean().iloc[-1]
+
+        row = df_sig.iloc[-1]
+        close_px = float(row["close"])
+        open_px = float(row["open"])
+        high_px = float(row["high"])
+        low_px = float(row["low"])
+        vol_now = float(row["volume"])
+        if close_px == ema200:
+            no_signal += 1
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        up_streak = True
+        down_streak = True
+        for j in range(int(ANTI_ALPHA_STREAK_N)):
+            c = df_sig.iloc[-1 - j]
+            if float(c["close"]) <= float(c["open"]):
+                up_streak = False
+            if float(c["close"]) >= float(c["open"]):
+                down_streak = False
+
+        vol_spike = vol_now >= float(vol_sma or 0) * float(ANTI_ALPHA_VOL_SPIKE_MULT)
+        body_pct = abs(close_px - open_px) / close_px if close_px else 0.0
+        ema_dist = abs(close_px - ema200) / ema200 if ema200 else 0.0
+        if ema_dist < ANTI_ALPHA_EMA_DIST_MIN:
+            gate_stats["ema_dist"] += 1
+            no_signal += 1
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        entry_side = None
+        fails = []
+        if close_px > ema200:
+            if not up_streak:
+                gate_stats["streak"] += 1
+                fails.append("streak")
+            if not vol_spike:
+                gate_stats["vol_spike"] += 1
+                fails.append("vol_spike")
+            if not (rsi_val >= ANTI_ALPHA_SHORT_RSI_MIN):
+                gate_stats["rsi"] += 1
+                fails.append("rsi")
+            if not (rsi_val >= rsi_prev):
+                gate_stats["momentum"] += 1
+                fails.append("momentum")
+            if not (body_pct >= ANTI_ALPHA_BODY_PCT_MIN):
+                gate_stats["body"] += 1
+                fails.append("body")
+            if not (close_px > float(df_sig["high"].iloc[-2])):
+                gate_stats["break"] += 1
+                fails.append("break")
+            if (
+                rsi_val >= ANTI_ALPHA_SHORT_RSI_MIN
+                and up_streak
+                and vol_spike
+                and rsi_val >= rsi_prev
+                and close_px > float(df_sig["high"].iloc[-2])
+                and body_pct >= ANTI_ALPHA_BODY_PCT_MIN
+            ):
+                entry_side = "SHORT"
+        elif close_px < ema200:
+            if not down_streak:
+                gate_stats["streak"] += 1
+                fails.append("streak")
+            if not vol_spike:
+                gate_stats["vol_spike"] += 1
+                fails.append("vol_spike")
+            if not (rsi_val <= ANTI_ALPHA_LONG_RSI_MAX):
+                gate_stats["rsi"] += 1
+                fails.append("rsi")
+            if not (rsi_val <= rsi_prev):
+                gate_stats["momentum"] += 1
+                fails.append("momentum")
+            if not (body_pct >= ANTI_ALPHA_BODY_PCT_MIN):
+                gate_stats["body"] += 1
+                fails.append("body")
+            if not (close_px < float(df_sig["low"].iloc[-2])):
+                gate_stats["break"] += 1
+                fails.append("break")
+            if (
+                rsi_val <= ANTI_ALPHA_LONG_RSI_MAX
+                and down_streak
+                and vol_spike
+                and rsi_val <= rsi_prev
+                and close_px < float(df_sig["low"].iloc[-2])
+                and body_pct >= ANTI_ALPHA_BODY_PCT_MIN
+            ):
+                entry_side = "LONG"
+
+        if not entry_side:
+            if debug_logged < 3:
+                debug_logged += 1
+                regime = "above_ema" if close_px > ema200 else "below_ema"
+                _append_anti_alpha_log(
+                    "ANTI_ALPHA_DEBUG sym=%s regime=%s close=%.6g ema=%.6g ema_dist=%.4f "
+                    "rsi=%.2f prev=%.2f vol=%.4g vol_ma=%.4g body=%.4f fails=%s"
+                    % (
+                        symbol,
+                        regime,
+                        close_px,
+                        ema200,
+                        ema_dist,
+                        rsi_val,
+                        rsi_prev,
+                        vol_now,
+                        float(vol_sma or 0),
+                        body_pct,
+                        ",".join(fails) if fails else "none",
+                    )
+                )
+            no_signal += 1
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        base_side = entry_side
+        # anti-alpha: invert the final decision (do not recompute signals by side)
+        entry_side = "SHORT" if entry_side == "LONG" else "LONG"
+
+        # allow opposite side; block only if already in same side
+        if entry_side == "LONG" and long_amt > 0:
+            _aa_skip(f"ANTI_ALPHA_SKIP sym={symbol} reason=ALREADY_IN_POSITION side={entry_side}")
+            _append_entry_gate_log("anti_alpha_v1", symbol, "already_in_position", side=entry_side)
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        if entry_side == "SHORT" and short_amt > 0:
+            _aa_skip(f"ANTI_ALPHA_SKIP sym={symbol} reason=ALREADY_IN_POSITION side={entry_side}")
+            _append_entry_gate_log("anti_alpha_v1", symbol, "already_in_position", side=entry_side)
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        if _exit_cooldown_blocked(state, symbol, "anti_alpha_v1", entry_side):
+            _aa_skip(f"ANTI_ALPHA_SKIP sym={symbol} reason=EXIT_COOLDOWN side={entry_side}")
+            _append_entry_gate_log("anti_alpha_v1", symbol, "exit_cooldown", side=entry_side)
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+        # block duplicate entry by symbol+side
+        if not _entry_guard_acquire(
+            state,
+            symbol,
+            ttl_sec=5.0,
+            key=f"anti_alpha_v1:{symbol}:{entry_side}",
+            engine="anti_alpha_v1",
+            side=entry_side,
+        ):
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        usdt = _resolve_entry_usdt()
+        if usdt <= 0:
+            _aa_skip(f"ANTI_ALPHA_SKIP sym={symbol} reason=NO_BALANCE side={entry_side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        if not _admin_is_active():
+            _aa_skip(f"ANTI_ALPHA_SKIP sym={symbol} reason=ADMIN_INACTIVE side={entry_side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        req_id = _enqueue_entry_request(
+            state,
+            symbol=symbol,
+            side=entry_side,
+            engine="ANTI_ALPHA_V1",
+            reason="anti_alpha_v1",
+            usdt=usdt,
+            live=(LONG_LIVE_TRADING if entry_side == "LONG" else LIVE_TRADING),
+            alert_reason="anti_alpha_v1",
+        )
+        if not req_id:
+            _aa_skip(f"ANTI_ALPHA_ENTRY_FAIL sym={symbol} side={entry_side}")
+            time.sleep(PER_SYMBOL_SLEEP)
+            continue
+
+        _append_anti_alpha_log(
+            f"ANTI_ALPHA_ENTRY sym={symbol} side={entry_side} base={base_side} close={close_px:.6g} ema200={ema200:.6g} "
+            f"ema_dist={ema_dist:.4f} rsi={rsi_val:.2f} prev={rsi_prev:.2f} "
+            f"vol={vol_now:.4g} vol_ma={float(vol_sma or 0):.4g} vol_spike={int(bool(vol_spike))} "
+            f"streak_up={int(bool(up_streak))} streak_down={int(bool(down_streak))} "
+            f"break={int(bool(close_px > float(df_1m['high'].iloc[-2]) if close_px > ema200 else close_px < float(df_1m['low'].iloc[-2])))} "
+            f"body={body_pct:.4f}"
+        )
+        if entry_side == "LONG":
+            result["long_hits"] += 1
+        else:
+            result["short_hits"] += 1
+        entries += 1
+        time.sleep(PER_SYMBOL_SLEEP)
+
+    elapsed = time.time() - start_ts
+    _append_anti_alpha_log(
+        f"ANTI_ALPHA_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={entries} "
+        f"skips={skips} no_signal={no_signal} no_data={no_data}"
+    )
+    _append_anti_alpha_log(
+        "ANTI_ALPHA_GATES " + " ".join([f"{k}={v}" for k, v in gate_stats.items()])
+    )
+    return result
+
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
     cycle_ts = state.get("_current_cycle_ts")
     side = (side or "").upper()
@@ -4892,6 +5213,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "관리자수동진입"
     if key in ("advanced_trend_follower", "adv_trend"):
         return "ADVANCED_TREND_FOLLOWER"
+    if key in ("anti_alpha_v1", "anti_alpha"):
+        return "ANTI_ALPHA_V1"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -4918,6 +5241,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "manual_entry"
     if label == "ADVANCED_TREND_FOLLOWER":
         return "advanced_trend_follower"
+    if label == "ANTI_ALPHA_V1":
+        return "anti_alpha_v1"
     return None
 
 def _display_engine_label(label: Optional[str]) -> str:
@@ -4929,6 +5254,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "SWAGGY_NO_ATLAS": "스웨기 단독",
         "LOSS_HEDGE_ENGINE": "손실방지엔진",
         "ADVANCED_TREND_FOLLOWER": "슈퍼트랜드 반전",
+        "ANTI_ALPHA_V1": "안티알파v1",
     }
     return overrides.get(name, name)
 
@@ -4950,6 +5276,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return ATLAS_RS_FAIL_SHORT_ENABLED
     if key == "ADVANCED_TREND_FOLLOWER":
         return ADV_TREND_ENABLED
+    if key == "ANTI_ALPHA_V1":
+        return ANTI_ALPHA_V1_ENABLED
     if key in ("RSI", "SCALP"):
         return RSI_ENABLED
     if key in ("MANUAL", "UNKNOWN", ""):
@@ -7665,6 +7993,7 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             "ATLAS_RS_FAIL_SHORT",
             "DTFX",
             "RSI",
+            "ANTI_ALPHA_V1",
             "MANUAL",
             "UNKNOWN",
         }
@@ -9197,6 +9526,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
+    global ANTI_ALPHA_V1_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -9224,6 +9554,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_dca_second_pct",
         "_dca_third_pct",
         "_exit_cooldown_hours",
+        "_realtime_only",
         "_sat_trade",
         "_swaggy_atlas_lab_enabled",
         "_swaggy_atlas_lab_v2_enabled",
@@ -9258,6 +9589,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_adv_trend_adx_min",
         "_adv_trend_mfi_long_max",
         "_adv_trend_mfi_short_min",
+        "_anti_alpha_v1_enabled",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
         "_rsi_enabled",
@@ -9331,6 +9663,12 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         AUTO_EXIT_SHORT_SL_PCT = float(state.get("_auto_exit_short_sl_pct"))
     if (not skip_keys or "_engine_exit_overrides" not in skip_keys) and isinstance(state.get("_engine_exit_overrides"), dict):
         ENGINE_EXIT_OVERRIDES = dict(state.get("_engine_exit_overrides"))
+    if "ANTI_ALPHA_V1" not in ENGINE_EXIT_OVERRIDES:
+        ENGINE_EXIT_OVERRIDES["ANTI_ALPHA_V1"] = {
+            "LONG": {"tp": 2.0, "sl": 2.0},
+            "SHORT": {"tp": 2.0, "sl": 2.0},
+        }
+        state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
     if (not skip_keys or "_live_trading" not in skip_keys) and isinstance(state.get("_live_trading"), bool):
         LIVE_TRADING = bool(state.get("_live_trading"))
     if (not skip_keys or "_long_live" not in skip_keys) and isinstance(state.get("_long_live"), bool):
@@ -9350,6 +9688,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         SWAGGY_NO_ATLAS_ENABLED = bool(state.get("_swaggy_no_atlas_enabled"))
     if (not skip_keys or "_adv_trend_enabled" not in skip_keys) and isinstance(state.get("_adv_trend_enabled"), bool):
         ADV_TREND_ENABLED = bool(state.get("_adv_trend_enabled"))
+    if (not skip_keys or "_anti_alpha_v1_enabled" not in skip_keys) and isinstance(state.get("_anti_alpha_v1_enabled"), bool):
+        ANTI_ALPHA_V1_ENABLED = bool(state.get("_anti_alpha_v1_enabled"))
     if (not skip_keys or "_adv_trend_min_qv" not in skip_keys) and isinstance(state.get("_adv_trend_min_qv"), (int, float)):
         ADV_TREND_MIN_QV = float(state.get("_adv_trend_min_qv"))
     if (not skip_keys or "_adv_trend_universe_top_n" not in skip_keys) and isinstance(state.get("_adv_trend_universe_top_n"), (int, float)):
@@ -9483,6 +9823,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         SATURDAY_TRADE_ENABLED = bool(state.get("_sat_trade"))
     if (not skip_keys or "_exit_cooldown_hours" not in skip_keys) and isinstance(state.get("_exit_cooldown_hours"), (int, float)):
         EXIT_COOLDOWN_HOURS = float(state.get("_exit_cooldown_hours"))
+    if (not skip_keys or "_realtime_only" not in skip_keys) and isinstance(state.get("_realtime_only"), bool):
+        REALTIME_ONLY_ENABLED = bool(state.get("_realtime_only"))
         COOLDOWN_SEC = int(EXIT_COOLDOWN_HOURS * 3600)
         EXIT_COOLDOWN_SEC = COOLDOWN_SEC
     if (not skip_keys or "_dtfx_enabled" not in skip_keys) and isinstance(state.get("_dtfx_enabled"), bool):
@@ -10068,7 +10410,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -10441,6 +10783,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] sat_trade cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/realtime_only", "realtime_only")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        REALTIME_ONLY_ENABLED = True
+                        state["_realtime_only"] = True
+                        state_dirty = True
+                        resp = "✅ realtime_only ON (헤비스캔 OFF)"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        REALTIME_ONLY_ENABLED = False
+                        state["_realtime_only"] = False
+                        state_dirty = True
+                        resp = "⛔ realtime_only OFF (헤비스캔 ON)"
+                    else:
+                        resp = (
+                            f"ℹ️ realtime_only 상태: {'ON' if REALTIME_ONLY_ENABLED else 'OFF'}\n"
+                            "사용법: /realtime_only on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] realtime_only cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
 
                 if cmd in ("/engine_exit", "engine_exit") and not responded:
                     parts = lower.split()
@@ -10626,6 +10991,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             "🤖 상태\n"
                             f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
                             f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
+                            f"/realtime_only(헤비스캔OFF): {'ON' if REALTIME_ONLY_ENABLED else 'OFF'}\n"
                             f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                             f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                             f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -10650,6 +11016,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                             f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
                             f"adv_trend={'ON' if ADV_TREND_ENABLED else 'OFF'} "
+                            f"anti_alpha={'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'} "
                             f"loss_hedge={'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'} "
                             f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -10660,6 +11027,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                             f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
                             f"/adv_trend(추가진입): {'ON' if ADV_TREND_ENABLED else 'OFF'}\n"
+                            f"/anti_alpha_v1(추가진입): {'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'}\n"
                             f"/loss_hedge_engine(손실방지): {'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -10696,6 +11064,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         "🤖 상태\n"
                         f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
                         f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
+                        f"/realtime_only(헤비스캔OFF): {'ON' if REALTIME_ONLY_ENABLED else 'OFF'}\n"
                         f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                         f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                         f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -10719,6 +11088,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"엔진요약: swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
                         f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                         f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
+                        f"adv_trend={'ON' if ADV_TREND_ENABLED else 'OFF'} "
+                        f"anti_alpha={'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'} "
                         f"loss_hedge={'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'} "
                         f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
                         f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -10728,6 +11099,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                         f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                         f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
+                        f"/adv_trend(추가진입): {'ON' if ADV_TREND_ENABLED else 'OFF'}\n"
+                        f"/anti_alpha_v1(추가진입): {'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'}\n"
                         f"/loss_hedge_engine(손실방지): {'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -11160,6 +11533,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] adv_trend cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/anti_alpha_v1", "anti_alpha_v1")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        ANTI_ALPHA_V1_ENABLED = True
+                        state["_anti_alpha_v1_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ anti_alpha_v1 ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        ANTI_ALPHA_V1_ENABLED = False
+                        state["_anti_alpha_v1_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ anti_alpha_v1 OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ anti_alpha_v1 상태: {'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'}\n"
+                            "사용법: /anti_alpha_v1 on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] anti_alpha_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/loss_hedge_engine", "loss_hedge_engine")) and not responded:
                     parts = lower.split()
@@ -12105,6 +12501,10 @@ def run():
     state["_symbols"] = symbols
     state["_startup_ts"] = time.time()
     try:
+        _reload_runtime_settings_from_disk(state)
+    except Exception:
+        pass
+    try:
         cycle_cache.set_fetcher(lambda sym, tf, limit: _fetch_ohlcv_with_retry(exchange, sym, tf, limit))
     except Exception:
         pass
@@ -12137,7 +12537,8 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global REALTIME_ONLY_ENABLED
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS, SWAGGY_NO_ATLAS_USE_WICK_BREAK
     global SWAGGY_NO_ATLAS_BREAK_MARGIN_STRONG, SWAGGY_NO_ATLAS_BREAK_MARGIN_WEAK
@@ -12429,7 +12830,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /adv_trend on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /adv_trend on|off|status, /anti_alpha_v1 on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -12570,6 +12971,8 @@ def run():
                     prev_open_kst = _fmt_ms_kst(prev_open_ts)
                     cycle_kst = _fmt_ms_kst(cycle_ts)
                     heavy_scan = bool(cycle_ts and cycle_ts != last_cycle_ts)
+                    if REALTIME_ONLY_ENABLED or state.get("_realtime_only") is True:
+                        heavy_scan = False
                     last_cycle_kst = _fmt_ms_kst(last_cycle_ts)
                     if heavy_scan:
                         print(
@@ -12785,7 +13188,7 @@ def run():
                         swaggy_atlas_lab_v2_cfg = SwaggyAtlasLabV2Config()
                         swaggy_atlas_lab_v2_atlas_cfg = SwaggyAtlasLabV2AtlasConfig()
 
-                    if ADV_TREND_ENABLED:
+                    if ADV_TREND_ENABLED or ANTI_ALPHA_V1_ENABLED:
                         # Advanced trend engine: shared universe + low-volatility universe
                         adv_candidates = []
                         for sym in symbols or []:
@@ -12903,6 +13306,7 @@ def run():
                         and swaggy_universe
                     )
                     adv_trend_ran = bool(heavy_scan and ADV_TREND_ENABLED and adv_trend_universe)
+                    anti_alpha_ran = bool(ANTI_ALPHA_V1_ENABLED and adv_trend_universe)
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
                     atlas_rs_fail_short_ran = bool(
                         ATLAS_RS_FAIL_SHORT_ENABLED
@@ -13163,6 +13567,8 @@ def run():
                     swaggy_no_atlas_thread = None
                     adv_trend_result = {}
                     adv_trend_thread = None
+                    anti_alpha_result = {}
+                    anti_alpha_thread = None
                     dtfx_result = {}
                     dtfx_thread = None
                     atlas_rs_fail_short_result = {}
@@ -13246,6 +13652,18 @@ def run():
                             daemon=True,
                         )
                         adv_trend_thread.start()
+                    if ANTI_ALPHA_V1_ENABLED:
+                        anti_alpha_thread = threading.Thread(
+                            target=lambda: anti_alpha_result.update(
+                                _run_anti_alpha_cycle(
+                                    adv_trend_universe,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        anti_alpha_thread.start()
                     if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
                         dtfx_thread = threading.Thread(
                             target=lambda: dtfx_result.update(
@@ -13899,6 +14317,8 @@ def run():
                         swaggy_no_atlas_thread.join()
                     if adv_trend_thread:
                         adv_trend_thread.join()
+                    if anti_alpha_thread:
+                        anti_alpha_thread.join()
                     if dtfx_thread:
                         dtfx_thread.join()
                     if atlas_rs_fail_short_thread:
@@ -13935,7 +14355,7 @@ def run():
                     )
                     print(
                         "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) "
-                        "adv_trend=%s(%d) swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
+                        "adv_trend=%s(%d) anti_alpha=%s(%d) swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
                         % (
                             "ON" if rsi_ran else "OFF",
                             rsi_universe_len,
@@ -13944,6 +14364,8 @@ def run():
                             "ON" if div15m_short_ran else "OFF",
                             div15m_short_universe_len,
                             "ON" if adv_trend_ran else "OFF",
+                            adv_trend_universe_len,
+                            "ON" if anti_alpha_ran else "OFF",
                             adv_trend_universe_len,
                             "ON" if swaggy_atlas_lab_ran else "OFF",
                             swaggy_atlas_lab_universe_len,
