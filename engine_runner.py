@@ -529,6 +529,8 @@ def _realtime_only_required() -> bool:
         return True
     if ANTI_ALPHA_V1_ENABLED:
         return True
+    if NOISE_REVERSE_V1_ENABLED:
+        return True
     if DIV15M_LONG_ENABLED or DIV15M_SHORT_ENABLED or ONLY_DIV15M_SHORT:
         return True
     return False
@@ -878,6 +880,7 @@ ADV_TREND_PULLBACK_WAIT_BARS = int(os.getenv("ADV_TREND_PULLBACK_WAIT_BARS", "4"
 ADV_TREND_PULLBACK_PIVOT = int(os.getenv("ADV_TREND_PULLBACK_PIVOT", "3"))
 
 ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
+NOISE_REVERSE_V1_ENABLED = os.getenv("NOISE_REVERSE_V1_ENABLED", "0") == "1"
 ANTI_ALPHA_EMA_LEN = int(os.getenv("ANTI_ALPHA_EMA_LEN", "200"))
 ANTI_ALPHA_RSI_LEN = int(os.getenv("ANTI_ALPHA_RSI_LEN", "14"))
 ANTI_ALPHA_VOL_SMA_LEN = int(os.getenv("ANTI_ALPHA_VOL_SMA_LEN", "20"))
@@ -887,6 +890,11 @@ ANTI_ALPHA_SHORT_RSI_MIN = float(os.getenv("ANTI_ALPHA_SHORT_RSI_MIN", "80"))
 ANTI_ALPHA_LONG_RSI_MAX = float(os.getenv("ANTI_ALPHA_LONG_RSI_MAX", "30"))
 ANTI_ALPHA_EMA_DIST_MIN = float(os.getenv("ANTI_ALPHA_EMA_DIST_MIN", "0.003"))
 ANTI_ALPHA_BODY_PCT_MIN = float(os.getenv("ANTI_ALPHA_BODY_PCT_MIN", "0.008"))
+NOISE_REVERSE_LOOKBACK = int(os.getenv("NOISE_REVERSE_LOOKBACK", "100"))
+NOISE_REVERSE_MA_LEN = int(os.getenv("NOISE_REVERSE_MA_LEN", "20"))
+NOISE_REVERSE_VOL_SMA_LEN = int(os.getenv("NOISE_REVERSE_VOL_SMA_LEN", "20"))
+NOISE_REVERSE_VOL_SPIKE_MULT = float(os.getenv("NOISE_REVERSE_VOL_SPIKE_MULT", "5.0"))
+NOISE_REVERSE_DISPARITY_PCT = float(os.getenv("NOISE_REVERSE_DISPARITY_PCT", "0.025"))
 LOSS_HEDGE_ENGINE_ENABLED = False
 LOSS_HEDGE_INTERVAL_MIN = 15
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
@@ -1866,6 +1874,12 @@ def _append_anti_alpha_log(line: str) -> None:
     date_tag = time.strftime("%Y-%m-%d")
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("anti_alpha_v1", f"anti_alpha_v1-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
+def _append_noise_reverse_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("noise_reverse_v1", f"noise_reverse_v1-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
 def _iso_kst(ts: Optional[float] = None) -> str:
@@ -4363,6 +4377,226 @@ def _run_anti_alpha_cycle(
     )
     return result
 
+def _run_noise_reverse_v1_cycle(
+    noise_universe,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"long_hits": 0, "short_hits": 0}
+    if not NOISE_REVERSE_V1_ENABLED or not noise_universe:
+        return result
+    start_ts = time.time()
+    checked = 0
+    entries = 0
+    skips = 0
+    no_signal = 0
+    no_data = 0
+    gate_stats = {
+        "vol_spike": 0,
+        "disparity": 0,
+        "break": 0,
+        "nan": 0,
+    }
+
+    def _nr_skip(msg: str) -> None:
+        nonlocal skips
+        skips += 1
+        _append_noise_reverse_log(msg)
+
+    _append_noise_reverse_log(
+        f"NOISE_REVERSE_CYCLE_START cycle_id={cycle_id} universe={len(noise_universe)}"
+    )
+    try:
+        refresh_positions_cache(force=True)
+    except Exception:
+        pass
+    open_total = count_open_positions(force=True)
+    if not isinstance(open_total, int):
+        open_total = _count_open_positions_state(state)
+
+    now_ts = time.time()
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        _nr_skip("NOISE_REVERSE_SKIP reason=SATURDAY_OFF")
+        return result
+
+    hedge_mode = False
+    try:
+        hedge_mode = is_hedge_mode()
+    except Exception:
+        hedge_mode = False
+
+    lookback = int(NOISE_REVERSE_LOOKBACK)
+    ma_len = int(NOISE_REVERSE_MA_LEN)
+    vol_len = int(NOISE_REVERSE_VOL_SMA_LEN)
+    min_len = max(lookback + 2, ma_len + 2, vol_len + 2, 120)
+    ltf_limit = max(min_len + 5, 140)
+
+    sleep_sec = 3.0
+    for symbol in noise_universe:
+        checked += 1
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if _both_sides_open(st) and not hedge_mode:
+            time.sleep(sleep_sec)
+            continue
+        try:
+            long_amt = get_long_position_amount(symbol)
+        except Exception:
+            long_amt = 0.0
+        try:
+            short_amt = get_short_position_amount(symbol)
+        except Exception:
+            short_amt = 0.0
+        st["in_pos_long"] = bool(long_amt > 0)
+        st["in_pos_short"] = bool(short_amt > 0)
+        st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
+        now_seen = time.time()
+        if long_amt > 0:
+            _set_last_entry_state(st, "LONG", now_seen)
+        if short_amt > 0:
+            _set_last_entry_state(st, "SHORT", now_seen)
+        state[symbol] = st
+
+        if isinstance(open_total, int) and open_total >= MAX_OPEN_POSITIONS:
+            _nr_skip(
+                f"NOISE_REVERSE_SKIP sym={symbol} reason=MAX_POS open={open_total} max={MAX_OPEN_POSITIONS}"
+            )
+            break
+
+        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+        if df_1m.empty:
+            no_data += 1
+            time.sleep(sleep_sec)
+            continue
+        if len(df_1m) < min_len:
+            no_data += 1
+            time.sleep(sleep_sec)
+            continue
+
+        # use confirmed candles only
+        df_sig = df_1m.iloc[:-1]
+        if len(df_sig) < min_len - 1:
+            no_data += 1
+            time.sleep(sleep_sec)
+            continue
+
+        ma20 = df_sig["close"].rolling(ma_len).mean()
+        vol_sma = df_sig["volume"].rolling(vol_len).mean()
+        hi100 = df_sig["high"].rolling(lookback).max().shift(1)
+        lo100 = df_sig["low"].rolling(lookback).min().shift(1)
+
+        row = df_sig.iloc[-1]
+        close_px = float(row["close"])
+        high_px = float(row["high"])
+        low_px = float(row["low"])
+        vol_now = float(row["volume"])
+        ma20_val = float(ma20.iloc[-1]) if pd.notna(ma20.iloc[-1]) else None
+        vol_sma_val = float(vol_sma.iloc[-1]) if pd.notna(vol_sma.iloc[-1]) else None
+        hi100_val = float(hi100.iloc[-1]) if pd.notna(hi100.iloc[-1]) else None
+        lo100_val = float(lo100.iloc[-1]) if pd.notna(lo100.iloc[-1]) else None
+
+        if (
+            not isinstance(ma20_val, (int, float))
+            or not isinstance(vol_sma_val, (int, float))
+            or not isinstance(hi100_val, (int, float))
+            or not isinstance(lo100_val, (int, float))
+        ):
+            gate_stats["nan"] += 1
+            no_signal += 1
+            time.sleep(sleep_sec)
+            continue
+
+        vol_spike = vol_sma_val > 0 and vol_now >= vol_sma_val * float(NOISE_REVERSE_VOL_SPIKE_MULT)
+        entry_side = None
+        if vol_spike:
+            if high_px > hi100_val and close_px > ma20_val * (1.0 + float(NOISE_REVERSE_DISPARITY_PCT)):
+                entry_side = "LONG"
+            elif low_px < lo100_val and close_px < ma20_val * (1.0 - float(NOISE_REVERSE_DISPARITY_PCT)):
+                entry_side = "SHORT"
+
+        if not vol_spike:
+            gate_stats["vol_spike"] += 1
+        if entry_side is None:
+            no_signal += 1
+            time.sleep(sleep_sec)
+            continue
+
+        if entry_side == "LONG" and long_amt > 0:
+            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=ALREADY_IN_POSITION side={entry_side}")
+            _append_entry_gate_log("noise_reverse_v1", symbol, "already_in_position", side=entry_side)
+            time.sleep(sleep_sec)
+            continue
+        if entry_side == "SHORT" and short_amt > 0:
+            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=ALREADY_IN_POSITION side={entry_side}")
+            _append_entry_gate_log("noise_reverse_v1", symbol, "already_in_position", side=entry_side)
+            time.sleep(sleep_sec)
+            continue
+
+        if _exit_cooldown_blocked(state, symbol, "noise_reverse_v1", entry_side):
+            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=EXIT_COOLDOWN side={entry_side}")
+            _append_entry_gate_log("noise_reverse_v1", symbol, "exit_cooldown", side=entry_side)
+            time.sleep(sleep_sec)
+            continue
+
+        if not _entry_guard_acquire(
+            state,
+            symbol,
+            ttl_sec=5.0,
+            key=f"noise_reverse_v1:{symbol}:{entry_side}",
+            engine="noise_reverse_v1",
+            side=entry_side,
+        ):
+            time.sleep(sleep_sec)
+            continue
+
+        usdt = _resolve_entry_usdt()
+        if usdt <= 0:
+            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=NO_BALANCE side={entry_side}")
+            time.sleep(sleep_sec)
+            continue
+
+        if not _admin_is_active():
+            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=ADMIN_INACTIVE side={entry_side}")
+            time.sleep(sleep_sec)
+            continue
+
+        req_id = _enqueue_entry_request(
+            state,
+            symbol=symbol,
+            side=entry_side,
+            engine="NOISE_REVERSE_V1",
+            reason="noise_reverse_v1",
+            usdt=usdt,
+            live=(LONG_LIVE_TRADING if entry_side == "LONG" else LIVE_TRADING),
+            alert_reason="noise_reverse_v1",
+        )
+        if not req_id:
+            _nr_skip(f"NOISE_REVERSE_ENTRY_FAIL sym={symbol} side={entry_side}")
+            time.sleep(sleep_sec)
+            continue
+
+        _append_noise_reverse_log(
+            f"NOISE_REVERSE_ENTRY sym={symbol} side={entry_side} close={close_px:.6g} "
+            f"ma20={ma20_val:.6g} hi100={hi100_val:.6g} lo100={lo100_val:.6g} "
+            f"vol={vol_now:.4g} vol_ma={vol_sma_val:.4g} spike={int(bool(vol_spike))}"
+        )
+        if entry_side == "LONG":
+            result["long_hits"] += 1
+        else:
+            result["short_hits"] += 1
+        entries += 1
+        time.sleep(sleep_sec)
+
+    elapsed = time.time() - start_ts
+    _append_noise_reverse_log(
+        f"NOISE_REVERSE_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={entries} "
+        f"skips={skips} no_signal={no_signal} no_data={no_data}"
+    )
+    _append_noise_reverse_log(
+        "NOISE_REVERSE_GATES " + " ".join([f"{k}={v}" for k, v in gate_stats.items()])
+    )
+    return result
+
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
     cycle_ts = state.get("_current_cycle_ts")
     side = (side or "").upper()
@@ -5215,6 +5449,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "ADVANCED_TREND_FOLLOWER"
     if key in ("anti_alpha_v1", "anti_alpha"):
         return "ANTI_ALPHA_V1"
+    if key in ("noise_reverse_v1", "noise_reverse"):
+        return "NOISE_REVERSE_V1"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -5243,6 +5479,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "advanced_trend_follower"
     if label == "ANTI_ALPHA_V1":
         return "anti_alpha_v1"
+    if label == "NOISE_REVERSE_V1":
+        return "noise_reverse_v1"
     return None
 
 def _display_engine_label(label: Optional[str]) -> str:
@@ -5255,6 +5493,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "LOSS_HEDGE_ENGINE": "손실방지엔진",
         "ADVANCED_TREND_FOLLOWER": "슈퍼트랜드 반전",
         "ANTI_ALPHA_V1": "안티알파v1",
+        "NOISE_REVERSE_V1": "노이즈리버스v1",
     }
     return overrides.get(name, name)
 
@@ -5278,6 +5517,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return ADV_TREND_ENABLED
     if key == "ANTI_ALPHA_V1":
         return ANTI_ALPHA_V1_ENABLED
+    if key == "NOISE_REVERSE_V1":
+        return NOISE_REVERSE_V1_ENABLED
     if key in ("RSI", "SCALP"):
         return RSI_ENABLED
     if key in ("MANUAL", "UNKNOWN", ""):
@@ -9526,7 +9767,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
-    global ANTI_ALPHA_V1_ENABLED
+    global ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -9590,6 +9831,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_adv_trend_mfi_long_max",
         "_adv_trend_mfi_short_min",
         "_anti_alpha_v1_enabled",
+        "_noise_reverse_v1_enabled",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
         "_rsi_enabled",
@@ -9669,6 +9911,12 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
             "SHORT": {"tp": 2.0, "sl": 2.0},
         }
         state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
+    if "NOISE_REVERSE_V1" not in ENGINE_EXIT_OVERRIDES:
+        ENGINE_EXIT_OVERRIDES["NOISE_REVERSE_V1"] = {
+            "LONG": {"tp": 2.0, "sl": 2.0},
+            "SHORT": {"tp": 2.0, "sl": 2.0},
+        }
+        state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
     if (not skip_keys or "_live_trading" not in skip_keys) and isinstance(state.get("_live_trading"), bool):
         LIVE_TRADING = bool(state.get("_live_trading"))
     if (not skip_keys or "_long_live" not in skip_keys) and isinstance(state.get("_long_live"), bool):
@@ -9690,6 +9938,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         ADV_TREND_ENABLED = bool(state.get("_adv_trend_enabled"))
     if (not skip_keys or "_anti_alpha_v1_enabled" not in skip_keys) and isinstance(state.get("_anti_alpha_v1_enabled"), bool):
         ANTI_ALPHA_V1_ENABLED = bool(state.get("_anti_alpha_v1_enabled"))
+    if (not skip_keys or "_noise_reverse_v1_enabled" not in skip_keys) and isinstance(state.get("_noise_reverse_v1_enabled"), bool):
+        NOISE_REVERSE_V1_ENABLED = bool(state.get("_noise_reverse_v1_enabled"))
     if (not skip_keys or "_adv_trend_min_qv" not in skip_keys) and isinstance(state.get("_adv_trend_min_qv"), (int, float)):
         ADV_TREND_MIN_QV = float(state.get("_adv_trend_min_qv"))
     if (not skip_keys or "_adv_trend_universe_top_n" not in skip_keys) and isinstance(state.get("_adv_trend_universe_top_n"), (int, float)):
@@ -10410,7 +10660,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -11017,6 +11267,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
                             f"adv_trend={'ON' if ADV_TREND_ENABLED else 'OFF'} "
                             f"anti_alpha={'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'} "
+                            f"noise_reverse={'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'} "
                             f"loss_hedge={'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'} "
                             f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -11028,6 +11279,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
                             f"/adv_trend(추가진입): {'ON' if ADV_TREND_ENABLED else 'OFF'}\n"
                             f"/anti_alpha_v1(추가진입): {'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'}\n"
+                            f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
                             f"/loss_hedge_engine(손실방지): {'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'}\n"
                             f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -11090,6 +11342,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
                         f"adv_trend={'ON' if ADV_TREND_ENABLED else 'OFF'} "
                         f"anti_alpha={'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'} "
+                        f"noise_reverse={'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'} "
                         f"loss_hedge={'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'} "
                         f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
                         f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -11101,6 +11354,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
                         f"/adv_trend(추가진입): {'ON' if ADV_TREND_ENABLED else 'OFF'}\n"
                         f"/anti_alpha_v1(추가진입): {'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'}\n"
+                        f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
                         f"/loss_hedge_engine(손실방지): {'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'}\n"
                         f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -11556,6 +11810,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] anti_alpha_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/noise_reverse_v1", "noise_reverse_v1")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        NOISE_REVERSE_V1_ENABLED = True
+                        state["_noise_reverse_v1_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ noise_reverse_v1 ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        NOISE_REVERSE_V1_ENABLED = False
+                        state["_noise_reverse_v1_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ noise_reverse_v1 OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ noise_reverse_v1 상태: {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
+                            "사용법: /noise_reverse_v1 on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] noise_reverse_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/loss_hedge_engine", "loss_hedge_engine")) and not responded:
                     parts = lower.split()
@@ -12125,6 +12402,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_swaggy_d1_overext_atr_mult",
                 "_loss_hedge_engine_enabled",
                 "_loss_hedge_interval_min",
+                "_noise_reverse_v1_enabled",
                 "_dtfx_enabled",
                 "_rsi_enabled",
                 "_runtime_cfg_ts",
@@ -12537,7 +12815,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global REALTIME_ONLY_ENABLED
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS, SWAGGY_NO_ATLAS_USE_WICK_BREAK
@@ -12830,7 +13108,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /adv_trend on|off|status, /anti_alpha_v1 on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /adv_trend on|off|status, /anti_alpha_v1 on|off|status, /noise_reverse_v1 on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -13091,6 +13369,8 @@ def run():
                     shared_top_n = cfg_vals.get("universe_top_n")
                     if not isinstance(shared_top_n, int):
                         shared_top_n = rsi_cfg.universe_top_n if rsi_cfg else 50
+                    if isinstance(shared_top_n, int):
+                        shared_top_n = min(shared_top_n, 20)
                     for s in symbols:
                         t = tickers.get(s)
                         if not t:
@@ -13123,6 +13403,8 @@ def run():
                         shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
                         if shared_top_n:
                             shared_universe = shared_universe[:shared_top_n]
+                    if isinstance(shared_universe, list) and len(shared_universe) > 20:
+                        shared_universe = shared_universe[:20]
                     state["_universe"] = list(shared_universe)
                     if rsi_engine:
                         ctx = EngineContext(
@@ -13210,6 +13492,8 @@ def run():
                         adv_candidates.sort(key=lambda x: x[1])  # low volatility first
                         low_vol = [sym for sym, _ in adv_candidates[:ADV_TREND_UNIVERSE_TOP_N]]
                         adv_trend_universe = list(dict.fromkeys(list(shared_universe) + low_vol))
+                        if len(adv_trend_universe) > 20:
+                            adv_trend_universe = adv_trend_universe[:20]
                         state["_adv_trend_universe"] = adv_trend_universe
 
                         structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
@@ -13281,6 +13565,8 @@ def run():
                     swaggy_atlas_lab_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_ENABLED else 0
                     swaggy_atlas_lab_v2_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_V2_ENABLED else 0
                     adv_trend_universe_len = len(adv_trend_universe) if adv_trend_universe else 0
+                    noise_reverse_universe = adv_trend_universe[:20] if adv_trend_universe else []
+                    noise_reverse_universe_len = len(noise_reverse_universe)
                     dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
                     atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
                     universe_structure_len = len(universe_structure)
@@ -13307,6 +13593,7 @@ def run():
                     )
                     adv_trend_ran = bool(heavy_scan and ADV_TREND_ENABLED and adv_trend_universe)
                     anti_alpha_ran = bool(ANTI_ALPHA_V1_ENABLED and adv_trend_universe)
+                    noise_reverse_ran = bool(NOISE_REVERSE_V1_ENABLED and noise_reverse_universe and (not heavy_scan))
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
                     atlas_rs_fail_short_ran = bool(
                         ATLAS_RS_FAIL_SHORT_ENABLED
@@ -13569,6 +13856,8 @@ def run():
                     adv_trend_thread = None
                     anti_alpha_result = {}
                     anti_alpha_thread = None
+                    noise_reverse_result = {}
+                    noise_reverse_thread = None
                     dtfx_result = {}
                     dtfx_thread = None
                     atlas_rs_fail_short_result = {}
@@ -13664,6 +13953,18 @@ def run():
                             daemon=True,
                         )
                         anti_alpha_thread.start()
+                    if NOISE_REVERSE_V1_ENABLED and (not heavy_scan):
+                        noise_reverse_thread = threading.Thread(
+                            target=lambda: noise_reverse_result.update(
+                                _run_noise_reverse_v1_cycle(
+                                    noise_reverse_universe,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        noise_reverse_thread.start()
                     if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
                         dtfx_thread = threading.Thread(
                             target=lambda: dtfx_result.update(
@@ -14319,6 +14620,8 @@ def run():
                         adv_trend_thread.join()
                     if anti_alpha_thread:
                         anti_alpha_thread.join()
+                    if noise_reverse_thread:
+                        noise_reverse_thread.join()
                     if dtfx_thread:
                         dtfx_thread.join()
                     if atlas_rs_fail_short_thread:
@@ -14355,7 +14658,8 @@ def run():
                     )
                     print(
                         "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) "
-                        "adv_trend=%s(%d) anti_alpha=%s(%d) swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
+                        "adv_trend=%s(%d) anti_alpha=%s(%d) noise_reverse=%s(%d) "
+                        "swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
                         % (
                             "ON" if rsi_ran else "OFF",
                             rsi_universe_len,
@@ -14367,6 +14671,8 @@ def run():
                             adv_trend_universe_len,
                             "ON" if anti_alpha_ran else "OFF",
                             adv_trend_universe_len,
+                            "ON" if noise_reverse_ran else "OFF",
+                            noise_reverse_universe_len,
                             "ON" if swaggy_atlas_lab_ran else "OFF",
                             swaggy_atlas_lab_universe_len,
                             "ON" if swaggy_atlas_lab_v2_ran else "OFF",
@@ -14402,7 +14708,8 @@ def run():
                     now_kst = _kst_now()
                     today_kst = now_kst.strftime("%Y-%m-%d")
                     last_report_date = state.get("_daily_report_date")
-                    cycle_sleep = CYCLE_SLEEP if heavy_scan else REALTIME_CYCLE_SLEEP
+                    # realtime-only cycle: short idle sleep for rate-limit safety
+                    cycle_sleep = CYCLE_SLEEP if heavy_scan else 3.0
                     if (now_kst.hour > 9 or (now_kst.hour == 9 and now_kst.minute >= 30)) and last_report_date != today_kst:
                         report_guard = os.path.join("reports", f"daily_report_{today_kst}.done")
                         try:
