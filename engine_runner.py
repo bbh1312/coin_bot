@@ -882,20 +882,23 @@ ADV_TREND_PULLBACK_PIVOT = int(os.getenv("ADV_TREND_PULLBACK_PIVOT", "3"))
 
 ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
 NOISE_REVERSE_V1_ENABLED = os.getenv("NOISE_REVERSE_V1_ENABLED", "0") == "1"
-ANTI_ALPHA_EMA_LEN = int(os.getenv("ANTI_ALPHA_EMA_LEN", "200"))
-ANTI_ALPHA_RSI_LEN = int(os.getenv("ANTI_ALPHA_RSI_LEN", "14"))
-ANTI_ALPHA_VOL_SMA_LEN = int(os.getenv("ANTI_ALPHA_VOL_SMA_LEN", "20"))
-ANTI_ALPHA_STREAK_N = int(os.getenv("ANTI_ALPHA_STREAK_N", "2"))
-ANTI_ALPHA_VOL_SPIKE_MULT = float(os.getenv("ANTI_ALPHA_VOL_SPIKE_MULT", "1.5"))
-ANTI_ALPHA_SHORT_RSI_MIN = float(os.getenv("ANTI_ALPHA_SHORT_RSI_MIN", "80"))
-ANTI_ALPHA_LONG_RSI_MAX = float(os.getenv("ANTI_ALPHA_LONG_RSI_MAX", "30"))
-ANTI_ALPHA_EMA_DIST_MIN = float(os.getenv("ANTI_ALPHA_EMA_DIST_MIN", "0.003"))
-ANTI_ALPHA_BODY_PCT_MIN = float(os.getenv("ANTI_ALPHA_BODY_PCT_MIN", "0.008"))
-NOISE_REVERSE_LOOKBACK = int(os.getenv("NOISE_REVERSE_LOOKBACK", "100"))
-NOISE_REVERSE_MA_LEN = int(os.getenv("NOISE_REVERSE_MA_LEN", "20"))
-NOISE_REVERSE_VOL_SMA_LEN = int(os.getenv("NOISE_REVERSE_VOL_SMA_LEN", "20"))
-NOISE_REVERSE_VOL_SPIKE_MULT = float(os.getenv("NOISE_REVERSE_VOL_SPIKE_MULT", "5.0"))
-NOISE_REVERSE_DISPARITY_PCT = float(os.getenv("NOISE_REVERSE_DISPARITY_PCT", "0.025"))
+# Backtest-baseline params (kept identical to backtest)
+ANTI_ALPHA_EMA_LEN = 200
+ANTI_ALPHA_RSI_LEN = 14
+ANTI_ALPHA_VOL_SMA_LEN = 20
+ANTI_ALPHA_STREAK_N = 2
+ANTI_ALPHA_VOL_SPIKE_MULT = 1.5
+ANTI_ALPHA_SHORT_RSI_MIN = 80
+ANTI_ALPHA_LONG_RSI_MAX = 30
+ANTI_ALPHA_EMA_DIST_MIN = 0.003
+ANTI_ALPHA_BODY_PCT_MIN = 0.008
+# Backtest-baseline params (kept identical to backtest)
+NOISE_REVERSE_LOOKBACK = 100
+NOISE_REVERSE_MA_LEN = 25
+NOISE_REVERSE_VOL_SMA_LEN = 20
+NOISE_REVERSE_VOL_SPIKE_MULT = 6.0
+NOISE_REVERSE_DISPARITY_PCT = 0.03
+NOISE_REVERSE_INVERT_SIDE = True
 LOSS_HEDGE_ENGINE_ENABLED = False
 LOSS_HEDGE_INTERVAL_MIN = 15
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
@@ -1072,6 +1075,15 @@ builtins.print = _buffered_print
 CYCLE_OHLCV_RAW_CACHE = cycle_cache.RAW_OHLCV
 CURRENT_CYCLE_CACHE = cycle_cache.DF_CACHE
 CYCLE_IND_CACHE = cycle_cache.IND_CACHE
+COMMON_UNIVERSE: list = []
+COMMON_UNIVERSE_READY = False
+COMMON_WARMUP_DONE = False
+COMMON_WARMUP_DAYS = int(os.getenv("COMMON_WARMUP_DAYS", "3"))
+COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m,5m,15m,1h,4h,1d").split(",") if tf.strip())
+COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "8"))
+COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "30"))
+COMMON_UNIVERSE_LOG_PATH = ""
+COMMON_WARMUP_LOG_PATH = ""
 
 class CachedExchange:
     def __init__(self, ex):
@@ -1129,6 +1141,159 @@ def _prefetch_ohlcv_for_cycle(
                 stats["failed"] += 1
                 CURRENT_CYCLE_STATS["rest_fails"] = int(CURRENT_CYCLE_STATS.get("rest_fails", 0) or 0) + 1
     return stats
+
+def _tf_bars_for_days(tf: str, days: int) -> int:
+    tf = (tf or "").strip().lower()
+    if tf.endswith("m"):
+        minutes = int(tf[:-1]) if tf[:-1].isdigit() else 1
+        return int((days * 24 * 60) / max(1, minutes))
+    if tf.endswith("h"):
+        hours = int(tf[:-1]) if tf[:-1].isdigit() else 1
+        return int((days * 24) / max(1, hours))
+    if tf.endswith("d"):
+        d = int(tf[:-1]) if tf[:-1].isdigit() else 1
+        return int(days / max(1, d))
+    return int(days * 24 * 60)
+
+def _fetch_ohlcv_range(exchange, symbol: str, tf: str, limit: int) -> list:
+    if limit <= 0:
+        return []
+    try:
+        tf_ms = int(exchange.parse_timeframe(tf) * 1000)
+    except Exception:
+        tf_ms = 60_000
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - (limit * tf_ms)
+    out = []
+    since = start_ms
+    last_ts = None
+    while since < end_ms and len(out) < limit:
+        batch_limit = min(1500, limit)
+        batch = exchange.fetch_ohlcv(symbol, tf, since=since, limit=batch_limit)
+        if not batch:
+            break
+        for row in batch:
+            ts = int(row[0])
+            if ts < start_ms:
+                continue
+            if ts >= end_ms:
+                break
+            if last_ts is None or ts > last_ts:
+                out.append(row)
+                last_ts = ts
+        if last_ts is None:
+            break
+        since = last_ts + tf_ms
+        if last_ts >= (end_ms - tf_ms):
+            break
+        time.sleep(getattr(exchange, "rateLimit", 0) / 1000.0)
+    return out[-limit:]
+
+def _build_common_universe(tickers: dict, symbols: list) -> list:
+    _maybe_reload_rsi_config()
+    cfg_defaults = _load_rsi_config_defaults()
+    rsi_cfg = rsi_engine.config if rsi_engine else cfg_defaults
+    cfg_vals = _read_rsi_config_values()
+    shared_min_qv = cfg_vals.get("min_quote_volume_usdt")
+    if not isinstance(shared_min_qv, (int, float)):
+        shared_min_qv = rsi_cfg.min_quote_volume_usdt if rsi_cfg else 30_000_000.0
+    shared_top_n = cfg_vals.get("universe_top_n")
+    if not isinstance(shared_top_n, int):
+        shared_top_n = rsi_cfg.universe_top_n if rsi_cfg else 50
+    anchors = ("BTC/USDT:USDT", "ETH/USDT:USDT")
+    if build_universe_from_tickers:
+        shared_universe = build_universe_from_tickers(
+            tickers,
+            symbols=symbols,
+            min_quote_volume_usdt=shared_min_qv,
+            top_n=shared_top_n,
+            anchors=anchors,
+        )
+    else:
+        pct_all_map = {}
+        qv_all_map = {}
+        for s in symbols:
+            t = tickers.get(s)
+            if not t:
+                continue
+            pct = t.get("percentage")
+            qv = t.get("quoteVolume")
+            if pct is None or qv is None:
+                continue
+            try:
+                pct = float(pct)
+                qv = float(qv)
+            except Exception:
+                continue
+            pct_all_map[s] = pct
+            qv_all_map[s] = qv
+        shared_universe = [s for s, _ in sorted(pct_all_map.items(), key=lambda x: abs(x[1]), reverse=True)]
+        shared_universe = [s for s in shared_universe if qv_all_map.get(s, 0) >= shared_min_qv]
+        shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
+        if shared_top_n:
+            shared_universe = shared_universe[:shared_top_n]
+    if COMMON_UNIVERSE_MAX_N and len(shared_universe) > COMMON_UNIVERSE_MAX_N:
+        shared_universe = shared_universe[:COMMON_UNIVERSE_MAX_N]
+    return shared_universe
+
+def _warmup_common_cache(state: dict, exchange, universe: list) -> bool:
+    if not universe:
+        return False
+    now = time.time()
+    backoff_until = float(state.get("_common_warmup_backoff_until", 0.0) or 0.0)
+    if backoff_until and now < backoff_until:
+        return False
+    plan = state.get("_common_warmup_plan")
+    if not isinstance(plan, list):
+        plan = []
+        for sym in universe:
+            for tf in COMMON_WARMUP_TFS:
+                limit = _tf_bars_for_days(tf, COMMON_WARMUP_DAYS)
+                plan.append((sym, tf, limit))
+        state["_common_warmup_plan"] = plan
+        state["_common_warmup_idx"] = 0
+    idx = int(state.get("_common_warmup_idx", 0) or 0)
+    done = 0
+    total = len(plan)
+    fetch_count = 0
+    while idx < total and fetch_count < COMMON_WARMUP_MAX_FETCH:
+        sym, tf, limit = plan[idx]
+        raw = cycle_cache.get_raw(sym, tf)
+        if isinstance(raw, list) and len(raw) >= limit:
+            if COMMON_WARMUP_LOG_PATH:
+                try:
+                    _append_log_lines(COMMON_WARMUP_LOG_PATH, [f"SKIP_HAVE sym={sym} tf={tf} bars={len(raw)} need={limit}"])
+                except Exception:
+                    pass
+            idx += 1
+            done += 1
+            continue
+        try:
+            data = _fetch_ohlcv_range(exchange, sym, tf, limit)
+            if data:
+                cycle_cache.set_raw(sym, tf, data)
+                if COMMON_WARMUP_LOG_PATH:
+                    try:
+                        _append_log_lines(COMMON_WARMUP_LOG_PATH, [f"FETCH_OK sym={sym} tf={tf} bars={len(data)} need={limit}"])
+                    except Exception:
+                        pass
+        except Exception as e:
+            msg = str(e)
+            if COMMON_WARMUP_LOG_PATH:
+                try:
+                    _append_log_lines(COMMON_WARMUP_LOG_PATH, [f"FETCH_FAIL sym={sym} tf={tf} err={msg}"])
+                except Exception:
+                    pass
+            if ("429" in msg) or ("-1003" in msg):
+                backoff = float(state.get("_common_warmup_backoff_secs", 5.0) or 5.0)
+                backoff = min(max(backoff, 1.0) * 1.5, 60.0)
+                state["_common_warmup_backoff_secs"] = backoff
+                state["_common_warmup_backoff_until"] = time.time() + backoff
+            pass
+        fetch_count += 1
+        idx += 1
+    state["_common_warmup_idx"] = idx
+    return idx >= total
 
 def _kst_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=9)
@@ -4559,11 +4724,15 @@ def _run_noise_reverse_v1_cycle(
                 entry_side = "LONG"
             elif low_px < lo100_val and close_px < ma20_val * (1.0 - float(NOISE_REVERSE_DISPARITY_PCT)):
                 entry_side = "SHORT"
+        base_side = entry_side
+        if entry_side and NOISE_REVERSE_INVERT_SIDE:
+            entry_side = "SHORT" if entry_side == "LONG" else "LONG"
 
         return {
             "symbol": symbol,
             "status": "ok",
             "entry_side": entry_side,
+            "base_side": base_side,
             "vol_spike": bool(vol_spike),
             "close": close_px,
             "ma20": ma20_val,
@@ -4722,8 +4891,9 @@ def _run_noise_reverse_v1_cycle(
         lo100_val = float(sig.get("lo100") or 0.0)
         vol_now = float(sig.get("vol_now") or 0.0)
         vol_sma_val = float(sig.get("vol_sma") or 0.0)
+        base_side = sig.get("base_side")
         _append_noise_reverse_log(
-            f"NOISE_REVERSE_ENTRY sym={symbol} side={entry_side} close={close_px:.6g} "
+            f"NOISE_REVERSE_ENTRY sym={symbol} side={entry_side} base={base_side} close={close_px:.6g} "
             f"ma20={ma20_val:.6g} hi100={hi100_val:.6g} lo100={lo100_val:.6g} "
             f"vol={vol_now:.4g} vol_ma={vol_sma_val:.4g} spike={int(bool(sig.get('vol_spike')))}"
         )
@@ -11287,6 +11457,39 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         print(f"[telegram] admin_follow cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
 
+                if cmd in ("/user_active", "user_active") and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    target = parts[2] if len(parts) >= 3 else "admin"
+                    resp = None
+                    acct = None
+                    try:
+                        for a in accounts_db.list_all_accounts() or []:
+                            if str(a.get("name")) == target:
+                                acct = a
+                                break
+                    except Exception:
+                        acct = None
+                    if not acct:
+                        resp = f"⛔ account not found: {target}"
+                    else:
+                        account_id = int(acct.get("id") or 0)
+                        if arg in ("on", "1", "true", "enable", "enabled"):
+                            ok = accounts_db.update_account_active(account_id, True)
+                            resp = f"✅ user_active ON ({target})" if ok else f"⛔ update failed ({target})"
+                        elif arg in ("off", "0", "false", "disable", "disabled"):
+                            ok = accounts_db.update_account_active(account_id, False)
+                            resp = f"✅ user_active OFF ({target})" if ok else f"⛔ update failed ({target})"
+                        else:
+                            cur = bool(acct.get("is_active", 1))
+                            resp = f"ℹ️ user_active ({target}): {'ON' if cur else 'OFF'}\n사용법: /user_active on|off|status [name]"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] user_active cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        if arg in ("on", "off", "1", "0", "true", "false", "enable", "disable", "enabled", "disabled"):
+                            _reload_account_contexts(reason="telegram_user_active")
+                        responded = True
+
                 if cmd in ("/reload_accounts", "reload_accounts") and not responded:
                     info = _reload_account_contexts(reason="telegram")
                     if info.get("ok"):
@@ -12925,6 +13128,17 @@ def run():
     print(f"[초기화] 상태 파일 로드: {len(state)}개 심볼")
     state["_symbols"] = symbols
     state["_startup_ts"] = time.time()
+    state["_common_warmup_start_ts"] = time.time()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    global COMMON_UNIVERSE_LOG_PATH, COMMON_WARMUP_LOG_PATH
+    try:
+        os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
+        os.makedirs(os.path.join("logs", "common_warmup"), exist_ok=True)
+        COMMON_UNIVERSE_LOG_PATH = os.path.join("common_universe", f"common_universe_{run_id}.log")
+        COMMON_WARMUP_LOG_PATH = os.path.join("common_warmup", f"common_warmup_{run_id}.log")
+    except Exception:
+        COMMON_UNIVERSE_LOG_PATH = ""
+        COMMON_WARMUP_LOG_PATH = ""
     try:
         _reload_runtime_settings_from_disk(state)
     except Exception:
@@ -12933,6 +13147,30 @@ def run():
         cycle_cache.set_fetcher(lambda sym, tf, limit: _fetch_ohlcv_with_retry(exchange, sym, tf, limit))
     except Exception:
         pass
+    # common universe init (once at startup)
+    global COMMON_UNIVERSE, COMMON_UNIVERSE_READY, COMMON_WARMUP_DONE
+    if isinstance(state.get("_common_warmup_done"), bool):
+        COMMON_WARMUP_DONE = bool(state.get("_common_warmup_done"))
+    try:
+        tickers = exchange.fetch_tickers()
+        state["_tickers"] = tickers
+        state["_tickers_ts"] = time.time()
+        COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
+        state["_common_universe"] = list(COMMON_UNIVERSE)
+        COMMON_UNIVERSE_READY = True
+        state["_common_universe_ready"] = True
+        print(f"[common-universe] ready size={len(COMMON_UNIVERSE)}")
+        if COMMON_UNIVERSE_LOG_PATH:
+            try:
+                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE size={len(COMMON_UNIVERSE)}"])
+                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
+            except Exception:
+                pass
+    except Exception as e:
+        COMMON_UNIVERSE = []
+        COMMON_UNIVERSE_READY = False
+        state["_common_universe_ready"] = False
+        print(f"[common-universe] init failed: {e}")
     global swaggy_engine, swaggy_atlas_lab_engine, swaggy_atlas_lab_v2_engine, swaggy_no_atlas_engine
     global atlas_engine, atlas_swaggy_cfg, dtfx_engine, div15m_engine, div15m_short_engine, atlas_rs_fail_short_engine
     swaggy_engine = SwaggyEngine() if SwaggyEngine else None
@@ -13255,7 +13493,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /adv_trend on|off|status, /anti_alpha_v1 on|off|status, /noise_reverse_v1 on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /adv_trend on|off|status, /anti_alpha_v1 on|off|status, /noise_reverse_v1 on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -13399,22 +13637,23 @@ def run():
                     if REALTIME_ONLY_ENABLED or state.get("_realtime_only") is True:
                         heavy_scan = False
                     last_cycle_kst = _fmt_ms_kst(last_cycle_ts)
-                    if heavy_scan:
-                        print(
-                            f"[CYCLE] server={server_kst} last_open={last_open_kst} prev_open={prev_open_kst} "
-                            f"cycle_ts={cycle_kst} last_cycle_ts={last_cycle_kst} mode=heavy-scan"
-                        )
-                    else:
-                        if _realtime_only_required():
+                    if COMMON_WARMUP_DONE:
+                        if heavy_scan:
                             print(
                                 f"[CYCLE] server={server_kst} last_open={last_open_kst} prev_open={prev_open_kst} "
-                                f"cycle_ts={cycle_kst} last_cycle_ts={last_cycle_kst} mode=realtime-only"
+                                f"cycle_ts={cycle_kst} last_cycle_ts={last_cycle_kst} mode=heavy-scan"
                             )
                         else:
-                            print(
-                                f"[CYCLE] server={server_kst} last_open={last_open_kst} prev_open={prev_open_kst} "
-                                f"cycle_ts={cycle_kst} last_cycle_ts={last_cycle_kst} mode=realtime-only skip=heavy-only"
-                            )
+                            if _realtime_only_required():
+                                print(
+                                    f"[CYCLE] server={server_kst} last_open={last_open_kst} prev_open={prev_open_kst} "
+                                    f"cycle_ts={cycle_kst} last_cycle_ts={last_cycle_kst} mode=realtime-only"
+                                )
+                            else:
+                                print(
+                                    f"[CYCLE] server={server_kst} last_open={last_open_kst} prev_open={prev_open_kst} "
+                                    f"cycle_ts={cycle_kst} last_cycle_ts={last_cycle_kst} mode=realtime-only skip=heavy-only"
+                                )
                     if not heavy_scan:
                         if not _realtime_only_required():
                             time.sleep(REALTIME_CYCLE_SLEEP)
@@ -13443,7 +13682,8 @@ def run():
                             state["_last_cycle_ts"] = cycle_ts
                             _LAST_CYCLE_TS_MEM = cycle_ts
                         cycle_label = cycle_kst if cycle_kst != "N/A" else str(cycle_count)
-                        print(f"\n[사이클 {cycle_label}] 시작 (heavy_scan=Y)")
+                        if COMMON_WARMUP_DONE:
+                            print(f"\n[사이클 {cycle_label}] 시작 (heavy_scan=Y)")
                     else:
                         realtime_count += 1
                         base_cycle = int(state.get("_last_cycle_ts", 0)) or cycle_ts or 0
@@ -13451,7 +13691,8 @@ def run():
                         if base_label == "N/A":
                             base_label = str(cycle_count)
                         cycle_label = f"{base_label}-RT{realtime_count}"
-                        print(f"\n[사이클 {cycle_label}] (동일 캔들) realtime only (heavy_scan=N)")
+                        if COMMON_WARMUP_DONE:
+                            print(f"\n[사이클 {cycle_label}] (동일 캔들) realtime only (heavy_scan=N)")
                     cycle_start = time.time()
                     run_rsi_short = bool(RSI_ENABLED and (not ONLY_DIV15M_SHORT))
                     run_div15m_long = bool((not ONLY_DIV15M_SHORT) and DIV15M_LONG_ENABLED and div15m_engine)
@@ -13492,194 +13733,77 @@ def run():
                         time.sleep(10)
                         continue
 
-                    universe_momentum = []
-                    universe_structure = []
-                    pct_all_map = {}
-                    qv_all_map = {}
-                    qv_map = {}
-                    anchors = ("BTC/USDT:USDT", "ETH/USDT:USDT")
-
-                    _maybe_reload_rsi_config()
-                    cfg_defaults = _load_rsi_config_defaults()
-                    if rsi_engine and cfg_defaults:
-                        rsi_engine.config = cfg_defaults
-                    rsi_cfg = rsi_engine.config if rsi_engine else cfg_defaults
-                    global _RSI_CONFIG_LOGGED
-                    cfg_vals = _read_rsi_config_values()
-                    if not _RSI_CONFIG_LOGGED:
-                        cfg_path = os.path.join(os.path.dirname(__file__), "engines", "rsi", "config.py")
-                        print(f"[config] rsi_config path={cfg_path} parsed={cfg_vals} engine={__file__}")
-                        _RSI_CONFIG_LOGGED = True
-                    shared_min_qv = cfg_vals.get("min_quote_volume_usdt")
-                    if not isinstance(shared_min_qv, (int, float)):
-                        shared_min_qv = rsi_cfg.min_quote_volume_usdt if rsi_cfg else 30_000_000.0
-                    shared_top_n = cfg_vals.get("universe_top_n")
-                    if not isinstance(shared_top_n, int):
-                        shared_top_n = rsi_cfg.universe_top_n if rsi_cfg else 50
-                    if isinstance(shared_top_n, int):
-                        shared_top_n = min(shared_top_n, 30)
-                    for s in symbols:
-                        t = tickers.get(s)
-                        if not t:
-                            continue
-                        pct = t.get("percentage")
-                        qv = t.get("quoteVolume")
-                        if pct is None or qv is None:
-                            continue
-                        try:
-                            pct = float(pct)
-                            qv = float(qv)
-                        except Exception:
-                            continue
-                        pct_all_map[s] = pct
-                        qv_all_map[s] = qv
-                        if qv >= shared_min_qv:
-                            qv_map[s] = qv
-                    shared_universe = []
-                    if build_universe_from_tickers:
-                        shared_universe = build_universe_from_tickers(
-                            tickers,
-                            symbols=symbols,
-                            min_quote_volume_usdt=shared_min_qv,
-                            top_n=shared_top_n,
-                            anchors=anchors,
-                        )
-                    else:
-                        shared_universe = [s for s, _ in sorted(pct_all_map.items(), key=lambda x: abs(x[1]), reverse=True)]
-                        shared_universe = [s for s in shared_universe if qv_all_map.get(s, 0) >= shared_min_qv]
-                        shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
-                        if shared_top_n:
-                            shared_universe = shared_universe[:shared_top_n]
-                    if isinstance(shared_universe, list) and len(shared_universe) > 30:
-                        shared_universe = shared_universe[:30]
+                    if not COMMON_UNIVERSE_READY or not isinstance(state.get("_common_universe"), list):
+                        COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
+                        state["_common_universe"] = list(COMMON_UNIVERSE)
+                        state["_common_universe_ready"] = True
+                        COMMON_UNIVERSE_READY = True
+                        print(f"[common-universe] refreshed size={len(COMMON_UNIVERSE)}")
+                        if COMMON_UNIVERSE_LOG_PATH and COMMON_UNIVERSE:
+                            try:
+                                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE refresh size={len(COMMON_UNIVERSE)}"])
+                                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
+                            except Exception:
+                                pass
+                    shared_universe = list(state.get("_common_universe") or [])
                     state["_universe"] = list(shared_universe)
-                    if rsi_engine:
-                        ctx = EngineContext(
-                            exchange=exchange,
-                            state=state,
-                            now_ts=time.time(),
-                            logger=print,
-                            config=rsi_engine.config,
-                        )
-                        universe_momentum = rsi_engine.build_universe(ctx)
-                    else:
-                        universe_momentum = list(shared_universe)
+                    state["_adv_trend_universe"] = list(shared_universe)
+                    state["_swaggy_universe"] = list(shared_universe)
+                    state["_dtfx_universe"] = list(shared_universe)
+                    state["_atlas_rs_fail_short_universe"] = list(shared_universe)
+                    if not shared_universe:
+                        print("[common-universe] empty; skip cycle")
+                        time.sleep(3.0)
+                        continue
+
+                    # all engines use common universe
+                    universe_momentum = list(shared_universe)
+                    universe_structure = list(shared_universe)
                     shared_universe_len = len(shared_universe)
                     rsi_universe_len = len(universe_momentum)
                     div15m_universe = list(shared_universe)
                     div15m_universe_len = len(div15m_universe)
                     div15m_short_universe = list(shared_universe)
                     div15m_short_universe_len = len(div15m_short_universe)
-                    swaggy_universe = []
-                    adv_trend_universe = []
-                    swaggy_cfg = None
-                    swaggy_atlas_lab_cfg = None
-                    swaggy_atlas_lab_atlas_cfg = None
-                    swaggy_atlas_lab_v2_cfg = None
-                    swaggy_atlas_lab_v2_atlas_cfg = None
-                    if (
-                        (SWAGGY_ENABLED or SWAGGY_ATLAS_LAB_ENABLED or SWAGGY_ATLAS_LAB_V2_ENABLED or SWAGGY_NO_ATLAS_ENABLED)
-                        and swaggy_engine
-                        and SwaggyConfig
-                        and EngineContext
-                    ):
-                        swaggy_cfg = SwaggyConfig()
-                        ctx = EngineContext(
-                            exchange=exchange,
-                            state=state,
-                            now_ts=time.time(),
-                            logger=print,
-                            config=swaggy_cfg,
-                        )
-                        swaggy_universe = swaggy_engine.build_universe(ctx)
-                        state["_swaggy_universe"] = swaggy_universe
-                    elif SWAGGY_ATLAS_LAB_ENABLED or SWAGGY_ATLAS_LAB_V2_ENABLED or SWAGGY_NO_ATLAS_ENABLED:
-                        dtfx_cfg = dtfx_cfg if dtfx_cfg else DTFXConfig()
-                        dtfx_min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
-                        anchors = []
-                        for s in dtfx_cfg.anchor_symbols or []:
-                            anchors.append(s if "/" in s else f"{s}/USDT:USDT")
-                        swaggy_universe = build_universe_from_tickers(
-                            tickers,
-                            symbols=symbols,
-                            min_quote_volume_usdt=dtfx_min_qv,
-                            top_n=dtfx_cfg.universe_top_n,
-                            anchors=tuple(anchors),
-                        )
-                        state["_swaggy_universe"] = swaggy_universe
+                    swaggy_universe = list(shared_universe)
+                    adv_trend_universe = list(shared_universe)
+                    dtfx_universe = list(shared_universe)
+                    atlas_rs_fail_short_universe = list(shared_universe)
+                    swaggy_cfg = SwaggyConfig() if SwaggyConfig else None
+                    swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig() if SwaggyAtlasLabConfig else None
+                    swaggy_atlas_lab_atlas_cfg = SwaggyAtlasLabAtlasConfig() if SwaggyAtlasLabAtlasConfig else None
+                    swaggy_atlas_lab_v2_cfg = SwaggyAtlasLabV2Config() if SwaggyAtlasLabV2Config else None
+                    swaggy_atlas_lab_v2_atlas_cfg = SwaggyAtlasLabV2AtlasConfig() if SwaggyAtlasLabV2AtlasConfig else None
                     if SWAGGY_NO_ATLAS_ENABLED and (swaggy_cfg is None):
                         if SwaggyNoAtlasConfig:
                             swaggy_cfg = SwaggyNoAtlasConfig()
-                    if SWAGGY_ATLAS_LAB_ENABLED and SwaggyAtlasLabConfig and SwaggyAtlasLabAtlasConfig:
-                        swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig()
-                        swaggy_atlas_lab_atlas_cfg = SwaggyAtlasLabAtlasConfig()
-                    if SWAGGY_ATLAS_LAB_V2_ENABLED and SwaggyAtlasLabV2Config and SwaggyAtlasLabV2AtlasConfig:
-                        swaggy_atlas_lab_v2_cfg = SwaggyAtlasLabV2Config()
-                        swaggy_atlas_lab_v2_atlas_cfg = SwaggyAtlasLabV2AtlasConfig()
 
-                    if ADV_TREND_ENABLED or ANTI_ALPHA_V1_ENABLED:
-                        # Advanced trend engine: shared universe + low-volatility universe
-                        adv_candidates = []
-                        for sym in symbols or []:
-                            t = tickers.get(sym) if isinstance(tickers, dict) else None
-                            if not t:
-                                continue
-                            pct = t.get("percentage")
-                            qv = t.get("quoteVolume")
-                            if pct is None or qv is None:
-                                continue
+                    # common OHLCV warmup (block engine run until ready)
+                    if not COMMON_WARMUP_DONE:
+                        COMMON_WARMUP_DONE = _warmup_common_cache(state, exchange, shared_universe)
+                        state["_common_warmup_done"] = COMMON_WARMUP_DONE
+                        if not COMMON_WARMUP_DONE:
+                            plan = state.get("_common_warmup_plan") or []
+                            idx = int(state.get("_common_warmup_idx", 0) or 0)
+                            backoff_until = float(state.get("_common_warmup_backoff_until", 0.0) or 0.0)
+                            if backoff_until and time.time() < backoff_until:
+                                remain = max(0.0, backoff_until - time.time())
+                                print(f"[common-warmup] backoff {remain:.1f}s")
+                                time.sleep(min(3.0, remain))
+                            else:
+                                print(f"[common-warmup] progress {idx}/{len(plan)}")
+                                time.sleep(1.0)
+                            continue
+                        if not state.get("_common_warmup_notified"):
                             try:
-                                pct = float(pct)
-                                qv = float(qv)
+                                start_ts = float(state.get("_common_warmup_start_ts") or state.get("_startup_ts") or time.time())
+                                elapsed = max(0, time.time() - start_ts)
+                                mins = int(elapsed // 60)
+                                secs = int(elapsed % 60)
+                                send_telegram(f"✅ 공통 워밍업 완료 (경과 {mins}m {secs}s)")
                             except Exception:
-                                continue
-                            if qv < ADV_TREND_MIN_QV:
-                                continue
-                            adv_candidates.append((sym, abs(pct)))
-                        adv_candidates.sort(key=lambda x: x[1])  # low volatility first
-                        low_vol = [sym for sym, _ in adv_candidates[:ADV_TREND_UNIVERSE_TOP_N]]
-                        adv_trend_universe = list(dict.fromkeys(list(shared_universe) + low_vol))
-                        if len(adv_trend_universe) > 30:
-                            adv_trend_universe = adv_trend_universe[:30]
-                        state["_adv_trend_universe"] = adv_trend_universe
-
-                        structure_candidates = sorted(qv_map.keys(), key=lambda x: qv_map.get(x, 0.0), reverse=True)
-                        if STRUCTURE_TOP_N:
-                            structure_candidates = structure_candidates[:STRUCTURE_TOP_N]
-                        _prefetch_ohlcv_for_cycle(
-                            structure_candidates,
-                            exchange,
-                            {"15m": 120, "4h": 120},
-                            label="structure-pre",
-                            ttl_by_tf={"4h": TTL_4H_SEC},
-                        )
-                        for s in structure_candidates:
-                            if _ema_align_ok(s, "15m", 120) or _ema_align_ok(s, "4h", 120):
-                                universe_structure.append(s)
-
-                    dtfx_universe = []
-                    if DTFX_ENABLED and dtfx_engine and dtfx_cfg and EngineContext:
-                        ctx = EngineContext(
-                            exchange=exchange,
-                            state=state,
-                            now_ts=time.time(),
-                            logger=print,
-                            config=dtfx_cfg,
-                        )
-                        dtfx_universe = dtfx_engine.build_universe(ctx)
-                        state["_dtfx_universe"] = dtfx_universe
-
-                    atlas_rs_fail_short_universe = []
-                    if ATLAS_RS_FAIL_SHORT_ENABLED and atlas_rs_fail_short_engine and atlas_rs_fail_short_cfg and EngineContext:
-                        ctx = EngineContext(
-                            exchange=exchange,
-                            state=state,
-                            now_ts=time.time(),
-                            logger=print,
-                            config=atlas_rs_fail_short_cfg,
-                        )
-                        atlas_rs_fail_short_universe = atlas_rs_fail_short_engine.build_universe(ctx)
-                        state["_atlas_rs_fail_short_universe"] = atlas_rs_fail_short_universe
+                                pass
+                            state["_common_warmup_notified"] = True
 
                     if heavy_scan:
                         universe_union = list(
@@ -13712,7 +13836,7 @@ def run():
                     swaggy_atlas_lab_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_ENABLED else 0
                     swaggy_atlas_lab_v2_universe_len = swaggy_universe_len if SWAGGY_ATLAS_LAB_V2_ENABLED else 0
                     adv_trend_universe_len = len(adv_trend_universe) if adv_trend_universe else 0
-                    noise_reverse_universe = adv_trend_universe[:30] if adv_trend_universe else []
+                    noise_reverse_universe = list(shared_universe)
                     noise_reverse_universe_len = len(noise_reverse_universe)
                     dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
                     atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
@@ -14396,7 +14520,7 @@ def run():
                             )
 
                     if not run_div15m_long:
-                        print("[모드] DIV15M_LONG 비활성: 롱 다이버전스 스캔 스킵")
+                        pass
                     for symbol in div15m_universe:
                         if not run_div15m_long:
                             break
@@ -14563,7 +14687,7 @@ def run():
                         )
 
                     if not run_div15m_short:
-                        print("[모드] DIV15M_SHORT 비활성: 숏 다이버전스 스캔 스킵")
+                        pass
                     div15m_short_bucket = state.setdefault("_div15m_short", {})
                     for symbol in div15m_short_universe:
                         if not run_div15m_short:
@@ -14796,7 +14920,14 @@ def run():
                     except Exception:
                         pass
                     print_section("사이클 요약")
-                    anchors_disp = ",".join(anchors)
+                    cfg_vals = _read_rsi_config_values()
+                    shared_min_qv = cfg_vals.get("min_quote_volume_usdt")
+                    if not isinstance(shared_min_qv, (int, float)):
+                        shared_min_qv = 0
+                    shared_top_n = cfg_vals.get("universe_top_n")
+                    if not isinstance(shared_top_n, int):
+                        shared_top_n = "N/A"
+                    anchors_disp = "BTC/USDT:USDT,ETH/USDT:USDT"
                     print(
                         f"[universe] rule=qVol>={int(shared_min_qv):,} sort=abs(pct) topN={shared_top_n} anchors={anchors_disp} "
                         f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "

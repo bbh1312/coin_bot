@@ -18,6 +18,12 @@ if ROOT_DIR not in sys.path:
 
 from engines.universe import build_universe_from_tickers
 
+# Backtest-baseline defaults (overridable via CLI)
+NOISE_REVERSE_LOOKBACK = 100
+NOISE_REVERSE_MA_LEN = 20
+NOISE_REVERSE_VOL_SMA_LEN = 20
+NOISE_REVERSE_VOL_SPIKE_MULT = 5.0
+NOISE_REVERSE_DISPARITY_PCT = 0.025
 
 def _ensure_dir(path: str) -> None:
     if not path:
@@ -177,12 +183,24 @@ def main() -> None:
     parser.add_argument("--entry-pct", type=float, default=1.0)
     parser.add_argument("--entry-base", default="equity", choices=["equity", "fixed"])
     parser.add_argument("--fixed-equity", type=float, default=1000.0)
-    parser.add_argument("--disparity-pct", type=float, default=0.025)
+    parser.add_argument("--lookback", type=int, default=NOISE_REVERSE_LOOKBACK)
+    parser.add_argument("--ma-len", type=int, default=NOISE_REVERSE_MA_LEN)
+    parser.add_argument("--vol-sma-len", type=int, default=NOISE_REVERSE_VOL_SMA_LEN)
+    parser.add_argument("--vol-spike-mult", type=float, default=NOISE_REVERSE_VOL_SPIKE_MULT)
+    parser.add_argument("--disparity-pct", type=float, default=NOISE_REVERSE_DISPARITY_PCT)
     parser.add_argument("--tp-pct", type=float, default=0.02)
     parser.add_argument("--sl-pct", type=float, default=0.02)
     parser.add_argument("--cooldown-bars", type=int, default=15)
+    parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")
+    parser.add_argument("--invert-side", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    # Backtest params can override defaults via CLI
+    lookback = int(args.lookback)
+    ma_len = int(args.ma_len)
+    vol_len = int(args.vol_sma_len)
+    vol_spike_mult = float(args.vol_spike_mult)
+    disparity_pct = float(args.disparity_pct)
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     log_dir = os.path.join(ROOT_DIR, "logs", "noise_reverse_v1", "backtest")
@@ -270,17 +288,19 @@ def main() -> None:
         df = _to_df(rows_1m)
         if df.empty or len(df) < 120:
             continue
-        df["ma20"] = df["close"].rolling(20).mean()
-        df["vol_sma20"] = df["volume"].rolling(20).mean()
-        df["hi100"] = df["high"].rolling(100).max().shift(1)
-        df["lo100"] = df["low"].rolling(100).min().shift(1)
+        df["ma20"] = df["close"].rolling(ma_len).mean()
+        df["vol_sma20"] = df["volume"].rolling(vol_len).mean()
+        df["hi100"] = df["high"].rolling(lookback).max().shift(1)
+        df["lo100"] = df["low"].rolling(lookback).min().shift(1)
 
         open_pos: Optional[Position] = None
         cooldown_left = 0
         loss_streak = 0
         max_loss_streak = 0
 
-        for i in range(100, len(df)):
+        min_len = max(lookback + 2, ma_len + 2, vol_len + 2, 120)
+        end_idx = len(df) - 1 if args.use_confirmed else len(df)
+        for i in range(min_len, end_idx):
             row = df.iloc[i]
             ts = int(row["ts"])
             o = float(row["open"])
@@ -421,35 +441,49 @@ def main() -> None:
                 cooldown_left -= 1
                 continue
 
-            ma20 = float(row["ma20"]) if pd.notna(row["ma20"]) else None
-            vol_sma20 = float(row["vol_sma20"]) if pd.notna(row["vol_sma20"]) else None
-            hi100 = float(row["hi100"]) if pd.notna(row["hi100"]) else None
-            lo100 = float(row["lo100"]) if pd.notna(row["lo100"]) else None
-            vol_now = float(row["volume"])
+            # use confirmed candle (previous bar) for signal when enabled
+            sig_row = df.iloc[i - 1] if args.use_confirmed else row
+            ma20 = float(sig_row["ma20"]) if pd.notna(sig_row["ma20"]) else None
+            vol_sma20 = float(sig_row["vol_sma20"]) if pd.notna(sig_row["vol_sma20"]) else None
+            hi100 = float(sig_row["hi100"]) if pd.notna(sig_row["hi100"]) else None
+            lo100 = float(sig_row["lo100"]) if pd.notna(sig_row["lo100"]) else None
+            vol_now = float(sig_row["volume"])
+            h_sig = float(sig_row["high"])
+            l_sig = float(sig_row["low"])
+            c_sig = float(sig_row["close"])
 
             entry_side: Optional[str] = None
-            vol_spike = isinstance(vol_sma20, (int, float)) and vol_sma20 > 0 and vol_now >= (vol_sma20 * 5.0)
+            vol_spike = (
+                isinstance(vol_sma20, (int, float))
+                and vol_sma20 > 0
+                and vol_now >= (vol_sma20 * vol_spike_mult)
+            )
             if vol_spike and isinstance(hi100, (int, float)) and isinstance(lo100, (int, float)) and isinstance(ma20, (int, float)):
-                if h > hi100 and c > ma20 * (1.0 + float(args.disparity_pct)):
+                if h_sig > hi100 and c_sig > ma20 * (1.0 + float(disparity_pct)):
                     entry_side = "LONG"
-                elif l < lo100 and c < ma20 * (1.0 - float(args.disparity_pct)):
+                elif l_sig < lo100 and c_sig < ma20 * (1.0 - float(disparity_pct)):
                     entry_side = "SHORT"
 
             if not entry_side:
                 continue
+            tp_pct = float(args.tp_pct)
+            sl_pct = float(args.sl_pct)
+            if args.invert_side:
+                entry_side = "SHORT" if entry_side == "LONG" else "LONG"
 
             base_equity = equity if args.entry_base == "equity" else float(args.fixed_equity)
             entry_usdt = base_equity * (float(args.entry_pct) / 100.0)
             if entry_usdt <= 0:
                 continue
 
+            # enter at next bar open to align with live confirmed-candle signal timing
             entry_px = o
             if entry_side == "LONG":
-                tp_px = entry_px * (1.0 + float(args.tp_pct))
-                sl_px = entry_px * (1.0 - float(args.sl_pct))
+                tp_px = entry_px * (1.0 + tp_pct)
+                sl_px = entry_px * (1.0 - sl_pct)
             else:
-                tp_px = entry_px * (1.0 - float(args.tp_pct))
-                sl_px = entry_px * (1.0 + float(args.sl_pct))
+                tp_px = entry_px * (1.0 - tp_pct)
+                sl_px = entry_px * (1.0 + sl_pct)
 
             size = entry_usdt / entry_px
             open_pos = Position(
@@ -528,6 +562,18 @@ def main() -> None:
                 stats["pnl_sum"],
             )
         )
+        # exit details under symbol summary
+        sym_trades = [t for t in trades if t.get("symbol") == sym]
+        for tr in sym_trades:
+            entry_ts = tr.get("entry_ts")
+            entry_kst = _dt_kst(int(entry_ts)) if isinstance(entry_ts, (int, float)) else "N/A"
+            side = tr.get("side") or "N/A"
+            pnl = tr.get("pnl_usdt")
+            win_flag = "W" if isinstance(pnl, (int, float)) and pnl > 0 else "L"
+            _bt_log(
+                "  [EXIT] entry=%s side=%s win=%s avg_mae=%.4f avg_hold=%.1f net_sum=%.3f"
+                % (entry_kst, side, win_flag, avg_mae, avg_hold, stats["pnl_sum"])
+            )
 
     total_entries = sum(s["entries"] for s in stats_by_symbol.values())
     total_exits = sum(s["exits"] for s in stats_by_symbol.values())

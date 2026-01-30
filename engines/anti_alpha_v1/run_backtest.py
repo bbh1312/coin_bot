@@ -210,6 +210,7 @@ def main() -> None:
     parser.add_argument("--sl-pct", type=float, default=0.02)
     parser.add_argument("--cooldown-bars", type=int, default=0)
     parser.add_argument("--invert-side", action="store_true")
+    parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -291,7 +292,10 @@ def main() -> None:
         open_short: Optional[Position] = None
         cooldown_left = 0
 
-        for i in range(max(args.streak_n, 1), len(df) - 1):
+        min_idx = max(int(args.streak_n), 1)
+        if args.use_confirmed:
+            min_idx = max(min_idx, 2)
+        for i in range(min_idx, len(df) - 1):
             row = df.iloc[i]
             ts = int(row["ts"])
 
@@ -419,11 +423,13 @@ def main() -> None:
                 if open_long or open_short:
                     continue
 
-            ema20 = float(row["ema20"]) if pd.notna(row["ema20"]) else None
-            rsi14 = float(row["rsi14"]) if pd.notna(row["rsi14"]) else None
-            vol_sma = float(row["vol_sma20"]) if pd.notna(row["vol_sma20"]) else None
-            close_px = float(row["close"])
-            volume = float(row["volume"])
+            sig_idx = i - 1 if args.use_confirmed else i
+            sig_row = df.iloc[sig_idx]
+            ema20 = float(sig_row["ema20"]) if pd.notna(sig_row["ema20"]) else None
+            rsi14 = float(sig_row["rsi14"]) if pd.notna(sig_row["rsi14"]) else None
+            vol_sma = float(sig_row["vol_sma20"]) if pd.notna(sig_row["vol_sma20"]) else None
+            close_px = float(sig_row["close"])
+            volume = float(sig_row["volume"])
 
             if not isinstance(ema20, (int, float)) or not isinstance(rsi14, (int, float)):
                 continue
@@ -436,7 +442,7 @@ def main() -> None:
             up_streak = True
             down_streak = True
             for j in range(int(args.streak_n)):
-                c = df.iloc[i - j]
+                c = df.iloc[sig_idx - j]
                 if float(c["close"]) <= float(c["open"]):
                     up_streak = False
                 if float(c["close"]) >= float(c["open"]):
@@ -445,7 +451,8 @@ def main() -> None:
             vol_spike = volume >= vol_sma * float(args.vol_spike_mult)
 
             entry_side: Optional[str] = None
-            prev_rsi = float(df["rsi14"].iloc[i - 1]) if i >= 1 and pd.notna(df["rsi14"].iloc[i - 1]) else None
+            prev_rsi_idx = sig_idx - 1
+            prev_rsi = float(df["rsi14"].iloc[prev_rsi_idx]) if prev_rsi_idx >= 0 and pd.notna(df["rsi14"].iloc[prev_rsi_idx]) else None
             if not isinstance(prev_rsi, (int, float)):
                 continue
 
@@ -460,7 +467,7 @@ def main() -> None:
                     and up_streak
                     and vol_spike
                     and rsi14 >= prev_rsi
-                    and close_px > float(df["high"].iloc[i - 1])
+                    and close_px > float(df["high"].iloc[prev_rsi_idx])
                     and body_pct >= float(args.body_pct_min)
                 ):
                     entry_side = "SHORT"
@@ -470,7 +477,7 @@ def main() -> None:
                     and down_streak
                     and vol_spike
                     and rsi14 <= prev_rsi
-                    and close_px < float(df["low"].iloc[i - 1])
+                    and close_px < float(df["low"].iloc[prev_rsi_idx])
                     and body_pct >= float(args.body_pct_min)
                 ):
                     entry_side = "LONG"
