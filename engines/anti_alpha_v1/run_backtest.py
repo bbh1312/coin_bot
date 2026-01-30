@@ -129,12 +129,18 @@ def _select_symbols(
     universe_mode: str,
     adv_min_qv: float,
     adv_top_n: int,
+    universe_cache: str,
 ) -> List[str]:
     if symbols_file:
         with open(symbols_file, "r", encoding="utf-8") as f:
             return [s.strip() for s in f.read().split(",") if s.strip()]
     if symbols_arg:
         return [s.strip() for s in symbols_arg.split(",") if s.strip()]
+    if universe_cache and os.path.exists(universe_cache):
+        with open(universe_cache, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if isinstance(cached, list):
+            return [s for s in cached if isinstance(s, str) and s]
     top_n = _parse_universe_arg(universe_arg) or 50
     tickers = exchange.fetch_tickers()
     anchors = ("BTC/USDT:USDT", "ETH/USDT:USDT")
@@ -145,6 +151,10 @@ def _select_symbols(
         anchors=anchors,
     )
     if (universe_mode or "").lower() != "adv_trend":
+        if universe_cache:
+            os.makedirs(os.path.dirname(universe_cache), exist_ok=True)
+            with open(universe_cache, "w", encoding="utf-8") as f:
+                json.dump(shared_universe, f)
         return shared_universe
     adv_candidates = []
     for sym, t in (tickers or {}).items():
@@ -164,7 +174,12 @@ def _select_symbols(
         adv_candidates.append((sym, abs(pct)))
     adv_candidates.sort(key=lambda x: x[1])  # low volatility first
     low_vol = [sym for sym, _ in adv_candidates[: int(adv_top_n)]]
-    return list(dict.fromkeys(list(shared_universe) + low_vol))
+    symbols = list(dict.fromkeys(list(shared_universe) + low_vol))
+    if universe_cache:
+        os.makedirs(os.path.dirname(universe_cache), exist_ok=True)
+        with open(universe_cache, "w", encoding="utf-8") as f:
+            json.dump(symbols, f)
+    return symbols
 
 
 @dataclass
@@ -192,6 +207,7 @@ def main() -> None:
     parser.add_argument("--universe-mode", default="adv_trend", choices=["adv_trend", "simple"])
     parser.add_argument("--adv-min-qv", type=float, default=float(os.getenv("ADV_TREND_MIN_QV", "5000000")))
     parser.add_argument("--adv-top-n", type=int, default=int(os.getenv("ADV_TREND_UNIVERSE_TOP_N", "30")))
+    parser.add_argument("--universe-cache", default="", help="cache universe symbols to reduce API calls")
     parser.add_argument("--initial-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-pct", type=float, default=1.0)
     parser.add_argument("--entry-base", default="equity", choices=["equity", "fixed"])
@@ -213,9 +229,11 @@ def main() -> None:
     parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    # keep confirmed-candle behavior aligned with live
+    args.use_confirmed = True
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(ROOT_DIR, "logs", "anti_alpha_v1")
+    log_dir = os.path.join(ROOT_DIR, "logs", "anti_alpha_v1", "backtest")
     _ensure_dir(log_dir)
     trades_path = os.path.join(log_dir, f"trades_{run_id}.csv")
     summary_path = os.path.join(log_dir, f"summary_{run_id}.json")
@@ -255,6 +273,7 @@ def main() -> None:
         args.universe_mode,
         args.adv_min_qv,
         args.adv_top_n,
+        args.universe_cache,
     )
 
     if args.start or args.end:
