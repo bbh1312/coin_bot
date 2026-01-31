@@ -25,6 +25,44 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _sanitize_symbol(symbol: str) -> str:
+    return symbol.replace("/", "_").replace(":", "_")
+
+
+def _ohlcv_cache_path(root_dir: str, symbol: str, timeframe: str, start_ms: int, end_ms: int) -> str:
+    safe = _sanitize_symbol(symbol)
+    return os.path.join(
+        root_dir,
+        "logs",
+        "advanced_trend_follower",
+        "ohlcv_cache",
+        f"{safe}_{timeframe}_{start_ms}_{end_ms}.csv",
+    )
+
+
+def _read_ohlcv_cache(path: str) -> List[list]:
+    if not os.path.exists(path):
+        return []
+    try:
+        df = pd.read_csv(path)
+        if df.empty:
+            return []
+        return df[["ts", "open", "high", "low", "close", "volume"]].values.tolist()
+    except Exception:
+        return []
+
+
+def _write_ohlcv_cache(path: str, rows: List[list]) -> None:
+    if not rows:
+        return
+    _ensure_dir(os.path.dirname(path))
+    try:
+        df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+        df.to_csv(path, index=False)
+    except Exception:
+        return
+
+
 def _utc_ms(dt: datetime) -> int:
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
@@ -45,6 +83,10 @@ def _fetch_ohlcv_all(
     end_ms: int,
     limit: int = 1500,
 ) -> List[list]:
+    cache_path = _ohlcv_cache_path(ROOT_DIR, symbol, timeframe, start_ms, end_ms)
+    cached = _read_ohlcv_cache(cache_path)
+    if cached:
+        return cached
     out: List[list] = []
     since = start_ms
     tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
@@ -68,6 +110,7 @@ def _fetch_ohlcv_all(
         time.sleep(exchange.rateLimit / 1000.0)
     if out:
         out = out[:-1]
+    _write_ohlcv_cache(cache_path, out)
     return out
 
 
@@ -261,7 +304,7 @@ def _select_symbols(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--days", type=int, default=3)
     parser.add_argument("--symbols", default="")
     parser.add_argument("--symbols-file", default="")
     parser.add_argument("--universe", default="top50")
@@ -279,17 +322,32 @@ def main() -> None:
     parser.add_argument("--adx-min", type=float, default=20.0)
     parser.add_argument("--mfi-long-max", type=float, default=80.0)
     parser.add_argument("--mfi-short-min", type=float, default=20.0)
+    parser.add_argument("--rsi-long-max", type=float, default=0.0)
+    parser.add_argument("--rsi-short-min", type=float, default=0.0)
+    parser.add_argument("--vol-sma-len", type=int, default=20)
+    parser.add_argument("--vol-spike-mult", type=float, default=0.0)
+    parser.add_argument("--ema-dist-min", type=float, default=0.0)
+    parser.add_argument("--bb-len", type=int, default=20)
+    parser.add_argument("--bb-std", type=float, default=2.0)
+    parser.add_argument("--bb-dist-min", type=float, default=0.0)
     parser.add_argument("--st-atr", type=int, default=10)
     parser.add_argument("--st-mult", type=float, default=3.0)
     parser.add_argument("--tf-main", default="15m")
     parser.add_argument("--tf-trend", default="4h")
+    parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")
+    parser.add_argument("--end-ms", type=int, default=0, help="fixed end timestamp in ms (for cache reuse)")
     args = parser.parse_args()
+    # align backtest with live (confirmed candles)
+    args.use_confirmed = True
 
     exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     end_dt = datetime.utcnow()
+    end_ms = _utc_ms(end_dt)
+    if int(args.end_ms or 0) > 0:
+        end_ms = int(args.end_ms)
+        end_dt = datetime.utcfromtimestamp(end_ms / 1000.0)
     start_dt = end_dt - pd.Timedelta(days=args.days)
     start_ms = _utc_ms(start_dt)
-    end_ms = _utc_ms(end_dt)
 
     symbols = _select_symbols(exchange, args.symbols, args.symbols_file, args.universe, args.min_qv)
     if not symbols:
@@ -352,6 +410,13 @@ def main() -> None:
         df = df.drop_duplicates("ts").reset_index(drop=True)
         df_trend = df_trend.drop_duplicates("ts").reset_index(drop=True)
         df_exit = df_exit.drop_duplicates("ts").reset_index(drop=True)
+        if args.use_confirmed:
+            if len(df) > 1:
+                df = df.iloc[:-1].reset_index(drop=True)
+            if len(df_trend) > 1:
+                df_trend = df_trend.iloc[:-1].reset_index(drop=True)
+            if len(df_exit) > 1:
+                df_exit = df_exit.iloc[:-1].reset_index(drop=True)
 
         df_trend["ema200"] = _ema(df_trend["close"], 200)
         df_trend = df_trend[["ts", "ema200"]].dropna()
@@ -372,8 +437,10 @@ def main() -> None:
         df["atr"] = _atr(df, args.st_atr)
         df["atr14"] = _atr(df, 14)
         df["atr_median"] = df["atr"].rolling(int(args.atr_scale_lookback)).median()
-        bb_len = 20
-        bb_std = 2.0
+        vol_sma_len = max(1, int(args.vol_sma_len))
+        df["vol_sma"] = df["volume"].rolling(vol_sma_len).mean()
+        bb_len = int(args.bb_len)
+        bb_std = float(args.bb_std)
         bb_mid = df["close"].rolling(bb_len).mean()
         bb_dev = df["close"].rolling(bb_len).std(ddof=0)
         df["bb_upper"] = bb_mid + (bb_std * bb_dev)
@@ -403,6 +470,9 @@ def main() -> None:
             ema20 = float(row["ema20"]) if pd.notna(row["ema20"]) else None
             vol_now = float(row["volume"]) if pd.notna(row["volume"]) else None
             vol_prev = float(df["volume"].iloc[i - 1]) if i >= 1 and pd.notna(df["volume"].iloc[i - 1]) else None
+            vol_sma = float(row["vol_sma"]) if pd.notna(row["vol_sma"]) else None
+            bb_upper = float(row["bb_upper"]) if pd.notna(row["bb_upper"]) else None
+            bb_lower = float(row["bb_lower"]) if pd.notna(row["bb_lower"]) else None
 
             if pos:
                 high_now = float(row["high"])
@@ -556,6 +626,31 @@ def main() -> None:
             flip_long = st_dir == 1 and prev_st_dir <= 0
             flip_short = st_dir == -1 and prev_st_dir >= 0
             if flip_long:
+                if adx is None or adx < float(args.adx_min):
+                    continue
+                if mfi is None or mfi > float(args.mfi_long_max):
+                    continue
+                if float(args.rsi_long_max) > 0 and (rsi is None or rsi > float(args.rsi_long_max)):
+                    continue
+                if float(args.vol_spike_mult) > 0:
+                    if vol_now is None or vol_sma is None or vol_sma <= 0:
+                        continue
+                    if vol_now < (vol_sma * float(args.vol_spike_mult)):
+                        continue
+                if float(args.ema_dist_min) > 0:
+                    if ema20 is None or ema20 == 0:
+                        continue
+                    if close_px <= ema20:
+                        continue
+                    ema_dist = abs(close_px - ema20) / ema20
+                    if ema_dist < float(args.ema_dist_min):
+                        continue
+                if float(args.bb_dist_min) > 0:
+                    if bb_upper is None or bb_upper == 0:
+                        continue
+                    bb_dist = (close_px - bb_upper) / bb_upper
+                    if bb_dist < float(args.bb_dist_min):
+                        continue
                 entry_ts = ts
                 entry_px = close_px
                 entry_idx = i
@@ -612,6 +707,31 @@ def main() -> None:
                 continue
 
             if flip_short:
+                if adx is None or adx < float(args.adx_min):
+                    continue
+                if mfi is None or mfi < float(args.mfi_short_min):
+                    continue
+                if float(args.rsi_short_min) > 0 and (rsi is None or rsi < float(args.rsi_short_min)):
+                    continue
+                if float(args.vol_spike_mult) > 0:
+                    if vol_now is None or vol_sma is None or vol_sma <= 0:
+                        continue
+                    if vol_now < (vol_sma * float(args.vol_spike_mult)):
+                        continue
+                if float(args.ema_dist_min) > 0:
+                    if ema20 is None or ema20 == 0:
+                        continue
+                    if close_px >= ema20:
+                        continue
+                    ema_dist = abs(close_px - ema20) / ema20
+                    if ema_dist < float(args.ema_dist_min):
+                        continue
+                if float(args.bb_dist_min) > 0:
+                    if bb_lower is None or bb_lower == 0:
+                        continue
+                    bb_dist = (bb_lower - close_px) / bb_lower
+                    if bb_dist < float(args.bb_dist_min):
+                        continue
                 entry_ts = ts
                 entry_px = close_px
                 entry_idx = i

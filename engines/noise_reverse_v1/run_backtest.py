@@ -20,10 +20,10 @@ from engines.universe import build_universe_from_tickers
 
 # Backtest-baseline defaults (overridable via CLI)
 NOISE_REVERSE_LOOKBACK = 100
-NOISE_REVERSE_MA_LEN = 20
+NOISE_REVERSE_MA_LEN = 25
 NOISE_REVERSE_VOL_SMA_LEN = 20
 NOISE_REVERSE_VOL_SPIKE_MULT = 5.0
-NOISE_REVERSE_DISPARITY_PCT = 0.025
+NOISE_REVERSE_DISPARITY_PCT = 0.03
 
 def _ensure_dir(path: str) -> None:
     if not path:

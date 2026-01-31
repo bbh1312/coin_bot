@@ -72,6 +72,25 @@ def _fetch_ohlcv_all(
     return out
 
 
+def _load_cached_ohlcv(path: str) -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    if df.empty or "ts" not in df.columns:
+        return None
+    return df
+
+
+def _save_cached_ohlcv(path: str, df: pd.DataFrame) -> None:
+    try:
+        df.to_csv(path, index=False)
+    except Exception:
+        pass
+
+
 def _to_df(rows: List[list]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
@@ -179,11 +198,14 @@ def main() -> None:
     parser.add_argument("--universe-mode", default="adv_trend", choices=["adv_trend", "simple"])
     parser.add_argument("--adv-min-qv", type=float, default=float(os.getenv("ADV_TREND_MIN_QV", "5000000")))
     parser.add_argument("--adv-top-n", type=int, default=int(os.getenv("ADV_TREND_UNIVERSE_TOP_N", "30")))
+    parser.add_argument("--cache-dir", default="")
+    parser.add_argument("--start-ms", type=int, default=0)
+    parser.add_argument("--end-ms", type=int, default=0)
     parser.add_argument("--initial-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-pct", type=float, default=1.0)
     parser.add_argument("--entry-base", default="equity", choices=["equity", "fixed"])
     parser.add_argument("--fixed-equity", type=float, default=1000.0)
-    parser.add_argument("--tp-pct", type=float, default=0.02)
+    parser.add_argument("--tp-pct", type=float, default=0.012)
     parser.add_argument("--sl-pct", type=float, default=0.02)
     parser.add_argument("--slip-pct", type=float, default=0.0)
     parser.add_argument("--rsi-len", type=int, default=14)
@@ -192,7 +214,10 @@ def main() -> None:
     parser.add_argument("--breakout-lookback", type=int, default=10)
     parser.add_argument("--vol-lookback", type=int, default=5)
     parser.add_argument("--vol-mult", type=float, default=2.5)
-    parser.add_argument("--wick-min-ratio", type=float, default=0.1)
+    parser.add_argument("--wick-min-ratio", type=float, default=0.0)
+    parser.add_argument("--invert-side", action="store_true")
+    parser.add_argument("--rsi-bend", action="store_true")
+    parser.add_argument("--cooldown-bars", type=int, default=1)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -243,10 +268,18 @@ def main() -> None:
         _bt_log("[backtest] no symbols")
         return
 
-    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=args.days)
-    start_ms = _utc_ms(start_dt)
-    end_ms = _utc_ms(end_dt)
+    if int(args.end_ms) > 0:
+        end_ms = int(args.end_ms)
+        end_dt = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)
+    else:
+        end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        end_ms = _utc_ms(end_dt)
+    if int(args.start_ms) > 0:
+        start_ms = int(args.start_ms)
+        start_dt = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc)
+    else:
+        start_dt = end_dt - timedelta(days=args.days)
+        start_ms = _utc_ms(start_dt)
 
     _bt_log(
         "[run] mode=liquidity_trap_v1 days=%d start_ms=%d end_ms=%d universe=%s tp=%.3f sl=%.3f"
@@ -264,23 +297,41 @@ def main() -> None:
     stats_by_symbol: Dict[str, Dict] = {}
     equity = float(args.initial_usdt)
 
+    cache_dir = args.cache_dir.strip()
+    if not cache_dir:
+        cache_dir = os.path.join(ROOT_DIR, "logs", "liquidity_trap_v1", "cache")
+    _ensure_dir(cache_dir)
+
     for symbol in symbols:
         try:
-            rows_1m = _fetch_ohlcv_all(exchange, symbol, "1m", start_ms, end_ms)
+            cache_name = "%s_%s_%s.csv" % (symbol.replace("/", "_").replace(":", "_"), start_ms, end_ms)
+            cache_path = os.path.join(cache_dir, cache_name)
+            cached = _load_cached_ohlcv(cache_path)
+            if cached is not None:
+                df = cached
+            else:
+                rows_1m = _fetch_ohlcv_all(exchange, symbol, "1m", start_ms, end_ms)
+                df = _to_df(rows_1m)
+                if not df.empty:
+                    _save_cached_ohlcv(cache_path, df)
         except Exception:
             continue
 
-        df = _to_df(rows_1m)
         if df.empty or len(df) < max(args.rsi_len, args.breakout_lookback, args.vol_lookback) + 5:
             continue
 
         df = df.drop_duplicates("ts").reset_index(drop=True)
         df["rsi"] = _rsi(df["close"], int(args.rsi_len))
+        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
         df["vol_sma"] = df["volume"].rolling(int(args.vol_lookback)).mean().shift(1)
         df["hi20"] = df["high"].rolling(int(args.breakout_lookback)).max().shift(1)
         df["lo20"] = df["low"].rolling(int(args.breakout_lookback)).min().shift(1)
 
-        open_pos: Optional[Position] = None
+        open_long: Optional[Position] = None
+        open_short: Optional[Position] = None
+        cooldown_left = 0
         kst_tz = timezone(timedelta(hours=9))
 
         for i in range(1, len(df) - 1):
@@ -291,59 +342,63 @@ def main() -> None:
             l = float(row["low"])
             c = float(row["close"])
 
-            if open_pos:
+            for pos_side, pos in (("LONG", open_long), ("SHORT", open_short)):
+                if not pos:
+                    continue
+                if pos.side == "LONG":
+                    pos.max_favorable = max(pos.max_favorable, (h - pos.entry_px) / pos.entry_px)
+                    pos.max_adverse = max(pos.max_adverse, (pos.entry_px - l) / pos.entry_px)
+                else:
+                    pos.max_favorable = max(pos.max_favorable, (pos.entry_px - l) / pos.entry_px)
+                    pos.max_adverse = max(pos.max_adverse, (h - pos.entry_px) / pos.entry_px)
                 exit_reason = None
                 exit_px = None
-                if open_pos.side == "LONG":
-                    tp_hit = h >= open_pos.tp_px
-                    sl_hit = l <= open_pos.sl_px
+                if pos.side == "LONG":
+                    tp_hit = h >= pos.tp_px
+                    sl_hit = l <= pos.sl_px
                     if tp_hit and sl_hit:
                         exit_reason = "SL"
-                        exit_px = open_pos.sl_px
+                        exit_px = pos.sl_px
                     elif sl_hit:
                         exit_reason = "SL"
-                        exit_px = open_pos.sl_px
+                        exit_px = pos.sl_px
                     elif tp_hit:
                         exit_reason = "TP"
-                        exit_px = open_pos.tp_px
+                        exit_px = pos.tp_px
                 else:
-                    tp_hit = l <= open_pos.tp_px
-                    sl_hit = h >= open_pos.sl_px
+                    tp_hit = l <= pos.tp_px
+                    sl_hit = h >= pos.sl_px
                     if tp_hit and sl_hit:
                         exit_reason = "SL"
-                        exit_px = open_pos.sl_px
+                        exit_px = pos.sl_px
                     elif sl_hit:
                         exit_reason = "SL"
-                        exit_px = open_pos.sl_px
+                        exit_px = pos.sl_px
                     elif tp_hit:
                         exit_reason = "TP"
-                        exit_px = open_pos.tp_px
+                        exit_px = pos.tp_px
 
-                hold_bars = i - open_pos.entry_idx
+                hold_bars = i - pos.entry_idx
 
                 if exit_reason:
-                    pnl_per_unit = (
-                        exit_px - open_pos.entry_px
-                        if open_pos.side == "LONG"
-                        else open_pos.entry_px - exit_px
-                    )
-                    pnl_usdt = pnl_per_unit * open_pos.size
-                    pnl_pct = pnl_per_unit / open_pos.entry_px
+                    pnl_per_unit = (exit_px - pos.entry_px) if pos.side == "LONG" else (pos.entry_px - exit_px)
+                    pnl_usdt = pnl_per_unit * pos.size
+                    pnl_pct = pnl_per_unit / pos.entry_px
 
                     trades.append(
                         {
                             "symbol": symbol,
-                            "side": open_pos.side,
-                            "entry_ts": open_pos.entry_ts,
+                            "side": pos.side,
+                            "entry_ts": pos.entry_ts,
                             "exit_ts": ts,
-                            "entry_px": open_pos.entry_px,
+                            "entry_px": pos.entry_px,
                             "exit_px": exit_px,
                             "pnl_usdt": pnl_usdt,
                             "pnl_pct": pnl_pct,
                             "exit_reason": exit_reason,
                             "hold_bars": hold_bars,
-                            "mfe": open_pos.max_favorable,
-                            "mae": open_pos.max_adverse,
+                            "mfe": pos.max_favorable,
+                            "mae": pos.max_adverse,
                         }
                     )
                     with open(trades_path, "a", newline="", encoding="utf-8") as f:
@@ -351,17 +406,17 @@ def main() -> None:
                         writer.writerow(
                             [
                                 symbol,
-                                open_pos.side,
-                                _dt_kst(open_pos.entry_ts),
+                                pos.side,
+                                _dt_kst(pos.entry_ts),
                                 _dt_kst(ts),
-                                open_pos.entry_px,
+                                pos.entry_px,
                                 exit_px,
                                 pnl_usdt,
                                 pnl_pct,
                                 exit_reason,
                                 hold_bars,
-                                open_pos.max_favorable,
-                                open_pos.max_adverse,
+                                pos.max_favorable,
+                                pos.max_adverse,
                             ]
                         )
 
@@ -383,8 +438,8 @@ def main() -> None:
                     )
                     sym_stats["exits"] += 1
                     sym_stats["trades"] += 1
-                    sym_stats["mfe_sum"] += float(open_pos.max_favorable)
-                    sym_stats["mae_sum"] += float(open_pos.max_adverse)
+                    sym_stats["mfe_sum"] += float(pos.max_favorable)
+                    sym_stats["mae_sum"] += float(pos.max_adverse)
                     sym_stats["hold_sum"] += float(hold_bars)
                     sym_stats["pnl_sum"] += float(pnl_usdt)
                     if pnl_usdt > 0:
@@ -403,11 +458,18 @@ def main() -> None:
                     if args.verbose:
                         _bt_log(
                             "LIQ_EXIT sym=%s side=%s reason=%s pnl=%.4f"
-                            % (symbol, open_pos.side, exit_reason, pnl_usdt)
+                            % (symbol, pos.side, exit_reason, pnl_usdt)
                         )
 
-                    open_pos = None
-                    continue
+                    if pos_side == "LONG":
+                        open_long = None
+                    else:
+                        open_short = None
+                    cooldown_left = int(args.cooldown_bars)
+
+            if cooldown_left > 0:
+                cooldown_left -= 1
+                continue
 
             dt_kst = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).astimezone(kst_tz)
             hour = dt_kst.hour
@@ -422,7 +484,13 @@ def main() -> None:
             sig_h = float(sig_row["high"])
             sig_l = float(sig_row["low"])
             sig_close = float(sig_row["close"])
+            sig_ema20 = float(sig_row["ema20"]) if pd.notna(sig_row["ema20"]) else None
+            sig_ema50 = float(sig_row["ema50"]) if pd.notna(sig_row["ema50"]) else None
+            sig_ema200 = float(sig_row["ema200"]) if pd.notna(sig_row["ema200"]) else None
             sig_vol = float(sig_row["volume"])
+            prev_rsi = None
+            if i - 2 >= 0:
+                prev_rsi = float(df.iloc[i - 2]["rsi"]) if pd.notna(df.iloc[i - 2]["rsi"]) else None
 
             entry_side: Optional[str] = None
             vol_ok = isinstance(vol_sma, (int, float)) and vol_sma > 0 and sig_vol >= vol_sma * float(args.vol_mult)
@@ -433,20 +501,46 @@ def main() -> None:
             if isinstance(hi20, (int, float)) and vol_ok and isinstance(rsi_val, (int, float)):
                 if sig_h > hi20 and rsi_val >= float(args.rsi_long_min):
                     if isinstance(wick_ratio, (int, float)) and wick_ratio > float(args.wick_min_ratio):
-                        entry_side = "LONG"
+                        if args.rsi_bend and isinstance(prev_rsi, (int, float)) and not (rsi_val < prev_rsi):
+                            pass
+                        else:
+                            entry_side = "LONG"
                 elif sig_l < lo20 and rsi_val <= float(args.rsi_short_max):
                     if isinstance(wick_ratio, (int, float)) and wick_ratio > float(args.wick_min_ratio):
-                        entry_side = "SHORT"
+                        if args.rsi_bend and isinstance(prev_rsi, (int, float)) and not (rsi_val > prev_rsi):
+                            pass
+                        else:
+                            entry_side = "SHORT"
 
             if not entry_side:
                 continue
 
+            if isinstance(sig_ema20, (int, float)):
+                if entry_side == "LONG" and not (sig_close > sig_ema20):
+                    continue
+                if entry_side == "SHORT" and not (sig_close < sig_ema20):
+                    continue
+            if isinstance(sig_ema50, (int, float)) and isinstance(sig_ema200, (int, float)):
+                if entry_side == "LONG" and not (sig_close > sig_ema50 > sig_ema200):
+                    continue
+                if entry_side == "SHORT" and not (sig_close < sig_ema50 < sig_ema200):
+                    continue
+
+            base_side = entry_side
+            if args.invert_side:
+                entry_side = "SHORT" if entry_side == "LONG" else "LONG"
+
+            # block duplicate entries by symbol+side (post-inversion)
+            if entry_side == "LONG" and open_long:
+                continue
+            if entry_side == "SHORT" and open_short:
+                continue
+
             entry_row = df.iloc[i + 1]
             entry_ts = int(entry_row["ts"])
-            if entry_side == "LONG":
-                entry_px = sig_close * 1.01
-            else:
-                entry_px = sig_close * 0.99
+            entry_px = float(entry_row["open"])
+            if args.slip_pct:
+                entry_px *= 1.0 + float(args.slip_pct)
 
             if entry_side == "LONG":
                 tp_px = entry_px * (1.0 + float(args.tp_pct))
@@ -459,7 +553,7 @@ def main() -> None:
             entry_usdt = base_equity * (float(args.entry_pct) / 100.0)
             size = entry_usdt / entry_px
 
-            open_pos = Position(
+            new_pos = Position(
                 side=entry_side,
                 entry_idx=i + 1,
                 entry_ts=entry_ts,
@@ -468,6 +562,10 @@ def main() -> None:
                 sl_px=sl_px,
                 size=size,
             )
+            if entry_side == "LONG":
+                open_long = new_pos
+            else:
+                open_short = new_pos
 
             sym_stats = stats_by_symbol.setdefault(
                 symbol,
@@ -488,9 +586,10 @@ def main() -> None:
             sym_stats["entries"] += 1
 
             if args.verbose:
-                _bt_log("LIQ_ENTRY sym=%s side=%s entry=%.6g" % (symbol, entry_side, entry_px))
+                _bt_log("LIQ_ENTRY sym=%s side=%s base=%s entry=%.6g" % (symbol, entry_side, base_side, entry_px))
 
-        open_pos = None
+        open_long = None
+        open_short = None
 
     wins = sum(1 for t in trades if t["pnl_pct"] > 0)
     losses = sum(1 for t in trades if t["pnl_pct"] <= 0)

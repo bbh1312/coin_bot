@@ -223,21 +223,27 @@ def _timeframe_minutes(tf: str) -> Optional[int]:
 def _read_common_universe_file(path: str) -> List[str]:
     if not path or not os.path.exists(path):
         return []
-    symbols: List[str] = []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                raw = line.strip()
-                if not raw:
-                    continue
-                if raw.startswith("COMMON_UNIVERSE"):
-                    continue
-                if raw.startswith("#"):
-                    continue
-                symbols.append(raw)
+            lines = [line.strip() for line in f if line.strip()]
     except Exception:
         return []
-    return symbols
+    last_idx = -1
+    size = None
+    for i, line in enumerate(lines):
+        if line.startswith("COMMON_UNIVERSE"):
+            last_idx = i
+            try:
+                size = int(line.split("size=")[-1].strip())
+            except Exception:
+                size = None
+    if last_idx == -1:
+        return [line for line in lines if not line.startswith("#")]
+    if not size or size <= 0:
+        return []
+    start = last_idx + 1
+    end = start + size
+    return [line for line in lines[start:end] if line and not line.startswith("#")]
 
 
 def _latest_common_universe_file(root_dir: str) -> str:
