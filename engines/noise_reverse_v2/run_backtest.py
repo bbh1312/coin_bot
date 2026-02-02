@@ -340,7 +340,7 @@ def main() -> None:
         loss_streak = 0
         max_loss_streak = 0
 
-        sig_offset = 2 if args.use_confirmed else 0
+        sig_offset = 1 if args.use_confirmed else 0
         min_len = max(lookback + sig_offset + 1, ma_len + sig_offset + 1, vol_len + sig_offset + 1, 120)
         end_idx = len(df) - 1 if args.use_confirmed else len(df)
         for i in range(min_len, end_idx):
@@ -517,8 +517,8 @@ def main() -> None:
             if entry_usdt <= 0:
                 continue
 
-            # enter at next bar open to align with live confirmed-candle signal timing
-            entry_px = o
+            # enter at confirmed candle close when enabled; otherwise current bar open
+            entry_px = c_sig if args.use_confirmed else o
             if entry_side == "LONG":
                 tp_px = entry_px * (1.0 + tp_pct)
                 sl_px = entry_px * (1.0 - sl_pct)

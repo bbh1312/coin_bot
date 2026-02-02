@@ -894,11 +894,11 @@ ANTI_ALPHA_LONG_RSI_MAX = 30
 ANTI_ALPHA_EMA_DIST_MIN = 0.003
 ANTI_ALPHA_BODY_PCT_MIN = 0.008
 # Backtest-baseline params (kept identical to backtest)
-NOISE_REVERSE_LOOKBACK = 220
+NOISE_REVERSE_LOOKBACK = 280
 NOISE_REVERSE_MA_LEN = 35
-NOISE_REVERSE_VOL_SMA_LEN = 30
+NOISE_REVERSE_VOL_SMA_LEN = 35
 NOISE_REVERSE_VOL_SPIKE_MULT = 6.0
-NOISE_REVERSE_DISPARITY_PCT = 0.04
+NOISE_REVERSE_DISPARITY_PCT = 0.045
 NOISE_REVERSE_INVERT_SIDE = True
 SRP_PB_LOOKBACK = 12
 SRP_VOL_MIN_MULT = 1.0
@@ -1113,6 +1113,12 @@ COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "30"))
 COMMON_UNIVERSE_LOG_PATH = ""
 COMMON_WARMUP_LOG_PATH = ""
 COMMON_WARMUP_CACHE_DIR = os.getenv("COMMON_WARMUP_CACHE_DIR", "").strip()
+NOISE_REVERSE_USE_COMMON_CACHE = os.getenv("NOISE_REVERSE_USE_COMMON_CACHE", "0") == "1"
+NOISE_REVERSE_FILE_CACHE: dict = {}
+NOISE_REVERSE_FILE_CACHE_USED: dict = {}
+NOISE_REVERSE_FILE_CACHE_MISS: dict = {}
+NOISE_REVERSE_FILE_CACHE_FAIL: dict = {}
+NOISE_REVERSE_SOURCE_LOGGED: dict = {}
 
 def _common_warmup_cache_dir() -> str:
     base = COMMON_WARMUP_CACHE_DIR or os.path.join("logs", "common_warmup", "ohlcv")
@@ -1140,6 +1146,62 @@ def _dump_common_warmup_ohlcv(sym: str, tf: str, data: list) -> None:
                 )
     except Exception:
         pass
+
+def _load_common_warmup_ohlcv(symbol: str, tf: str, limit: int) -> Optional["pd.DataFrame"]:
+    cache_dir = _common_warmup_cache_dir()
+    path = os.path.join(cache_dir, f"{symbol.replace('/', '_').replace(':', '_')}_{tf}.csv")
+    if not os.path.exists(path):
+        if not NOISE_REVERSE_FILE_CACHE_MISS.get(path):
+            try:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_CACHE source=file-miss path={path}"
+                )
+            except Exception:
+                pass
+            NOISE_REVERSE_FILE_CACHE_MISS[path] = True
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+    key = (symbol, tf, path)
+    cached = NOISE_REVERSE_FILE_CACHE.get(key)
+    if cached and cached.get("mtime") == mtime:
+        df = cached.get("df")
+        if df is not None and not df.empty:
+            return df.tail(limit) if len(df) > limit else df
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        if not NOISE_REVERSE_FILE_CACHE_FAIL.get(path):
+            try:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_CACHE source=file-read-fail path={path} err={e}"
+                )
+            except Exception:
+                pass
+            NOISE_REVERSE_FILE_CACHE_FAIL[path] = True
+        return None
+    if df.empty or "ts" not in df.columns:
+        if not NOISE_REVERSE_FILE_CACHE_FAIL.get(path):
+            try:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_CACHE source=file-bad path={path} cols={list(df.columns)} rows={len(df)}"
+                )
+            except Exception:
+                pass
+            NOISE_REVERSE_FILE_CACHE_FAIL[path] = True
+        return None
+    if not NOISE_REVERSE_FILE_CACHE_USED.get(path):
+        try:
+            _append_noise_reverse_log(
+                f"NOISE_REVERSE_CACHE source=file path={path} rows={len(df)}"
+            )
+        except Exception:
+            pass
+        NOISE_REVERSE_FILE_CACHE_USED[path] = True
+    NOISE_REVERSE_FILE_CACHE[key] = {"mtime": mtime, "df": df}
+    return df.tail(limit) if len(df) > limit else df
 
 def _append_common_warmup_ohlcv(sym: str, tf: str, data: list) -> None:
     if not data:
@@ -4444,7 +4506,26 @@ def _run_anti_alpha_cycle(
     min_len = max(ANTI_ALPHA_EMA_LEN, ANTI_ALPHA_RSI_LEN, ANTI_ALPHA_VOL_SMA_LEN) + ANTI_ALPHA_STREAK_N + 3
 
     def _compute_signal(symbol: str) -> dict:
-        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+        df_1m = None
+        used_file = False
+        if NOISE_REVERSE_USE_COMMON_CACHE:
+            df_1m = _load_common_warmup_ohlcv(symbol, "1m", ltf_limit)
+            if df_1m is not None:
+                used_file = True
+            if df_1m is None and symbol in debug_syms:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_CACHE source=file-none sym={symbol}"
+                )
+        if df_1m is None:
+            df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+        if symbol in debug_syms and not NOISE_REVERSE_SOURCE_LOGGED.get(symbol):
+            try:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_CACHE source={'file' if used_file else 'cycle'} sym={symbol}"
+                )
+            except Exception:
+                pass
+            NOISE_REVERSE_SOURCE_LOGGED[symbol] = True
         if not df_1m.empty and "ts" in df_1m.columns:
             try:
                 last_ts = int(df_1m["ts"].iloc[-1])
@@ -4815,6 +4896,14 @@ def _run_noise_reverse_v1_cycle(
     _append_noise_reverse_log(
         f"NOISE_REVERSE_CYCLE_START cycle_id={cycle_id} universe={len(noise_universe)}"
     )
+    if NOISE_REVERSE_USE_COMMON_CACHE and not state.get("_nr_common_cache_logged"):
+        try:
+            _append_noise_reverse_log(
+                f"NOISE_REVERSE_CACHE mode=common_file dir={_common_warmup_cache_dir()}"
+            )
+        except Exception:
+            pass
+        state["_nr_common_cache_logged"] = True
     try:
         refresh_positions_cache(force=True)
     except Exception:
@@ -4844,15 +4933,34 @@ def _run_noise_reverse_v1_cycle(
     symbols = list(noise_universe or [])
 
     def _compute_signal(symbol: str) -> dict:
-        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
-        if not df_1m.empty and "ts" in df_1m.columns:
+        df_1m = None
+        used_file = False
+        if NOISE_REVERSE_USE_COMMON_CACHE:
+            df_1m = _load_common_warmup_ohlcv(symbol, "1m", ltf_limit)
+            if df_1m is not None:
+                used_file = True
+            if df_1m is None and symbol in debug_syms:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_CACHE source=file-none sym={symbol}"
+                )
+        if df_1m is None:
+            df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+            if not df_1m.empty and "ts" in df_1m.columns:
+                try:
+                    last_ts = int(df_1m["ts"].iloc[-1])
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - last_ts > 120_000:
+                        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit, force=True)
+                except Exception:
+                    pass
+        if symbol in debug_syms and not NOISE_REVERSE_SOURCE_LOGGED.get(symbol):
             try:
-                last_ts = int(df_1m["ts"].iloc[-1])
-                now_ms = int(time.time() * 1000)
-                if now_ms - last_ts > 120_000:
-                    df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit, force=True)
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_CACHE source={'file' if used_file else 'cycle'} sym={symbol}"
+                )
             except Exception:
                 pass
+            NOISE_REVERSE_SOURCE_LOGGED[symbol] = True
         if df_1m.empty:
             if symbol in debug_syms:
                 _append_noise_reverse_log(f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=empty_df")
@@ -4913,7 +5021,7 @@ def _run_noise_reverse_v1_cycle(
         if symbol in debug_syms:
             _append_noise_reverse_log(
                 "NOISE_REVERSE_TRACE sym=%s ts=%d o=%.6g h=%.6g l=%.6g c=%.6g ma20=%.6g hi100=%.6g lo100=%.6g "
-                "vol=%.4g vol_ma=%.4g vol_mult=%.3g disp=%.4g vol_spike=%s base=%s entry=%s"
+                "vol=%.4g vol_ma=%.4g vol_mult=%.3g disp=%.4g vol_spike=%s base=%s entry=%s source=%s"
                 % (
                     symbol,
                     ts,
@@ -4931,6 +5039,7 @@ def _run_noise_reverse_v1_cycle(
                     int(bool(vol_spike)),
                     base_side or "",
                     entry_side or "",
+                    "file" if used_file else "cycle",
                 )
             )
 
@@ -9124,6 +9233,7 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             "DTFX",
             "RSI",
             "ANTI_ALPHA_V1",
+            "NOISE_REVERSE_V1",
             "MANUAL",
             "UNKNOWN",
         }
@@ -14236,6 +14346,18 @@ def run():
                         server_ms = int(exchange.milliseconds())
                     except Exception:
                         server_ms = int(time.time() * 1000)
+                    one_min_ms = 60_000
+                    three_min_ms = 180_000
+                    last_1m_open = (server_ms // one_min_ms - 1) * one_min_ms
+                    last_3m_open = (server_ms // three_min_ms - 1) * three_min_ms
+                    prev_1m_open = _coerce_state_int(state.get("_last_rt_1m_open", 0))
+                    prev_3m_open = _coerce_state_int(state.get("_last_rt_3m_open", 0))
+                    new_1m_bar = bool(last_1m_open and last_1m_open != prev_1m_open)
+                    new_3m_bar = bool(last_3m_open and last_3m_open != prev_3m_open)
+                    if new_1m_bar:
+                        state["_last_rt_1m_open"] = last_1m_open
+                    if new_3m_bar:
+                        state["_last_rt_3m_open"] = last_3m_open
                     try:
                         ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", "15m", limit=3)
                         if ohlcv and len(ohlcv) >= 2:
@@ -14322,7 +14444,7 @@ def run():
                         if COMMON_WARMUP_DONE:
                             print(f"\n[사이클 {cycle_label}] (동일 캔들) realtime only (heavy_scan=N)")
                     cycle_start = time.time()
-                    run_rsi_short = bool(RSI_ENABLED and (not ONLY_DIV15M_SHORT))
+                    run_rsi_short = bool(RSI_ENABLED and (not ONLY_DIV15M_SHORT) and new_3m_bar)
                     run_div15m_long = bool((not ONLY_DIV15M_SHORT) and DIV15M_LONG_ENABLED and div15m_engine)
                     run_div15m_short = bool(div15m_short_engine and (DIV15M_SHORT_ENABLED or ONLY_DIV15M_SHORT))
                     # 기존 Manage/SYNC는 Universe 생성 후로 이동하여 universe 심볼도 포함
@@ -14500,7 +14622,7 @@ def run():
                     )
                     adv_trend_ran = bool(heavy_scan and ADV_TREND_ENABLED and adv_trend_universe)
                     anti_alpha_ran = bool(ANTI_ALPHA_V1_ENABLED and adv_trend_universe)
-                    noise_reverse_ran = bool(NOISE_REVERSE_V1_ENABLED and noise_reverse_universe and (not heavy_scan))
+                    noise_reverse_ran = bool(NOISE_REVERSE_V1_ENABLED and noise_reverse_universe and (not heavy_scan) and new_1m_bar)
                     srp_ran = bool(SRP_ST_REGIME_PULLBACK_V1_ENABLED and srp_universe and (not heavy_scan))
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
                     atlas_rs_fail_short_ran = bool(
@@ -14909,7 +15031,7 @@ def run():
                             daemon=True,
                         )
                         anti_alpha_thread.start()
-                    if NOISE_REVERSE_V1_ENABLED and (not heavy_scan):
+                    if NOISE_REVERSE_V1_ENABLED and (not heavy_scan) and new_1m_bar:
                         noise_reverse_thread = threading.Thread(
                             target=lambda: noise_reverse_result.update(
                                 _run_noise_reverse_v1_cycle(

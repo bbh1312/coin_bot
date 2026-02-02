@@ -19,11 +19,11 @@ if ROOT_DIR not in sys.path:
 from engines.universe import build_universe_from_tickers
 
 # Backtest-baseline defaults (overridable via CLI)
-NOISE_REVERSE_LOOKBACK = 220
+NOISE_REVERSE_LOOKBACK = 280
 NOISE_REVERSE_MA_LEN = 35
-NOISE_REVERSE_VOL_SMA_LEN = 30
+NOISE_REVERSE_VOL_SMA_LEN = 35
 NOISE_REVERSE_VOL_SPIKE_MULT = 6.0
-NOISE_REVERSE_DISPARITY_PCT = 0.04
+NOISE_REVERSE_DISPARITY_PCT = 0.045
 
 
 def _ohlcv_cache_path(root_dir: str, symbol: str, timeframe: str, start_ms: int, end_ms: int) -> str:
@@ -93,7 +93,9 @@ def _parse_utc_dt(text: str) -> Optional[datetime]:
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(raw, fmt)
-            return dt.replace(tzinfo=timezone.utc)
+            # Interpret input as KST by default, then convert to UTC
+            kst = timezone(timedelta(hours=9))
+            return dt.replace(tzinfo=kst).astimezone(timezone.utc)
         except Exception:
             continue
     return None
@@ -286,8 +288,8 @@ class Position:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=7)
-    parser.add_argument("--start", default="", help="UTC start, format: YYYY-MM-DD or YYYY-MM-DD HH:MM")
-    parser.add_argument("--end", default="", help="UTC end, format: YYYY-MM-DD or YYYY-MM-DD HH:MM")
+    parser.add_argument("--start", default="", help="KST start, format: YYYY-MM-DD or YYYY-MM-DD HH:MM")
+    parser.add_argument("--end", default="", help="KST end, format: YYYY-MM-DD or YYYY-MM-DD HH:MM")
     parser.add_argument("--end-ms", type=int, default=0, help="fixed end timestamp in ms (for cache reuse)")
     parser.add_argument("--symbols", default="")
     parser.add_argument("--symbols-file", default="")
@@ -316,10 +318,11 @@ def main() -> None:
     parser.add_argument("--ema-dist-min", type=float, default=0.0)
     parser.add_argument("--tp-pct", type=float, default=0.025)
     parser.add_argument("--sl-pct", type=float, default=0.025)
-    parser.add_argument("--cooldown-bars", type=int, default=15)
+    parser.add_argument("--cooldown-bars", type=int, default=1)
     parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")
     parser.add_argument("--invert-side", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--pad-minutes", type=int, default=0, help="prepend extra minutes for indicator warmup")
     args = parser.parse_args()
     # Backtest params can override defaults via CLI
     lookback = int(args.lookback)
@@ -388,22 +391,31 @@ def main() -> None:
         start_dt = end_dt - timedelta(days=args.days)
     start_ms = _utc_ms(start_dt)
     end_ms = _utc_ms(end_dt)
+    eval_start_ms = start_ms
     if int(args.end_ms or 0) > 0:
         end_ms = int(args.end_ms)
         end_dt = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)
         start_dt = end_dt - timedelta(days=args.days)
         start_ms = _utc_ms(start_dt)
+        eval_start_ms = start_ms
+
+    pad_minutes = int(args.pad_minutes or 0)
+    if pad_minutes > 0:
+        pad_ms = pad_minutes * 60_000
+        start_ms = max(0, start_ms - pad_ms)
 
     _bt_log(
-        "[run] mode=noise_reverse_v1 days=%d start_ms=%d end_ms=%d universe=%s cooldown=%d tp=%.3f sl=%.3f"
+        "[run] mode=noise_reverse_v1 days=%d start_ms=%d eval_start_ms=%d end_ms=%d universe=%s cooldown=%d tp=%.3f sl=%.3f pad_min=%d"
         % (
             args.days,
             start_ms,
+            eval_start_ms,
             end_ms,
             args.universe,
             int(args.cooldown_bars),
             float(args.tp_pct),
             float(args.sl_pct),
+            pad_minutes,
         )
     )
 
@@ -462,6 +474,8 @@ def main() -> None:
         for i in range(min_len, end_idx):
             row = df.iloc[i]
             ts = int(row["ts"])
+            if ts < eval_start_ms:
+                continue
             o = float(row["open"])
             h = float(row["high"])
             l = float(row["low"])
