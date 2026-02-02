@@ -19,11 +19,62 @@ if ROOT_DIR not in sys.path:
 from engines.universe import build_universe_from_tickers
 
 # Backtest-baseline defaults (overridable via CLI)
-NOISE_REVERSE_LOOKBACK = 100
-NOISE_REVERSE_MA_LEN = 25
-NOISE_REVERSE_VOL_SMA_LEN = 20
-NOISE_REVERSE_VOL_SPIKE_MULT = 5.0
-NOISE_REVERSE_DISPARITY_PCT = 0.03
+NOISE_REVERSE_LOOKBACK = 220
+NOISE_REVERSE_MA_LEN = 35
+NOISE_REVERSE_VOL_SMA_LEN = 30
+NOISE_REVERSE_VOL_SPIKE_MULT = 6.0
+NOISE_REVERSE_DISPARITY_PCT = 0.04
+
+
+def _ohlcv_cache_path(root_dir: str, symbol: str, timeframe: str, start_ms: int, end_ms: int) -> str:
+    safe_symbol = symbol.replace("/", "_").replace(":", "_")
+    return os.path.join(
+        root_dir,
+        "logs",
+        "noise_reverse_v1",
+        "ohlcv_cache",
+        f"{safe_symbol}_{timeframe}_{start_ms}_{end_ms}.csv",
+    )
+
+
+def _read_ohlcv_cache(path: str) -> List[list]:
+    if not path or not os.path.exists(path):
+        return []
+    rows: List[list] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) != 6:
+                    continue
+                try:
+                    rows.append(
+                        [
+                            int(float(parts[0])),
+                            float(parts[1]),
+                            float(parts[2]),
+                            float(parts[3]),
+                            float(parts[4]),
+                            float(parts[5]),
+                        ]
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return rows
+
+
+def _write_ohlcv_cache(path: str, rows: List[list]) -> None:
+    if not path or not rows:
+        return
+    _ensure_dir(os.path.dirname(path))
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(",".join(str(x) for x in r) + "\n")
+    except Exception:
+        return
 
 def _ensure_dir(path: str) -> None:
     if not path:
@@ -65,6 +116,10 @@ def _fetch_ohlcv_all(
     end_ms: int,
     limit: int = 1500,
 ) -> List[list]:
+    cache_path = _ohlcv_cache_path(ROOT_DIR, symbol, timeframe, start_ms, end_ms)
+    cached = _read_ohlcv_cache(cache_path)
+    if cached:
+        return cached
     out: List[list] = []
     since = start_ms
     tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
@@ -88,13 +143,66 @@ def _fetch_ohlcv_all(
         time.sleep(exchange.rateLimit / 1000.0)
     if out:
         out = out[:-1]
+        _write_ohlcv_cache(cache_path, out)
     return out
+
+
+def _load_cached_ohlcv(path: str) -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    if df.empty or "ts" not in df.columns:
+        return None
+    return df
+
+
+def _load_common_cache(symbol: str, tf: str, start_ms: int, end_ms: int, cache_dir: str) -> Optional[pd.DataFrame]:
+    if not cache_dir:
+        return None
+    fname = f"{symbol.replace('/', '_').replace(':', '_')}_{tf}.csv"
+    path = os.path.join(cache_dir, fname)
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    if df.empty or "ts" not in df.columns:
+        return None
+    try:
+        df = df[(df["ts"] >= start_ms) & (df["ts"] <= end_ms)]
+    except Exception:
+        return None
+    return df.reset_index(drop=True)
+
+
+def _save_cached_ohlcv(path: str, df: pd.DataFrame) -> None:
+    try:
+        df.to_csv(path, index=False)
+    except Exception:
+        pass
 
 
 def _to_df(rows: List[list]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+
+
+def _rsi(series: pd.Series, length: int) -> pd.Series:
+    if length <= 0:
+        return pd.Series(index=series.index, dtype="float")
+    delta = series.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    avg_gain = gains.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = losses.ewm(alpha=1 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(0.0)
 
 
 def _select_symbols(
@@ -106,6 +214,7 @@ def _select_symbols(
     universe_mode: str,
     adv_min_qv: float,
     adv_top_n: int,
+    common_universe_file: str,
 ) -> List[str]:
     if symbols_file:
         with open(symbols_file, "r", encoding="utf-8") as f:
@@ -114,6 +223,13 @@ def _select_symbols(
     if symbols_arg:
         symbols = [s.strip() for s in symbols_arg.split(",") if s.strip()]
         return symbols
+    if common_universe_file:
+        try:
+            with open(common_universe_file, "r", encoding="utf-8") as f:
+                symbols = [s.strip() for s in f.read().splitlines() if s.strip()]
+            return symbols
+        except Exception:
+            pass
 
     raw = (universe_arg or "").strip().lower()
     if raw.startswith("top"):
@@ -172,13 +288,18 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--start", default="", help="UTC start, format: YYYY-MM-DD or YYYY-MM-DD HH:MM")
     parser.add_argument("--end", default="", help="UTC end, format: YYYY-MM-DD or YYYY-MM-DD HH:MM")
+    parser.add_argument("--end-ms", type=int, default=0, help="fixed end timestamp in ms (for cache reuse)")
     parser.add_argument("--symbols", default="")
     parser.add_argument("--symbols-file", default="")
+    parser.add_argument("--common-universe-file", default="", help="use shared universe file from live")
     parser.add_argument("--universe", default="top50")
     parser.add_argument("--min-qv", type=float, default=30_000_000.0)
     parser.add_argument("--universe-mode", default="adv_trend", choices=["adv_trend", "simple"])
     parser.add_argument("--adv-min-qv", type=float, default=float(os.getenv("ADV_TREND_MIN_QV", "5000000")))
     parser.add_argument("--adv-top-n", type=int, default=int(os.getenv("ADV_TREND_UNIVERSE_TOP_N", "30")))
+    parser.add_argument("--cache-dir", default="")
+    parser.add_argument("--use-common-cache", action="store_true", help="use common warmup OHLCV cache if available")
+    parser.add_argument("--common-cache-dir", default="", help="common warmup OHLCV cache directory")
     parser.add_argument("--initial-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-pct", type=float, default=1.0)
     parser.add_argument("--entry-base", default="equity", choices=["equity", "fixed"])
@@ -188,8 +309,13 @@ def main() -> None:
     parser.add_argument("--vol-sma-len", type=int, default=NOISE_REVERSE_VOL_SMA_LEN)
     parser.add_argument("--vol-spike-mult", type=float, default=NOISE_REVERSE_VOL_SPIKE_MULT)
     parser.add_argument("--disparity-pct", type=float, default=NOISE_REVERSE_DISPARITY_PCT)
-    parser.add_argument("--tp-pct", type=float, default=0.02)
-    parser.add_argument("--sl-pct", type=float, default=0.02)
+    parser.add_argument("--rsi-len", type=int, default=14)
+    parser.add_argument("--rsi-long-max", type=float, default=0.0)
+    parser.add_argument("--rsi-short-min", type=float, default=0.0)
+    parser.add_argument("--ema-len", type=int, default=20)
+    parser.add_argument("--ema-dist-min", type=float, default=0.0)
+    parser.add_argument("--tp-pct", type=float, default=0.025)
+    parser.add_argument("--sl-pct", type=float, default=0.025)
     parser.add_argument("--cooldown-bars", type=int, default=15)
     parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")
     parser.add_argument("--invert-side", action="store_true")
@@ -244,6 +370,7 @@ def main() -> None:
         args.universe_mode,
         args.adv_min_qv,
         args.adv_top_n,
+        args.common_universe_file,
     )
     if not symbols:
         _bt_log("[backtest] no symbols")
@@ -261,6 +388,11 @@ def main() -> None:
         start_dt = end_dt - timedelta(days=args.days)
     start_ms = _utc_ms(start_dt)
     end_ms = _utc_ms(end_dt)
+    if int(args.end_ms or 0) > 0:
+        end_ms = int(args.end_ms)
+        end_dt = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)
+        start_dt = end_dt - timedelta(days=args.days)
+        start_ms = _utc_ms(start_dt)
 
     _bt_log(
         "[run] mode=noise_reverse_v1 days=%d start_ms=%d end_ms=%d universe=%s cooldown=%d tp=%.3f sl=%.3f"
@@ -279,19 +411,46 @@ def main() -> None:
     stats_by_symbol: Dict[str, Dict] = {}
     equity = float(args.initial_usdt)
 
+    cache_dir = args.cache_dir.strip()
+    if not cache_dir:
+        cache_dir = os.path.join(ROOT_DIR, "logs", "noise_reverse_v1", "cache")
+    common_cache_dir = args.common_cache_dir.strip()
+    if not common_cache_dir:
+        common_cache_dir = os.getenv("COMMON_WARMUP_CACHE_DIR", "").strip()
+    if not common_cache_dir:
+        common_cache_dir = os.path.join(ROOT_DIR, "logs", "common_warmup", "ohlcv")
+    _ensure_dir(cache_dir)
+
     for symbol in symbols:
         try:
-            rows_1m = _fetch_ohlcv_all(exchange, symbol, "1m", start_ms, end_ms)
+            cache_name = "%s_%s_%s.csv" % (symbol.replace("/", "_").replace(":", "_"), start_ms, end_ms)
+            cache_path = os.path.join(cache_dir, cache_name)
+            cached = _load_cached_ohlcv(cache_path)
+            if cached is not None:
+                df = cached
+            else:
+                if args.use_common_cache:
+                    common_df = _load_common_cache(symbol, "1m", start_ms, end_ms, common_cache_dir)
+                else:
+                    common_df = None
+                if common_df is not None and not common_df.empty:
+                    df = common_df
+                else:
+                    rows_1m = _fetch_ohlcv_all(exchange, symbol, "1m", start_ms, end_ms)
+                    df = _to_df(rows_1m)
+                if not df.empty:
+                    _save_cached_ohlcv(cache_path, df)
         except Exception:
             continue
 
-        df = _to_df(rows_1m)
         if df.empty or len(df) < 120:
             continue
         df["ma20"] = df["close"].rolling(ma_len).mean()
         df["vol_sma20"] = df["volume"].rolling(vol_len).mean()
         df["hi100"] = df["high"].rolling(lookback).max().shift(1)
         df["lo100"] = df["low"].rolling(lookback).min().shift(1)
+        df["rsi"] = _rsi(df["close"], int(args.rsi_len))
+        df["ema"] = df["close"].ewm(span=int(args.ema_len), adjust=False).mean()
 
         open_pos: Optional[Position] = None
         cooldown_left = 0
@@ -447,6 +606,8 @@ def main() -> None:
             vol_sma20 = float(sig_row["vol_sma20"]) if pd.notna(sig_row["vol_sma20"]) else None
             hi100 = float(sig_row["hi100"]) if pd.notna(sig_row["hi100"]) else None
             lo100 = float(sig_row["lo100"]) if pd.notna(sig_row["lo100"]) else None
+            rsi = float(sig_row["rsi"]) if pd.notna(sig_row["rsi"]) else None
+            ema = float(sig_row["ema"]) if pd.notna(sig_row["ema"]) else None
             vol_now = float(sig_row["volume"])
             h_sig = float(sig_row["high"])
             l_sig = float(sig_row["low"])
@@ -466,6 +627,19 @@ def main() -> None:
 
             if not entry_side:
                 continue
+            if float(args.rsi_long_max) > 0 or float(args.rsi_short_min) > 0:
+                if entry_side == "LONG":
+                    if rsi is None or rsi > float(args.rsi_long_max):
+                        continue
+                else:
+                    if rsi is None or rsi < float(args.rsi_short_min):
+                        continue
+            if float(args.ema_dist_min) > 0:
+                if ema is None or ema == 0:
+                    continue
+                ema_dist = abs(c_sig - ema) / ema
+                if ema_dist < float(args.ema_dist_min):
+                    continue
             tp_pct = float(args.tp_pct)
             sl_pct = float(args.sl_pct)
             if args.invert_side:
@@ -476,8 +650,8 @@ def main() -> None:
             if entry_usdt <= 0:
                 continue
 
-            # enter at next bar open to align with live confirmed-candle signal timing
-            entry_px = o
+            # enter at confirmed candle close to align with live market order timing
+            entry_px = c_sig
             if entry_side == "LONG":
                 tp_px = entry_px * (1.0 + tp_pct)
                 sl_px = entry_px * (1.0 - sl_pct)

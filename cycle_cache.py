@@ -1,4 +1,5 @@
 from typing import Dict, Tuple, Any, Optional, Callable
+import os
 import time
 
 import pandas as pd
@@ -7,6 +8,46 @@ RAW_OHLCV: Dict[Tuple[str, str], dict] = {}
 DF_CACHE: Dict[Tuple[str, str, int], pd.DataFrame] = {}
 IND_CACHE: Dict[Tuple[str, str, Tuple[Any, ...]], Any] = {}
 FETCHER: Optional[Callable[[str, str, int], Optional[list]]] = None
+DISK_CACHE_DIR = os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
+DISK_CACHE_ENABLED = os.getenv("COMMON_OHLCV_CACHE_ENABLED", "1") not in ("0", "false", "off", "no")
+
+
+def _safe_symbol(symbol: str) -> str:
+    return symbol.replace("/", "_").replace(":", "_")
+
+
+def _disk_path(symbol: str, tf: str, limit: int) -> str:
+    fname = f"{_safe_symbol(symbol)}_{tf}_{limit}.csv"
+    return os.path.join(DISK_CACHE_DIR, fname)
+
+
+def _read_disk_cache(symbol: str, tf: str, limit: int) -> Optional[list]:
+    if not DISK_CACHE_ENABLED:
+        return None
+    path = _disk_path(symbol, tf, limit)
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+        if df.empty:
+            return None
+        return df[["ts", "open", "high", "low", "close", "volume"]].values.tolist()
+    except Exception:
+        return None
+
+
+def _write_disk_cache(symbol: str, tf: str, limit: int, data: list) -> None:
+    if not DISK_CACHE_ENABLED:
+        return
+    if not data:
+        return
+    path = _disk_path(symbol, tf, limit)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
+        df.to_csv(path, index=False)
+    except Exception:
+        return
 
 
 def clear_cycle_cache(keep_raw: bool = False) -> None:
@@ -27,6 +68,7 @@ def drop_raw_by_tf(tfs) -> None:
 
 def set_raw(symbol: str, tf: str, data: list) -> None:
     RAW_OHLCV[(symbol, tf)] = {"ts": time.time(), "data": data}
+    _write_disk_cache(symbol, tf, len(data), data)
     # Raw data updated; drop derived caches for this symbol/tf so next get_df/get_ind recompute.
     for key in list(DF_CACHE.keys()):
         if key[0] == symbol and key[1] == tf:
@@ -66,6 +108,10 @@ def get_df(symbol: str, tf: str, limit: int, force: bool = False) -> pd.DataFram
             return cached
     raw = get_raw(symbol, tf)
     if force or not raw:
+        disk = _read_disk_cache(symbol, tf, limit)
+        if disk:
+            raw = disk
+            set_raw(symbol, tf, raw)
         if FETCHER:
             raw = FETCHER(symbol, tf, limit)
             if raw:

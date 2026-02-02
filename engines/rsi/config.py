@@ -22,3 +22,4 @@ class RsiConfig:
     rsi1h_ttl_sec: int = 300
     rsi_1h_limit: int = 30
     rsi_default_limit: int = 60
+    rsi_use_confirmed_candle: bool = False

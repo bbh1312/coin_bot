@@ -56,7 +56,7 @@ class RsiEngine(BaseEngine):
             if self._cycle_stats is not None:
                 hits_by_tf = self._cycle_stats.setdefault("cache_hits_by_tf", {})
                 hits_by_tf[tf] = hits_by_tf.get(tf, 0) + 1
-            return df
+            return df.iloc[:-1].copy() if (self.config.rsi_use_confirmed_candle and len(df) > 1) else df
         if self._cycle_stats is not None:
             miss_by_tf = self._cycle_stats.setdefault("cache_miss_by_tf", {})
             miss_by_tf[tf] = miss_by_tf.get(tf, 0) + 1
@@ -406,6 +406,18 @@ class RsiEngine(BaseEngine):
                 f"[근접] {symbol} 통과 {pass_count}/{len(check_status)} 미달 {missing} | "
                 f"{rsi_info} | {vol_info} | {struct_info}"
             )
+
+        try:
+            ts_15m = int(df_15m["ts"].iloc[-1]) if len(df_15m) else None
+            ts_5m = int(df_5m_once["ts"].iloc[-1]) if len(df_5m_once) else None
+            df_3m = self._fetch_df(symbol, "3m", limit=cfg.rsi_default_limit)
+            ts_3m = int(df_3m["ts"].iloc[-1]) if len(df_3m) else None
+            logger(
+                f"[rsi-confirmed] {symbol} use_confirmed={cfg.rsi_use_confirmed_candle} "
+                f"ts_15m={ts_15m} ts_5m={ts_5m} ts_3m={ts_3m}"
+            )
+        except Exception:
+            pass
 
         return RsiScanResult(
             ready_entry=ready_entry,

@@ -626,6 +626,8 @@ def main() -> None:
             flip_long = st_dir == 1 and prev_st_dir <= 0
             flip_short = st_dir == -1 and prev_st_dir >= 0
             if flip_long:
+                if ema_trend is None or close_px <= float(ema_trend):
+                    continue
                 if adx is None or adx < float(args.adx_min):
                     continue
                 if mfi is None or mfi > float(args.mfi_long_max):
@@ -707,6 +709,8 @@ def main() -> None:
                 continue
 
             if flip_short:
+                if ema_trend is None or close_px >= float(ema_trend):
+                    continue
                 if adx is None or adx < float(args.adx_min):
                     continue
                 if mfi is None or mfi < float(args.mfi_short_min):

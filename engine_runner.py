@@ -894,11 +894,11 @@ ANTI_ALPHA_LONG_RSI_MAX = 30
 ANTI_ALPHA_EMA_DIST_MIN = 0.003
 ANTI_ALPHA_BODY_PCT_MIN = 0.008
 # Backtest-baseline params (kept identical to backtest)
-NOISE_REVERSE_LOOKBACK = 100
-NOISE_REVERSE_MA_LEN = 25
-NOISE_REVERSE_VOL_SMA_LEN = 20
+NOISE_REVERSE_LOOKBACK = 220
+NOISE_REVERSE_MA_LEN = 35
+NOISE_REVERSE_VOL_SMA_LEN = 30
 NOISE_REVERSE_VOL_SPIKE_MULT = 6.0
-NOISE_REVERSE_DISPARITY_PCT = 0.03
+NOISE_REVERSE_DISPARITY_PCT = 0.04
 NOISE_REVERSE_INVERT_SIDE = True
 SRP_PB_LOOKBACK = 12
 SRP_VOL_MIN_MULT = 1.0
@@ -972,6 +972,7 @@ STRUCTURE_TOP_N = 30
 PER_SYMBOL_SLEEP = 0.05
 CYCLE_SLEEP = float(os.getenv("CYCLE_SLEEP", "1.0"))
 REALTIME_CYCLE_SLEEP = float(os.getenv("REALTIME_CYCLE_SLEEP", "60"))
+REALTIME_ALIGN_DELAY_SEC = float(os.getenv("REALTIME_ALIGN_DELAY_SEC", "5.0"))
 REALTIME_ONLY_ENABLED = os.getenv("REALTIME_ONLY_ENABLED", "0") == "1"
 CURRENT_CYCLE_STATS: Dict[str, dict] = {}
 FUNDING_TTL_CACHE: Dict[str, tuple] = {}
@@ -1002,6 +1003,19 @@ def prune_ohlcv_cache():
 def print_section(title: str) -> None:
     print(f"[{title}]")
     print("---")
+
+def _sleep_until_next_minute_delay(exchange, delay_sec: float) -> None:
+    """Align realtime cycles to next minute boundary + delay."""
+    try:
+        now_ms = int(exchange.milliseconds())
+    except Exception:
+        now_ms = int(time.time() * 1000)
+    delay_ms = max(0, int(delay_sec * 1000))
+    next_min_ms = (now_ms // 60000 + 1) * 60000
+    target_ms = next_min_ms + delay_ms
+    wait_ms = target_ms - now_ms
+    if wait_ms > 0:
+        time.sleep(wait_ms / 1000.0)
 
 _PRINT_ORIG = builtins.print
 _THREAD_LOG = threading.local()
@@ -1092,12 +1106,75 @@ CYCLE_IND_CACHE = cycle_cache.IND_CACHE
 COMMON_UNIVERSE: list = []
 COMMON_UNIVERSE_READY = False
 COMMON_WARMUP_DONE = False
-COMMON_WARMUP_DAYS = int(os.getenv("COMMON_WARMUP_DAYS", "3"))
-COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m,5m,15m,1h,4h,1d").split(",") if tf.strip())
+COMMON_WARMUP_DAYS = int(os.getenv("COMMON_WARMUP_DAYS", "1"))
+COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m").split(",") if tf.strip())
 COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "8"))
 COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "30"))
 COMMON_UNIVERSE_LOG_PATH = ""
 COMMON_WARMUP_LOG_PATH = ""
+COMMON_WARMUP_CACHE_DIR = os.getenv("COMMON_WARMUP_CACHE_DIR", "").strip()
+
+def _common_warmup_cache_dir() -> str:
+    base = COMMON_WARMUP_CACHE_DIR or os.path.join("logs", "common_warmup", "ohlcv")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return base
+
+def _dump_common_warmup_ohlcv(sym: str, tf: str, data: list) -> None:
+    if not data:
+        return
+    path = os.path.join(
+        _common_warmup_cache_dir(),
+        f"{sym.replace('/', '_').replace(':', '_')}_{tf}.csv",
+    )
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ts,open,high,low,close,volume\n")
+            for row in data:
+                if not row or len(row) < 6:
+                    continue
+                f.write(
+                    f"{int(row[0])},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n"
+                )
+    except Exception:
+        pass
+
+def _append_common_warmup_ohlcv(sym: str, tf: str, data: list) -> None:
+    if not data:
+        return
+    path = os.path.join(
+        _common_warmup_cache_dir(),
+        f"{sym.replace('/', '_').replace(':', '_')}_{tf}.csv",
+    )
+    try:
+        last_ts = None
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                try:
+                    f.seek(-4096, os.SEEK_END)
+                except Exception:
+                    f.seek(0, os.SEEK_SET)
+                tail = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+                if tail:
+                    last = tail[-1].split(",")
+                    if last and last[0].isdigit():
+                        last_ts = int(last[0])
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("ts,open,high,low,close,volume\n")
+        with open(path, "a", encoding="utf-8") as f:
+            for row in data:
+                if not row or len(row) < 6:
+                    continue
+                ts = int(row[0])
+                if last_ts is not None and ts <= last_ts:
+                    continue
+                f.write(f"{ts},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n")
+                last_ts = ts
+    except Exception:
+        pass
 
 class CachedExchange:
     def __init__(self, ex):
@@ -1122,7 +1199,16 @@ def _prefetch_ohlcv_for_cycle(
     label: str = "prefetch",
     ttl_by_tf: Optional[dict] = None,
 ) -> dict:
-    stats = {"symbols": len(symbols or []), "tfs": list(plan.keys()), "fetched": 0, "failed": 0, "fresh_hits": {}, "fetched_by_tf": {}}
+    stats = {
+        "symbols": len(symbols or []),
+        "tfs": list(plan.keys()),
+        "fetched": 0,
+        "failed": 0,
+        "fresh_hits": {},
+        "fetched_by_tf": {},
+        "ts_min_by_tf": {},
+        "ts_max_by_tf": {},
+    }
     if not symbols or not plan:
         return stats
     ttl_by_tf = ttl_by_tf or {}
@@ -1147,6 +1233,17 @@ def _prefetch_ohlcv_for_cycle(
                     cycle_cache.set_raw(symbol, tf, data)
                     stats["fetched"] += 1
                     stats["fetched_by_tf"][tf] = int(stats["fetched_by_tf"].get(tf, 0) or 0) + 1
+                    if tf == "1m":
+                        _append_common_warmup_ohlcv(symbol, tf, data)
+                    try:
+                        first_ts = int(data[0][0])
+                        last_ts = int(data[-1][0])
+                        cur_min = stats["ts_min_by_tf"].get(tf)
+                        cur_max = stats["ts_max_by_tf"].get(tf)
+                        stats["ts_min_by_tf"][tf] = first_ts if cur_min is None else min(cur_min, first_ts)
+                        stats["ts_max_by_tf"][tf] = last_ts if cur_max is None else max(cur_max, last_ts)
+                    except Exception:
+                        pass
                     _inc_map("cache_miss_by_tf", tf)
                 else:
                     stats["failed"] += 1
@@ -1286,6 +1383,7 @@ def _warmup_common_cache(state: dict, exchange, universe: list) -> bool:
             data = _fetch_ohlcv_range(exchange, sym, tf, limit)
             if data:
                 cycle_cache.set_raw(sym, tf, data)
+                _dump_common_warmup_ohlcv(sym, tf, data)
                 if COMMON_WARMUP_LOG_PATH:
                     try:
                         _append_log_lines(COMMON_WARMUP_LOG_PATH, [f"FETCH_OK sym={sym} tf={tf} bars={len(data)} need={limit}"])
@@ -1307,7 +1405,31 @@ def _warmup_common_cache(state: dict, exchange, universe: list) -> bool:
         fetch_count += 1
         idx += 1
     state["_common_warmup_idx"] = idx
-    return idx >= total
+    done_all = idx >= total
+    if done_all and not state.get("_common_warmup_ts_logged"):
+        lines = []
+        for tf in COMMON_WARMUP_TFS:
+            min_ts = None
+            for sym in universe:
+                raw = cycle_cache.get_raw(sym, tf)
+                if isinstance(raw, list) and raw:
+                    try:
+                        ts = int(raw[0][0])
+                    except Exception:
+                        continue
+                    if min_ts is None or ts < min_ts:
+                        min_ts = ts
+            if min_ts:
+                lines.append(f"WARMUP_MIN_TS tf={tf} ts={min_ts} kst={_ts_to_kst_str(min_ts/1000.0)}")
+        if lines:
+            print("[common-warmup] " + " | ".join(lines))
+            if COMMON_WARMUP_LOG_PATH:
+                try:
+                    _append_log_lines(COMMON_WARMUP_LOG_PATH, lines)
+                except Exception:
+                    pass
+        state["_common_warmup_ts_logged"] = True
+    return done_all
 
 def _kst_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=9)
@@ -4323,6 +4445,14 @@ def _run_anti_alpha_cycle(
 
     def _compute_signal(symbol: str) -> dict:
         df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+        if not df_1m.empty and "ts" in df_1m.columns:
+            try:
+                last_ts = int(df_1m["ts"].iloc[-1])
+                now_ms = int(time.time() * 1000)
+                if now_ms - last_ts > 120_000:
+                    df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit, force=True)
+            except Exception:
+                pass
         if df_1m.empty:
             return {"symbol": symbol, "status": "no_data"}
         if len(df_1m) < min_len:
@@ -4667,6 +4797,15 @@ def _run_noise_reverse_v1_cycle(
         "nan": 0,
     }
     debug_logged = 0
+    debug_syms = set()
+    try:
+        debug_syms = {
+            s.strip()
+            for s in os.getenv("NOISE_REVERSE_DEBUG_SYMBOLS", "").split(",")
+            if s.strip()
+        }
+    except Exception:
+        debug_syms = set()
 
     def _nr_skip(msg: str) -> None:
         nonlocal skips
@@ -4701,17 +4840,35 @@ def _run_noise_reverse_v1_cycle(
     min_len = max(lookback + 2, ma_len + 2, vol_len + 2, 120)
     ltf_limit = max(min_len + 5, 140)
 
-    sleep_sec = 3.0
+    sleep_sec = 1.0
     symbols = list(noise_universe or [])
 
     def _compute_signal(symbol: str) -> dict:
         df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
+        if not df_1m.empty and "ts" in df_1m.columns:
+            try:
+                last_ts = int(df_1m["ts"].iloc[-1])
+                now_ms = int(time.time() * 1000)
+                if now_ms - last_ts > 120_000:
+                    df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit, force=True)
+            except Exception:
+                pass
         if df_1m.empty:
+            if symbol in debug_syms:
+                _append_noise_reverse_log(f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=empty_df")
             return {"symbol": symbol, "status": "no_data"}
         if len(df_1m) < min_len:
+            if symbol in debug_syms:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=short_df len={len(df_1m)} need={min_len}"
+                )
             return {"symbol": symbol, "status": "no_data"}
         df_sig = df_1m.iloc[:-1]
         if len(df_sig) < min_len - 1:
+            if symbol in debug_syms:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=short_sig len={len(df_sig)} need={min_len-1}"
+                )
             return {"symbol": symbol, "status": "no_data"}
 
         ma20 = df_sig["close"].rolling(ma_len).mean()
@@ -4720,6 +4877,8 @@ def _run_noise_reverse_v1_cycle(
         lo100 = df_sig["low"].rolling(lookback).min().shift(1)
 
         row = df_sig.iloc[-1]
+        ts = int(row["ts"]) if "ts" in row else 0
+        open_px = float(row["open"])
         close_px = float(row["close"])
         high_px = float(row["high"])
         low_px = float(row["low"])
@@ -4735,6 +4894,10 @@ def _run_noise_reverse_v1_cycle(
             or not isinstance(hi100_val, (int, float))
             or not isinstance(lo100_val, (int, float))
         ):
+            if symbol in debug_syms:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_TRACE sym={symbol} status=nan ma20={ma20_val} vol_sma={vol_sma_val} hi100={hi100_val} lo100={lo100_val}"
+                )
             return {"symbol": symbol, "status": "nan"}
 
         vol_spike = vol_sma_val > 0 and vol_now >= vol_sma_val * float(NOISE_REVERSE_VOL_SPIKE_MULT)
@@ -4747,6 +4910,29 @@ def _run_noise_reverse_v1_cycle(
         base_side = entry_side
         if entry_side and NOISE_REVERSE_INVERT_SIDE:
             entry_side = "SHORT" if entry_side == "LONG" else "LONG"
+        if symbol in debug_syms:
+            _append_noise_reverse_log(
+                "NOISE_REVERSE_TRACE sym=%s ts=%d o=%.6g h=%.6g l=%.6g c=%.6g ma20=%.6g hi100=%.6g lo100=%.6g "
+                "vol=%.4g vol_ma=%.4g vol_mult=%.3g disp=%.4g vol_spike=%s base=%s entry=%s"
+                % (
+                    symbol,
+                    ts,
+                    open_px,
+                    high_px,
+                    low_px,
+                    close_px,
+                    ma20_val,
+                    hi100_val,
+                    lo100_val,
+                    vol_now,
+                    vol_sma_val,
+                    float(NOISE_REVERSE_VOL_SPIKE_MULT),
+                    float(NOISE_REVERSE_DISPARITY_PCT),
+                    int(bool(vol_spike)),
+                    base_side or "",
+                    entry_side or "",
+                )
+            )
 
         return {
             "symbol": symbol,
@@ -4754,6 +4940,10 @@ def _run_noise_reverse_v1_cycle(
             "entry_side": entry_side,
             "base_side": base_side,
             "vol_spike": bool(vol_spike),
+            "ts": ts,
+            "open": open_px,
+            "high": high_px,
+            "low": low_px,
             "close": close_px,
             "ma20": ma20_val,
             "hi100": hi100_val,
@@ -4764,7 +4954,7 @@ def _run_noise_reverse_v1_cycle(
 
     results_map: Dict[str, dict] = {}
     if symbols:
-        with ThreadPoolExecutor(max_workers=5) as ex:
+        with ThreadPoolExecutor(max_workers=10) as ex:
             future_map = {ex.submit(_compute_signal, sym): sym for sym in symbols}
             for fut in as_completed(future_map):
                 try:
@@ -4814,6 +5004,29 @@ def _run_noise_reverse_v1_cycle(
             no_signal += 1
             time.sleep(sleep_sec)
             continue
+        sig_ts = int(sig.get("ts") or 0)
+        if sig_ts > 0:
+            last_ts = int(st.get("nr_last_ts") or 0)
+            if last_ts == sig_ts:
+                stale_count = int(st.get("nr_stale_count") or 0) + 1
+                st["nr_stale_count"] = stale_count
+                if stale_count in (3, 6, 10):
+                    _append_noise_reverse_log(
+                        "NOISE_REVERSE_STALE sym=%s ts=%d count=%d close=%.6g ma20=%.6g vol=%.4g vol_ma=%.4g"
+                        % (
+                            symbol,
+                            sig_ts,
+                            stale_count,
+                            float(sig.get("close") or 0.0),
+                            float(sig.get("ma20") or 0.0),
+                            float(sig.get("vol_now") or 0.0),
+                            float(sig.get("vol_sma") or 0.0),
+                        )
+                    )
+            else:
+                st["nr_last_ts"] = sig_ts
+                st["nr_stale_count"] = 0
+            state[symbol] = st
         entry_side = sig.get("entry_side")
         if not sig.get("vol_spike"):
             gate_stats["vol_spike"] += 1
@@ -4827,6 +5040,10 @@ def _run_noise_reverse_v1_cycle(
                 lo100_val = float(sig.get("lo100") or 0.0)
                 vol_now = float(sig.get("vol_now") or 0.0)
                 vol_sma_val = float(sig.get("vol_sma") or 0.0)
+                sig_ts = int(sig.get("ts") or 0)
+                sig_open = float(sig.get("open") or 0.0)
+                sig_high = float(sig.get("high") or 0.0)
+                sig_low = float(sig.get("low") or 0.0)
                 fail_parts = []
                 if not sig.get("vol_spike"):
                     fail_parts.append("vol_spike")
@@ -4835,16 +5052,23 @@ def _run_noise_reverse_v1_cycle(
                 if not (float(sig.get("close") or 0.0) > 0 and (float(sig.get("hi100") or 0.0) > 0 or float(sig.get("lo100") or 0.0) > 0)):
                     fail_parts.append("break")
                 _append_noise_reverse_log(
-                    "NOISE_REVERSE_DEBUG sym=%s close=%.6g ma20=%.6g hi100=%.6g lo100=%.6g "
-                    "vol=%.4g vol_ma=%.4g fails=%s"
+                    "NOISE_REVERSE_DEBUG sym=%s ts=%d o=%.6g h=%.6g l=%.6g c=%.6g "
+                    "ma20=%.6g hi100=%.6g lo100=%.6g vol=%.4g vol_ma=%.4g "
+                    "vol_mult=%.3g disp=%.4g fails=%s"
                     % (
                         symbol,
+                        sig_ts,
+                        sig_open,
+                        sig_high,
+                        sig_low,
                         close_px,
                         ma20_val,
                         hi100_val,
                         lo100_val,
                         vol_now,
                         vol_sma_val,
+                        float(NOISE_REVERSE_VOL_SPIKE_MULT),
+                        float(NOISE_REVERSE_DISPARITY_PCT),
                         ",".join(fail_parts) if fail_parts else "none",
                     )
                 )
@@ -4890,6 +5114,22 @@ def _run_noise_reverse_v1_cycle(
             time.sleep(sleep_sec)
             continue
 
+        pending = _is_manage_pending(state, symbol, entry_side)
+        cur_total = None
+        try:
+            cur_total = count_open_positions(force=True)
+        except Exception:
+            cur_total = None
+        if not isinstance(cur_total, int):
+            cur_total = _count_open_positions_state(state)
+        if pending:
+            _nr_skip(f"NOISE_REVERSE_ENTRY_FAIL sym={symbol} side={entry_side} reason=PENDING")
+            time.sleep(sleep_sec)
+            continue
+        if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
+            _nr_skip(f"NOISE_REVERSE_ENTRY_FAIL sym={symbol} side={entry_side} reason=MAX_POS {cur_total}/{MAX_OPEN_POSITIONS}")
+            time.sleep(sleep_sec)
+            continue
         req_id = _enqueue_entry_request(
             state,
             symbol=symbol,
@@ -4901,7 +5141,7 @@ def _run_noise_reverse_v1_cycle(
             alert_reason="noise_reverse_v1",
         )
         if not req_id:
-            _nr_skip(f"NOISE_REVERSE_ENTRY_FAIL sym={symbol} side={entry_side}")
+            _nr_skip(f"NOISE_REVERSE_ENTRY_FAIL sym={symbol} side={entry_side} reason=ENQUEUE_FAIL")
             time.sleep(sleep_sec)
             continue
 
@@ -10586,8 +10826,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
     if "NOISE_REVERSE_V1" not in ENGINE_EXIT_OVERRIDES:
         ENGINE_EXIT_OVERRIDES["NOISE_REVERSE_V1"] = {
-            "LONG": {"tp": 2.0, "sl": 2.0},
-            "SHORT": {"tp": 2.0, "sl": 2.0},
+            "LONG": {"tp": 2.5, "sl": 2.5},
+            "SHORT": {"tp": 2.5, "sl": 2.5},
         }
         state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
     if (not skip_keys or "_live_trading" not in skip_keys) and isinstance(state.get("_live_trading"), bool):
@@ -14044,6 +14284,8 @@ def run():
                         if not _realtime_only_required():
                             time.sleep(REALTIME_CYCLE_SLEEP)
                             continue
+                        # realtime-only: align to minute boundary + delay for confirmed-candle logic
+                        _sleep_until_next_minute_delay(exchange, REALTIME_ALIGN_DELAY_SEC)
 
                     # 사이클 캐시/통계 초기화
                     try:
@@ -14131,6 +14373,12 @@ def run():
                                 _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
                             except Exception:
                                 pass
+                        try:
+                            os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
+                            with open(os.path.join("logs", "common_universe", "latest.txt"), "w", encoding="utf-8") as f:
+                                f.write("\n".join(COMMON_UNIVERSE))
+                        except Exception:
+                            pass
                     shared_universe = list(state.get("_common_universe") or [])
                     state["_universe"] = list(shared_universe)
                     state["_adv_trend_universe"] = list(shared_universe)
@@ -14391,23 +14639,69 @@ def run():
                         fast_stats = _prefetch_ohlcv_for_cycle(fast_symbols, exchange, fast_plan, label="fast")
 
                         print(
-                            "[prefetch] fast_tf: symbols=%d tfs=%s fetched=%d failed=%d"
-                            % (fast_stats["symbols"], fast_stats["tfs"], fast_stats["fetched"], fast_stats["failed"])
+                            "[prefetch] fast_tf: symbols=%d tfs=%s fetched=%d failed=%d ts_min=%s ts_max=%s"
+                            % (
+                                fast_stats["symbols"],
+                                fast_stats["tfs"],
+                                fast_stats["fetched"],
+                                fast_stats["failed"],
+                                fast_stats.get("ts_min_by_tf"),
+                                fast_stats.get("ts_max_by_tf"),
+                            )
                         )
                         print(
-                            "[prefetch] mid_tf: symbols=%d tfs=%s skipped=%d fetched=%d failed=%d"
-                            % (mid_stats["symbols"], mid_stats["tfs"], mid_skipped, mid_stats["fetched"], mid_stats["failed"])
+                            "[prefetch] mid_tf: symbols=%d tfs=%s skipped=%d fetched=%d failed=%d ts_min=%s ts_max=%s"
+                            % (
+                                mid_stats["symbols"],
+                                mid_stats["tfs"],
+                                mid_skipped,
+                                mid_stats["fetched"],
+                                mid_stats["failed"],
+                                mid_stats.get("ts_min_by_tf"),
+                                mid_stats.get("ts_max_by_tf"),
+                            )
                         )
                         h4_hit = slow_stats["fresh_hits"].get("4h", 0)
                         d1_hit = slow_stats["fresh_hits"].get("1d", 0)
                         h4_miss = slow_stats.get("fetched_by_tf", {}).get("4h", 0)
                         d1_miss = slow_stats.get("fetched_by_tf", {}).get("1d", 0)
                         print(
-                            "[prefetch] slow_tf: 4h_hit=%d miss=%d | 1d_hit=%d miss=%d"
-                            % (h4_hit, h4_miss, d1_hit, d1_miss)
+                            "[prefetch] slow_tf: 4h_hit=%d miss=%d | 1d_hit=%d miss=%d | ts_min=%s ts_max=%s"
+                            % (
+                                h4_hit,
+                                h4_miss,
+                                d1_hit,
+                                d1_miss,
+                                slow_stats.get("ts_min_by_tf"),
+                                slow_stats.get("ts_max_by_tf"),
+                            )
                         )
                     else:
-                        print("[prefetch] skip heavy scan (realtime only)")
+                        # realtime-only: still refresh 1m for engines that depend on fresh LTF data
+                        ltf_plan = {}
+                        if NOISE_REVERSE_V1_ENABLED and noise_reverse_universe:
+                            nr_lookback = int(NOISE_REVERSE_LOOKBACK)
+                            nr_ma = int(NOISE_REVERSE_MA_LEN)
+                            nr_vol = int(NOISE_REVERSE_VOL_SMA_LEN)
+                            nr_min = max(nr_lookback + 2, nr_ma + 2, nr_vol + 2, 120)
+                            nr_limit = max(nr_min + 5, 140)
+                            ltf_plan["1m"] = nr_limit
+                        if SRP_ST_REGIME_PULLBACK_V1_ENABLED and srp_universe:
+                            ltf_plan.setdefault(SRP_LTF, 200)
+                        if ltf_plan:
+                            rt_stats = _prefetch_ohlcv_for_cycle(
+                                noise_reverse_universe or srp_universe, exchange, ltf_plan, label="realtime"
+                            )
+                            print(
+                                "[prefetch] realtime-only ltf refresh tfs=%s ts_min=%s ts_max=%s"
+                                % (
+                                    list(ltf_plan.keys()),
+                                    rt_stats.get("ts_min_by_tf"),
+                                    rt_stats.get("ts_max_by_tf"),
+                                )
+                            )
+                        else:
+                            print("[prefetch] skip heavy scan (realtime only)")
 
                     now = time.time()
 
@@ -15394,7 +15688,7 @@ def run():
                     today_kst = now_kst.strftime("%Y-%m-%d")
                     last_report_date = state.get("_daily_report_date")
                     # realtime-only cycle: short idle sleep for rate-limit safety
-                    cycle_sleep = CYCLE_SLEEP if heavy_scan else 3.0
+                    cycle_sleep = CYCLE_SLEEP if heavy_scan else 5.0
                     if (now_kst.hour > 9 or (now_kst.hour == 9 and now_kst.minute >= 30)) and last_report_date != today_kst:
                         report_guard = os.path.join("reports", f"daily_report_{today_kst}.done")
                         try:

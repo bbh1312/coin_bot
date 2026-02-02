@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import bisect
 import csv
 import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import ccxt
@@ -18,6 +19,7 @@ if ROOT_DIR not in sys.path:
 from engines.base import EngineContext
 from engines.rsi.engine import RsiEngine
 from engines.rsi.config import RsiConfig
+import cycle_cache
 
 
 def _fetch_ohlcv_all(
@@ -59,6 +61,71 @@ def _to_df(rows: List[list]) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     return df
+
+
+def _safe_symbol(symbol: str) -> str:
+    return symbol.replace("/", "_").replace(":", "_")
+
+
+def _timeframe_minutes(tf: str) -> int:
+    raw = (tf or "").strip().lower()
+    if raw.endswith("m"):
+        return int(raw[:-1])
+    if raw.endswith("h"):
+        return int(raw[:-1]) * 60
+    if raw.endswith("d"):
+        return int(raw[:-1]) * 1440
+    return 0
+
+
+def _read_common_cache(symbol: str, tf: str, min_rows: int) -> Optional[List[list]]:
+    cache_dir = os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
+    safe = _safe_symbol(symbol)
+    if not os.path.isdir(cache_dir):
+        return None
+    prefix = f"{safe}_{tf}_"
+    best_limit = -1
+    best_path = None
+    for name in os.listdir(cache_dir):
+        if not name.startswith(prefix) or not name.endswith(".csv"):
+            continue
+        try:
+            limit = int(name[len(prefix) : -4])
+        except Exception:
+            continue
+        if limit > best_limit:
+            best_limit = limit
+            best_path = os.path.join(cache_dir, name)
+    if not best_path:
+        return None
+    try:
+        df = pd.read_csv(best_path)
+        if df.empty or len(df) < min_rows:
+            return None
+        return df[["ts", "open", "high", "low", "close", "volume"]].values.tolist()
+    except Exception:
+        return None
+
+
+def _symbols_from_common_cache(exchange: ccxt.Exchange, cache_dir: str) -> List[str]:
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return []
+    safe_map: Dict[str, str] = {}
+    for sym in getattr(exchange, "symbols", []) or []:
+        safe_map[_safe_symbol(sym)] = sym
+    symbols: List[str] = []
+    for name in os.listdir(cache_dir):
+        if not name.endswith(".csv"):
+            continue
+        base = name[:-4]
+        parts = base.split("_")
+        if len(parts) < 3:
+            continue
+        safe = "_".join(parts[:-2])
+        sym = safe_map.get(safe)
+        if sym and sym not in symbols:
+            symbols.append(sym)
+    return symbols
 
 
 def _ensure_dir(path: str) -> None:
@@ -204,11 +271,17 @@ def parse_args():
     parser.add_argument("--symbols", type=str, default="")
     parser.add_argument("--max-symbols", type=int, default=7)
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--start", type=str, default="", help="UTC start, format: YYYY-MM-DD HH:MM")
+    parser.add_argument("--end", type=str, default="", help="UTC end, format: YYYY-MM-DD HH:MM")
+    parser.add_argument("--start-kst", type=str, default="", help="KST start, format: YYYY-MM-DD HH:MM")
+    parser.add_argument("--end-kst", type=str, default="", help="KST end, format: YYYY-MM-DD HH:MM")
     parser.add_argument("--tf-base", type=str, default="3m")
     parser.add_argument("--out-signals", type=str, default="rsi_signals.csv")
     parser.add_argument("--out-trades", type=str, default="rsi_trades.csv")
     parser.add_argument("--log-path", type=str, default="backtest.log")
     parser.add_argument("--entry-mode", type=str, default="NEXT_OPEN", choices=["NEXT_OPEN", "SIGNAL_CLOSE"])
+    parser.add_argument("--use-confirmed", action="store_true", default=True, help="use previous candle for signal")
+    parser.add_argument("--no-use-confirmed", action="store_false", dest="use_confirmed")
     parser.add_argument("--reentry-minutes", type=int, default=60)
     parser.add_argument("--sl-pct", type=float, default=0.02)
     parser.add_argument("--tp-pct", type=float, default=0.02)
@@ -216,13 +289,105 @@ def parse_args():
     parser.add_argument("--fee-rate", type=float, default=0.0)
     parser.add_argument("--slippage-pct", type=float, default=0.0)
     parser.add_argument("--position-usdt", type=float, default=100.0)
+    parser.add_argument("--use-common-cache", action="store_true", default=True)
+    parser.add_argument("--no-use-common-cache", action="store_false", dest="use_common_cache")
+    parser.add_argument("--symbols-from-common-cache", action="store_true", default=False)
+    parser.add_argument("--common-cache-dir", type=str, default="")
+    parser.add_argument("--replay-entries-log", type=str, default="", help="replay live rsi_entries log for signal audit")
+    parser.add_argument("--replay-out", type=str, default="rsi_replay.csv")
+    parser.add_argument("--warmup-hours", type=int, default=48, help="extra history (hours) for indicator warmup")
     return parser.parse_args()
+
+
+def _parse_utc_dt(text: str) -> Optional[datetime]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _parse_kst_dt(text: str) -> Optional[datetime]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    kst = timezone(timedelta(hours=9))
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=kst).astimezone(timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _parse_kst_ts(text: str) -> Optional[int]:
+    dt = _parse_kst_dt(text)
+    if dt is None:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def _load_replay_entries(path: str) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+    if not path or not os.path.exists(path):
+        return entries
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            # Example:
+            # 2026-02-01 06:43:05 engine=rsi side=SHORT symbol=C98/USDT:USDT price=0.0263 ...
+            parts = raw.split()
+            if len(parts) < 4:
+                continue
+            ts_text = " ".join(parts[:2])
+            meta = {"ts_text": ts_text, "raw": raw}
+            for p in parts[2:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    meta[k.strip()] = v.strip()
+            entries.append(meta)
+    return entries
 
 
 def main() -> None:
     args = parse_args()
-    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = end_ms - int(args.days) * 24 * 60 * 60 * 1000
+    replay_entries = _load_replay_entries(args.replay_entries_log)
+    start_dt = None
+    end_dt = None
+    if args.start_kst or args.end_kst:
+        start_dt = _parse_kst_dt(args.start_kst)
+        end_dt = _parse_kst_dt(args.end_kst)
+    elif args.start or args.end:
+        start_dt = _parse_utc_dt(args.start)
+        end_dt = _parse_utc_dt(args.end)
+    elif replay_entries:
+        ts_vals = []
+        for ent in replay_entries:
+            ts_ms = _parse_kst_ts(ent.get("ts_text", ""))
+            if ts_ms is not None:
+                ts_vals.append(ts_ms)
+        if ts_vals:
+            min_ts = min(ts_vals)
+            max_ts = max(ts_vals)
+            start_dt = datetime.fromtimestamp((min_ts / 1000.0), tz=timezone.utc) - timedelta(hours=6)
+            end_dt = datetime.fromtimestamp((max_ts / 1000.0), tz=timezone.utc) + timedelta(hours=6)
+
+    if end_dt is None:
+        end_dt = datetime.now(timezone.utc)
+    if start_dt is None:
+        start_dt = end_dt - timedelta(days=args.days)
+
+    end_ms = int(end_dt.timestamp() * 1000)
+    start_ms = int(start_dt.timestamp() * 1000)
+    warmup_hours = max(0, int(args.warmup_hours or 0))
+    fetch_start_dt = start_dt - timedelta(hours=warmup_hours) if warmup_hours > 0 else start_dt
+    fetch_start_ms = int(fetch_start_dt.timestamp() * 1000)
     if end_ms <= start_ms:
         raise SystemExit("end must be after start")
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -232,6 +397,9 @@ def main() -> None:
     out_signals = os.path.join(base_dir, os.path.basename(args.out_signals)) if args.out_signals else ""
     out_trades = os.path.join(base_dir, os.path.basename(args.out_trades)) if args.out_trades else ""
     log_path = os.path.join(base_dir, os.path.basename(args.log_path)) if args.log_path else ""
+    replay_out = ""
+    if replay_entries:
+        replay_out = os.path.join(base_dir, os.path.basename(args.replay_out)) if args.replay_out else ""
     if out_signals:
         _ensure_dir(os.path.dirname(out_signals))
     if out_trades:
@@ -273,12 +441,42 @@ def main() -> None:
         _write_csv_header(out_signals, signal_cols)
     if out_trades:
         _write_csv_header(out_trades, trade_cols)
+    if replay_out:
+        _write_csv_header(
+            replay_out,
+            [
+                "ts",
+                "symbol",
+                "ready_entry",
+                "reason",
+                "rsi1h",
+                "rsi15m",
+                "rsi5m",
+                "rsi5m_prev",
+                "rsi3m",
+                "rsi3m_prev",
+                "rsi3m_prev2",
+                "vol_ok",
+                "vol_cur",
+                "vol_avg",
+                "struct_ok",
+                "lower_highs",
+                "wick_reject",
+                "impulse_block",
+                "spike_ready",
+                "struct_ready",
+                "raw",
+            ],
+        )
 
     exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
 
     cfg = RsiConfig()
     engine = RsiEngine(cfg)
+    if not symbols and args.symbols_from_common_cache:
+        cache_dir = args.common_cache_dir.strip() or os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
+        symbols = _symbols_from_common_cache(exchange, cache_dir)
     if not symbols:
         tickers = exchange.fetch_tickers()
         state = {"_tickers": tickers, "_symbols": list(tickers.keys())}
@@ -291,6 +489,11 @@ def main() -> None:
             return
     if isinstance(args.max_symbols, int) and args.max_symbols > 0:
         symbols = symbols[: args.max_symbols]
+    if replay_entries:
+        replay_syms = [e.get("symbol") for e in replay_entries if e.get("symbol")]
+        for sym in replay_syms:
+            if sym not in symbols:
+                symbols.append(sym)
 
     tfs = {
         "1h": "1h",
@@ -310,13 +513,30 @@ def main() -> None:
         "hold_sum": 0.0,
     }
     tf_minutes = float(exchange.parse_timeframe(args.tf_base)) / 60.0
+    replay_by_symbol: Dict[str, List[Dict[str, str]]] = {}
+    if replay_entries:
+        for ent in replay_entries:
+            sym = ent.get("symbol", "")
+            if sym:
+                replay_by_symbol.setdefault(sym, []).append(ent)
+        for sym in replay_by_symbol:
+            replay_by_symbol[sym].sort(key=lambda x: x.get("ts_text", ""))
     for symbol in symbols:
-        log_fp.write(f"[rsi] fetch sym={symbol} start={start_ms} end={end_ms}\n")
+        log_fp.write(f"[rsi] fetch sym={symbol} start={fetch_start_ms} end={end_ms}\n")
         log_fp.flush()
-        raw_1h = _fetch_ohlcv_all(exchange, symbol, tfs["1h"], start_ms, end_ms)
-        raw_15m = _fetch_ohlcv_all(exchange, symbol, tfs["15m"], start_ms, end_ms)
-        raw_5m = _fetch_ohlcv_all(exchange, symbol, tfs["5m"], start_ms, end_ms)
-        raw_3m = _fetch_ohlcv_all(exchange, symbol, tfs["3m"], start_ms, end_ms)
+        def _fetch_with_cache(tf: str) -> List[list]:
+            minutes = _timeframe_minutes(tf)
+            min_rows = int((end_ms - fetch_start_ms) / (minutes * 60 * 1000)) + 2 if minutes else 0
+            if args.use_common_cache and min_rows > 0:
+                cached = _read_common_cache(symbol, tf, min_rows)
+                if cached:
+                    return cached
+            return _fetch_ohlcv_all(exchange, symbol, tf, fetch_start_ms, end_ms)
+
+        raw_1h = _fetch_with_cache(tfs["1h"])
+        raw_15m = _fetch_with_cache(tfs["15m"])
+        raw_5m = _fetch_with_cache(tfs["5m"])
+        raw_3m = _fetch_with_cache(tfs["3m"])
         df_1h = _to_df(raw_1h)
         df_15m = _to_df(raw_15m)
         df_5m = _to_df(raw_5m)
@@ -326,6 +546,10 @@ def main() -> None:
             log_fp.flush()
             continue
 
+        ts_1h = [int(x) for x in df_1h["ts"].tolist()]
+        ts_15m = [int(x) for x in df_15m["ts"].tolist()]
+        ts_5m = [int(x) for x in df_5m["ts"].tolist()]
+        ts_3m = [int(x) for x in df_3m["ts"].tolist()]
         i1h = i15m = i5m = -1
         pending: Optional[PendingEntry] = None
         trade: Optional[TradeState] = None
@@ -341,24 +565,37 @@ def main() -> None:
             "hold_sum": 0.0,
         }
 
-        for i in range(len(df_3m)):
+        start_i = 1 if args.use_confirmed else 0
+        for i in range(start_i, len(df_3m)):
             ts = int(df_3m["ts"].iloc[i])
             o = float(df_3m["open"].iloc[i])
             h = float(df_3m["high"].iloc[i])
             l = float(df_3m["low"].iloc[i])
             c = float(df_3m["close"].iloc[i])
+            if ts < start_ms:
+                continue
 
-            while (i1h + 1) < len(df_1h) and int(df_1h["ts"].iloc[i1h + 1]) <= ts:
-                i1h += 1
-            while (i15m + 1) < len(df_15m) and int(df_15m["ts"].iloc[i15m + 1]) <= ts:
-                i15m += 1
-            while (i5m + 1) < len(df_5m) and int(df_5m["ts"].iloc[i5m + 1]) <= ts:
-                i5m += 1
+            sig_idx = i - 1 if args.use_confirmed else i
+            if sig_idx < 0:
+                continue
+            sig_ts = int(df_3m["ts"].iloc[sig_idx])
+
+            if args.use_confirmed:
+                i1h = bisect.bisect_right(ts_1h, sig_ts) - 1
+                i15m = bisect.bisect_right(ts_15m, sig_ts) - 1
+                i5m = bisect.bisect_right(ts_5m, sig_ts) - 1
+            else:
+                while (i1h + 1) < len(df_1h) and int(df_1h["ts"].iloc[i1h + 1]) <= ts:
+                    i1h += 1
+                while (i15m + 1) < len(df_15m) and int(df_15m["ts"].iloc[i15m + 1]) <= ts:
+                    i15m += 1
+                while (i5m + 1) < len(df_5m) and int(df_5m["ts"].iloc[i5m + 1]) <= ts:
+                    i5m += 1
 
             slice_1h = _slice_until(df_1h, i1h)
             slice_15m = _slice_until(df_15m, i15m)
             slice_5m = _slice_until(df_5m, i5m)
-            slice_3m = _slice_until(df_3m, i)
+            slice_3m = _slice_until(df_3m, sig_idx)
 
             if trade is not None:
                 trade.high_max = max(trade.high_max, h)
@@ -503,8 +740,8 @@ def main() -> None:
                             "Y" if struct_ok else "N",
                         ],
                     )
-                if args.entry_mode == "SIGNAL_CLOSE":
-                    entry_px = c
+                if args.use_confirmed:
+                    entry_px = o if args.entry_mode == "NEXT_OPEN" else float(df_3m["close"].iloc[sig_idx])
                     sl_px = entry_px * (1 + args.sl_pct)
                     tp_px = entry_px * (1 - args.tp_pct)
                     trade = TradeState(
@@ -517,8 +754,110 @@ def main() -> None:
                         low_min=l,
                     )
                 else:
-                    if (i + 1) < len(df_3m):
-                        pending = PendingEntry(entry_idx=i + 1, signal_idx=i, entry_ts=ts, entry_px=c)
+                    if args.entry_mode == "SIGNAL_CLOSE":
+                        entry_px = c
+                        sl_px = entry_px * (1 + args.sl_pct)
+                        tp_px = entry_px * (1 - args.tp_pct)
+                        trade = TradeState(
+                            entry_idx=i,
+                            entry_ts=ts,
+                            entry_px=entry_px,
+                            sl_px=sl_px,
+                            tp_px=tp_px,
+                            high_max=h,
+                            low_min=l,
+                        )
+                    else:
+                        if (i + 1) < len(df_3m):
+                            pending = PendingEntry(entry_idx=i + 1, signal_idx=i, entry_ts=ts, entry_px=c)
+
+        if replay_out and symbol in replay_by_symbol:
+            for ent in replay_by_symbol[symbol]:
+                ts_ms = _parse_kst_ts(ent.get("ts_text", ""))
+                if ts_ms is None:
+                    continue
+                sig_ts = ts_ms
+                sig_idx = bisect.bisect_right(ts_3m, sig_ts) - 1
+                if args.use_confirmed:
+                    sig_idx = max(-1, sig_idx)
+                if sig_idx < 0:
+                    continue
+                sig_ts = int(df_3m["ts"].iloc[sig_idx])
+                i1h = bisect.bisect_right(ts_1h, sig_ts) - 1
+                i15m = bisect.bisect_right(ts_15m, sig_ts) - 1
+                i5m = bisect.bisect_right(ts_5m, sig_ts) - 1
+
+                slice_1h = _slice_until(df_1h, i1h)
+                slice_15m = _slice_until(df_15m, i15m)
+                slice_5m = _slice_until(df_5m, i5m)
+                slice_3m = _slice_until(df_3m, sig_idx)
+                if len(slice_1h) < max(20, cfg.rsi_len + 2) or len(slice_15m) < 20 or len(slice_5m) < 20:
+                    continue
+
+                r1h = float(_rsi_wilder(slice_1h["close"], cfg.rsi_len).iloc[-1]) if len(slice_1h) >= cfg.rsi_len else None
+                r15 = float(_rsi_wilder(slice_15m["close"], cfg.rsi_len).iloc[-1]) if len(slice_15m) >= cfg.rsi_len else None
+                r5_series = _rsi_wilder(slice_5m["close"], cfg.rsi_len)
+                r5 = float(r5_series.iloc[-1]) if len(r5_series) >= 1 else None
+                r5_prev = float(r5_series.iloc[-2]) if len(r5_series) >= 2 else None
+                r3_series = _rsi_wilder(slice_3m["close"], cfg.rsi_len)
+                r3m_val = float(r3_series.iloc[-3]) if len(r3_series) >= 3 else None
+                r3_prev = float(r3_series.iloc[-2]) if len(r3_series) >= 2 else None
+                r3 = float(r3_series.iloc[-1]) if len(r3_series) >= 1 else None
+
+                passed_1h = (r1h is not None) and (r1h >= cfg.thresholds["1h"])
+                passed_15m = (r15 is not None) and (r15 >= cfg.thresholds["15m"])
+                passed_5m = (r5 is not None) and (r5 >= cfg.thresholds["5m"])
+                ok_tf = passed_15m and passed_5m
+
+                rsi5m_downturn = r5_prev is not None and r5 is not None and r5_prev > r5
+                thr_3m_downturn = float(cfg.rsi3m_downturn_threshold)
+                rsi3m_downturn = (
+                    (r3_prev is not None and r3 is not None and r3_prev >= thr_3m_downturn and r3_prev > r3)
+                    or (r3m_val is not None and r3_prev is not None and r3m_val >= thr_3m_downturn and r3m_val > r3_prev)
+                )
+
+                vol_ok, vol_cur, vol_avg = _volume_surge_5m(slice_5m, cfg.vol_surge_lookback, cfg.vol_surge_mult)
+                struct_ok, struct_metrics = _structural_rejection_5m(slice_5m)
+                impulse_block = _impulse_block(slice_5m)
+
+                spike_ready = (
+                    (r3 is not None)
+                    and (r3 >= cfg.rsi3m_spike_threshold)
+                    and rsi3m_downturn
+                    and vol_ok
+                    and passed_1h
+                    and passed_15m
+                )
+                struct_ready = ok_tf and vol_ok and struct_ok and rsi5m_downturn and (not impulse_block)
+                ready_entry = spike_ready or struct_ready
+                reason = "spike_ready" if spike_ready else ("struct_ready" if struct_ready else "")
+
+                _append_csv(
+                    replay_out,
+                    [
+                        sig_ts,
+                        symbol,
+                        "Y" if ready_entry else "N",
+                        reason,
+                        f"{r1h:.2f}" if r1h is not None else "",
+                        f"{r15:.2f}" if r15 is not None else "",
+                        f"{r5:.2f}" if r5 is not None else "",
+                        f"{r5_prev:.2f}" if r5_prev is not None else "",
+                        f"{r3:.2f}" if r3 is not None else "",
+                        f"{r3_prev:.2f}" if r3_prev is not None else "",
+                        f"{r3m_val:.2f}" if r3m_val is not None else "",
+                        "Y" if vol_ok else "N",
+                        f"{vol_cur:.2f}",
+                        f"{vol_avg:.2f}",
+                        "Y" if struct_ok else "N",
+                        "Y" if struct_metrics.get("lower_highs") else "N",
+                        "Y" if struct_metrics.get("wick_reject") else "N",
+                        "Y" if impulse_block else "N",
+                        "Y" if spike_ready else "N",
+                        "Y" if struct_ready else "N",
+                        ent.get("raw", ""),
+                    ],
+                )
 
         if trade is not None:
             last_idx = len(df_3m) - 1
