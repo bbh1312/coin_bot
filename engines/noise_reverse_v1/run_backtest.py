@@ -19,11 +19,11 @@ if ROOT_DIR not in sys.path:
 from engines.universe import build_universe_from_tickers
 
 # Backtest-baseline defaults (overridable via CLI)
-NOISE_REVERSE_LOOKBACK = 280
-NOISE_REVERSE_MA_LEN = 35
-NOISE_REVERSE_VOL_SMA_LEN = 35
-NOISE_REVERSE_VOL_SPIKE_MULT = 6.0
-NOISE_REVERSE_DISPARITY_PCT = 0.045
+NOISE_REVERSE_LOOKBACK = 300
+NOISE_REVERSE_MA_LEN = 40
+NOISE_REVERSE_VOL_SMA_LEN = 25
+NOISE_REVERSE_VOL_SPIKE_MULT = 3.5
+NOISE_REVERSE_DISPARITY_PCT = 0.055
 
 
 def _ohlcv_cache_path(root_dir: str, symbol: str, timeframe: str, start_ms: int, end_ms: int) -> str:
@@ -316,7 +316,7 @@ def main() -> None:
     parser.add_argument("--rsi-short-min", type=float, default=0.0)
     parser.add_argument("--ema-len", type=int, default=20)
     parser.add_argument("--ema-dist-min", type=float, default=0.0)
-    parser.add_argument("--tp-pct", type=float, default=0.025)
+    parser.add_argument("--tp-pct", type=float, default=0.03)
     parser.add_argument("--sl-pct", type=float, default=0.025)
     parser.add_argument("--cooldown-bars", type=int, default=1)
     parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")

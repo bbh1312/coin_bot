@@ -53,6 +53,20 @@ def _read_ohlcv_cache(path: str) -> List[list]:
         return []
 
 
+def _read_common_warmup(path: str) -> List[list]:
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        df = pd.read_csv(path)
+        if df.empty:
+            return []
+        if "ts" not in df.columns:
+            return []
+        return df[["ts", "open", "high", "low", "close", "volume"]].values.tolist()
+    except Exception:
+        return []
+
+
 def _write_ohlcv_cache(path: str, rows: List[list]) -> None:
     if not rows:
         return
@@ -84,7 +98,15 @@ def _fetch_ohlcv_all(
     start_ms: int,
     end_ms: int,
     limit: int = 1500,
+    use_common_warmup: bool = False,
+    common_warmup_dir: str = "",
 ) -> List[list]:
+    if use_common_warmup and common_warmup_dir:
+        safe = _sanitize_symbol(symbol)
+        warmup_path = os.path.join(common_warmup_dir, f"{safe}_{timeframe}.csv")
+        warmup_rows = _read_common_warmup(warmup_path)
+        if warmup_rows:
+            return [r for r in warmup_rows if start_ms <= int(r[0]) <= end_ms]
     cache_path = _ohlcv_cache_path(ROOT_DIR, symbol, timeframe, start_ms, end_ms)
     cached = _read_ohlcv_cache(cache_path)
     if cached:
@@ -290,12 +312,24 @@ def _select_symbols(
     common_universe_file: str,
     use_common_universe_latest: bool,
     common_universe_cache: str,
+    use_common_warmup: bool,
+    common_warmup_dir: str,
 ) -> List[str]:
     if symbols_file:
         with open(symbols_file, "r", encoding="utf-8") as f:
             return [s.strip() for s in f.read().split(",") if s.strip()]
     if symbols_arg:
         return [s.strip() for s in symbols_arg.split(",") if s.strip()]
+    if use_common_warmup and common_warmup_dir and os.path.isdir(common_warmup_dir):
+        out = []
+        for fn in os.listdir(common_warmup_dir):
+            if not fn.endswith("_1m.csv"):
+                continue
+            sym = fn.replace("_1m.csv", "")
+            if sym:
+                out.append(sym)
+        if out:
+            return sorted(set(out))
     cached = _read_symbol_cache(common_universe_cache)
     if cached:
         return cached
@@ -364,7 +398,11 @@ def main() -> None:
     parser.add_argument("--st-mult", type=float, default=3.0)
     parser.add_argument("--tf-ltf", default="5m")
     parser.add_argument("--tf-htf", default="1h")
+    parser.add_argument("--tp-pct", type=float, default=0.0, help="fixed TP percent (0 = use r_mult)")
+    parser.add_argument("--sl-pct", type=float, default=0.0, help="fixed SL percent (0 = use swing/ATR)")
     parser.add_argument("--use-confirmed", action="store_true", help="use previous bar for signal (confirmed)")
+    parser.add_argument("--use-common-warmup", action="store_true", help="read OHLCV from logs/common_warmup/ohlcv")
+    parser.add_argument("--common-warmup-dir", default=os.path.join("logs", "common_warmup", "ohlcv"))
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -409,6 +447,8 @@ def main() -> None:
         args.common_universe_file,
         args.common_universe_latest,
         args.common_universe_cache,
+        args.use_common_warmup,
+        args.common_warmup_dir,
     )
 
     end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -422,8 +462,24 @@ def main() -> None:
 
     for symbol in symbols:
         try:
-            rows_ltf = _fetch_ohlcv_all(exchange, symbol, args.tf_ltf, start_ms, end_ms)
-            rows_htf = _fetch_ohlcv_all(exchange, symbol, args.tf_htf, start_ms, end_ms)
+            rows_ltf = _fetch_ohlcv_all(
+                exchange,
+                symbol,
+                args.tf_ltf,
+                start_ms,
+                end_ms,
+                use_common_warmup=args.use_common_warmup,
+                common_warmup_dir=args.common_warmup_dir,
+            )
+            rows_htf = _fetch_ohlcv_all(
+                exchange,
+                symbol,
+                args.tf_htf,
+                start_ms,
+                end_ms,
+                use_common_warmup=args.use_common_warmup,
+                common_warmup_dir=args.common_warmup_dir,
+            )
         except Exception:
             continue
 
@@ -694,13 +750,31 @@ def main() -> None:
                 else:
                     entry_px *= 1.0 - float(args.slip_pct)
 
+            tp_pct = float(args.tp_pct)
+            sl_pct = float(args.sl_pct)
             swing_level = _find_swing_level(df_5m, start_idx, i, entry_side)
             if entry_side == "LONG":
-                sl_price = swing_level if swing_level is not None else (st_line - (0.2 * atr14))
-                tp_price = entry_px + float(args.r_mult) * (entry_px - sl_price)
+                sl_price = (
+                    entry_px * (1.0 - sl_pct)
+                    if sl_pct > 0
+                    else (swing_level if swing_level is not None else (st_line - (0.2 * atr14)))
+                )
+                tp_price = (
+                    entry_px * (1.0 + tp_pct)
+                    if tp_pct > 0
+                    else entry_px + float(args.r_mult) * (entry_px - sl_price)
+                )
             else:
-                sl_price = swing_level if swing_level is not None else (st_line + (0.2 * atr14))
-                tp_price = entry_px - float(args.r_mult) * (sl_price - entry_px)
+                sl_price = (
+                    entry_px * (1.0 + sl_pct)
+                    if sl_pct > 0
+                    else (swing_level if swing_level is not None else (st_line + (0.2 * atr14)))
+                )
+                tp_price = (
+                    entry_px * (1.0 - tp_pct)
+                    if tp_pct > 0
+                    else entry_px - float(args.r_mult) * (sl_price - entry_px)
+                )
 
             risk_per_unit = abs(entry_px - sl_price)
             if risk_per_unit <= 0:

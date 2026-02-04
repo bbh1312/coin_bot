@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import ccxt
+import pandas as pd
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT_DIR not in sys.path:
@@ -18,15 +19,14 @@ if ROOT_DIR not in sys.path:
 from engines.swaggy_atlas_lab_v2.atlas_eval import evaluate_global_gate, evaluate_local
 from engines.swaggy_atlas_lab_v2.broker_sim import BrokerSim
 from engines.swaggy_atlas_lab_v2.config import AtlasConfig, BacktestConfig, SwaggyConfig
-from engines.dtfx.engine import DTFXConfig
 from engines.swaggy_atlas_lab_v2.data import (
+    build_universe_from_tickers,
     ensure_dir,
     fetch_ohlcv_all,
     slice_df,
     to_df,
     save_universe,
 )
-from engines.universe import build_universe_from_tickers
 from engines.swaggy_atlas_lab_v2.policy import AtlasMode, apply_policy
 from engines.swaggy_atlas_lab_v2.report import (
     build_summary,
@@ -83,6 +83,30 @@ def _append_swaggy_trade_json(payload: Dict[str, object]) -> None:
             f.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
     except Exception:
         pass
+
+
+def _sanitize_symbol(symbol: str) -> str:
+    return symbol.replace("/", "_").replace(":", "_")
+
+
+def _read_common_cache(base_dir: str, symbol: str, tf: str, start_ms: int, end_ms: int):
+    if not base_dir:
+        return pd.DataFrame()
+    fname = f"{_sanitize_symbol(symbol)}_{tf}.csv"
+    path = os.path.join(base_dir, fname)
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
+    try:
+        df = df[(df["ts"] >= start_ms) & (df["ts"] <= end_ms)]
+    except Exception:
+        pass
+    return df
 
 
 def _entry_quality_bucket(
@@ -161,6 +185,10 @@ def parse_args():
     parser.add_argument("--symbols", default="", help="comma-separated symbols")
     parser.add_argument("--symbols-file", default="", help="path to fixed symbol list")
     parser.add_argument("--universe", default="top50", help="topN (e.g. top50) or 'symbols'")
+    parser.add_argument("--use-confirmed", action="store_true")
+    parser.add_argument("--use-live-cache", action="store_true")
+    parser.add_argument("--common-warmup-dir", default="", help="common warmup cache dir")
+    parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--max-symbols", type=int, default=7)
     parser.add_argument("--anchor", default="BTC,ETH")
     parser.add_argument("--tp-pct", type=float, default=0.02)
@@ -170,6 +198,12 @@ def parse_args():
     parser.add_argument("--timeout-bars", type=int, default=0)
     parser.add_argument("--cooldown-min", type=int, default=0)
     parser.add_argument("--d1-overext-atr", type=float, default=None)
+    parser.add_argument("--atlas-rs-pass", type=float, default=None)
+    parser.add_argument("--atlas-rs-z-pass", type=float, default=None)
+    parser.add_argument("--atlas-exception-min-score", type=int, default=None)
+    parser.add_argument("--atlas-indep-corr", type=float, default=None)
+    parser.add_argument("--atlas-indep-beta", type=float, default=None)
+    parser.add_argument("--atlas-vol-pass", type=float, default=None)
     parser.add_argument("--sat-trade", choices=["on", "off"], default="on", help="allow entries on Saturday (KST)")
     parser.add_argument("--loss-hedge", action="store_true", help="enable loss-hedge entries")
     parser.add_argument("--loss-hedge-min", type=float, default=-10.0, help="trigger loss% (e.g. -10)")
@@ -238,6 +272,11 @@ def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
 
 def main() -> None:
     args = parse_args()
+    use_live_cache = bool(args.use_live_cache)
+    cache_only = bool(args.cache_only)
+    common_dir = args.common_warmup_dir.strip() if isinstance(args.common_warmup_dir, str) else ""
+    if use_live_cache and not common_dir:
+        common_dir = os.path.join(ROOT_DIR, "logs", "common_warmup", "ohlcv")
     sat_trade_enabled = str(args.sat_trade or "on").lower() == "on"
     runtime_overrides = _load_runtime_overrides()
     runtime_d1_overext = _coerce_float(runtime_overrides.get("_swaggy_d1_overext_atr_mult"))
@@ -275,9 +314,22 @@ def main() -> None:
     at_cfg = AtlasConfig()
     if isinstance(args.cooldown_min, int) and args.cooldown_min > 0:
         sw_cfg.cooldown_min = int(args.cooldown_min)
+    if isinstance(args.atlas_rs_pass, (int, float)):
+        at_cfg.rs_pass = float(args.atlas_rs_pass)
+    if isinstance(args.atlas_rs_z_pass, (int, float)):
+        at_cfg.rs_z_pass = float(args.atlas_rs_z_pass)
+    if isinstance(args.atlas_exception_min_score, int):
+        at_cfg.exception_min_score = int(args.atlas_exception_min_score)
+    if isinstance(args.atlas_indep_corr, (int, float)):
+        at_cfg.indep_corr = float(args.atlas_indep_corr)
+    if isinstance(args.atlas_indep_beta, (int, float)):
+        at_cfg.indep_beta = float(args.atlas_indep_beta)
+    if isinstance(args.atlas_vol_pass, (int, float)):
+        at_cfg.vol_pass = float(args.atlas_vol_pass)
 
     ex = _make_exchange()
-    ex.load_markets()
+    if not cache_only:
+        ex.load_markets()
     ltf_minutes = float(ex.parse_timeframe(sw_cfg.tf_ltf)) / 60.0
     anchor_symbols = [s.strip() for s in args.anchor.split(",") if s.strip()]
     symbols: List[str] = []
@@ -286,21 +338,22 @@ def main() -> None:
             symbols = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
     elif args.symbols.strip():
         symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    elif args.universe.strip().lower() == "common":
+        latest_path = os.path.join(ROOT_DIR, "logs", "common_universe", "latest.txt")
+        if not os.path.exists(latest_path):
+            raise SystemExit("common universe not found (logs/common_universe/latest.txt)")
+        with open(latest_path, "r", encoding="utf-8") as f:
+            symbols = [line.strip() for line in f if line.strip()]
+        source = "common_universe"
     else:
+        if cache_only:
+            raise SystemExit("--cache-only requires --symbols/--symbols-file or --universe common")
         tickers = ex.fetch_tickers()
-        dtfx_cfg = DTFXConfig()
-        min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
-        anchors = []
-        for s in dtfx_cfg.anchor_symbols or []:
-            anchors.append(s if "/" in s else f"{s}/USDT:USDT")
-        symbols = build_universe_from_tickers(
-            tickers,
-            symbols=list(tickers.keys()),
-            min_quote_volume_usdt=min_qv,
-            top_n=dtfx_cfg.universe_top_n,
-            anchors=tuple(anchors),
-        )
-    source = "symbols_file" if args.symbols_file.strip() else ("symbols_arg" if args.symbols.strip() else "dtfx_universe")
+        top_n = _parse_universe_arg(args.universe)
+        symbols = build_universe_from_tickers(tickers, top_n=top_n, anchor_symbols=anchor_symbols)
+        source = "tickers_universe"
+    if args.symbols_file.strip() or args.symbols.strip():
+        source = "symbols_file" if args.symbols_file.strip() else "symbols_arg"
     if isinstance(args.max_symbols, int) and args.max_symbols > 0:
         symbols = symbols[: args.max_symbols]
     save_universe(
@@ -319,12 +372,22 @@ def main() -> None:
     for sym in symbols:
         tf_map: Dict[str, object] = {}
         for tf in tfs:
-            rows = fetch_ohlcv_all(ex, sym, tf, start_ms, end_ms)
-            tf_map[tf] = to_df(rows)
-        data_by_sym[sym] = tf_map
+            if use_live_cache:
+                df = _read_common_cache(common_dir, sym, tf, start_ms, end_ms)
+                if df.empty and cache_only:
+                    continue
+            else:
+                rows = fetch_ohlcv_all(ex, sym, tf, start_ms, end_ms)
+                df = to_df(rows)
+            tf_map[tf] = df
+        if tf_map:
+            data_by_sym[sym] = tf_map
 
-    btc_data = fetch_ohlcv_all(ex, at_cfg.ref_symbol, sw_cfg.tf_mtf, start_ms, end_ms)
-    btc_df = to_df(btc_data)
+    if use_live_cache:
+        btc_df = _read_common_cache(common_dir, at_cfg.ref_symbol, sw_cfg.tf_mtf, start_ms, end_ms)
+    else:
+        btc_data = fetch_ohlcv_all(ex, at_cfg.ref_symbol, sw_cfg.tf_mtf, start_ms, end_ms)
+        btc_df = to_df(btc_data)
 
     modes = [
         AtlasMode.HARD,
@@ -362,23 +425,30 @@ def main() -> None:
             )
             for sym in symbols:
                 sym_state = engine._state.setdefault(sym, {})
-                df_ltf = data_by_sym[sym][sw_cfg.tf_ltf]
-                df_mtf = data_by_sym[sym][sw_cfg.tf_mtf]
-                df_htf = data_by_sym[sym][sw_cfg.tf_htf]
-                df_htf2 = data_by_sym[sym][sw_cfg.tf_htf2]
-                df_d1 = data_by_sym[sym][sw_cfg.tf_d1]
+                tf_map = data_by_sym.get(sym, {})
+                df_ltf = tf_map.get(sw_cfg.tf_ltf)
+                df_mtf = tf_map.get(sw_cfg.tf_mtf)
+                df_htf = tf_map.get(sw_cfg.tf_htf)
+                df_htf2 = tf_map.get(sw_cfg.tf_htf2)
+                df_d1 = tf_map.get(sw_cfg.tf_d1)
+                df_3m = tf_map.get("3m")
+                if any(df is None or (hasattr(df, "empty") and df.empty) for df in (df_ltf, df_mtf, df_htf, df_htf2, df_d1, df_3m)):
+                    continue
                 if df_ltf is not None and not df_ltf.empty:
                     try:
                         last_close_by_sym[sym] = float(df_ltf.iloc[-1]["close"])
                         last_ts_by_sym[sym] = int(df_ltf.iloc[-1]["ts"])
                     except Exception:
                         pass
-                for i in range(30, len(df_ltf)):
+                start_idx = 31 if args.use_confirmed else 30
+                for i in range(start_idx, len(df_ltf)):
                     cur = df_ltf.iloc[i]
-                    ts_ms = int(cur["ts"])
+                    sig_idx = i - 1 if args.use_confirmed else i
+                    sig_row = df_ltf.iloc[sig_idx]
+                    ts_ms = int(sig_row["ts"])
                     now_ts = ts_ms / 1000.0
-                    d5 = df_ltf.iloc[: i + 1]
-                    d3 = slice_df(data_by_sym[sym]["3m"], ts_ms)
+                    d5 = df_ltf.iloc[: sig_idx + 1]
+                    d3 = slice_df(df_3m, ts_ms)
                     d15 = slice_df(df_mtf, ts_ms)
                     d1h = slice_df(df_htf, ts_ms)
                     d4h = slice_df(df_htf2, ts_ms)

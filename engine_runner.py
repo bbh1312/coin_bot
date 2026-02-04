@@ -74,61 +74,67 @@ try:
         SwaggyConfig = None
         format_cut_top = None
         format_zone_stats = None
-    from engines.swaggy_atlas_lab.swaggy_signal import SwaggySignalEngine as SwaggyAtlasLabEngine
-    from engines.swaggy_atlas_lab.config import SwaggyConfig as SwaggyAtlasLabConfig
-    from engines.swaggy_atlas_lab.config import AtlasConfig as SwaggyAtlasLabAtlasConfig
-    from engines.swaggy_atlas_lab_v2.swaggy_signal import SwaggySignalEngine as SwaggyAtlasLabV2Engine
-    from engines.swaggy_atlas_lab_v2.config import SwaggyConfig as SwaggyAtlasLabV2Config
-    from engines.swaggy_atlas_lab_v2.config import AtlasConfig as SwaggyAtlasLabV2AtlasConfig
-    from engines.swaggy_no_atlas.engine import SwaggyNoAtlasEngine
-    from engines.swaggy_no_atlas.config import SwaggyNoAtlasConfig
-    from engines.swaggy_atlas_lab.atlas_eval import (
-        evaluate_global_gate as lab_evaluate_global_gate,
-        evaluate_local as lab_evaluate_local,
-    )
-    from engines.swaggy_atlas_lab_v2.atlas_eval import (
-        evaluate_global_gate as lab_v2_evaluate_global_gate,
-        evaluate_local as lab_v2_evaluate_local,
-    )
-    from engines.swaggy_atlas_lab.policy import apply_policy as lab_apply_policy
-    from engines.swaggy_atlas_lab.policy import AtlasMode as SwaggyAtlasLabMode
-    from engines.swaggy_atlas_lab_v2.policy import apply_policy as lab_v2_apply_policy
-    from engines.swaggy_atlas_lab_v2.policy import AtlasMode as SwaggyAtlasLabV2Mode
     from engines.atlas.atlas_engine import AtlasEngine, AtlasSwaggyConfig
     from engines.rsi.engine import RsiEngine
     from engines.universe import build_universe_from_tickers
-    from engines.dtfx.engine import DTFXEngine, DTFXConfig
-    from engines.dtfx.core.logger import write_dtfx_log
     from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
     from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
-    from engines.swaggy_atlas_lab.indicators import atr
+    from engines.st_flip_v1.engine import compute_signal as st_flip_compute_signal
+    from engines.st_flip_v1.config import StFlipConfig
 except Exception as _import_err:
     SwaggyEngine = None
     SwaggyConfig = None
     EngineContext = None
     format_cut_top = None
     format_zone_stats = None
-    SwaggyAtlasLabEngine = None
-    SwaggyAtlasLabConfig = None
-    SwaggyAtlasLabAtlasConfig = None
-    SwaggyAtlasLabV2Engine = None
-    SwaggyAtlasLabV2Config = None
-    SwaggyAtlasLabV2AtlasConfig = None
-    SwaggyNoAtlasEngine = None
-    SwaggyNoAtlasConfig = None
-    lab_evaluate_global_gate = None
-    lab_evaluate_local = None
-    lab_apply_policy = None
-    SwaggyAtlasLabMode = None
-    lab_v2_evaluate_global_gate = None
-    lab_v2_evaluate_local = None
-    lab_v2_apply_policy = None
-    SwaggyAtlasLabV2Mode = None
     _IMPORT_ERROR = str(_import_err)
     try:
         print(f"[import-error] { _IMPORT_ERROR }")
     except Exception:
         pass
+
+if "SwaggyAtlasLabEngine" not in globals():
+    SwaggyAtlasLabEngine = None
+if "SwaggyAtlasLabConfig" not in globals():
+    SwaggyAtlasLabConfig = None
+if "SwaggyAtlasLabAtlasConfig" not in globals():
+    SwaggyAtlasLabAtlasConfig = None
+if "SwaggyAtlasLabV2Engine" not in globals():
+    SwaggyAtlasLabV2Engine = None
+if "SwaggyAtlasLabV2Config" not in globals():
+    SwaggyAtlasLabV2Config = None
+if "SwaggyAtlasLabV2AtlasConfig" not in globals():
+    SwaggyAtlasLabV2AtlasConfig = None
+if "SwaggyNoAtlasEngine" not in globals():
+    SwaggyNoAtlasEngine = None
+if "SwaggyNoAtlasConfig" not in globals():
+    SwaggyNoAtlasConfig = None
+if "lab_evaluate_global_gate" not in globals():
+    lab_evaluate_global_gate = None
+if "lab_evaluate_local" not in globals():
+    lab_evaluate_local = None
+if "lab_apply_policy" not in globals():
+    lab_apply_policy = None
+if "SwaggyAtlasLabMode" not in globals():
+    SwaggyAtlasLabMode = None
+if "lab_v2_evaluate_global_gate" not in globals():
+    lab_v2_evaluate_global_gate = None
+if "lab_v2_evaluate_local" not in globals():
+    lab_v2_evaluate_local = None
+if "lab_v2_apply_policy" not in globals():
+    lab_v2_apply_policy = None
+if "SwaggyAtlasLabV2Mode" not in globals():
+    SwaggyAtlasLabV2Mode = None
+if "DTFXEngine" not in globals():
+    DTFXEngine = None
+if "DTFXConfig" not in globals():
+    DTFXConfig = None
+if "write_dtfx_log" not in globals():
+    write_dtfx_log = None
+if "st_flip_compute_signal" not in globals():
+    st_flip_compute_signal = None
+if "StFlipConfig" not in globals():
+    StFlipConfig = None
 
 if "Div15mLongEngine" not in globals():
     Div15mLongEngine = None
@@ -201,6 +207,8 @@ div15m_short_engine = None
 load_env()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BOT_TOKEN_SUPER_TREND = os.getenv("TELEGRAM_BOT_TOKEN_SUPER_TREND", "")
+CHAT_ID_SUPER_TREND = os.getenv("TELEGRAM_CHAT_ID_SUPER_TREND", "")
 # 런타임 전송용 chat_id (state에서 복원/업데이트)
 CHAT_ID_RUNTIME = CHAT_ID
 START_TIME = time.time()
@@ -883,6 +891,8 @@ ADV_TREND_PULLBACK_PIVOT = int(os.getenv("ADV_TREND_PULLBACK_PIVOT", "3"))
 ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
 NOISE_REVERSE_V1_ENABLED = os.getenv("NOISE_REVERSE_V1_ENABLED", "0") == "1"
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = os.getenv("SRP_ST_REGIME_PULLBACK_V1_ENABLED", "0") == "1"
+RUNUP_WASHOUT_SHORT_3M_ENABLED = os.getenv("RUNUP_WASHOUT_SHORT_3M_ENABLED", "0") == "1"
+ST_FLIP_V1_ENABLED = os.getenv("ST_FLIP_V1_ENABLED", "0") == "1"
 # Backtest-baseline params (kept identical to backtest)
 ANTI_ALPHA_EMA_LEN = 200
 ANTI_ALPHA_RSI_LEN = 14
@@ -894,11 +904,11 @@ ANTI_ALPHA_LONG_RSI_MAX = 30
 ANTI_ALPHA_EMA_DIST_MIN = 0.003
 ANTI_ALPHA_BODY_PCT_MIN = 0.008
 # Backtest-baseline params (kept identical to backtest)
-NOISE_REVERSE_LOOKBACK = 280
-NOISE_REVERSE_MA_LEN = 35
-NOISE_REVERSE_VOL_SMA_LEN = 35
-NOISE_REVERSE_VOL_SPIKE_MULT = 6.0
-NOISE_REVERSE_DISPARITY_PCT = 0.045
+NOISE_REVERSE_LOOKBACK = 300
+NOISE_REVERSE_MA_LEN = 40
+NOISE_REVERSE_VOL_SMA_LEN = 25
+NOISE_REVERSE_VOL_SPIKE_MULT = 3.5
+NOISE_REVERSE_DISPARITY_PCT = 0.055
 NOISE_REVERSE_INVERT_SIDE = True
 SRP_PB_LOOKBACK = 12
 SRP_VOL_MIN_MULT = 1.0
@@ -913,6 +923,51 @@ SRP_ST_ATR = 7
 SRP_ST_MULT = 4.0
 SRP_LTF = "5m"
 SRP_HTF = "1h"
+ST_FLIP_LTF = os.getenv("ST_FLIP_LTF", "3m")
+ST_FLIP_EMA_LEN = int(os.getenv("ST_FLIP_EMA_LEN", "60"))
+ST_FLIP_EMA_LONG_LEN = int(os.getenv("ST_FLIP_EMA_LONG_LEN", "200"))
+ST_FLIP_ST_PERIOD = int(os.getenv("ST_FLIP_ST_PERIOD", "10"))
+ST_FLIP_ST_MULT = float(os.getenv("ST_FLIP_ST_MULT", "3.0"))
+ST_FLIP_LOOKBACK = int(os.getenv("ST_FLIP_LOOKBACK", "200"))
+ST_FLIP_ALERT_ONLY = os.getenv("ST_FLIP_ALERT_ONLY", "0") == "1"
+ST_FLIP_ADX_LEN = int(os.getenv("ST_FLIP_ADX_LEN", "14"))
+ST_FLIP_ADX_MIN = float(os.getenv("ST_FLIP_ADX_MIN", "25"))
+ST_FLIP_PSAR_STEP = float(os.getenv("ST_FLIP_PSAR_STEP", "0.02"))
+ST_FLIP_PSAR_MAX = float(os.getenv("ST_FLIP_PSAR_MAX", "0.2"))
+ST_FLIP_VOL_SMA_LEN = int(os.getenv("ST_FLIP_VOL_SMA_LEN", "20"))
+ST_FLIP_VOL_MULT = float(os.getenv("ST_FLIP_VOL_MULT", "1.5"))
+ST_FLIP_RSI_LEN = int(os.getenv("ST_FLIP_RSI_LEN", "14"))
+ST_FLIP_RSI_MIN = float(os.getenv("ST_FLIP_RSI_MIN", "30"))
+ST_FLIP_RSI_MAX = float(os.getenv("ST_FLIP_RSI_MAX", "70"))
+ST_FLIP_RSI_MOM_MIN = float(os.getenv("ST_FLIP_RSI_MOM_MIN", "0"))
+ST_FLIP_BODY_PCT_MIN = float(os.getenv("ST_FLIP_BODY_PCT_MIN", "0"))
+ST_FLIP_ADX_OFF = os.getenv("ST_FLIP_ADX_OFF", "0") == "1"
+ST_FLIP_PSAR_OFF = os.getenv("ST_FLIP_PSAR_OFF", "0") == "1"
+ST_FLIP_VOL_OFF = os.getenv("ST_FLIP_VOL_OFF", "0") == "1"
+ST_FLIP_RSI_OFF = os.getenv("ST_FLIP_RSI_OFF", "0") == "1"
+RUNUP_LTF = "15m"
+RUNUP_RATIO = float(os.getenv("RUNUP_RATIO", "1.5"))
+RUNUP_ARMED_TTL_HOURS = 48.0
+RUNUP_CLOSE_POS_MAX = 0.12
+RUNUP_VOL_MIN = 2.5
+RUNUP_RET_MIN = -0.06
+RUNUP_RELIEF_WAIT_BARS = int(os.getenv("RUNUP_RELIEF_WAIT_BARS", "10"))
+RUNUP_RELIEF_ATR = float(os.getenv("RUNUP_RELIEF_ATR", "0.8"))
+RUNUP_RELIEF_RET = float(os.getenv("RUNUP_RELIEF_RET", "0.02"))
+RUNUP_FAIL_WAIT_BARS = int(os.getenv("RUNUP_FAIL_WAIT_BARS", "10"))
+RUNUP_FAIL_CLOSE_POS_MAX = float(os.getenv("RUNUP_FAIL_CLOSE_POS_MAX", "0.25"))
+RUNUP_FAIL_EMA_LEN = int(os.getenv("RUNUP_FAIL_EMA_LEN", "7"))
+RUNUP_RETEST_EPS = float(os.getenv("RUNUP_RETEST_EPS", "0.0015"))
+RUNUP_CONT_VOL_MIN = 1.5
+RUNUP_SL_LOOKBACK = 5
+RUNUP_SL_BUFFER_ATR = 0.25
+RUNUP_SL_PCT_CAP = float(os.getenv("RUNUP_SL_PCT_CAP", "0.06"))
+RUNUP_TP_ATR = 0.6
+RUNUP_MAX_HOLD_BARS = 40
+RUNUP_COOLDOWN_BARS = 10
+RUNUP_ALERT_COOLDOWN_HOURS = float(os.getenv("RUNUP_ALERT_COOLDOWN_HOURS", "6"))
+RUNUP_WRITE_CACHE = os.getenv("RUNUP_WRITE_CACHE", "1") not in ("0", "false", "off", "no")
+RUNUP_LOG_DETAIL = os.getenv("RUNUP_LOG_DETAIL", "1") not in ("0", "false", "off", "no")
 LOSS_HEDGE_ENGINE_ENABLED = False
 LOSS_HEDGE_INTERVAL_MIN = 15
 SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").strip()
@@ -1107,7 +1162,8 @@ COMMON_UNIVERSE: list = []
 COMMON_UNIVERSE_READY = False
 COMMON_WARMUP_DONE = False
 COMMON_WARMUP_DAYS = int(os.getenv("COMMON_WARMUP_DAYS", "1"))
-COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m").split(",") if tf.strip())
+RUNUP_WARMUP_DAYS = int(os.getenv("RUNUP_WARMUP_DAYS", "4"))
+COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m,3m").split(",") if tf.strip())
 COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "8"))
 COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "30"))
 COMMON_UNIVERSE_LOG_PATH = ""
@@ -1295,7 +1351,7 @@ def _prefetch_ohlcv_for_cycle(
                     cycle_cache.set_raw(symbol, tf, data)
                     stats["fetched"] += 1
                     stats["fetched_by_tf"][tf] = int(stats["fetched_by_tf"].get(tf, 0) or 0) + 1
-                    if tf == "1m":
+                    if tf in COMMON_WARMUP_TFS:
                         _append_common_warmup_ohlcv(symbol, tf, data)
                     try:
                         first_ts = int(data[0][0])
@@ -1421,7 +1477,10 @@ def _warmup_common_cache(state: dict, exchange, universe: list) -> bool:
         plan = []
         for sym in universe:
             for tf in COMMON_WARMUP_TFS:
-                limit = _tf_bars_for_days(tf, COMMON_WARMUP_DAYS)
+                days = COMMON_WARMUP_DAYS
+                if tf == "3m" and RUNUP_WASHOUT_SHORT_3M_ENABLED:
+                    days = max(days, RUNUP_WARMUP_DAYS)
+                limit = _tf_bars_for_days(tf, days)
                 plan.append((sym, tf, limit))
         state["_common_warmup_plan"] = plan
         state["_common_warmup_idx"] = 0
@@ -2246,10 +2305,22 @@ def _append_noise_reverse_log(line: str) -> None:
     path = os.path.join("noise_reverse_v1", f"noise_reverse_v1-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
+def _append_st_flip_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("st_flip_v1", f"st_flip_v1-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
 def _append_srp_st_log(line: str) -> None:
     date_tag = time.strftime("%Y-%m-%d")
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("srp_st_regime_pullback_v1", f"srp_st_regime_pullback_v1-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
+def _append_runup_washout_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("wash_short_suite", f"runup_washout_short_3m-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
 def _iso_kst(ts: Optional[float] = None) -> str:
@@ -4943,6 +5014,12 @@ def _run_noise_reverse_v1_cycle(
                 _append_noise_reverse_log(
                     f"NOISE_REVERSE_CACHE source=file-none sym={symbol}"
                 )
+        if df_1m is None and NOISE_REVERSE_USE_COMMON_CACHE:
+            if symbol in debug_syms:
+                _append_noise_reverse_log(
+                    f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=file_only"
+                )
+            return {"symbol": symbol, "status": "no_data"}
         if df_1m is None:
             df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
             if not df_1m.empty and "ts" in df_1m.columns:
@@ -5283,6 +5360,165 @@ def _run_noise_reverse_v1_cycle(
     )
     return result
 
+def _run_st_flip_v1_cycle(
+    st_flip_universe,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"long_hits": 0, "short_hits": 0}
+    alert_only = bool(ST_FLIP_ALERT_ONLY) and not ST_FLIP_V1_ENABLED
+    if (not ST_FLIP_V1_ENABLED and not alert_only) or not st_flip_universe or not st_flip_compute_signal:
+        return result
+    start_ts = time.time()
+    checked = 0
+    entries = 0
+    no_signal = 0
+    no_data = 0
+    _append_st_flip_log(
+        f"ST_FLIP_CYCLE_START cycle_id={cycle_id} universe={len(st_flip_universe)}"
+    )
+    try:
+        refresh_positions_cache(force=True)
+    except Exception:
+        pass
+
+    min_len = max(ST_FLIP_LOOKBACK, ST_FLIP_EMA_LEN + 5, ST_FLIP_EMA_LONG_LEN + 5, ST_FLIP_ST_PERIOD + 5, 120)
+    fetch_len = min_len + 1  # drop last bar (confirmed) and still keep min_len
+    for symbol in list(st_flip_universe or []):
+        checked += 1
+        df = cycle_cache.get_df(symbol, ST_FLIP_LTF, limit=fetch_len)
+        if df is None or df.empty:
+            no_data += 1
+            continue
+        df_sig = df.iloc[:-1]
+        if df_sig.empty or len(df_sig) < min_len:
+            no_data += 1
+            continue
+        sig = st_flip_compute_signal(
+            df_sig,
+            period=int(ST_FLIP_ST_PERIOD),
+            mult=float(ST_FLIP_ST_MULT),
+            ema_len=int(ST_FLIP_EMA_LEN),
+            ema_long_len=int(ST_FLIP_EMA_LONG_LEN),
+            adx_len=int(ST_FLIP_ADX_LEN),
+            adx_min=float(ST_FLIP_ADX_MIN),
+            psar_step=float(ST_FLIP_PSAR_STEP),
+            psar_max=float(ST_FLIP_PSAR_MAX),
+            vol_sma_len=int(ST_FLIP_VOL_SMA_LEN),
+            vol_mult=float(ST_FLIP_VOL_MULT),
+            rsi_len=int(ST_FLIP_RSI_LEN),
+            rsi_min=float(ST_FLIP_RSI_MIN),
+            rsi_max=float(ST_FLIP_RSI_MAX),
+            rsi_mom_min=float(ST_FLIP_RSI_MOM_MIN),
+            body_pct_min=float(ST_FLIP_BODY_PCT_MIN),
+            adx_off=bool(ST_FLIP_ADX_OFF),
+            psar_off=bool(ST_FLIP_PSAR_OFF),
+            vol_off=bool(ST_FLIP_VOL_OFF),
+            rsi_off=bool(ST_FLIP_RSI_OFF),
+        )
+        if not sig or sig.close is None or sig.ema120 is None:
+            no_signal += 1
+            continue
+        entry_side = None
+        if sig.flip_up and sig.close > sig.ema120 and sig.filter_up:
+            entry_side = "LONG"
+        elif sig.flip_down and sig.close < sig.ema120 and sig.filter_down:
+            entry_side = "SHORT"
+        if not entry_side:
+            no_signal += 1
+            continue
+
+        st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+        if st.get("in_pos"):
+            _append_entry_gate_log("st_flip_v1", symbol, "already_in_position", side=entry_side)
+            no_signal += 1
+            continue
+        if _exit_cooldown_blocked(state, symbol, "st_flip_v1", entry_side):
+            _append_entry_gate_log("st_flip_v1", symbol, "exit_cooldown", side=entry_side)
+            no_signal += 1
+            continue
+
+        guard_key = f"st_flip_v1:{symbol}:{entry_side}"
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="st_flip_v1", side=entry_side)
+        if not lock_ok:
+            _append_st_flip_log(
+                f"ST_FLIP_ENTRY_FAIL sym={symbol} side={entry_side} reason=LOCK held_by={lock_owner} age={lock_age:.1f}"
+            )
+            no_signal += 1
+            continue
+        if not _entry_guard_acquire(state, symbol, key=guard_key, engine="st_flip_v1", side=entry_side):
+            _entry_lock_release(state, symbol, owner="st_flip_v1", side=entry_side)
+            _append_st_flip_log(
+                f"ST_FLIP_ENTRY_FAIL sym={symbol} side={entry_side} reason=GUARD"
+            )
+            no_signal += 1
+            continue
+
+        req_id = None
+        if not alert_only:
+            req_id = _enqueue_entry_request(
+                state=state,
+                symbol=symbol,
+                side=entry_side,
+                engine="ST_FLIP_V1",
+                reason="st_flip_v1",
+                usdt=USDT_PER_TRADE,
+                live=(LONG_LIVE_TRADING if entry_side == "LONG" else LIVE_TRADING),
+                alert_reason="st_flip_v1",
+                entry_price_hint=float(sig.close),
+            meta={
+                "flip_up": sig.flip_up,
+                "flip_down": sig.flip_down,
+                "st_dir_last": sig.st_dir_last,
+                "st_dir_prev": sig.st_dir_prev,
+                "ema120": sig.ema120,
+                "close": sig.close,
+                "adx": sig.adx,
+                "psar": sig.psar,
+                "vol_ratio": sig.vol_ratio,
+                "rsi": sig.rsi,
+                "tf": ST_FLIP_LTF,
+            },
+        )
+            if not req_id:
+                _entry_lock_release(state, symbol, owner="st_flip_v1", side=entry_side)
+                _append_st_flip_log(
+                    f"ST_FLIP_ENTRY_FAIL sym={symbol} side={entry_side} reason=ENQUEUE_FAIL"
+                )
+                no_signal += 1
+                continue
+
+        _send_entry_alert(
+            send_alert,
+            side=entry_side,
+            symbol=symbol,
+            engine="ST_FLIP_V1",
+            entry_price=float(sig.close),
+            usdt=USDT_PER_TRADE,
+            reason="st_flip_v1",
+            live=(LONG_LIVE_TRADING if entry_side == "LONG" else LIVE_TRADING),
+            state=state,
+        )
+        entries += 1
+        if entry_side == "LONG":
+            result["long_hits"] += 1
+        else:
+            result["short_hits"] += 1
+        _append_st_flip_log(
+            f"ST_FLIP_ENTRY sym={symbol} side={entry_side} close={sig.close:.6g} ema120={sig.ema120:.6g} "
+            f"st_prev={sig.st_dir_prev} st_last={sig.st_dir_last} req_id={req_id} alert_only={int(alert_only)}"
+        )
+        if alert_only:
+            _entry_lock_release(state, symbol, owner="st_flip_v1", side=entry_side)
+
+    elapsed = time.time() - start_ts
+    _append_st_flip_log(
+        f"ST_FLIP_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={entries} "
+        f"no_signal={no_signal} no_data={no_data}"
+    )
+    return result
+
 def _run_srp_st_regime_pullback_v1_cycle(
     srp_universe,
     state,
@@ -5578,6 +5814,179 @@ def _run_srp_st_regime_pullback_v1_cycle(
     )
     return result
 
+def _run_runup_washout_short_3m_cycle(
+    runup_universe,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"ext": 0, "top": 0, "top_ok": 0, "rev": 0}
+    if not RUNUP_WASHOUT_SHORT_3M_ENABLED or not runup_universe:
+        return result
+    start_ts = time.time()
+    checked = 0
+    no_signal = 0
+    no_data = 0
+    _append_runup_washout_log(
+        f"RUNUP_CYCLE_START cycle_id={cycle_id} universe={len(runup_universe)}"
+    )
+
+    now_ts = time.time()
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        _append_runup_washout_log("RUNUP_SKIP reason=SATURDAY_OFF")
+        return result
+
+    runup_state = state.setdefault("_runup_washout_state", {})
+    left_bars = 6
+    gate_bars = 192
+    min_gap_bars = 48
+    confirm_window = 6
+    ext_dist_pct = 6.0
+    ext_lookback = 24
+    rev_window = 96
+    min_len = max(gate_bars, ext_lookback, min_gap_bars) + confirm_window + 20
+    min_len = max(min_len, 300)
+    ltf_limit = max(min_len + 10, 400)
+
+    symbols = list(runup_universe or [])
+    for symbol in symbols:
+        checked += 1
+        df = cycle_cache.get_df(symbol, RUNUP_LTF, limit=ltf_limit)
+        if df.empty:
+            if RUNUP_LOG_DETAIL:
+                _append_runup_washout_log(f"RUNUP_SKIP sym={symbol} reason=NO_DATA empty_df")
+            no_data += 1
+            continue
+        if RUNUP_WRITE_CACHE:
+            try:
+                raw_rows = df[["ts", "open", "high", "low", "close", "volume"]].values.tolist()
+                if raw_rows:
+                    cycle_cache.set_raw(symbol, RUNUP_LTF, raw_rows)
+            except Exception:
+                pass
+        df_sig = df.iloc[:-1]
+        if len(df_sig) < min_len:
+            if RUNUP_LOG_DETAIL:
+                _append_runup_washout_log(
+                    f"RUNUP_SKIP sym={symbol} reason=NO_DATA short_len len={len(df_sig)} need={min_len}"
+                )
+            no_data += 1
+            continue
+
+        i = len(df_sig) - 1
+        row = df_sig.iloc[i]
+        ts_ms = int(row["ts"])
+        sym_state = runup_state.setdefault(symbol, {})
+        if sym_state.get("last_eval_ts") == ts_ms:
+            continue
+        sym_state["last_eval_ts"] = ts_ms
+
+        ema20 = ema(df_sig["close"], 20)
+        if len(ema20) < 2:
+            no_signal += 1
+            continue
+        ema20_val = float(ema20.iloc[-1]) if pd.notna(ema20.iloc[-1]) else None
+        ema20_prev = float(ema20.iloc[-2]) if pd.notna(ema20.iloc[-2]) else None
+
+        close_px = float(row["close"])
+        high_px = float(row["high"])
+        low_px = float(row["low"])
+
+        if not all(isinstance(v, (int, float)) for v in [ema20_val, ema20_prev]):
+            if RUNUP_LOG_DETAIL:
+                _append_runup_washout_log(
+                    f"RUNUP_SKIP sym={symbol} reason=IND_NAN ema20={ema20_val} ema20_prev={ema20_prev}"
+                )
+            no_signal += 1
+            continue
+
+        # EXT (overextension)
+        if ema20_val > 0 and i - ext_lookback + 1 >= 0:
+            dist_pct = (close_px - ema20_val) / ema20_val * 100.0
+            ext_hi = float(df_sig["high"].iloc[i - ext_lookback + 1 : i + 1].max())
+            if dist_pct >= ext_dist_pct and high_px >= ext_hi:
+                if sym_state.get("last_ext_ts") != ts_ms:
+                    sym_state["last_ext_ts"] = ts_ms
+                    msg = f"[EXT↑] {symbol} 15m close={close_px:.6g}"
+                    send_alert(msg)
+                    result["ext"] += 1
+
+        # TOP (left-only pivot high + gate + min gap)
+        c = i
+        if c - left_bars >= 0:
+            window = df_sig["high"].iloc[c - left_bars : c + 1]
+            maxv = float(window.max())
+            try:
+                is_unique = int((window == maxv).sum()) == 1
+            except Exception:
+                is_unique = False
+            if float(df_sig["high"].iloc[c]) == maxv and is_unique:
+                gate_ok = False
+                if i - gate_bars + 1 >= 0:
+                    hh = float(df_sig["high"].iloc[i - gate_bars + 1 : i + 1].max())
+                    ll = float(df_sig["low"].iloc[i - gate_bars + 1 : i + 1].min())
+                    if ll > 0 and (hh / ll) >= float(RUNUP_RATIO):
+                        gate_ok = True
+                gap_ok = True
+                last_top_idx = sym_state.get("last_top_index")
+                if isinstance(last_top_idx, int):
+                    gap_ok = (i - last_top_idx) >= min_gap_bars
+                if gate_ok and gap_ok:
+                    sym_state["last_top_index"] = i
+                    base_low = float(df_sig["low"].iloc[max(0, i - left_bars + 1) : i + 1].min())
+                    sym_state["ok_active"] = True
+                    sym_state["base_low"] = base_low
+                    sym_state["ok_deadline_index"] = i + confirm_window
+                    sym_state["rev_active"] = True
+                    sym_state["rev_deadline_index"] = i + rev_window
+                    confirmed_ts = _ts_to_kst_str(ts_ms / 1000.0)
+                    pivot_ts = _ts_to_kst_str(float(df_sig["ts"].iloc[c]) / 1000.0)
+                    if sym_state.get("last_top_ts") != ts_ms:
+                        sym_state["last_top_ts"] = ts_ms
+                        msg = f"[TOP]   {symbol} 15m\\nconfirmed={confirmed_ts}\\npivot={pivot_ts}"
+                        send_alert(msg)
+                        result["top"] += 1
+
+        # TOP_OK (structure break)
+        if sym_state.get("ok_active"):
+            ok_deadline = int(sym_state.get("ok_deadline_index") or -1)
+            if i > ok_deadline:
+                sym_state["ok_active"] = False
+            else:
+                base_low = float(sym_state.get("base_low") or 0.0)
+                if low_px < base_low and close_px < ema20_val:
+                    sym_state["ok_active"] = False
+                    sym_state["rev_active"] = True
+                    sym_state["rev_deadline_index"] = i + rev_window
+                    if sym_state.get("last_top_ok_ts") != ts_ms:
+                        sym_state["last_top_ok_ts"] = ts_ms
+                        msg = f"[TOP_OK] {symbol} 15m close={close_px:.6g}"
+                        send_alert(msg)
+                        result["top_ok"] += 1
+
+        # REV (EMA recross)
+        if sym_state.get("rev_active"):
+            rev_deadline = int(sym_state.get("rev_deadline_index") or -1)
+            if i > rev_deadline:
+                sym_state["rev_active"] = False
+            else:
+                prev_close = float(df_sig["close"].iloc[i - 1]) if i >= 1 else None
+                if isinstance(prev_close, (int, float)) and prev_close <= ema20_prev and close_px > ema20_val:
+                    sym_state["rev_active"] = False
+                    if sym_state.get("last_rev_ts") != ts_ms:
+                        sym_state["last_rev_ts"] = ts_ms
+                        msg = f"[REV↑] {symbol} 15m close={close_px:.6g}"
+                        send_alert(msg)
+                        result["rev"] += 1
+
+        no_signal += 1
+
+    elapsed = time.time() - start_ts
+    _append_runup_washout_log(
+        f"RUNUP_CYCLE_END elapsed={elapsed:.2f}s checked={checked} ext={result['ext']} "
+        f"top={result['top']} top_ok={result['top_ok']} rev={result['rev']} no_signal={no_signal} no_data={no_data}"
+    )
+    return result
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
     cycle_ts = state.get("_current_cycle_ts")
     side = (side or "").upper()
@@ -6436,6 +6845,10 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "NOISE_REVERSE_V1"
     if key in ("srp_st_regime_pullback_v1", "srp_st"):
         return "SRP_ST_REGIME_PULLBACK_V1"
+    if key in ("st_flip_v1", "st_flip"):
+        return "ST_FLIP_V1"
+    if key in ("runup_washout_short_3m", "runup"):
+        return "RUNUP_WASHOUT_SHORT_3M"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -6456,6 +6869,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "dtfx_long" if side == "LONG" else "dtfx_short"
     if label == "RSI":
         return "short_entry"
+    if label == "RUNUP_WASHOUT_SHORT_3M":
+        return "runup_washout_short_3m"
     if label == "SCALP":
         return "long_entry"
     if label == "MANUAL":
@@ -6468,6 +6883,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "noise_reverse_v1"
     if label == "SRP_ST_REGIME_PULLBACK_V1":
         return "srp_st_regime_pullback_v1"
+    if label == "ST_FLIP_V1":
+        return "st_flip_v1"
     return None
 
 def _display_engine_label(label: Optional[str]) -> str:
@@ -6482,6 +6899,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "ANTI_ALPHA_V1": "안티알파v1",
         "NOISE_REVERSE_V1": "노이즈리버스v1",
         "SRP_ST_REGIME_PULLBACK_V1": "SRP-ST풀백v1",
+        "ST_FLIP_V1": "ST플립v1",
     }
     return overrides.get(name, name)
 
@@ -6509,6 +6927,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return NOISE_REVERSE_V1_ENABLED
     if key == "SRP_ST_REGIME_PULLBACK_V1":
         return SRP_ST_REGIME_PULLBACK_V1_ENABLED
+    if key == "ST_FLIP_V1":
+        return ST_FLIP_V1_ENABLED
     if key in ("RSI", "SCALP"):
         return RSI_ENABLED
     if key in ("MANUAL", "UNKNOWN", ""):
@@ -9234,6 +9654,8 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             "RSI",
             "ANTI_ALPHA_V1",
             "NOISE_REVERSE_V1",
+            "ST_FLIP_V1",
+            "RUNUP_WASHOUT_SHORT_3M",
             "MANUAL",
             "UNKNOWN",
         }
@@ -9347,6 +9769,11 @@ def _detect_position_events(state: dict, send_telegram) -> None:
         managed = isinstance(open_tr, dict)
         managed_engine = (open_tr.get("meta") or {}).get("engine") if managed else None
         changed = False
+        entry_price = None
+        exit_price = None
+        engine_label = managed_engine or "MANUAL"
+        exit_reason = "manual_close"
+        sl_price_meta = None
         key = f"{symbol}|{side}"
         prev = snap.get(key) if isinstance(snap, dict) else None
         prev_qty = prev.get("qty") if isinstance(prev, dict) else None
@@ -9714,6 +10141,46 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
     except Exception:
         pass
+    # avoid duplicate entry alerts (signal + fill)
+    recent_alert = _entry_alert_info(state, symbol, side)
+    if isinstance(recent_alert, dict):
+        try:
+            recent_ts = float(recent_alert.get("ts") or 0.0)
+        except Exception:
+            recent_ts = 0.0
+        recent_engine = str(recent_alert.get("engine") or "").upper()
+        cur_engine = str(req.get("engine") or "").upper()
+        if recent_ts and (time.time() - recent_ts) <= 120.0 and (not cur_engine or cur_engine == recent_engine):
+            _clear_manage_pending(state, symbol, side)
+            return True
+
+    sl_disp = None
+    tp_disp = None
+    if isinstance(extra_meta, dict):
+        sl_price_meta = extra_meta.get("sl_price")
+        if isinstance(sl_price_meta, (int, float)):
+            sl_disp = f"{float(sl_price_meta):.6g}"
+        tp_pct_meta = extra_meta.get("tp_pct")
+        if isinstance(tp_pct_meta, (int, float)):
+            base_px = fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint")
+            try:
+                base_px = float(base_px) if base_px is not None else None
+            except Exception:
+                base_px = None
+            if isinstance(base_px, (int, float)) and base_px > 0:
+                pct = float(tp_pct_meta) / 100.0
+                if side == "SHORT":
+                    tp_disp = f"{(base_px * (1.0 - pct)):.6g}"
+                else:
+                    tp_disp = f"{(base_px * (1.0 + pct)):.6g}"
+
+    if not sl_disp:
+        sl_disp = _fmt_price_safe(
+            fill_price if isinstance(fill_price, (int, float)) else None,
+            _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
+            side=side,
+        )
+
     _send_entry_alert(
         (lambda text: send_telegram(text, allow_early=True)),
         side=side,
@@ -9726,12 +10193,8 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         order_info=None,
         entry_order_id=entry_order_id,
         label_tag=str(alert_tag) if isinstance(alert_tag, str) and alert_tag.startswith("MULTI_ENTRY") else None,
-        sl=_fmt_price_safe(
-            fill_price if isinstance(fill_price, (int, float)) else None,
-            _get_engine_exit_thresholds(_engine_label_from_reason(req.get("reason")), side)[1],
-            side=side,
-        ),
-        tp=None,
+        sl=sl_disp,
+        tp=tp_disp,
         state=state,
     )
     _clear_manage_pending(state, symbol, side)
@@ -10789,7 +11252,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
-    global ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED
+    global ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, RUNUP_WASHOUT_SHORT_3M_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -10854,9 +11317,16 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_adv_trend_mfi_short_min",
         "_anti_alpha_v1_enabled",
         "_noise_reverse_v1_enabled",
+        "_st_flip_v1_enabled",
+        "_st_flip_v1_alert_only",
         "_srp_st_regime_pullback_v1_enabled",
+        "_runup_washout_short_3m_enabled",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
+        "_noise_reverse_v1_enabled",
+        "_st_flip_v1_enabled",
+        "_srp_st_regime_pullback_v1_enabled",
+        "_runup_washout_short_3m_enabled",
         "_rsi_enabled",
         "_dtfx_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -10928,17 +11398,28 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         AUTO_EXIT_SHORT_SL_PCT = float(state.get("_auto_exit_short_sl_pct"))
     if (not skip_keys or "_engine_exit_overrides" not in skip_keys) and isinstance(state.get("_engine_exit_overrides"), dict):
         ENGINE_EXIT_OVERRIDES = dict(state.get("_engine_exit_overrides"))
-    if "ANTI_ALPHA_V1" not in ENGINE_EXIT_OVERRIDES:
-        ENGINE_EXIT_OVERRIDES["ANTI_ALPHA_V1"] = {
-            "LONG": {"tp": 2.0, "sl": 2.0},
-            "SHORT": {"tp": 2.0, "sl": 2.0},
+    if not ENGINE_EXIT_OVERRIDES:
+        ENGINE_EXIT_OVERRIDES = {
+            "NOISE_REVERSE_V1": {
+                "LONG": {"tp": 2.5, "sl": 2.5},
+                "SHORT": {"tp": 2.5, "sl": 2.5},
+            }
         }
         state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
-    if "NOISE_REVERSE_V1" not in ENGINE_EXIT_OVERRIDES:
-        ENGINE_EXIT_OVERRIDES["NOISE_REVERSE_V1"] = {
-            "LONG": {"tp": 2.5, "sl": 2.5},
-            "SHORT": {"tp": 2.5, "sl": 2.5},
-        }
+    # Ensure RUNUP uses engine-calculated SL/TP (disable pct exits)
+    if isinstance(ENGINE_EXIT_OVERRIDES, dict):
+        runup_cfg = ENGINE_EXIT_OVERRIDES.get("RUNUP_WASHOUT_SHORT_3M")
+        if not isinstance(runup_cfg, dict):
+            ENGINE_EXIT_OVERRIDES["RUNUP_WASHOUT_SHORT_3M"] = {"SHORT": {"tp": 0.0, "sl": 0.0}}
+        else:
+            short_cfg = runup_cfg.get("SHORT")
+            if not isinstance(short_cfg, dict):
+                runup_cfg["SHORT"] = {"tp": 0.0, "sl": 0.0}
+            else:
+                if not isinstance(short_cfg.get("tp"), (int, float)):
+                    short_cfg["tp"] = 0.0
+                if not isinstance(short_cfg.get("sl"), (int, float)):
+                    short_cfg["sl"] = 0.0
         state["_engine_exit_overrides"] = ENGINE_EXIT_OVERRIDES
     if (not skip_keys or "_live_trading" not in skip_keys) and isinstance(state.get("_live_trading"), bool):
         LIVE_TRADING = bool(state.get("_live_trading"))
@@ -10963,8 +11444,14 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         ANTI_ALPHA_V1_ENABLED = bool(state.get("_anti_alpha_v1_enabled"))
     if (not skip_keys or "_noise_reverse_v1_enabled" not in skip_keys) and isinstance(state.get("_noise_reverse_v1_enabled"), bool):
         NOISE_REVERSE_V1_ENABLED = bool(state.get("_noise_reverse_v1_enabled"))
+    if (not skip_keys or "_st_flip_v1_enabled" not in skip_keys) and isinstance(state.get("_st_flip_v1_enabled"), bool):
+        ST_FLIP_V1_ENABLED = bool(state.get("_st_flip_v1_enabled"))
+    if (not skip_keys or "_st_flip_v1_alert_only" not in skip_keys) and isinstance(state.get("_st_flip_v1_alert_only"), bool):
+        ST_FLIP_ALERT_ONLY = bool(state.get("_st_flip_v1_alert_only"))
     if (not skip_keys or "_srp_st_regime_pullback_v1_enabled" not in skip_keys) and isinstance(state.get("_srp_st_regime_pullback_v1_enabled"), bool):
         SRP_ST_REGIME_PULLBACK_V1_ENABLED = bool(state.get("_srp_st_regime_pullback_v1_enabled"))
+    if (not skip_keys or "_runup_washout_short_3m_enabled" not in skip_keys) and isinstance(state.get("_runup_washout_short_3m_enabled"), bool):
+        RUNUP_WASHOUT_SHORT_3M_ENABLED = bool(state.get("_runup_washout_short_3m_enabled"))
     if (not skip_keys or "_adv_trend_min_qv" not in skip_keys) and isinstance(state.get("_adv_trend_min_qv"), (int, float)):
         ADV_TREND_MIN_QV = float(state.get("_adv_trend_min_qv"))
     if (not skip_keys or "_adv_trend_universe_top_n" not in skip_keys) and isinstance(state.get("_adv_trend_universe_top_n"), (int, float)):
@@ -11232,6 +11719,10 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_swaggy_d1_overext_atr_mult",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
+        "_runup_washout_short_3m_enabled",
+        "_noise_reverse_v1_enabled",
+        "_st_flip_v1_enabled",
+        "_srp_st_regime_pullback_v1_enabled",
         "_rsi_enabled",
         "_dtfx_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -11597,6 +12088,34 @@ def _send_telegram_direct(text: str, allow_early: bool = False, chat_id: Optiona
                 return False
             time.sleep(0.8)
 
+def _send_super_trend_alert(text: str, allow_early: bool = False) -> bool:
+    if (time.time() - START_TIME) < TELEGRAM_STARTUP_GRACE_SEC and not allow_early:
+        return False
+    token = BOT_TOKEN_SUPER_TREND
+    chat_id = CHAT_ID_SUPER_TREND
+    if not token or not chat_id:
+        print("[telegram-super-trend] missing TELEGRAM_BOT_TOKEN_SUPER_TREND or TELEGRAM_CHAT_ID_SUPER_TREND")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": _safe_telegram_text(text, 3800),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    for attempt in range(2):
+        try:
+            r = requests.post(url, json=payload, timeout=20)
+            if not r.ok:
+                print("[telegram-super-trend] failed:", r.status_code, r.text)
+            return r.ok
+        except Exception as e:
+            if attempt == 1:
+                print("[telegram-super-trend] error:", e)
+                return False
+            time.sleep(0.8)
+    return False
+
 def _enqueue_telegram(text: str, allow_early: bool = False, chat_id: Optional[str] = None) -> bool:
     try:
         os.makedirs("logs", exist_ok=True)
@@ -11685,7 +12204,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, RUNUP_WASHOUT_SHORT_3M_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -12308,40 +12827,27 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                             f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                             f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
-                            f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
-                            f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
-                            f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
-                            f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
-                            f"/loss_hedge_interval: {LOSS_HEDGE_INTERVAL_MIN}분\n"
-                            f"/swaggy_atlas_lab_off: {SWAGGY_ATLAS_LAB_OFF_WINDOWS or 'NONE'}\n"
-                            f"/swaggy_atlas_lab_v2_off: {SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS or 'NONE'}\n"
-                            f"/swaggy_no_atlas_off: {SWAGGY_NO_ATLAS_OFF_WINDOWS or 'NONE'}\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                             f"/engine_exit: {_format_engine_exit_overrides()}\n"
                             "--------------\n"
-                            f"엔진요약: swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
-                            f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
-                            f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
-                            f"adv_trend={'ON' if ADV_TREND_ENABLED else 'OFF'} "
-                            f"anti_alpha={'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'} "
-                            f"noise_reverse={'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'} "
+                            f"엔진요약: noise_reverse={'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'} "
+                            f"st_flip={'ON' if ST_FLIP_V1_ENABLED else 'OFF'}(alert_only={'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}) "
                             f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
-                            f"loss_hedge={'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'} "
-                            f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
+                            f"runup={'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'} "
+                            f"swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
+                            f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
                             f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
                             ""
                             "--------------\n"
+                            f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
+                            f"/st_flip_v1(추가진입): {'ON' if ST_FLIP_V1_ENABLED else 'OFF'}\n"
+                            f"/st_flip_v1_alert(알람전용): {'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}\n"
+                            f"/srp_st_regime_pullback_v1(추가진입): {'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'}\n"
+                            f"/runup_washout_short_3m(추가진입): {'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
-                            f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
-                            f"/adv_trend(추가진입): {'ON' if ADV_TREND_ENABLED else 'OFF'}\n"
-                            f"/anti_alpha_v1(추가진입): {'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'}\n"
-                            f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
-                            f"/srp_st_regime_pullback_v1(추가진입): {'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'}\n"
-                            f"/loss_hedge_engine(손실방지): {'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'}\n"
-                            f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
                             f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                             ""
@@ -12385,40 +12891,23 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
                         f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                         f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
-                        f"/swaggy_no_atlas_overext: {SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN:.2f} "
-                        f"({ 'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF' })\n"
-                        f"/swaggy_no_atlas_overext_on: {'ON' if SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED else 'OFF'}\n"
-                        f"/swaggy_d1_overext: {SWAGGY_D1_OVEREXT_ATR_MULT:.2f}\n"
-                        f"/loss_hedge_interval: {LOSS_HEDGE_INTERVAL_MIN}분\n"
-                        f"/swaggy_atlas_lab_off: {SWAGGY_ATLAS_LAB_OFF_WINDOWS or 'NONE'}\n"
-                        f"/swaggy_atlas_lab_v2_off: {SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS or 'NONE'}\n"
-                        f"/swaggy_no_atlas_off: {SWAGGY_NO_ATLAS_OFF_WINDOWS or 'NONE'}\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
                         f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                         f"/engine_exit: {_format_engine_exit_overrides()}\n"
                         "--------------\n"
-                        f"엔진요약: swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
-                        f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
-                        f"no_atlas={'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'} "
-                        f"adv_trend={'ON' if ADV_TREND_ENABLED else 'OFF'} "
-                        f"anti_alpha={'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'} "
-                        f"noise_reverse={'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'} "
+                        f"엔진요약: noise_reverse={'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'} "
+                        f"st_flip={'ON' if ST_FLIP_V1_ENABLED else 'OFF'}(alert_only={'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}) "
                         f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
-                        f"loss_hedge={'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'} "
-                        f"dtfx={'ON' if DTFX_ENABLED else 'OFF'} "
+                        f"runup={'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'} "
                         f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
                         f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
                         ""
                         "--------------\n"
-                        f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
-                        f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
-                        f"/swaggy_no_atlas(추가진입): {'ON' if SWAGGY_NO_ATLAS_ENABLED else 'OFF'}\n"
-                        f"/adv_trend(추가진입): {'ON' if ADV_TREND_ENABLED else 'OFF'}\n"
-                        f"/anti_alpha_v1(추가진입): {'ON' if ANTI_ALPHA_V1_ENABLED else 'OFF'}\n"
                         f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
+                        f"/st_flip_v1(추가진입): {'ON' if ST_FLIP_V1_ENABLED else 'OFF'}\n"
+                        f"/st_flip_v1_alert(알람전용): {'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}\n"
                         f"/srp_st_regime_pullback_v1(추가진입): {'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'}\n"
-                        f"/loss_hedge_engine(손실방지): {'ON' if LOSS_HEDGE_ENGINE_ENABLED else 'OFF'}\n"
-                        f"/dtfx(추가진입): {'ON' if DTFX_ENABLED else 'OFF'}\n\n"
+                        f"/runup_washout_short_3m(추가진입): {'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'}\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
                         f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                         ""
@@ -12896,6 +13385,52 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] noise_reverse_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/st_flip_v1", "st_flip_v1", "st_flip")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        ST_FLIP_V1_ENABLED = True
+                        state["_st_flip_v1_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ st_flip_v1 ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        ST_FLIP_V1_ENABLED = False
+                        state["_st_flip_v1_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ st_flip_v1 OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ st_flip_v1 상태: {'ON' if ST_FLIP_V1_ENABLED else 'OFF'}\n"
+                            "사용법: /st_flip_v1 on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] st_flip_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/st_flip_v1_alert", "st_flip_v1_alert", "st_flip_alert")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        ST_FLIP_ALERT_ONLY = True
+                        state["_st_flip_v1_alert_only"] = True
+                        state_dirty = True
+                        resp = "✅ st_flip_v1 ALERT_ONLY ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        ST_FLIP_ALERT_ONLY = False
+                        state["_st_flip_v1_alert_only"] = False
+                        state_dirty = True
+                        resp = "⛔ st_flip_v1 ALERT_ONLY OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ st_flip_v1 alert_only: {'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}\n"
+                            "사용법: /st_flip_v1_alert on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] st_flip_v1_alert cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/srp_st_regime_pullback_v1", "srp_st_regime_pullback_v1", "srp_st")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -12918,6 +13453,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] srp_st_regime_pullback_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/runup_washout_short_3m", "runup_washout_short_3m", "runup")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        RUNUP_WASHOUT_SHORT_3M_ENABLED = True
+                        state["_runup_washout_short_3m_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ runup_washout_short_3m ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        RUNUP_WASHOUT_SHORT_3M_ENABLED = False
+                        state["_runup_washout_short_3m_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ runup_washout_short_3m OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ runup_washout_short_3m 상태: {'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'}\n"
+                            "사용법: /runup_washout_short_3m on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] runup_washout_short_3m cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/loss_hedge_engine", "loss_hedge_engine")) and not responded:
                     parts = lower.split()
@@ -13190,6 +13748,9 @@ def _adv_atr(df: pd.DataFrame, length: int) -> pd.Series:
         axis=1,
     ).max(axis=1)
     return tr.ewm(alpha=1 / length, adjust=False).mean()
+
+def atr(df: pd.DataFrame, length: int) -> pd.Series:
+    return _adv_atr(df, length)
 
 def _adv_mfi(df: pd.DataFrame, length: int) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -13488,6 +14049,8 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_loss_hedge_engine_enabled",
                 "_loss_hedge_interval_min",
                 "_noise_reverse_v1_enabled",
+                "_st_flip_v1_enabled",
+                "_st_flip_v1_alert_only",
                 "_srp_st_regime_pullback_v1_enabled",
                 "_dtfx_enabled",
                 "_rsi_enabled",
@@ -13555,6 +14118,7 @@ def save_state_to(state: Dict[str, dict], path: str) -> None:
                 "_div15m_long_enabled",
                 "_div15m_short_enabled",
                 "_rsi_enabled",
+                "_st_flip_v1_enabled",
                 "_runtime_cfg_ts",
             ]
             for key in runtime_keys:
@@ -13865,6 +14429,8 @@ def run():
     state["_symbols"] = symbols
     state["_startup_ts"] = time.time()
     state["_common_warmup_start_ts"] = time.time()
+    # Reset runup alert flags on each restart (send fresh batch after reboot)
+    state["_runup_washout_alerted_once"] = {}
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     global COMMON_UNIVERSE_LOG_PATH, COMMON_WARMUP_LOG_PATH
     try:
@@ -13880,7 +14446,11 @@ def run():
     except Exception:
         pass
     try:
-        cycle_cache.set_fetcher(lambda sym, tf, limit: _fetch_ohlcv_with_retry(exchange, sym, tf, limit))
+        def _cycle_cache_fetcher(sym: str, tf: str, limit: int):
+            if isinstance(limit, int) and limit > 1500:
+                return _fetch_ohlcv_range(exchange, sym, tf, limit)
+            return _fetch_ohlcv_with_retry(exchange, sym, tf, limit)
+        cycle_cache.set_fetcher(_cycle_cache_fetcher)
     except Exception:
         pass
     # common universe init (once at startup)
@@ -14229,7 +14799,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /swaggy_no_atlas_overext n, /swaggy_no_atlas_overext_on on|off|status, /swaggy_d1_overext n, /swaggy_atlas_lab_off windows, /swaggy_atlas_lab_v2_off windows, /swaggy_no_atlas_off windows, /exit_cd_h n, /swaggy_atlas_lab on|off|status, /swaggy_atlas_lab_v2 on|off|status, /swaggy_no_atlas on|off|status, /adv_trend on|off|status, /anti_alpha_v1 on|off|status, /noise_reverse_v1 on|off|status, /srp_st_regime_pullback_v1 on|off|status, /loss_hedge_engine on|off|status, /loss_hedge_interval n, /rsi on|off|status, /dtfx on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /noise_reverse_v1 on|off|status, /st_flip_v1 on|off|status, /srp_st_regime_pullback_v1 on|off|status, /runup_washout_short_3m on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -14348,16 +14918,22 @@ def run():
                         server_ms = int(time.time() * 1000)
                     one_min_ms = 60_000
                     three_min_ms = 180_000
+                    fifteen_min_ms = 900_000
                     last_1m_open = (server_ms // one_min_ms - 1) * one_min_ms
                     last_3m_open = (server_ms // three_min_ms - 1) * three_min_ms
+                    last_15m_open = (server_ms // fifteen_min_ms - 1) * fifteen_min_ms
                     prev_1m_open = _coerce_state_int(state.get("_last_rt_1m_open", 0))
                     prev_3m_open = _coerce_state_int(state.get("_last_rt_3m_open", 0))
+                    prev_15m_open = _coerce_state_int(state.get("_last_rt_15m_open", 0))
                     new_1m_bar = bool(last_1m_open and last_1m_open != prev_1m_open)
                     new_3m_bar = bool(last_3m_open and last_3m_open != prev_3m_open)
+                    new_15m_bar = bool(last_15m_open and last_15m_open != prev_15m_open)
                     if new_1m_bar:
                         state["_last_rt_1m_open"] = last_1m_open
                     if new_3m_bar:
                         state["_last_rt_3m_open"] = last_3m_open
+                    if new_15m_bar:
+                        state["_last_rt_15m_open"] = last_15m_open
                     try:
                         ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", "15m", limit=3)
                         if ohlcv and len(ohlcv) >= 2:
@@ -14596,6 +15172,10 @@ def run():
                     noise_reverse_universe_len = len(noise_reverse_universe)
                     srp_universe = list(shared_universe)
                     srp_universe_len = len(srp_universe)
+                    st_flip_universe = list(shared_universe)
+                    st_flip_universe_len = len(st_flip_universe)
+                    runup_universe = list(shared_universe)
+                    runup_universe_len = len(runup_universe)
                     dtfx_universe_len = len(dtfx_universe) if dtfx_universe else 0
                     atlas_rs_fail_short_universe_len = len(atlas_rs_fail_short_universe) if atlas_rs_fail_short_universe else 0
                     universe_structure_len = len(universe_structure)
@@ -14624,6 +15204,8 @@ def run():
                     anti_alpha_ran = bool(ANTI_ALPHA_V1_ENABLED and adv_trend_universe)
                     noise_reverse_ran = bool(NOISE_REVERSE_V1_ENABLED and noise_reverse_universe and (not heavy_scan) and new_1m_bar)
                     srp_ran = bool(SRP_ST_REGIME_PULLBACK_V1_ENABLED and srp_universe and (not heavy_scan))
+                    st_flip_ran = bool((ST_FLIP_V1_ENABLED or ST_FLIP_ALERT_ONLY) and st_flip_universe and (not heavy_scan) and new_1m_bar)
+                    runup_ran = bool(RUNUP_WASHOUT_SHORT_3M_ENABLED and runup_universe and new_15m_bar)
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
                     atlas_rs_fail_short_ran = bool(
                         ATLAS_RS_FAIL_SHORT_ENABLED
@@ -14681,6 +15263,9 @@ def run():
 
                     # MID TF (15m) - 2~3 사이클마다
                     mid_plan["15m"] = max(mid_plan.get("15m", 0), 60)
+                    if RUNUP_WASHOUT_SHORT_3M_ENABLED:
+                        runup_15m_limit = _tf_bars_for_days("15m", max(COMMON_WARMUP_DAYS, RUNUP_WARMUP_DAYS)) + 5
+                        mid_plan["15m"] = max(mid_plan.get("15m", 0), runup_15m_limit)
                     if swaggy_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), 200)
                         mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_cfg.vp_lookback_1h))
@@ -14810,9 +15395,22 @@ def run():
                             ltf_plan["1m"] = nr_limit
                         if SRP_ST_REGIME_PULLBACK_V1_ENABLED and srp_universe:
                             ltf_plan.setdefault(SRP_LTF, 200)
+                        if ST_FLIP_V1_ENABLED and st_flip_universe:
+                            st_min = max(ST_FLIP_LOOKBACK, ST_FLIP_EMA_LEN + 5, ST_FLIP_EMA_LONG_LEN + 5, ST_FLIP_ST_PERIOD + 5, 120)
+                            tf_key = str(ST_FLIP_LTF or "1m")
+                            if tf_key in ltf_plan:
+                                ltf_plan[tf_key] = max(int(ltf_plan.get(tf_key) or 0), st_min)
+                            else:
+                                ltf_plan[tf_key] = st_min
+                        if RUNUP_WASHOUT_SHORT_3M_ENABLED and runup_universe:
+                            runup_15m_limit = _tf_bars_for_days("15m", max(COMMON_WARMUP_DAYS, RUNUP_WARMUP_DAYS)) + 5
+                            ltf_plan.setdefault("15m", runup_15m_limit)
                         if ltf_plan:
                             rt_stats = _prefetch_ohlcv_for_cycle(
-                                noise_reverse_universe or srp_universe, exchange, ltf_plan, label="realtime"
+                                list(set((noise_reverse_universe or []) + (srp_universe or []) + (st_flip_universe or []) + (runup_universe or []))),
+                                exchange,
+                                ltf_plan,
+                                label="realtime",
                             )
                             print(
                                 "[prefetch] realtime-only ltf refresh tfs=%s ts_min=%s ts_max=%s"
@@ -14934,8 +15532,12 @@ def run():
                     anti_alpha_thread = None
                     noise_reverse_result = {}
                     noise_reverse_thread = None
+                    st_flip_result = {}
+                    st_flip_thread = None
                     srp_result = {}
                     srp_thread = None
+                    runup_result = {}
+                    runup_thread = None
                     dtfx_result = {}
                     dtfx_thread = None
                     atlas_rs_fail_short_result = {}
@@ -15043,6 +15645,18 @@ def run():
                             daemon=True,
                         )
                         noise_reverse_thread.start()
+                    if (ST_FLIP_V1_ENABLED or ST_FLIP_ALERT_ONLY) and (not heavy_scan) and new_1m_bar:
+                        st_flip_thread = threading.Thread(
+                            target=lambda: st_flip_result.update(
+                                _run_st_flip_v1_cycle(
+                                    st_flip_universe,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        st_flip_thread.start()
                     if SRP_ST_REGIME_PULLBACK_V1_ENABLED and (not heavy_scan):
                         srp_thread = threading.Thread(
                             target=lambda: srp_result.update(
@@ -15055,6 +15669,18 @@ def run():
                             daemon=True,
                         )
                         srp_thread.start()
+                    if RUNUP_WASHOUT_SHORT_3M_ENABLED and new_15m_bar:
+                        runup_thread = threading.Thread(
+                            target=lambda: runup_result.update(
+                                _run_runup_washout_short_3m_cycle(
+                                    runup_universe,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        runup_thread.start()
                     if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
                         dtfx_thread = threading.Thread(
                             target=lambda: dtfx_result.update(
@@ -15712,6 +16338,8 @@ def run():
                         anti_alpha_thread.join()
                     if noise_reverse_thread:
                         noise_reverse_thread.join()
+                    if st_flip_thread:
+                        st_flip_thread.join()
                     if srp_thread:
                         srp_thread.join()
                     if dtfx_thread:
@@ -15752,36 +16380,28 @@ def run():
                     print(
                         f"[universe] rule=qVol>={int(shared_min_qv):,} sort=abs(pct) topN={shared_top_n} anchors={anchors_disp} "
                         f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
-                        f"adv_trend={adv_trend_universe_len} dtfx={dtfx_universe_len} "
-                        f"arsf={atlas_rs_fail_short_universe_len} union={universe_union_len}"
+                        f"union={universe_union_len}"
                     )
                     print(
-                        "[engines] rsi=%s(%d) div15m_long=%s(%d) div15m_short=%s(%d) "
-                        "adv_trend=%s(%d) anti_alpha=%s(%d) noise_reverse=%s(%d) srp_st=%s(%d) "
-                        "swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d) dtfx=%s(%d) arsf=%s(%d)"
+                        "[engines] rsi=%s(%d) anti_alpha=%s(%d) noise_reverse=%s(%d) st_flip=%s(%d) srp_st=%s(%d) runup=%s(%d) "
+                        "swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d)"
                         % (
                             "ON" if rsi_ran else "OFF",
                             rsi_universe_len,
-                            "ON" if div15m_long_ran else "OFF",
-                            div15m_universe_len,
-                            "ON" if div15m_short_ran else "OFF",
-                            div15m_short_universe_len,
-                            "ON" if adv_trend_ran else "OFF",
-                            adv_trend_universe_len,
                             "ON" if anti_alpha_ran else "OFF",
                             adv_trend_universe_len,
                             "ON" if noise_reverse_ran else "OFF",
                             noise_reverse_universe_len,
+                            "ON" if st_flip_ran else "OFF",
+                            st_flip_universe_len,
                             "ON" if srp_ran else "OFF",
                             srp_universe_len,
+                            "ON" if runup_ran else "OFF",
+                            runup_universe_len,
                             "ON" if swaggy_atlas_lab_ran else "OFF",
                             swaggy_atlas_lab_universe_len,
                             "ON" if swaggy_atlas_lab_v2_ran else "OFF",
                             swaggy_atlas_lab_v2_universe_len,
-                            "ON" if dtfx_ran else "OFF",
-                            dtfx_universe_len,
-                            "ON" if atlas_rs_fail_short_ran else "OFF",
-                            atlas_rs_fail_short_universe_len,
                         )
                     )
                     if swaggy_atlas_lab_v2_ran:

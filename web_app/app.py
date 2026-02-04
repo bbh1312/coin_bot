@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import ast
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 import sys
@@ -33,23 +34,15 @@ from engine_runner import (
     USDT_PER_TRADE,
     BASE_ENTRY_USDT,
     REALTIME_ONLY_ENABLED,
+    NOISE_REVERSE_V1_ENABLED,
     SWAGGY_ATLAS_LAB_ENABLED,
     SWAGGY_ATLAS_LAB_V2_ENABLED,
-    SWAGGY_NO_ATLAS_ENABLED,
-    ADV_TREND_ENABLED,
-    ANTI_ALPHA_V1_ENABLED,
-    NOISE_REVERSE_V1_ENABLED,
-    SWAGGY_ATLAS_LAB_OFF_WINDOWS,
-    SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS,
-    SWAGGY_NO_ATLAS_OFF_WINDOWS,
-    SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
-    SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED,
-    SWAGGY_D1_OVEREXT_ATR_MULT,
+    ST_FLIP_V1_ENABLED,
+    ST_FLIP_ALERT_ONLY,
+    RUNUP_WASHOUT_SHORT_3M_ENABLED,
     SATURDAY_TRADE_ENABLED,
-    DTFX_ENABLED,
     ATLAS_RS_FAIL_SHORT_ENABLED,
     RSI_ENABLED,
-    LOSS_HEDGE_ENGINE_ENABLED,
     DCA_ENABLED,
     DCA_PCT,
     DCA_FIRST_PCT,
@@ -92,21 +85,12 @@ COMMAND_DEFS = [
     {"cmd": "/auto_exit", "key": "_auto_exit", "label": "Auto Exit", "type": "toggle"},
     {"cmd": "/sat_trade", "key": "_sat_trade", "label": "토요일 진입", "type": "toggle"},
     {"cmd": "/realtime_only", "key": "_realtime_only", "label": "Realtime Only (헤비스캔 OFF)", "type": "toggle"},
+    {"cmd": "/noise_reverse_v1", "key": "_noise_reverse_v1_enabled", "label": "Noise Reverse V1", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
-    {"cmd": "/swaggy_no_atlas", "key": "_swaggy_no_atlas_enabled", "label": "Swaggy No Atlas", "type": "toggle"},
-    {"cmd": "/adv_trend", "key": "_adv_trend_enabled", "label": "Triple-Check Engine", "type": "toggle"},
-    {"cmd": "/anti_alpha_v1", "key": "_anti_alpha_v1_enabled", "label": "Anti Alpha V1", "type": "toggle"},
-    {"cmd": "/noise_reverse_v1", "key": "_noise_reverse_v1_enabled", "label": "Noise Reverse V1", "type": "toggle"},
-    {"cmd": "/loss_hedge_engine", "key": "_loss_hedge_engine_enabled", "label": "손실방지엔진", "type": "toggle"},
-    {"cmd": "/loss_hedge_interval", "key": "_loss_hedge_interval_min", "label": "손실방지 체크 주기(분)", "type": "int", "step": 1},
-    {"cmd": "/swaggy_atlas_lab_off", "key": "_swaggy_atlas_lab_off_windows", "label": "Swaggy Lab Off Windows", "type": "text"},
-    {"cmd": "/swaggy_atlas_lab_v2_off", "key": "_swaggy_atlas_lab_v2_off_windows", "label": "Swaggy Lab V2 Off Windows", "type": "text"},
-    {"cmd": "/swaggy_no_atlas_off", "key": "_swaggy_no_atlas_off_windows", "label": "Swaggy No Atlas Off Windows", "type": "text"},
-    {"cmd": "/swaggy_no_atlas_overext", "key": "_swaggy_no_atlas_overext_min", "label": "No Atlas Overext Min", "type": "number", "step": 0.01},
-    {"cmd": "/swaggy_no_atlas_overext_on", "key": "_swaggy_no_atlas_overext_min_enabled", "label": "No Atlas Overext Min On/Off", "type": "toggle"},
-    {"cmd": "/swaggy_d1_overext", "key": "_swaggy_d1_overext_atr_mult", "label": "Swaggy D1 Overext ATR", "type": "number", "step": 0.1},
-    {"cmd": "/dtfx", "key": "_dtfx_enabled", "label": "DTFX", "type": "toggle"},
+    {"cmd": "/st_flip_v1", "key": "_st_flip_v1_enabled", "label": "ST Flip V1", "type": "toggle"},
+    {"cmd": "/st_flip_v1_alert", "key": "_st_flip_v1_alert_only", "label": "ST Flip V1 Alert Only", "type": "toggle"},
+    {"cmd": "/runup_washout_short_3m", "key": "_runup_washout_short_3m_enabled", "label": "Runup Washout Short 3M", "type": "toggle"},
     {"cmd": "/atlas_rs_fail_short", "key": "_atlas_rs_fail_short_enabled", "label": "Atlas RS Fail Short", "type": "toggle"},
     {"cmd": "/rsi", "key": "_rsi_enabled", "label": "RSI", "type": "toggle"},
     {"cmd": "/dca", "key": "_dca_enabled", "label": "DCA", "type": "toggle"},
@@ -125,6 +109,39 @@ COMMAND_DEFS = [
 ]
 COMMANDS_BY_CMD = {d["cmd"]: d for d in COMMAND_DEFS}
 COMMANDS_BY_KEY = {d["key"]: d for d in COMMAND_DEFS}
+
+def _normalize_engine_exit_overrides(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict = {}
+    for eng_key, sides in raw.items():
+        if not isinstance(eng_key, str):
+            continue
+        if not isinstance(sides, dict):
+            continue
+        eng_norm = eng_key.strip().upper()
+        if not eng_norm:
+            continue
+        out_sides: dict = {}
+        for side_key, cfg in sides.items():
+            if not isinstance(side_key, str) or not isinstance(cfg, dict):
+                continue
+            side_norm = side_key.strip().upper()
+            if side_norm not in ("LONG", "SHORT"):
+                continue
+            tp = cfg.get("tp")
+            sl = cfg.get("sl")
+            try:
+                tp = float(tp)
+                sl = float(sl)
+            except Exception:
+                continue
+            if tp <= 0 or sl <= 0:
+                continue
+            out_sides[side_norm] = {"tp": tp, "sl": sl}
+        if out_sides:
+            normalized[eng_norm] = out_sides
+    return normalized
 
 
 def _build_account_contexts_web(include_inactive: bool = False) -> list[AccountContext]:
@@ -253,21 +270,10 @@ DEFAULTS = {
     "_realtime_only": REALTIME_ONLY_ENABLED,
     "_max_open_positions": MAX_OPEN_POSITIONS,
     "_entry_usdt": USDT_PER_TRADE,
-    "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
-    "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
-    "_swaggy_no_atlas_enabled": SWAGGY_NO_ATLAS_ENABLED,
-    "_adv_trend_enabled": ADV_TREND_ENABLED,
-    "_anti_alpha_v1_enabled": ANTI_ALPHA_V1_ENABLED,
     "_noise_reverse_v1_enabled": NOISE_REVERSE_V1_ENABLED,
-    "_loss_hedge_engine_enabled": LOSS_HEDGE_ENGINE_ENABLED,
-    "_loss_hedge_interval_min": 15,
-    "_swaggy_atlas_lab_off_windows": SWAGGY_ATLAS_LAB_OFF_WINDOWS,
-    "_swaggy_atlas_lab_v2_off_windows": SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS,
-    "_swaggy_no_atlas_off_windows": SWAGGY_NO_ATLAS_OFF_WINDOWS,
-    "_swaggy_no_atlas_overext_min": SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN,
-    "_swaggy_no_atlas_overext_min_enabled": SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED,
-    "_swaggy_d1_overext_atr_mult": SWAGGY_D1_OVEREXT_ATR_MULT,
-    "_dtfx_enabled": DTFX_ENABLED,
+    "_st_flip_v1_enabled": ST_FLIP_V1_ENABLED if "ST_FLIP_V1_ENABLED" in globals() else False,
+    "_st_flip_v1_alert_only": ST_FLIP_ALERT_ONLY if "ST_FLIP_ALERT_ONLY" in globals() else False,
+    "_runup_washout_short_3m_enabled": RUNUP_WASHOUT_SHORT_3M_ENABLED,
     "_rsi_enabled": RSI_ENABLED,
     "_dca_enabled": DCA_ENABLED,
     "_dca_pct": DCA_PCT,
@@ -276,6 +282,8 @@ DEFAULTS = {
     "_dca_third_pct": DCA_THIRD_PCT,
     "_exit_cooldown_hours": EXIT_COOLDOWN_HOURS,
     "_atlas_rs_fail_short_enabled": ATLAS_RS_FAIL_SHORT_ENABLED,
+    "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
+    "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
     "_auto_exit_long_tp_pct": AUTO_EXIT_LONG_TP_PCT,
     "_auto_exit_long_sl_pct": AUTO_EXIT_LONG_SL_PCT,
     "_auto_exit_short_tp_pct": AUTO_EXIT_SHORT_TP_PCT,
@@ -1082,15 +1090,22 @@ def command():
             if value is None or (isinstance(value, str) and not value.strip()):
                 return jsonify({"status": "missing value", "key": key}), 400
             if isinstance(value, dict):
-                state[key] = value
+                parsed = value
             else:
                 try:
                     parsed = json.loads(value)
                 except Exception:
-                    return jsonify({"status": "invalid json", "key": key}), 400
+                    try:
+                        parsed = ast.literal_eval(value)
+                    except Exception:
+                        return jsonify({"status": "invalid json", "key": key}), 400
                 if not isinstance(parsed, dict):
                     return jsonify({"status": "json must be object", "key": key}), 400
-                state[key] = parsed
+            if key == "_engine_exit_overrides":
+                parsed = _normalize_engine_exit_overrides(parsed)
+                if not parsed:
+                    return jsonify({"status": "empty overrides", "key": key}), 400
+            state[key] = parsed
         elif item["type"] == "text":
             if value is None:
                 state[key] = ""

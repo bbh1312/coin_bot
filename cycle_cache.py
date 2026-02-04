@@ -10,6 +10,8 @@ IND_CACHE: Dict[Tuple[str, str, Tuple[Any, ...]], Any] = {}
 FETCHER: Optional[Callable[[str, str, int], Optional[list]]] = None
 DISK_CACHE_DIR = os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
 DISK_CACHE_ENABLED = os.getenv("COMMON_OHLCV_CACHE_ENABLED", "1") not in ("0", "false", "off", "no")
+WARMUP_CACHE_DIR = os.getenv("COMMON_WARMUP_CACHE_DIR", os.path.join("logs", "common_warmup", "ohlcv"))
+WARMUP_CACHE_ENABLED = os.getenv("COMMON_WARMUP_CACHE_ENABLED", "1") not in ("0", "false", "off", "no")
 
 
 def _safe_symbol(symbol: str) -> str:
@@ -25,6 +27,26 @@ def _read_disk_cache(symbol: str, tf: str, limit: int) -> Optional[list]:
     if not DISK_CACHE_ENABLED:
         return None
     path = _disk_path(symbol, tf, limit)
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+        if df.empty:
+            return None
+        return df[["ts", "open", "high", "low", "close", "volume"]].values.tolist()
+    except Exception:
+        return None
+
+
+def _warmup_path(symbol: str, tf: str) -> str:
+    fname = f"{_safe_symbol(symbol)}_{tf}.csv"
+    return os.path.join(WARMUP_CACHE_DIR, fname)
+
+
+def _read_warmup_cache(symbol: str, tf: str) -> Optional[list]:
+    if not WARMUP_CACHE_ENABLED:
+        return None
+    path = _warmup_path(symbol, tf)
     if not os.path.exists(path):
         return None
     try:
@@ -112,10 +134,21 @@ def get_df(symbol: str, tf: str, limit: int, force: bool = False) -> pd.DataFram
         if disk:
             raw = disk
             set_raw(symbol, tf, raw)
-        if FETCHER:
+        if not raw:
+            warm = _read_warmup_cache(symbol, tf)
+            if warm:
+                raw = warm
+                set_raw(symbol, tf, raw)
+        if FETCHER and not raw:
             raw = FETCHER(symbol, tf, limit)
             if raw:
                 set_raw(symbol, tf, raw)
+    # If we have some data but it's shorter than required, try refresh from fetcher.
+    if FETCHER and raw and len(raw) < limit:
+        fresh = FETCHER(symbol, tf, limit)
+        if fresh:
+            raw = fresh
+            set_raw(symbol, tf, raw)
     if not raw:
         return pd.DataFrame()
     sliced = raw[-limit:] if len(raw) >= limit else raw

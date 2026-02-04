@@ -9,17 +9,15 @@ try:
 except Exception:
     SwaggyEngine = None
 from engines.atlas.atlas_engine import AtlasEngine
-from engines.dtfx.engine import DTFXEngine
 from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
-from engines.swaggy_no_atlas.engine import SwaggyNoAtlasEngine
+from engines.st_flip_v1.engine import StFlipEngine
 
 
 _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
     "rsi": RsiEngine,
     "atlas": AtlasEngine,
-    "dtfx": DTFXEngine,
     "atlas_rs_fail_short": AtlasRsFailShortEngine,
-    "swaggy_no_atlas": SwaggyNoAtlasEngine,
+    "st_flip_v1": StFlipEngine,
 }
 if SwaggyEngine:
     _ENGINE_REGISTRY["swaggy"] = SwaggyEngine

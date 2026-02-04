@@ -27,6 +27,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Atlas RS Fail Short Backtest Runner")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--ltf", type=str, default="15m")
+    parser.add_argument("--use-confirmed", action="store_true")
     parser.add_argument("--reentry-minutes", type=int, default=120)
     parser.add_argument("--sl-pct", type=float, default=0.03)
     parser.add_argument("--tp-pct", type=float, default=0.03)
@@ -158,6 +159,7 @@ def run_backtest(
     log_path: str,
     sleep_ms: int,
     max_retries: int,
+    use_confirmed: bool,
 ) -> Dict[str, Dict[str, float]]:
     end_ms = _now_ms()
     since_ms = _since_ms(days)
@@ -225,10 +227,14 @@ def run_backtest(
             idx_ref += 1
         if idx_ref < 0:
             continue
+        slice_idx = idx - 1 if use_confirmed else idx
+        ref_slice_idx = idx_ref - 1 if use_confirmed else idx_ref
+        if slice_idx < 0 or ref_slice_idx < 0:
+            continue
 
         cycle_cache.clear_cycle_cache(keep_raw=True)
-        cycle_cache.set_raw(symbol, cfg.ltf_tf, _slice_to_idx(rows, idx))
-        cycle_cache.set_raw(ref_symbol, cfg.ltf_tf, _slice_to_idx(ref_raw, idx_ref))
+        cycle_cache.set_raw(symbol, cfg.ltf_tf, _slice_to_idx(rows, slice_idx))
+        cycle_cache.set_raw(ref_symbol, cfg.ltf_tf, _slice_to_idx(ref_raw, ref_slice_idx))
         state.pop("_atlas_swaggy_gate", None)
         ctx.now_ts = ts / 1000.0
 
@@ -657,6 +663,7 @@ def main():
         log_path,
         args.sleep_ms,
         args.retry,
+        bool(args.use_confirmed),
     )
     for stats in stats_map.values():
         for k in total:

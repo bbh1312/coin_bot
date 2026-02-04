@@ -19,7 +19,6 @@ if ROOT_DIR not in sys.path:
 from engines.swaggy_atlas_lab.atlas_eval import evaluate_global_gate, evaluate_local
 from engines.swaggy_atlas_lab.broker_sim import BrokerSim
 from engines.swaggy_atlas_lab.config import AtlasConfig, BacktestConfig, SwaggyConfig
-from engines.dtfx.engine import DTFXConfig
 from engines.swaggy_atlas_lab.data import (
     ensure_dir,
     fetch_ohlcv_all,
@@ -145,6 +144,10 @@ def parse_args():
     parser.add_argument("--symbols", default="", help="comma-separated symbols")
     parser.add_argument("--symbols-file", default="", help="path to fixed symbol list")
     parser.add_argument("--universe", default="top50", help="topN (e.g. top50) or 'symbols'")
+    parser.add_argument("--use-confirmed", action="store_true")
+    parser.add_argument("--use-live-cache", action="store_true")
+    parser.add_argument("--common-warmup-dir", type=str, default="")
+    parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--max-symbols", type=int, default=7)
     parser.add_argument("--anchor", default="BTC,ETH")
     parser.add_argument("--tp-pct", type=float, default=0.02)
@@ -178,6 +181,29 @@ def _coerce_float(val) -> Optional[float]:
         return float(str(val))
     except Exception:
         return None
+
+
+def _sanitize_symbol(symbol: str) -> str:
+    return symbol.replace("/", "_").replace(":", "_")
+
+
+def _read_common_cache(common_dir: str, symbol: str, timeframe: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    if not common_dir:
+        return pd.DataFrame()
+    safe = _sanitize_symbol(symbol)
+    path = os.path.join(common_dir, f"{safe}_{timeframe}.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty or "ts" not in df.columns:
+        return pd.DataFrame()
+    try:
+        return df[(df["ts"] >= start_ms) & (df["ts"] <= end_ms)].copy()
+    except Exception:
+        return pd.DataFrame()
 
 
 def _is_saturday_kst_ms(ts_ms: int) -> bool:
@@ -218,6 +244,9 @@ def _overext_dist(df, side: str, cfg: SwaggyConfig) -> float:
 def main() -> None:
     args = parse_args()
     sat_trade_enabled = str(args.sat_trade or "on").lower() == "on"
+    use_live_cache = bool(args.use_live_cache)
+    cache_only = bool(args.cache_only)
+    common_dir = args.common_warmup_dir or os.getenv("COMMON_WARMUP_CACHE_DIR", "")
     runtime_overrides = _load_runtime_overrides()
     runtime_d1_overext = _coerce_float(runtime_overrides.get("_swaggy_d1_overext_atr_mult"))
     if args.d1_overext_atr is None and runtime_d1_overext is not None:
@@ -256,30 +285,42 @@ def main() -> None:
         sw_cfg.cooldown_min = int(args.cooldown_min)
 
     ex = _make_exchange()
-    ex.load_markets()
+    if not cache_only:
+        ex.load_markets()
     ltf_minutes = float(ex.parse_timeframe(sw_cfg.tf_ltf)) / 60.0
     anchor_symbols = [s.strip() for s in args.anchor.split(",") if s.strip()]
     symbols: List[str] = []
-    if args.symbols_file.strip():
+    if args.universe.lower() in ("common", "common_universe"):
+        latest_path = os.path.join(ROOT_DIR, "logs", "common_universe", "latest.txt")
+        if os.path.exists(latest_path):
+            with open(latest_path, "r", encoding="utf-8") as f:
+                symbols = [line.strip() for line in f.read().splitlines() if line.strip()]
+    elif args.symbols_file.strip():
         with open(args.symbols_file, "r", encoding="utf-8") as f:
             symbols = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
     elif args.symbols.strip():
         symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     else:
-        tickers = ex.fetch_tickers()
-        dtfx_cfg = DTFXConfig()
-        min_qv = max(dtfx_cfg.min_quote_volume_usdt, dtfx_cfg.low_liquidity_qv_usdt)
-        anchors = []
-        for s in dtfx_cfg.anchor_symbols or []:
-            anchors.append(s if "/" in s else f"{s}/USDT:USDT")
-        symbols = build_universe_from_tickers(
-            tickers,
-            symbols=list(tickers.keys()),
-            min_quote_volume_usdt=min_qv,
-            top_n=dtfx_cfg.universe_top_n,
-            anchors=tuple(anchors),
-        )
-    source = "symbols_file" if args.symbols_file.strip() else ("symbols_arg" if args.symbols.strip() else "dtfx_universe")
+        if cache_only:
+            symbols = []
+        else:
+            tickers = ex.fetch_tickers()
+            top_n = _parse_universe_arg(args.universe)
+            anchors = []
+            for s in anchor_symbols:
+                anchors.append(s if "/" in s else f"{s}/USDT:USDT")
+            symbols = build_universe_from_tickers(
+                tickers,
+                symbols=list(tickers.keys()),
+                min_quote_volume_usdt=8_000_000.0,
+                top_n=top_n,
+                anchors=tuple(anchors),
+            )
+    source = (
+        "common_universe"
+        if args.universe.lower() in ("common", "common_universe")
+        else ("symbols_file" if args.symbols_file.strip() else ("symbols_arg" if args.symbols.strip() else "dtfx_universe"))
+    )
     if isinstance(args.max_symbols, int) and args.max_symbols > 0:
         symbols = symbols[: args.max_symbols]
     save_universe(
@@ -298,12 +339,22 @@ def main() -> None:
     for sym in symbols:
         tf_map: Dict[str, object] = {}
         for tf in tfs:
-            rows = fetch_ohlcv_all(ex, sym, tf, start_ms, end_ms)
-            tf_map[tf] = to_df(rows)
-        data_by_sym[sym] = tf_map
+            if use_live_cache:
+                df = _read_common_cache(common_dir, sym, tf, start_ms, end_ms)
+                if df.empty and cache_only:
+                    continue
+            else:
+                rows = fetch_ohlcv_all(ex, sym, tf, start_ms, end_ms)
+                df = to_df(rows)
+            tf_map[tf] = df
+        if tf_map:
+            data_by_sym[sym] = tf_map
 
-    btc_data = fetch_ohlcv_all(ex, at_cfg.ref_symbol, sw_cfg.tf_mtf, start_ms, end_ms)
-    btc_df = to_df(btc_data)
+    if use_live_cache:
+        btc_df = _read_common_cache(common_dir, at_cfg.ref_symbol, sw_cfg.tf_mtf, start_ms, end_ms)
+    else:
+        btc_data = fetch_ohlcv_all(ex, at_cfg.ref_symbol, sw_cfg.tf_mtf, start_ms, end_ms)
+        btc_df = to_df(btc_data)
 
     modes = [
         AtlasMode.HARD,
@@ -324,37 +375,49 @@ def main() -> None:
     last_day_exits_by_mode: Dict[str, int] = {}
     last_day_start_ms = end_ms - 24 * 60 * 60 * 1000
 
+    def _log(line: str) -> None:
+        with open(log_path, "a", encoding="utf-8") as log_fp:
+            log_fp.write(line + "\n")
+        _append_backtest_log(line)
+
     with open(log_path, "a", encoding="utf-8") as log_fp:
         for mode in modes:
             run_line = f"[run] mode={mode.value} days={args.days} start_ms={start_ms} end_ms={end_ms}"
-            log_fp.write(run_line + "\n")
-            _append_backtest_log(run_line)
+            _log(run_line)
             engine = SwaggySignalEngine(sw_cfg)
             broker = BrokerSim(bt_cfg.tp_pct, bt_cfg.sl_pct, bt_cfg.fee_rate, bt_cfg.slippage_pct, bt_cfg.timeout_bars)
             for sym in symbols:
                 sym_state = engine._state.setdefault(sym, {})
-                df_ltf = data_by_sym[sym][sw_cfg.tf_ltf]
+                df_ltf = data_by_sym[sym].get(sw_cfg.tf_ltf)
+                if df_ltf is None or (isinstance(df_ltf, pd.DataFrame) and df_ltf.empty):
+                    continue
                 if isinstance(df_ltf, pd.DataFrame) and not df_ltf.empty:
                     try:
                         last_close_by_sym[sym] = float(df_ltf.iloc[-1]["close"])
                         last_ts_by_sym[sym] = int(df_ltf.iloc[-1]["ts"])
                     except Exception:
                         pass
-                df_mtf = data_by_sym[sym][sw_cfg.tf_mtf]
-                df_htf = data_by_sym[sym][sw_cfg.tf_htf]
-                df_htf2 = data_by_sym[sym][sw_cfg.tf_htf2]
-                df_d1 = data_by_sym[sym][sw_cfg.tf_d1]
-                for i in range(30, len(df_ltf)):
+                df_mtf = data_by_sym[sym].get(sw_cfg.tf_mtf)
+                df_htf = data_by_sym[sym].get(sw_cfg.tf_htf)
+                df_htf2 = data_by_sym[sym].get(sw_cfg.tf_htf2)
+                df_d1 = data_by_sym[sym].get(sw_cfg.tf_d1)
+                if any(df is None or (isinstance(df, pd.DataFrame) and df.empty) for df in (df_mtf, df_htf, df_htf2, df_d1)):
+                    continue
+                start_idx = 31 if args.use_confirmed else 30
+                for i in range(start_idx, len(df_ltf)):
                     cur = df_ltf.iloc[i]
                     ts_ms = int(cur["ts"])
-                    now_ts = ts_ms / 1000.0
-                    d5 = df_ltf.iloc[: i + 1]
-                    d3 = slice_df(data_by_sym[sym]["3m"], ts_ms)
-                    d15 = slice_df(df_mtf, ts_ms)
-                    d1h = slice_df(df_htf, ts_ms)
-                    d4h = slice_df(df_htf2, ts_ms)
+                    sig_idx = i - 1 if args.use_confirmed else i
+                    sig_row = df_ltf.iloc[sig_idx]
+                    sig_ts_ms = int(sig_row["ts"])
+                    now_ts = sig_ts_ms / 1000.0
+                    d5 = df_ltf.iloc[: sig_idx + 1]
+                    d3 = slice_df(data_by_sym[sym]["3m"], sig_ts_ms)
+                    d15 = slice_df(df_mtf, sig_ts_ms)
+                    d1h = slice_df(df_htf, sig_ts_ms)
+                    d4h = slice_df(df_htf2, sig_ts_ms)
                     prev_phase = sym_state.get("phase")
-                    d1d = slice_df(df_d1, ts_ms)
+                    d1d = slice_df(df_d1, sig_ts_ms)
                     signal = engine.evaluate_symbol(sym, d4h, d1h, d15, d5, d3, d1d, now_ts)
                     debug = signal.debug if isinstance(signal.debug, dict) else {}
                     event_list = debug.get("events") if isinstance(debug.get("events"), list) else []
@@ -497,6 +560,7 @@ def main() -> None:
                                     "mfe_sum": 0.0,
                                     "mae_sum": 0.0,
                                     "hold_sum": 0.0,
+                                    "net_sum": 0.0,
                                 },
                             )
                             stats["trades"] += 1
@@ -512,6 +576,7 @@ def main() -> None:
                             stats["mfe_sum"] += trade.mfe
                             stats["mae_sum"] += abs(trade.mae)
                             stats["hold_sum"] += float(trade.bars) * ltf_minutes
+                            stats["net_sum"] += float(pnl_pct)
                             if isinstance(trade.exit_ts, (int, float)) and trade.exit_ts >= last_day_start_ms:
                                 last_day_exits_by_mode[mode.value] = last_day_exits_by_mode.get(mode.value, 0) + 1
                             entry_dt = ""
@@ -545,7 +610,7 @@ def main() -> None:
 
                     if not signal.entry_ok or not side or entry_px is None:
                         continue
-                    if not sat_trade_enabled and _is_saturday_kst_ms(ts_ms):
+                    if not sat_trade_enabled and _is_saturday_kst_ms(sig_ts_ms):
                         _append_backtest_log(
                             f"ENTRY_SKIP ts={ts_ms} sym={sym} side={side} reason=SATURDAY_OFF"
                         )
@@ -752,6 +817,7 @@ def main() -> None:
                             "mfe_sum": 0.0,
                             "mae_sum": 0.0,
                             "hold_sum": 0.0,
+                            "net_sum": 0.0,
                         },
                     )
                     stats["entries"] += 1
@@ -794,266 +860,50 @@ def main() -> None:
             msg = f"{msg} shadow={shadow_path}"
         print(msg)
     if stats_by_key:
-        trades_by_key: Dict[tuple[str, str], List[Dict]] = {}
-        for t in trades:
-            key = (t.get("mode") or "", t.get("sym") or "")
-            trades_by_key.setdefault(key, []).append(t)
-        total_by_mode: Dict[str, Dict[str, float]] = {}
         multi_mode = len({k[0] for k in stats_by_key.keys()}) > 1
+        total = {"entries": 0, "exits": 0, "trades": 0, "wins": 0, "losses": 0, "mfe_sum": 0.0, "mae_sum": 0.0, "hold_sum": 0.0, "net_sum": 0.0}
         for (mode, sym), stats in stats_by_key.items():
             trades_count = int(stats.get("trades") or 0)
             entries = int(stats.get("entries") or 0)
             exits = int(stats.get("exits") or 0)
             wins = int(stats.get("wins") or 0)
             losses = int(stats.get("losses") or 0)
-            tp = int(stats.get("tp") or 0)
-            sl = int(stats.get("sl") or 0)
             win_rate = (wins / trades_count * 100.0) if trades_count else 0.0
             avg_mfe = (stats.get("mfe_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
             avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
-            sym_trades = trades_by_key.get((mode, sym), [])
-            long_wins = sum(1 for t in sym_trades if t.get("side") == "LONG" and float(t.get("pnl_pct") or 0.0) > 0)
-            long_losses = sum(1 for t in sym_trades if t.get("side") == "LONG" and float(t.get("pnl_pct") or 0.0) <= 0)
-            short_wins = sum(1 for t in sym_trades if t.get("side") == "SHORT" and float(t.get("pnl_pct") or 0.0) > 0)
-            short_losses = sum(1 for t in sym_trades if t.get("side") == "SHORT" and float(t.get("pnl_pct") or 0.0) <= 0)
             label = f"{sym}@{mode}" if multi_mode else sym
-            last_day_exits = last_day_exits_by_mode.get(mode, 0)
-            base_usdt = float(bt_cfg.base_usdt or 0.0)
-            tp_sum_usdt = tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
-            sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
-            net_sum_usdt = tp_sum_usdt - sl_sum_usdt
-            entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
-            print(
-                "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
-                % (
-                    label,
-                    entries,
-                    exits,
-                    trades_count,
-                    wins,
-                    losses,
-                    win_rate,
-                    tp,
-                    sl,
-                    avg_mfe,
-                    avg_mae,
-                    avg_hold,
-                    last_day_exits,
-                    base_usdt,
-                    tp_sum_usdt,
-                    sl_sum_usdt,
-                    net_sum_usdt,
-                    entry_sym_count,
-                )
+            line = (
+                f"[BACKTEST] {label} entries={entries} exits={exits} trades={trades_count} wins={wins} losses={losses} "
+                f"winrate={win_rate:.2f}% avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f} "
+                f"net_sum={float(stats.get('net_sum') or 0.0):.3f}"
             )
-            entries = list(trade_logs.get((mode, sym), []))
-            open_trade = open_trades.get((mode, sym))
-            if isinstance(open_trade, dict):
-                entry_dt = ""
-                entry_ts = open_trade.get("entry_ts")
-                if isinstance(entry_ts, (int, float)) and entry_ts > 0:
-                    entry_dt = datetime.fromtimestamp(entry_ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-                entry_px = open_trade.get("entry_price")
-                side = (open_trade.get("side") or "").upper()
-                last_px = last_close_by_sym.get(sym)
-                last_ts = last_ts_by_sym.get(sym)
-                last_dt = ""
-                if isinstance(last_ts, (int, float)) and last_ts > 0:
-                    last_dt = datetime.fromtimestamp(float(last_ts) / 1000.0, tz=timezone.utc).strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
-                unrealized = None
-                if isinstance(entry_px, (int, float)) and isinstance(last_px, (int, float)) and entry_px > 0:
-                    if side == "SHORT":
-                        unrealized = (float(entry_px) - float(last_px)) / float(entry_px) * 100.0
-                    else:
-                        unrealized = (float(last_px) - float(entry_px)) / float(entry_px) * 100.0
-                last_disp = f"{float(last_px):.6g}" if isinstance(last_px, (int, float)) else "N/A"
-                pnl_disp = f"{float(unrealized):.2f}%" if isinstance(unrealized, (int, float)) else "N/A"
-                entries.append(
-                    {
-                        "entry_ts": entry_ts or 0,
-                        "line": "[BACKTEST][OPEN] sym=%s mode=%s side=%s entry_dt=%s exit_dt=%s entry_px=%.6g "
-                        "last_px=%s last_dt=%s unrealized_pct=%s"
-                        % (
-                            open_trade.get("sym"),
-                            open_trade.get("mode"),
-                            open_trade.get("side"),
-                            entry_dt,
-                            "",
-                            float(entry_px or 0.0),
-                            last_disp,
-                            last_dt or "N/A",
-                            pnl_disp,
-                        ),
-                    }
-                )
-            entries.sort(key=lambda item: item.get("entry_ts") or 0, reverse=True)
-            for entry in entries:
-                print(entry.get("line", ""))
-            mode_total = total_by_mode.setdefault(
-                mode,
-                {
-                    "entries": 0,
-                    "exits": 0,
-                    "trades": 0,
-                    "wins": 0,
-                    "losses": 0,
-                    "tp": 0,
-                    "sl": 0,
-                    "mfe_sum": 0.0,
-                    "mae_sum": 0.0,
-                    "hold_sum": 0.0,
-                    "long_wins": 0,
-                    "long_losses": 0,
-                    "short_wins": 0,
-                    "short_losses": 0,
-                },
-            )
-            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
-                mode_total[key] += int(stats.get(key) or 0)
-            mode_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
-            mode_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
-            mode_total["hold_sum"] += float(stats.get("hold_sum") or 0.0)
-            mode_total["long_wins"] += long_wins
-            mode_total["long_losses"] += long_losses
-            mode_total["short_wins"] += short_wins
-            mode_total["short_losses"] += short_losses
-        grand_total = {
-            "entries": 0,
-            "exits": 0,
-            "trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "tp": 0,
-            "sl": 0,
-            "mfe_sum": 0.0,
-            "mae_sum": 0.0,
-            "hold_sum": 0.0,
-            "long_wins": 0,
-            "long_losses": 0,
-            "short_wins": 0,
-            "short_losses": 0,
-        }
-        for mode, stats in total_by_mode.items():
-            trades_count = int(stats.get("trades") or 0)
-            entries = int(stats.get("entries") or 0)
-            exits = int(stats.get("exits") or 0)
-            wins = int(stats.get("wins") or 0)
-            losses = int(stats.get("losses") or 0)
-            tp = int(stats.get("tp") or 0)
-            sl = int(stats.get("sl") or 0)
-            win_rate = (wins / trades_count * 100.0) if trades_count else 0.0
-            avg_mfe = (stats.get("mfe_sum", 0.0) / trades_count) if trades_count else 0.0
-            avg_mae = (stats.get("mae_sum", 0.0) / trades_count) if trades_count else 0.0
-            avg_hold = (stats.get("hold_sum", 0.0) / trades_count) if trades_count else 0.0
-            label = f"TOTAL@{mode}" if multi_mode else "TOTAL"
-            last_day_exits = last_day_exits_by_mode.get(mode, 0)
-            base_usdt = float(bt_cfg.base_usdt or 0.0)
-            tp_sum_usdt = tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
-            sl_sum_usdt = sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
-            net_sum_usdt = tp_sum_usdt - sl_sum_usdt
-            entry_sym_count = len(entry_syms_by_mode.get(mode, set()))
-            print(
-                "[BACKTEST] %s entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
-                % (
-                    label,
-                    entries,
-                    exits,
-                    trades_count,
-                    wins,
-                    losses,
-                    win_rate,
-                    tp,
-                    sl,
-                    avg_mfe,
-                    avg_mae,
-                    avg_hold,
-                    last_day_exits,
-                    base_usdt,
-                    tp_sum_usdt,
-                    sl_sum_usdt,
-                    net_sum_usdt,
-                    entry_sym_count,
-                )
-            )
-            for key in ("trades", "wins", "losses", "tp", "sl", "entries", "exits"):
-                grand_total[key] += int(stats.get(key) or 0)
-            grand_total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
-            grand_total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
-            grand_total["hold_sum"] += float(stats.get("hold_sum") or 0.0)
-            for key in ("long_wins", "long_losses", "short_wins", "short_losses"):
-                grand_total[key] += int(stats.get(key) or 0)
-        total_trades = int(grand_total.get("trades") or 0)
-        total_entries = int(grand_total.get("entries") or 0)
-        total_exits = int(grand_total.get("exits") or 0)
-        total_wins = int(grand_total.get("wins") or 0)
-        total_losses = int(grand_total.get("losses") or 0)
-        total_tp = int(grand_total.get("tp") or 0)
-        total_sl = int(grand_total.get("sl") or 0)
-        total_win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
-        total_avg_mfe = (grand_total.get("mfe_sum", 0.0) / total_trades) if total_trades else 0.0
-        total_avg_mae = (grand_total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
-        total_avg_hold = (grand_total.get("hold_sum", 0.0) / total_trades) if total_trades else 0.0
-        if multi_mode:
-            base_usdt = float(bt_cfg.base_usdt or 0.0)
-            total_tp_sum = total_tp * base_usdt * float(bt_cfg.tp_pct or 0.0)
-            total_sl_sum = total_sl * base_usdt * float(bt_cfg.sl_pct or 0.0)
-            total_net_sum = total_tp_sum - total_sl_sum
-            total_entry_syms = len(set().union(*entry_syms_by_mode.values())) if entry_syms_by_mode else 0
-            print(
-                "[BACKTEST] TOTAL entries=%d exits=%d trades=%d wins=%d losses=%d winrate=%.2f%% tp=%d sl=%d "
-                "avg_mfe=%.4f avg_mae=%.4f avg_hold=%.1f last_day_exits=%d "
-                "base_usdt=%.2f tp_sum=%.3f sl_sum=%.3f net_sum=%.3f entry_syms=%d"
-                % (
-                    total_entries,
-                    total_exits,
-                    total_trades,
-                    total_wins,
-                    total_losses,
-                    total_win_rate,
-                    total_tp,
-                    total_sl,
-                    total_avg_mfe,
-                    total_avg_mae,
-                    total_avg_hold,
-                    sum(last_day_exits_by_mode.values()),
-                    base_usdt,
-                    total_tp_sum,
-                    total_sl_sum,
-                    total_net_sum,
-                    total_entry_syms,
-                )
-            )
-        if d1_block_by_key:
-            by_mode: Dict[str, int] = {}
-            total_blocks = 0
-            for (mode, sym), count in sorted(d1_block_by_key.items()):
-                line = f"[BACKTEST] {sym}@{mode} block=D1_EMA7_DIST count={count}"
-                print(line)
-                _append_backtest_log(line)
-                by_mode[mode] = by_mode.get(mode, 0) + count
-                total_blocks += count
-            for mode, count in sorted(by_mode.items()):
-                line = f"[BACKTEST] TOTAL@{mode} block=D1_EMA7_DIST count={count}"
-                print(line)
-                _append_backtest_log(line)
-            line = f"[BACKTEST] TOTAL block=D1_EMA7_DIST count={total_blocks}"
             print(line)
-            _append_backtest_log(line)
-    else:
-        base_usdt = float(bt_cfg.base_usdt or 0.0)
-        print(
-            "[BACKTEST] TOTAL entries=0 exits=0 trades=0 wins=0 losses=0 winrate=0.00%% tp=0 sl=0 "
-            "avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0 last_day_exits=0 "
-            "base_usdt=%.2f tp_sum=0.000 sl_sum=0.000 net_sum=0.000 entry_syms=0"
-            % base_usdt
+            _log(line)
+            for key in ("entries", "exits", "trades", "wins", "losses"):
+                total[key] += int(stats.get(key) or 0)
+            total["mfe_sum"] += float(stats.get("mfe_sum") or 0.0)
+            total["mae_sum"] += float(stats.get("mae_sum") or 0.0)
+            total["hold_sum"] += float(stats.get("hold_sum") or 0.0)
+            total["net_sum"] += float(stats.get("net_sum") or 0.0)
+
+        total_trades = int(total.get("trades") or 0)
+        total_win_rate = (total.get("wins", 0) / total_trades * 100.0) if total_trades else 0.0
+        total_avg_mfe = (total.get("mfe_sum", 0.0) / total_trades) if total_trades else 0.0
+        total_avg_mae = (total.get("mae_sum", 0.0) / total_trades) if total_trades else 0.0
+        total_avg_hold = (total.get("hold_sum", 0.0) / total_trades) if total_trades else 0.0
+        line = (
+            f"[BACKTEST] TOTAL entries={total.get('entries', 0)} exits={total.get('exits', 0)} "
+            f"trades={total_trades} wins={total.get('wins', 0)} losses={total.get('losses', 0)} "
+            f"winrate={total_win_rate:.2f}% avg_mfe={total_avg_mfe:.4f} avg_mae={total_avg_mae:.4f} "
+            f"avg_hold={total_avg_hold:.1f} net_sum={float(total.get('net_sum') or 0.0):.3f}"
         )
+        print(line)
+        _log(line)
+    else:
+        line = "[BACKTEST] TOTAL entries=0 exits=0 trades=0 wins=0 losses=0 winrate=0.00% avg_mfe=0.0000 avg_mae=0.0000 avg_hold=0.0 net_sum=0.000"
+        print(line)
+        _log(line)
 
 
 if __name__ == "__main__":
