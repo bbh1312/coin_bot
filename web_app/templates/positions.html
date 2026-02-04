@@ -200,6 +200,61 @@
             letter-spacing: 0.08em;
             background: rgba(127, 29, 29, 0.35);
         }
+        .pnl-card {
+            margin: 1rem 0 1.5rem;
+            padding: 1rem 1.2rem;
+            border-radius: 1rem;
+            border: 1px solid var(--line);
+            background: rgba(10, 14, 20, 0.7);
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.85rem;
+        }
+        .pnl-card h3 {
+            margin: 0 0 0.6rem;
+            font-size: 1rem;
+            letter-spacing: 0.02em;
+        }
+        .pnl-list {
+            display: grid;
+            gap: 0.45rem;
+        }
+        .pnl-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.5rem;
+            padding-bottom: 0.35rem;
+            border-bottom: 1px dashed rgba(148, 163, 184, 0.2);
+        }
+        .pnl-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .pnl-toggle {
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            background: rgba(255, 255, 255, 0.04);
+            color: #f8f7f4;
+            padding: 0.15rem 0.55rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            letter-spacing: 0.02em;
+            cursor: pointer;
+        }
+        .pnl-toggle.active {
+            border-color: rgba(126, 231, 154, 0.8);
+            color: var(--accent-2);
+            background: rgba(126, 231, 154, 0.12);
+        }
+        .pnl-row:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+        .pnl-name {
+            color: var(--muted);
+        }
+        .pnl-value.pos { color: var(--accent-2); }
+        .pnl-value.neg { color: var(--danger); }
         @media (max-width: 840px) {
             header {
                 flex-direction: column;
@@ -237,6 +292,15 @@
                 <a class="link-btn" href="/positions">Refresh</a>
             </div>
         </header>
+        <section class="card pnl-card" id="pnl-today">
+            <h3>오늘 순이익</h3>
+            <div class="pnl-list">
+                <div class="pnl-row">
+                    <span class="pnl-name">Loading...</span>
+                    <span class="pnl-value">--</span>
+                </div>
+            </div>
+        </section>
         <section class="card">
             <div class="meta">
                 <span>updated: {{ updated_at }}</span>
@@ -326,6 +390,7 @@
     <script>
         const tabs = document.querySelectorAll(".tab-btn");
         const rows = document.querySelectorAll("tbody tr");
+        const pnlTodayBox = document.getElementById("pnl-today");
         tabs.forEach((btn) => {
             btn.addEventListener("click", () => {
                 tabs.forEach((el) => el.classList.remove("active"));
@@ -346,6 +411,60 @@
                 });
             });
         });
+
+        async function refreshPnlToday() {
+            const res = await fetch("/status");
+            if (!res.ok) {
+                return;
+            }
+            const data = await res.json();
+            const pnlList = pnlTodayBox.querySelector(".pnl-list");
+            const pnlItems = data.pnl_today || [];
+            pnlList.innerHTML = "";
+            if (!pnlItems.length) {
+                const row = document.createElement("div");
+                row.className = "pnl-row";
+                row.innerHTML = `<span class="pnl-name">no data</span><span class="pnl-value">--</span>`;
+                pnlList.appendChild(row);
+            } else {
+                pnlItems.forEach((item) => {
+                    const row = document.createElement("div");
+                    row.className = "pnl-row";
+                    const name = item.name || "unknown";
+                    const isActive = item.is_active !== false;
+                    if (item.error) {
+                        row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="pnl-value">N/A</span></div>`;
+                    } else {
+                        const pnlVal = item.pnl;
+                        const pnlText = typeof pnlVal === "number" ? `${pnlVal >= 0 ? "+" : ""}${pnlVal.toFixed(1)} USDT` : "N/A";
+                        const cls = typeof pnlVal === "number" ? (pnlVal >= 0 ? "pnl-value pos" : "pnl-value neg") : "pnl-value";
+                        row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="${cls}">${pnlText}</span></div>`;
+                    }
+                    const controls = row.querySelector(".pnl-controls");
+                    if (controls) {
+                        const toggle = document.createElement("button");
+                        toggle.className = `pnl-toggle${isActive ? " active" : ""}`;
+                        toggle.textContent = isActive ? "ACTIVE" : "OFF";
+                        toggle.addEventListener("click", async () => {
+                            toggle.disabled = true;
+                            await fetch("/admin/accounts", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    account_id: item.account_id,
+                                    is_active: !isActive,
+                                }),
+                            });
+                            await refreshPnlToday();
+                        });
+                        controls.appendChild(toggle);
+                    }
+                    pnlList.appendChild(row);
+                });
+            }
+        }
+
+        refreshPnlToday();
     </script>
 </body>
 </html>

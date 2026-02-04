@@ -91,6 +91,7 @@ COMMAND_DEFS = [
     {"cmd": "/st_flip_v1", "key": "_st_flip_v1_enabled", "label": "ST Flip V1", "type": "toggle"},
     {"cmd": "/st_flip_v1_alert", "key": "_st_flip_v1_alert_only", "label": "ST Flip V1 Alert Only", "type": "toggle"},
     {"cmd": "/runup_washout_short_3m", "key": "_runup_washout_short_3m_enabled", "label": "Runup Washout Short 3M", "type": "toggle"},
+    {"cmd": "/wash_short_suite", "key": "_wash_short_suite_enabled", "label": "Wash Short Suite", "type": "toggle"},
     {"cmd": "/atlas_rs_fail_short", "key": "_atlas_rs_fail_short_enabled", "label": "Atlas RS Fail Short", "type": "toggle"},
     {"cmd": "/rsi", "key": "_rsi_enabled", "label": "RSI", "type": "toggle"},
     {"cmd": "/dca", "key": "_dca_enabled", "label": "DCA", "type": "toggle"},
@@ -991,59 +992,64 @@ def status():
         if value is None and key in DEFAULTS:
             value = DEFAULTS[key]
         payload[key] = value
-    accounts_payload = []
-    pnl_today_payload = []
-    pnl_start_ts = _kst_today_start_ts()
-    pnl_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_start_ts + 9 * 3600))
-    for acct in _list_accounts_all():
-        account_id = int(acct["id"])
-        settings = _load_account_settings(account_id)
-        state_path = _state_path_for_account(acct)
-        acct_state = load_state_from(state_path)
-        executor = _build_executor(acct, settings, force_hedge=True)
-        futures_usdt = None
-        entry_usdt_available = 0.0
-        pnl_val = None
-        pnl_trades = 0
-        pnl_err = None
-        try:
-            with executor.activate():
-                futures_usdt = executor.get_available_usdt()
-                entry_usdt_available = _entry_usdt_available(executor, float(settings.get("entry_pct") or 0.0))
-                pnl_val, pnl_trades, pnl_err = _fetch_realized_pnl_since(executor.ctx.exchange, pnl_start_ts)
-        except Exception:
+    lite = str(request.args.get("lite", "")).lower() in ("1", "true", "yes")
+    if not lite:
+        accounts_payload = []
+        pnl_today_payload = []
+        pnl_start_ts = _kst_today_start_ts()
+        pnl_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_start_ts + 9 * 3600))
+        for acct in _list_accounts_all():
+            account_id = int(acct["id"])
+            settings = _load_account_settings(account_id)
+            state_path = _state_path_for_account(acct)
+            acct_state = load_state_from(state_path)
+            executor = _build_executor(acct, settings, force_hedge=True)
             futures_usdt = None
-        admin_follow_enabled = acct_state.get("_admin_follow_enabled")
-        if admin_follow_enabled is None:
-            admin_follow_enabled = True
-        manual_entry_enabled = acct_state.get("_admin_manual_entry_enabled")
-        if manual_entry_enabled is None:
-            manual_entry_enabled = True
-        accounts_payload.append(
-            {
-                "account_id": account_id,
-                "name": str(acct.get("name") or account_id),
-                "open_positions": _open_positions_for_account(executor, acct_state),
-                "futures_usdt": futures_usdt,
-                "entry_usdt_available": entry_usdt_available,
-                "admin_follow_enabled": bool(admin_follow_enabled),
-                "manual_entry_enabled": bool(manual_entry_enabled),
-                "is_active": bool(acct.get("is_active", 1)),
-            }
-        )
-        pnl_today_payload.append(
-            {
-                "account_id": account_id,
-                "name": str(acct.get("name") or account_id),
-                "pnl": pnl_val,
-                "trades": pnl_trades,
-                "error": pnl_err,
-                "date": pnl_date_kst,
-                "is_active": bool(acct.get("is_active", 1)),
-            }
-        )
-    payload["accounts"] = accounts_payload
-    payload["pnl_today"] = pnl_today_payload
+            entry_usdt_available = 0.0
+            pnl_val = None
+            pnl_trades = 0
+            pnl_err = None
+            try:
+                with executor.activate():
+                    futures_usdt = executor.get_available_usdt()
+                    entry_usdt_available = _entry_usdt_available(executor, float(settings.get("entry_pct") or 0.0))
+                    pnl_val, pnl_trades, pnl_err = _fetch_realized_pnl_since(executor.ctx.exchange, pnl_start_ts)
+            except Exception:
+                futures_usdt = None
+            admin_follow_enabled = acct_state.get("_admin_follow_enabled")
+            if admin_follow_enabled is None:
+                admin_follow_enabled = True
+            manual_entry_enabled = acct_state.get("_admin_manual_entry_enabled")
+            if manual_entry_enabled is None:
+                manual_entry_enabled = True
+            accounts_payload.append(
+                {
+                    "account_id": account_id,
+                    "name": str(acct.get("name") or account_id),
+                    "open_positions": _open_positions_for_account(executor, acct_state),
+                    "futures_usdt": futures_usdt,
+                    "entry_usdt_available": entry_usdt_available,
+                    "admin_follow_enabled": bool(admin_follow_enabled),
+                    "manual_entry_enabled": bool(manual_entry_enabled),
+                    "is_active": bool(acct.get("is_active", 1)),
+                }
+            )
+            pnl_today_payload.append(
+                {
+                    "account_id": account_id,
+                    "name": str(acct.get("name") or account_id),
+                    "pnl": pnl_val,
+                    "trades": pnl_trades,
+                    "error": pnl_err,
+                    "date": pnl_date_kst,
+                    "is_active": bool(acct.get("is_active", 1)),
+                }
+            )
+        payload["accounts"] = accounts_payload
+        payload["pnl_today"] = pnl_today_payload
+    else:
+        payload["accounts"] = []
+        payload["pnl_today"] = []
     return jsonify(payload)
 
 

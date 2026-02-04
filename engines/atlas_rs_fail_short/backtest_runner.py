@@ -31,6 +31,12 @@ def parse_args():
     parser.add_argument("--reentry-minutes", type=int, default=120)
     parser.add_argument("--sl-pct", type=float, default=0.03)
     parser.add_argument("--tp-pct", type=float, default=0.03)
+    parser.add_argument("--sl-atr", type=float, default=0.0)
+    parser.add_argument("--tp-atr", type=float, default=0.0)
+    parser.add_argument("--symbols", type=str, default="")
+    parser.add_argument("--symbols-file", type=str, default="")
+    parser.add_argument("--common-universe-file", type=str, default="", help="use common universe log file")
+    parser.add_argument("--common-universe-latest", action="store_true", help="use logs/common_universe/latest.txt")
     parser.add_argument("--out", type=str, default="")
     parser.add_argument("--out-trades", type=str, default="")
     parser.add_argument("--out-decisions", type=str, default="")
@@ -39,6 +45,17 @@ def parse_args():
     parser.add_argument("--sleep-ms", type=int, default=200)
     parser.add_argument("--retry", type=int, default=3)
     return parser.parse_args()
+
+
+def _read_symbol_file(path: str) -> List[str]:
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [s.strip() for s in f.read().splitlines() if s.strip()]
+
+
+def _latest_common_universe_file(root_dir: str) -> str:
+    return os.path.join(root_dir, "logs", "common_universe", "latest.txt")
 
 
 def _now_ms() -> int:
@@ -155,6 +172,8 @@ def run_backtest(
     out_decisions: str,
     sl_pct: float,
     tp_pct: float,
+    sl_atr: float,
+    tp_atr: float,
     reentry_minutes: int,
     log_path: str,
     sleep_ms: int,
@@ -434,15 +453,30 @@ def run_backtest(
                 ]
             ),
         )
+        atr_val = tech.get("atr")
+        use_atr = (
+            isinstance(atr_val, (int, float))
+            and atr_val > 0
+            and sl_atr > 0
+            and tp_atr > 0
+        )
+        if use_atr:
+            sl_px = float(sig.entry_price or 0.0) + (float(atr_val) * sl_atr)
+            tp_px = float(sig.entry_price or 0.0) - (float(atr_val) * tp_atr)
+        else:
+            sl_px = float(sig.entry_price or 0.0) * (1 + sl_pct)
+            tp_px = float(sig.entry_price or 0.0) * (1 - tp_pct)
+
         if log_path:
             _log_file(
-                "[BACKTEST][ENTRY] symbol=%s entry_dt=%s entry_px=%.6g sl_px=%.6g tp_px=%.6g confirm=%s rsi=%s atr=%s trigger=%s"
+                "[BACKTEST][ENTRY] symbol=%s entry_dt=%s entry_px=%.6g sl_px=%.6g tp_px=%.6g mode=%s confirm=%s rsi=%s atr=%s trigger=%s"
                 % (
                     symbol,
                     dt,
                     float(sig.entry_price or 0.0),
-                    float(sig.entry_price or 0.0) * (1 + sl_pct),
-                    float(sig.entry_price or 0.0) * (1 - tp_pct),
+                    sl_px,
+                    tp_px,
+                    "ATR" if use_atr else "PCT",
                     str(tech.get("confirm_type") or ""),
                     str(tech.get("rsi") or ""),
                     str(tech.get("atr") or ""),
@@ -454,8 +488,8 @@ def run_backtest(
             "entry_px": sig.entry_price,
             "entry_ts": ts,
             "entry_dt": dt,
-            "sl_px": sig.entry_price * (1 + sl_pct),
-            "tp_px": sig.entry_price * (1 - tp_pct),
+            "sl_px": sl_px,
+            "tp_px": tp_px,
             "entry_idx": idx,
             "mfe": 0.0,
             "mae": 0.0,
@@ -583,10 +617,24 @@ def main():
         )
     engine = AtlasRsFailShortEngine(cfg)
     tickers = exchange.fetch_tickers()
+    common_syms: List[str] = []
+    if args.symbols_file:
+        common_syms = _read_symbol_file(args.symbols_file)
+    elif args.symbols:
+        common_syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    else:
+        common_path = args.common_universe_file
+        if not common_path and args.common_universe_latest:
+            common_path = _latest_common_universe_file(ROOT_DIR)
+        if common_path:
+            common_syms = _read_symbol_file(common_path)
+
     state = {
         "_tickers": tickers,
         "_symbols": list(tickers.keys()),
     }
+    if common_syms:
+        state["_common_universe"] = list(common_syms)
     ctx = EngineContext(exchange=exchange, state=state, now_ts=time.time(), logger=lambda *_: None, config=cfg)
     engine.on_start(ctx)
     symbols = engine.build_universe(ctx)
@@ -659,6 +707,8 @@ def main():
         out_decisions,
         args.sl_pct,
         args.tp_pct,
+        args.sl_atr,
+        args.tp_atr,
         args.reentry_minutes,
         log_path,
         args.sleep_ms,

@@ -68,6 +68,31 @@ def _entry_alerted_in_state(st: dict, side: str) -> bool:
     suffix = "long" if side == "LONG" else "short"
     return bool(st.get(f"entry_alerted_{suffix}"))
 
+def _has_recent_entry_alert(st: dict, side: str, now_ts: float, window_sec: float = 600.0) -> bool:
+    if not isinstance(st, dict):
+        return False
+    if _entry_alerted_in_state(st, side):
+        return True
+    suffix = "long" if side.upper() == "LONG" else "short"
+    eng = str(st.get(f"entry_alerted_{suffix}_engine") or "").upper()
+    ts = st.get(f"entry_alerted_{suffix}_ts")
+    if eng and eng not in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+        if isinstance(ts, (int, float)) and (now_ts - float(ts)) <= window_sec:
+            return True
+    return False
+
+def _allow_engine_backfill_for_trade(state: dict, symbol: str, side: str, open_tr: Optional[dict], now_ts: float) -> bool:
+    if not isinstance(open_tr, dict):
+        return True
+    meta = open_tr.get("meta") if isinstance(open_tr.get("meta"), dict) else {}
+    reason = str(meta.get("reason") or "")
+    if reason != "manual_entry":
+        return True
+    if open_tr.get("entry_order_id"):
+        return True
+    st = state.get(symbol, {}) if isinstance(state, dict) else {}
+    return _has_recent_entry_alert(st, side, now_ts=now_ts)
+
 
 def _manual_entry_alert_blocked(state: dict, st: dict, symbol: str, side: str, now_ts: float) -> bool:
     if not isinstance(st, dict):
@@ -454,11 +479,14 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
 
 def _trade_engine_label(tr: Optional[dict]) -> str:
     if isinstance(tr, dict):
+        meta = tr.get("meta") if isinstance(tr.get("meta"), dict) else {}
+        reason = (meta or {}).get("reason")
+        if reason == "manual_entry" and not tr.get("entry_order_id"):
+            return "MANUAL"
         label = tr.get("engine_label")
         if isinstance(label, str) and label:
             if label not in ("UNKNOWN", "MANUAL"):
                 return label
-        reason = (tr.get("meta") or {}).get("reason")
         base_label = er._engine_label_from_reason(reason)
         if base_label not in ("UNKNOWN", "MANUAL"):
             return base_label
@@ -523,6 +551,8 @@ def _backfill_engine_labels_from_entry_events(state: dict, window_sec: float = 2
             continue
         if tr.get("status") != "open":
             continue
+        if not _allow_engine_backfill_for_trade(state, tr.get("symbol"), tr.get("side"), tr, now_ts):
+            continue
         cur_label = _trade_engine_label(tr)
         if cur_label not in ("UNKNOWN", "MANUAL"):
             continue
@@ -586,6 +616,8 @@ def _maybe_update_open_trade_engine(state: dict, symbol: str, side: str, now_ts:
     open_tr = er._get_open_trade(state, side, symbol)
     if not isinstance(open_tr, dict):
         return
+    if not _allow_engine_backfill_for_trade(state, symbol, side, open_tr, now_ts):
+        return
     cur_label = _trade_engine_label(open_tr)
     if cur_label not in ("UNKNOWN", "MANUAL"):
         return
@@ -612,13 +644,15 @@ def _maybe_update_open_trade_engine(state: dict, symbol: str, side: str, now_ts:
 
 
 def _backfill_engine_from_recent_event(state: dict, symbol: str, side: str, now_ts: float) -> bool:
+    open_tr = er._get_open_trade(state, side, symbol)
+    if not _allow_engine_backfill_for_trade(state, symbol, side, open_tr, now_ts):
+        return False
     rec = _get_recent_entry_event(symbol, side, now_ts=now_ts, window_sec=600.0)
     if not isinstance(rec, dict):
         return False
     eng = str(rec.get("engine") or "").upper()
     if not eng or eng in ("UNKNOWN", "MANUAL"):
         return False
-    open_tr = er._get_open_trade(state, side, symbol)
     if not isinstance(open_tr, dict):
         return False
     open_tr["engine_label"] = eng
@@ -1541,14 +1575,15 @@ def main():
                     qty = detail.get("qty") if isinstance(detail, dict) else None
                     meta = {"reason": "manual_entry"}
                     entry_order_id = None
-                    recent = _get_recent_entry_event(symbol, "LONG", now_ts=now_ts)
-                    if isinstance(recent, dict):
-                        eng = str(recent.get("engine") or "").upper()
-                        reason = _reason_from_engine_label(eng, "LONG")
-                        if reason:
-                            meta["reason"] = reason
-                        meta["engine"] = eng
-                        entry_order_id = recent.get("entry_order_id")
+                    if _has_recent_entry_alert(st, "LONG", now_ts=now_ts):
+                        recent = _get_recent_entry_event(symbol, "LONG", now_ts=now_ts)
+                        if isinstance(recent, dict):
+                            eng = str(recent.get("engine") or "").upper()
+                            reason = _reason_from_engine_label(eng, "LONG")
+                            if reason:
+                                meta["reason"] = reason
+                            meta["engine"] = eng
+                            entry_order_id = recent.get("entry_order_id")
                     if "engine" not in meta:
                         alerted_eng = str(st.get("entry_alerted_long_engine") or "").upper()
                         alerted_ts = st.get("entry_alerted_long_ts")
@@ -1633,14 +1668,15 @@ def main():
                     detail = executor_mod.get_short_position_detail(symbol) or {}
                     entry_price = detail.get("entry") if isinstance(detail, dict) else None
                     qty = detail.get("qty") if isinstance(detail, dict) else None
-                    recent = _get_recent_entry_event(symbol, "SHORT", now_ts=now_ts)
-                    if isinstance(recent, dict):
-                        eng = str(recent.get("engine") or "").upper()
-                        reason = _reason_from_engine_label(eng, "SHORT")
-                        if reason:
-                            meta["reason"] = reason
-                        meta["engine"] = eng
-                        entry_order_id = recent.get("entry_order_id")
+                    if _has_recent_entry_alert(st, "SHORT", now_ts=now_ts):
+                        recent = _get_recent_entry_event(symbol, "SHORT", now_ts=now_ts)
+                        if isinstance(recent, dict):
+                            eng = str(recent.get("engine") or "").upper()
+                            reason = _reason_from_engine_label(eng, "SHORT")
+                            if reason:
+                                meta["reason"] = reason
+                            meta["engine"] = eng
+                            entry_order_id = recent.get("entry_order_id")
                     if "engine" not in meta:
                         alerted_eng = str(st.get("entry_alerted_short_engine") or "").upper()
                         alerted_ts = st.get("entry_alerted_short_ts")

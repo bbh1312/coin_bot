@@ -28,7 +28,12 @@ class AtlasRsFailShortEngine(BaseEngine):
         self.config = config or AtlasRsFailShortConfig()
 
     def build_universe(self, ctx: EngineContext) -> list[str]:
-        tickers = ctx.state.get("_tickers")
+        state = ctx.state if isinstance(ctx.state, dict) else {}
+        for key in ("_common_universe", "_atlas_rs_fail_short_universe", "_universe"):
+            shared = state.get(key)
+            if isinstance(shared, list) and shared:
+                return list(shared)
+        tickers = state.get("_tickers")
         if not isinstance(tickers, dict):
             return []
         min_qv = 8_000_000.0

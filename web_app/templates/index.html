@@ -345,15 +345,6 @@
                 <h2>Live Execution</h2>
                 <div class="hint">실주문 모드와 자동 청산을 빠르게 전환합니다.</div>
                 <div id="live-controls"></div>
-                <div class="pnl-card" id="pnl-today">
-                    <h3>오늘 순이익</h3>
-                    <div class="pnl-list">
-                        <div class="pnl-row">
-                            <span class="pnl-name">Loading...</span>
-                            <span class="pnl-value">--</span>
-                        </div>
-                    </div>
-                </div>
             </div>
             <div class="card engines-card">
                 <h2>Engines</h2>
@@ -381,7 +372,6 @@
         const COMMANDS = {{ commands | tojson }};
         const statusPill = document.getElementById("status-pill");
         const liveControls = document.getElementById("live-controls");
-        const pnlTodayBox = document.getElementById("pnl-today");
         const engineControls = document.getElementById("engine-controls");
         const riskControls = document.getElementById("risk-controls");
         const commandByKey = new Map(COMMANDS.map((item) => [item.key, item]));
@@ -514,7 +504,7 @@
         }
 
         async function refreshStatus() {
-            const res = await fetch("/status");
+            const res = await fetch("/status?lite=1");
             if (!res.ok) {
                 statusPill.textContent = "Status fetch failed";
                 return;
@@ -563,50 +553,6 @@
                     riskControls.appendChild(buildNumberRow(item, current));
                 }
             });
-            const pnlList = pnlTodayBox.querySelector(".pnl-list");
-            const pnlItems = data.pnl_today || [];
-            pnlList.innerHTML = "";
-            if (!pnlItems.length) {
-                const row = document.createElement("div");
-                row.className = "pnl-row";
-                row.innerHTML = `<span class="pnl-name">no data</span><span class="pnl-value">--</span>`;
-                pnlList.appendChild(row);
-            } else {
-                pnlItems.forEach((item) => {
-                    const row = document.createElement("div");
-                    row.className = "pnl-row";
-                    const name = item.name || "unknown";
-                    const isActive = item.is_active !== false;
-                    if (item.error) {
-                        row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="pnl-value">N/A</span></div>`;
-                    } else {
-                        const pnlVal = item.pnl;
-                        const pnlText = typeof pnlVal === "number" ? `${pnlVal >= 0 ? "+" : ""}${pnlVal.toFixed(1)} USDT` : "N/A";
-                        const cls = typeof pnlVal === "number" ? (pnlVal >= 0 ? "pnl-value pos" : "pnl-value neg") : "pnl-value";
-                        row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="${cls}">${pnlText}</span></div>`;
-                    }
-                    const controls = row.querySelector(".pnl-controls");
-                    if (controls) {
-                        const toggle = document.createElement("button");
-                        toggle.className = `pnl-toggle${isActive ? " active" : ""}`;
-                        toggle.textContent = isActive ? "ACTIVE" : "OFF";
-                        toggle.addEventListener("click", async () => {
-                            toggle.disabled = true;
-                            await fetch("/admin/accounts", {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({
-                                    account_id: item.account_id,
-                                    is_active: !isActive,
-                                }),
-                            });
-                            await refreshStatus();
-                        });
-                        controls.appendChild(toggle);
-                    }
-                    pnlList.appendChild(row);
-                });
-            }
         }
 
         function _fmtDate(d) {

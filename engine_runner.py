@@ -81,12 +81,14 @@ try:
     from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
     from engines.st_flip_v1.engine import compute_signal as st_flip_compute_signal
     from engines.st_flip_v1.config import StFlipConfig
+    from engines.wash_short_suite.engine import WashShortSuiteConfig
 except Exception as _import_err:
     SwaggyEngine = None
     SwaggyConfig = None
     EngineContext = None
     format_cut_top = None
     format_zone_stats = None
+    WashShortSuiteConfig = None
     _IMPORT_ERROR = str(_import_err)
     try:
         print(f"[import-error] { _IMPORT_ERROR }")
@@ -892,6 +894,7 @@ ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
 NOISE_REVERSE_V1_ENABLED = os.getenv("NOISE_REVERSE_V1_ENABLED", "0") == "1"
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = os.getenv("SRP_ST_REGIME_PULLBACK_V1_ENABLED", "0") == "1"
 RUNUP_WASHOUT_SHORT_3M_ENABLED = os.getenv("RUNUP_WASHOUT_SHORT_3M_ENABLED", "0") == "1"
+WASH_SHORT_SUITE_ENABLED = os.getenv("WASH_SHORT_SUITE_ENABLED", "0") == "1"
 ST_FLIP_V1_ENABLED = os.getenv("ST_FLIP_V1_ENABLED", "0") == "1"
 # Backtest-baseline params (kept identical to backtest)
 ANTI_ALPHA_EMA_LEN = 200
@@ -2321,6 +2324,12 @@ def _append_runup_washout_log(line: str) -> None:
     date_tag = time.strftime("%Y-%m-%d")
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("wash_short_suite", f"runup_washout_short_3m-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
+def _append_wash_short_suite_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("wash_short_suite", f"wash_short_suite-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
 def _iso_kst(ts: Optional[float] = None) -> str:
@@ -5987,6 +5996,200 @@ def _run_runup_washout_short_3m_cycle(
         f"top={result['top']} top_ok={result['top_ok']} rev={result['rev']} no_signal={no_signal} no_data={no_data}"
     )
     return result
+
+def _run_wash_short_suite_cycle(
+    wash_universe,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"entries": 0}
+    if not WASH_SHORT_SUITE_ENABLED or not wash_universe or WashShortSuiteConfig is None:
+        return result
+    start_ts = time.time()
+    checked = 0
+    no_signal = 0
+    no_data = 0
+    _append_wash_short_suite_log(
+        f"WASH_CYCLE_START cycle_id={cycle_id} universe={len(wash_universe)}"
+    )
+
+    now_ts = time.time()
+    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
+        _append_wash_short_suite_log("WASH_SKIP reason=SATURDAY_OFF")
+        return result
+
+    cfg = WashShortSuiteConfig()
+    wash_state = state.setdefault("_wash_short_suite_state", {})
+    tf_trend = cfg.tf_trend
+    tf_main = cfg.tf_main
+    tf_exec = cfg.tf_exec
+    min_tr = max(cfg.ema_slow + 20, 180)
+    min_main = max(cfg.ema_slow + cfg.swing_lookback, 200)
+    min_exec = max(cfg.vol_sma_len + 20, 200)
+
+    symbols = list(wash_universe or [])
+    for symbol in symbols:
+        checked += 1
+        df_tr = cycle_cache.get_df(symbol, tf_trend, limit=min_tr)
+        df_main = cycle_cache.get_df(symbol, tf_main, limit=min_main)
+        df_ex = cycle_cache.get_df(symbol, tf_exec, limit=min_exec)
+        if df_tr.empty or df_main.empty or df_ex.empty:
+            no_data += 1
+            continue
+        df_tr_sig = df_tr.iloc[:-1]
+        df_main_sig = df_main.iloc[:-1]
+        df_ex_sig = df_ex.iloc[:-1]
+        if len(df_tr_sig) < min_tr or len(df_main_sig) < min_main or len(df_ex_sig) < min_exec:
+            no_data += 1
+            continue
+
+        i_ex = len(df_ex_sig) - 1
+        row_ex = df_ex_sig.iloc[i_ex]
+        ts_ms = int(row_ex["ts"])
+        sym_state = wash_state.setdefault(symbol, {})
+        if sym_state.get("last_eval_ts") == ts_ms:
+            continue
+        sym_state["last_eval_ts"] = ts_ms
+
+        ema20_tr = ema(df_tr_sig["close"], cfg.ema_fast)
+        ema60_tr = ema(df_tr_sig["close"], cfg.ema_mid)
+        ema120_tr = ema(df_tr_sig["close"], cfg.ema_slow)
+        adx_tr, pdi_tr, mdi_tr = _wash_adx_di(df_tr_sig, cfg.adx_len)
+
+        ema20_main = ema(df_main_sig["close"], cfg.ema_fast)
+        ema60_main = ema(df_main_sig["close"], cfg.ema_mid)
+        ema120_main = ema(df_main_sig["close"], cfg.ema_slow)
+        adx_main, pdi_main, mdi_main = _wash_adx_di(df_main_sig, cfg.adx_len)
+        bb_mid = _wash_bb_mid(df_main_sig["close"], cfg.ema_fast)
+        atr_main = atr(df_main_sig, cfg.adx_len)
+
+        ts_tr = df_tr_sig["ts"].astype(int).to_numpy()
+        ts_main = df_main_sig["ts"].astype(int).to_numpy()
+        ts_ex = df_ex_sig["ts"].astype(int).to_numpy()
+        idx_tr = int(np.searchsorted(ts_tr, ts_ms, side="right") - 1)
+        idx_main = int(np.searchsorted(ts_main, ts_ms, side="right") - 1)
+        if idx_tr <= 0 or idx_main <= 0:
+            no_data += 1
+            continue
+
+        # Step 1: trend filter
+        trend_ok = (
+            ema20_tr.iloc[idx_tr] < ema60_tr.iloc[idx_tr] < ema120_tr.iloc[idx_tr]
+            and adx_tr.iloc[idx_tr] > cfg.adx_min
+            and mdi_tr.iloc[idx_tr] > pdi_tr.iloc[idx_tr]
+            and float(df_tr_sig.iloc[idx_tr]["close"]) < float(ema60_tr.iloc[idx_tr])
+            and ema20_main.iloc[idx_main] < ema60_main.iloc[idx_main] < ema120_main.iloc[idx_main]
+            and adx_main.iloc[idx_main] > cfg.adx_min
+            and mdi_main.iloc[idx_main] > pdi_main.iloc[idx_main]
+            and float(df_main_sig.iloc[idx_main]["close"]) < float(ema60_main.iloc[idx_main])
+        )
+        if not trend_ok:
+            no_signal += 1
+            continue
+
+        # Step 2: pullback zone
+        swing_start = max(0, idx_main - cfg.swing_lookback)
+        swing_high = float(df_main_sig["high"].iloc[swing_start: idx_main + 1].max())
+        swing_low = float(df_main_sig["low"].iloc[swing_start: idx_main + 1].min())
+        fibs = _wash_fib_levels(swing_high, swing_low)
+        ema_mid = float(ema20_main.iloc[idx_main])
+        bbm = float(bb_mid.iloc[idx_main]) if not np.isnan(bb_mid.iloc[idx_main]) else ema_mid
+        levels = fibs + [ema_mid, bbm, swing_low]
+        price = float(df_main_sig.iloc[idx_main]["close"])
+        if not any(_wash_in_zone(price, lv, cfg.pullback_eps) for lv in levels):
+            no_signal += 1
+            continue
+
+        # Step 3: exec trigger
+        rsi_ex = _adv_rsi(df_ex_sig["close"], cfg.rsi_len)
+        vol_sma_ex = df_ex_sig["volume"].astype(float).rolling(cfg.vol_sma_len).mean()
+        rsi_now = float(rsi_ex.iloc[i_ex])
+        rsi_prev = float(rsi_ex.iloc[i_ex - 1]) if i_ex > 0 else rsi_now
+        rsi_turn = cfg.rsi_min <= rsi_now <= cfg.rsi_max and (rsi_now + cfg.rsi_lower_high_delta) < rsi_prev
+        cur = df_ex_sig.iloc[i_ex]
+        prev = df_ex_sig.iloc[i_ex - 1]
+        candle_ok = _wash_is_shooting_star(cur) or _wash_is_bear_engulf(prev, cur)
+        vol_now = float(cur["volume"])
+        vol_avg = float(vol_sma_ex.iloc[i_ex]) if not np.isnan(vol_sma_ex.iloc[i_ex]) else 0.0
+        vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 0.0
+        pullback_ok = vol_ratio >= cfg.vol_reversal_min
+        if not (rsi_turn and candle_ok and pullback_ok):
+            no_signal += 1
+            continue
+
+        # Entry block on next bar
+        if i_ex + 1 >= len(df_ex):
+            no_data += 1
+            continue
+        entry = df_ex.iloc[i_ex + 1]
+        entry_high = float(entry["high"])
+        entry_low = float(entry["low"])
+        entry_close = float(entry["close"])
+        entry_rng = max(entry_high - entry_low, 1e-9)
+        entry_close_pos = (entry_close - entry_low) / entry_rng
+        entry_vol = float(entry["volume"])
+        entry_vol_avg = float(vol_sma_ex.iloc[i_ex + 1]) if not np.isnan(vol_sma_ex.iloc[i_ex + 1]) else 0.0
+        entry_vol_ratio = (entry_vol / entry_vol_avg) if entry_vol_avg > 0 else 0.0
+        if entry_high > float(cur["high"]) * cfg.entry_block_high_mult:
+            no_signal += 1
+            continue
+        if entry_close_pos >= cfg.entry_block_close_pos and entry_vol_ratio >= cfg.entry_block_vol_ratio:
+            no_signal += 1
+            continue
+
+        entry_px = float(entry_close)
+        atr_px = float(atr_main.iloc[idx_main]) if not np.isnan(atr_main.iloc[idx_main]) else 0.0
+        sl_price = entry_px * (1.0 + cfg.sl_pct)
+        if atr_px > 0:
+            sl_price = max(sl_price, entry_px + atr_px * cfg.sl_atr_mult)
+        tp_price = entry_px - atr_px * cfg.tp_atr_mult if atr_px > 0 else entry_px * (1.0 - cfg.tp_pct)
+
+        usdt = _resolve_entry_usdt()
+        if usdt <= 0 or not _admin_is_active():
+            no_signal += 1
+            continue
+
+        req_id = _enqueue_entry_request(
+            state,
+            symbol=symbol,
+            side="SHORT",
+            engine="WASH_SHORT_SUITE",
+            reason="wash_short_suite",
+            usdt=usdt,
+            live=LIVE_TRADING,
+            alert_reason="wash_short_suite",
+            entry_price_hint=entry_px,
+            meta={"sl_price": float(sl_price), "tp_price": float(tp_price)},
+        )
+        if not req_id:
+            no_signal += 1
+            continue
+        try:
+            place_short_sl_px(symbol, float(sl_price))
+        except Exception:
+            pass
+        _send_entry_alert(
+            send_alert,
+            side="SHORT",
+            symbol=symbol,
+            engine="WASH_SHORT_SUITE",
+            entry_price=entry_px,
+            usdt=usdt,
+            reason=_display_engine_label("WASH_SHORT_SUITE"),
+            sl=f"{float(sl_price):.6g}",
+            tp=f"{float(tp_price):.6g}",
+            entry_order_id=req_id,
+            extras=["기준: Wash Short Suite"],
+            state=state,
+        )
+        result["entries"] += 1
+
+    elapsed = time.time() - start_ts
+    _append_wash_short_suite_log(
+        f"WASH_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} no_signal={no_signal} no_data={no_data}"
+    )
+    return result
 def _entry_guard_key(state: Dict[str, dict], symbol: str, side: str) -> str:
     cycle_ts = state.get("_current_cycle_ts")
     side = (side or "").upper()
@@ -6849,6 +7052,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "ST_FLIP_V1"
     if key in ("runup_washout_short_3m", "runup"):
         return "RUNUP_WASHOUT_SHORT_3M"
+    if key in ("wash_short_suite", "wash_suite"):
+        return "WASH_SHORT_SUITE"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -6871,6 +7076,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "short_entry"
     if label == "RUNUP_WASHOUT_SHORT_3M":
         return "runup_washout_short_3m"
+    if label == "WASH_SHORT_SUITE":
+        return "wash_short_suite"
     if label == "SCALP":
         return "long_entry"
     if label == "MANUAL":
@@ -6900,6 +7107,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "NOISE_REVERSE_V1": "노이즈리버스v1",
         "SRP_ST_REGIME_PULLBACK_V1": "SRP-ST풀백v1",
         "ST_FLIP_V1": "ST플립v1",
+        "WASH_SHORT_SUITE": "워시숏슈트",
     }
     return overrides.get(name, name)
 
@@ -6929,6 +7137,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return SRP_ST_REGIME_PULLBACK_V1_ENABLED
     if key == "ST_FLIP_V1":
         return ST_FLIP_V1_ENABLED
+    if key == "WASH_SHORT_SUITE":
+        return WASH_SHORT_SUITE_ENABLED
     if key in ("RSI", "SCALP"):
         return RSI_ENABLED
     if key in ("MANUAL", "UNKNOWN", ""):
@@ -9656,6 +9866,7 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             "NOISE_REVERSE_V1",
             "ST_FLIP_V1",
             "RUNUP_WASHOUT_SHORT_3M",
+            "WASH_SHORT_SUITE",
             "MANUAL",
             "UNKNOWN",
         }
@@ -11252,7 +11463,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
-    global ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, RUNUP_WASHOUT_SHORT_3M_ENABLED
+    global ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, RUNUP_WASHOUT_SHORT_3M_ENABLED, WASH_SHORT_SUITE_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -11321,12 +11532,14 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_st_flip_v1_alert_only",
         "_srp_st_regime_pullback_v1_enabled",
         "_runup_washout_short_3m_enabled",
+        "_wash_short_suite_enabled",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
         "_noise_reverse_v1_enabled",
         "_st_flip_v1_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_runup_washout_short_3m_enabled",
+        "_wash_short_suite_enabled",
         "_rsi_enabled",
         "_dtfx_enabled",
         "_atlas_rs_fail_short_enabled",
@@ -11452,6 +11665,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         SRP_ST_REGIME_PULLBACK_V1_ENABLED = bool(state.get("_srp_st_regime_pullback_v1_enabled"))
     if (not skip_keys or "_runup_washout_short_3m_enabled" not in skip_keys) and isinstance(state.get("_runup_washout_short_3m_enabled"), bool):
         RUNUP_WASHOUT_SHORT_3M_ENABLED = bool(state.get("_runup_washout_short_3m_enabled"))
+    if (not skip_keys or "_wash_short_suite_enabled" not in skip_keys) and isinstance(state.get("_wash_short_suite_enabled"), bool):
+        WASH_SHORT_SUITE_ENABLED = bool(state.get("_wash_short_suite_enabled"))
     if (not skip_keys or "_adv_trend_min_qv" not in skip_keys) and isinstance(state.get("_adv_trend_min_qv"), (int, float)):
         ADV_TREND_MIN_QV = float(state.get("_adv_trend_min_qv"))
     if (not skip_keys or "_adv_trend_universe_top_n" not in skip_keys) and isinstance(state.get("_adv_trend_universe_top_n"), (int, float)):
@@ -12204,7 +12419,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, RUNUP_WASHOUT_SHORT_3M_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, RUNUP_WASHOUT_SHORT_3M_ENABLED, WASH_SHORT_SUITE_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -12835,6 +13050,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"st_flip={'ON' if ST_FLIP_V1_ENABLED else 'OFF'}(alert_only={'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}) "
                             f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
                             f"runup={'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'} "
+                            f"wash_suite={'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'} "
                             f"swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
                             f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -12846,6 +13062,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/st_flip_v1_alert(알람전용): {'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}\n"
                             f"/srp_st_regime_pullback_v1(추가진입): {'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'}\n"
                             f"/runup_washout_short_3m(추가진입): {'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'}\n"
+                            f"/wash_short_suite(추가진입): {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -12899,6 +13116,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"st_flip={'ON' if ST_FLIP_V1_ENABLED else 'OFF'}(alert_only={'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}) "
                         f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
                         f"runup={'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'} "
+                        f"wash_suite={'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'} "
                         f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
                         f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
                         ""
@@ -12908,6 +13126,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/st_flip_v1_alert(알람전용): {'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}\n"
                         f"/srp_st_regime_pullback_v1(추가진입): {'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'}\n"
                         f"/runup_washout_short_3m(추가진입): {'ON' if RUNUP_WASHOUT_SHORT_3M_ENABLED else 'OFF'}\n"
+                        f"/wash_short_suite(추가진입): {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
                         f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                         ""
@@ -13477,6 +13696,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] runup_washout_short_3m cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/wash_short_suite", "wash_short_suite", "wash_suite")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        WASH_SHORT_SUITE_ENABLED = True
+                        state["_wash_short_suite_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ wash_short_suite ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        WASH_SHORT_SUITE_ENABLED = False
+                        state["_wash_short_suite_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ wash_short_suite OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ wash_short_suite 상태: {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
+                            "사용법: /wash_short_suite on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] wash_short_suite cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/loss_hedge_engine", "loss_hedge_engine")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -13822,6 +14064,61 @@ def _adv_rsi(series: pd.Series, length: int) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(0.0)
+
+def _wash_adx_di(df: pd.DataFrame, length: int) -> tuple[pd.Series, pd.Series, pd.Series]:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    tr = pd.concat(
+        [(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr_val = tr.ewm(alpha=1 / length, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr_val.replace(0, float("nan")))
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr_val.replace(0, float("nan")))
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, float("nan"))) * 100
+    adx = dx.ewm(alpha=1 / length, adjust=False).mean()
+    return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
+
+def _wash_bb_mid(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(length).mean()
+
+def _wash_upper_wick_ratio(row: pd.Series) -> float:
+    rng = float(row["high"] - row["low"])
+    if rng <= 0:
+        return 0.0
+    upper = float(row["high"] - max(row["open"], row["close"]))
+    return upper / rng
+
+def _wash_body_ratio(row: pd.Series) -> float:
+    rng = float(row["high"] - row["low"])
+    if rng <= 0:
+        return 0.0
+    return float(abs(row["close"] - row["open"]) / rng)
+
+def _wash_is_shooting_star(row: pd.Series) -> bool:
+    return _wash_upper_wick_ratio(row) >= 0.6 and _wash_body_ratio(row) <= 0.5
+
+def _wash_is_bear_engulf(prev: pd.Series, cur: pd.Series) -> bool:
+    return (
+        float(prev["close"]) > float(prev["open"])
+        and float(cur["close"]) < float(cur["open"])
+        and float(cur["open"]) >= float(prev["close"])
+        and float(cur["close"]) <= float(prev["open"])
+    )
+
+def _wash_fib_levels(high: float, low: float) -> list[float]:
+    diff = high - low
+    return [high - diff * 0.382, high - diff * 0.5, high - diff * 0.618]
+
+def _wash_in_zone(price: float, level: float, eps: float) -> bool:
+    if level <= 0:
+        return False
+    return abs(price - level) / level <= eps
 
 def _adv_find_pivots(series: pd.Series, lookback: int, mode: str) -> list:
     if series.empty or lookback <= 0:
@@ -14799,7 +15096,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /noise_reverse_v1 on|off|status, /st_flip_v1 on|off|status, /srp_st_regime_pullback_v1 on|off|status, /runup_washout_short_3m on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /noise_reverse_v1 on|off|status, /st_flip_v1 on|off|status, /srp_st_regime_pullback_v1 on|off|status, /runup_washout_short_3m on|off|status, /wash_short_suite on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -15101,6 +15398,8 @@ def run():
                     adv_trend_universe = list(shared_universe)
                     dtfx_universe = list(shared_universe)
                     atlas_rs_fail_short_universe = list(shared_universe)
+                    wash_short_suite_universe = list(shared_universe)
+                    wash_short_suite_universe_len = len(wash_short_suite_universe)
                     swaggy_cfg = SwaggyConfig() if SwaggyConfig else None
                     swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig() if SwaggyAtlasLabConfig else None
                     swaggy_atlas_lab_atlas_cfg = SwaggyAtlasLabAtlasConfig() if SwaggyAtlasLabAtlasConfig else None
@@ -15538,6 +15837,8 @@ def run():
                     srp_thread = None
                     runup_result = {}
                     runup_thread = None
+                    wash_result = {}
+                    wash_thread = None
                     dtfx_result = {}
                     dtfx_thread = None
                     atlas_rs_fail_short_result = {}
@@ -15681,6 +15982,18 @@ def run():
                             daemon=True,
                         )
                         runup_thread.start()
+                    if WASH_SHORT_SUITE_ENABLED and new_1m_bar:
+                        wash_thread = threading.Thread(
+                            target=lambda: wash_result.update(
+                                _run_wash_short_suite_cycle(
+                                    wash_short_suite_universe,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        wash_thread.start()
                     if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
                         dtfx_thread = threading.Thread(
                             target=lambda: dtfx_result.update(
