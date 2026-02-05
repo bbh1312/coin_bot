@@ -236,6 +236,60 @@ def _btc_guard(btc_1h: pd.DataFrame, btc_15m: pd.DataFrame, btc_1m: pd.DataFrame
     return True
 
 
+def _body_ratio(row: pd.Series) -> float:
+    high = float(row["high"])
+    low = float(row["low"])
+    open_ = float(row["open"])
+    close = float(row["close"])
+    rng = max(high - low, 1e-9)
+    return abs(close - open_) / rng
+
+
+def _is_bull_body(row: pd.Series, min_ratio: float) -> bool:
+    return float(row["close"]) > float(row["open"]) and _body_ratio(row) >= min_ratio
+
+
+def _rsi_fast_drop(rsi_series: pd.Series, idx: int, from_level: float, to_level: float, bars: int) -> bool:
+    if idx <= 0 or bars <= 0:
+        return False
+    rsi_now = float(rsi_series.iloc[idx])
+    if rsi_now >= to_level:
+        return False
+    start = max(0, idx - bars)
+    window = rsi_series.iloc[start: idx + 1]
+    return bool((window >= from_level).any())
+
+
+def _read_oi_cache(path: str) -> List[Tuple[int, float]]:
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        df = pd.read_csv(path)
+        if df.empty or "ts" not in df.columns:
+            return []
+        return list(zip(df["ts"].astype(int).tolist(), df["oi"].astype(float).tolist()))
+    except Exception:
+        return []
+
+def _oi_at(oi_rows: List[Tuple[int, float]], ts_ms: int) -> Optional[float]:
+    if not oi_rows:
+        return None
+    # assume sorted by ts
+    lo, hi = 0, len(oi_rows) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        ts, val = oi_rows[mid]
+        if ts == ts_ms:
+            return val
+        if ts < ts_ms:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if hi >= 0:
+        return oi_rows[hi][1]
+    return None
+
+
 def run_backtest() -> None:
     parser = argparse.ArgumentParser("long_b2_v1 backtest")
     parser.add_argument("--days", type=int, default=3)
@@ -255,6 +309,12 @@ def run_backtest() -> None:
     parser.add_argument("--tp1-ratio", type=float, default=0.3)
     parser.add_argument("--trail-pct", type=float, default=0.01)
     parser.add_argument("--swing-lookback", type=int, default=50)
+    parser.add_argument("--body-min", type=float, default=0.6)
+    parser.add_argument("--rsi-drop-bars", type=int, default=4)
+    parser.add_argument("--rsi-drop-from", type=float, default=70.0)
+    parser.add_argument("--rsi-drop-to", type=float, default=40.0)
+    parser.add_argument("--use-oi", action="store_true")
+    parser.add_argument("--oi-cache-dir", type=str, default="")
     args = parser.parse_args()
 
     exchange = ccxt.binance({"enableRateLimit": True})
@@ -282,6 +342,7 @@ def run_backtest() -> None:
 
     use_common = bool(args.use_live_cache)
     common_dir = args.common_warmup_dir or os.getenv("COMMON_WARMUP_CACHE_DIR", "")
+    oi_dir = args.oi_cache_dir or os.path.join(ROOT_DIR, "logs", "long_b2_v1", "oi_cache")
 
     # BTC guard data
     btc_1h_rows = _fetch_ohlcv_all(exchange, "BTC/USDT:USDT", "1h", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
@@ -311,6 +372,10 @@ def run_backtest() -> None:
     stats_by_symbol: Dict[str, Dict[str, float]] = {}
 
     for sym in universe:
+        oi_rows = []
+        if args.use_oi:
+            oi_path = os.path.join(oi_dir, f"{_sanitize_symbol(sym)}_3m.csv")
+            oi_rows = _read_oi_cache(oi_path)
         rows_tr = _fetch_ohlcv_all(exchange, sym, "1h", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
         rows_main = _fetch_ohlcv_all(exchange, sym, "15m", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
         rows_ex = _fetch_ohlcv_all(exchange, sym, "3m", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
@@ -525,6 +590,8 @@ def run_backtest() -> None:
 
             rsi_main_now = float(rsi_main.iloc[idx_main]) if not np.isnan(rsi_main.iloc[idx_main]) else 0.0
             rsi_main_prev = float(rsi_main.iloc[idx_main - 1]) if idx_main > 0 else rsi_main_now
+            if _rsi_fast_drop(rsi_main, idx_main, args.rsi_drop_from, args.rsi_drop_to, args.rsi_drop_bars):
+                continue
 
             cur_ex = df_ex.iloc[sig_idx]
             prev_ex = df_ex.iloc[sig_idx - 1]
@@ -556,6 +623,8 @@ def run_backtest() -> None:
                 and rsi_main_now >= 48.0
                 and rsi_main_now >= rsi_main_prev
             )
+            if spring_trap and not _is_bull_body(df_main.iloc[idx_main], args.body_min):
+                spring_trap = False
 
             # Trigger C: Golden Pocket
             gp_hit = any(_in_zone(main_close, lv, 0.002) for lv in fibs) or main_close <= bbl
@@ -563,9 +632,17 @@ def run_backtest() -> None:
 
             # Recovery trigger after breakdown
             recovery = last_breakdown_idx is not None and main_close > bbm and obv_ok and vol_ok
+            if recovery and not _is_bull_body(df_main.iloc[idx_main], args.body_min):
+                recovery = False
 
             if not (gap_filler or spring_trap or golden_pocket or recovery):
                 continue
+
+            if args.use_oi:
+                oi_now = _oi_at(oi_rows, int(df_ex.iloc[sig_idx]["ts"]))
+                oi_prev = _oi_at(oi_rows, int(df_ex.iloc[sig_idx - 1]["ts"]))
+                if oi_now is None or oi_prev is None or oi_now < oi_prev:
+                    continue
 
             entry = df_ex.iloc[i]
             entry_px = float(entry["close"])

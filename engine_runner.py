@@ -510,8 +510,8 @@ def _set_last_entry_broadcast(symbol: str, side: str, admin_status: str, admin_o
         return
     admin_label = ADMIN_ACCOUNT_CONTEXT.name if ADMIN_ACCOUNT_CONTEXT else "admin"
     entries = []
-    admin_suffix = "" if admin_ok else "(실패)"
-    entries.append(f"{admin_label}{admin_suffix}")
+    admin_label_status = _status_to_kr_label(admin_status, admin_ok)
+    entries.append(f"{admin_label}({admin_label_status})")
     for r in follower_results or []:
         acct = r.get("acct") or "unknown"
         status = r.get("status") or "unknown"
@@ -607,10 +607,13 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
     except Exception:
         _set_last_entry_broadcast(symbol, "SHORT", "error", False, [])
         raise
+    admin_status = _extract_status(res)
+    admin_ok = admin_status == "ok"
+    if not admin_ok:
+        _set_last_entry_broadcast(symbol, "SHORT", admin_status, admin_ok, [])
+        return res
     followers = FOLLOWER_CONTEXTS
     if not followers:
-        admin_status = _extract_status(res)
-        admin_ok = admin_status in ("ok", "dry_run", "skip")
         _set_last_entry_broadcast(symbol, "SHORT", admin_status, admin_ok, [])
         return res
     use_pct = _calc_effective_entry_pct(usdt_amount)
@@ -628,8 +631,6 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
             "fn": lambda a=acct, u=follower_usdt: a.executor.short_market(symbol, usdt_amount=u, leverage=leverage, margin_mode=margin_mode),
         })
     results = _broadcast_followers("short_market", follower_calls, {"symbol": symbol})
-    admin_status = _extract_status(res)
-    admin_ok = admin_status in ("ok", "dry_run", "skip")
     _set_last_entry_broadcast(symbol, "SHORT", admin_status, admin_ok, results)
     return res
 
@@ -681,10 +682,13 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
     except Exception:
         _set_last_entry_broadcast(symbol, "LONG", "error", False, [])
         raise
+    admin_status = _extract_status(res)
+    admin_ok = admin_status == "ok"
+    if not admin_ok:
+        _set_last_entry_broadcast(symbol, "LONG", admin_status, admin_ok, [])
+        return res
     followers = FOLLOWER_CONTEXTS
     if not followers:
-        admin_status = _extract_status(res)
-        admin_ok = admin_status in ("ok", "dry_run", "skip")
         _set_last_entry_broadcast(symbol, "LONG", admin_status, admin_ok, [])
         return res
     use_pct = _calc_effective_entry_pct(usdt_amount)
@@ -702,15 +706,13 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
             "fn": lambda a=acct, u=follower_usdt: a.executor.long_market(symbol, usdt_amount=u, leverage=leverage, margin_mode=margin_mode),
         })
     results = _broadcast_followers("long_market", follower_calls, {"symbol": symbol})
-    admin_status = _extract_status(res)
-    admin_ok = admin_status in ("ok", "dry_run", "skip")
     _set_last_entry_broadcast(symbol, "LONG", admin_status, admin_ok, results)
     return res
 
 def close_short_market(symbol: str) -> dict:
     res = _EXEC_CLOSE_SHORT_MARKET(symbol)
     admin_status = _extract_status(res)
-    if admin_status == "skip":
+    if admin_status != "ok":
         return res
     followers = FOLLOWER_CONTEXTS
     if not followers:
@@ -763,7 +765,7 @@ def _close_followers_short_only(symbol: str) -> None:
 def close_long_market(symbol: str) -> dict:
     res = _EXEC_CLOSE_LONG_MARKET(symbol)
     admin_status = _extract_status(res)
-    if admin_status == "skip":
+    if admin_status != "ok":
         return res
     followers = FOLLOWER_CONTEXTS
     if not followers:
@@ -814,6 +816,9 @@ def _close_followers_long_only(symbol: str) -> None:
 
 def close_long_market_qty(symbol: str, qty: float) -> dict:
     res = _EXEC_CLOSE_LONG_MARKET_QTY(symbol, qty)
+    admin_status = _extract_status(res)
+    if admin_status != "ok":
+        return res
     followers = FOLLOWER_CONTEXTS
     if not followers:
         return res
@@ -840,6 +845,9 @@ def close_long_market_qty(symbol: str, qty: float) -> dict:
 
 def close_short_market_qty(symbol: str, qty: float) -> dict:
     res = _EXEC_CLOSE_SHORT_MARKET_QTY(symbol, qty)
+    admin_status = _extract_status(res)
+    if admin_status != "ok":
+        return res
     followers = FOLLOWER_CONTEXTS
     if not followers:
         return res
@@ -10817,6 +10825,12 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
         print(f"[manage-queue] execute failed sym={symbol} side={side} err={e}")
         _clear_manage_pending(state, symbol, side)
         return False, "execute_failed"
+    status = _extract_status(res)
+    if status in ("skip", "dry_run"):
+        _clear_manage_pending(state, symbol, side)
+        reason = res.get("reason") if isinstance(res, dict) else None
+        reason = str(reason) if reason else status
+        return False, reason
     entry_order_id = _order_id_from_res(res)
     fill_price = res.get("last") or (res.get("order") or {}).get("average") or (res.get("order") or {}).get("price")
     qty = res.get("amount") or (res.get("order") or {}).get("amount")
@@ -15651,12 +15665,12 @@ def run():
                         state["_pos_limit_reached"] = True
                         last_warn = _coerce_state_float(state.get("_pos_limit_skip_ts", 0.0))
                         if (now - last_warn) >= 60:
-                            print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 조회 스킵")
+                            print(f"[제한] 동시 포지션 {active_positions_total_est}/{MAX_OPEN_POSITIONS} → 신규 진입 스킵(캐시 유지)")
                             state["_pos_limit_skip_ts"] = now
                             _log_off_window_status(state, now, tag="pos_limit")
-                        time.sleep(1)
-                        continue
-                    state["_pos_limit_reached"] = False
+                        # NOTE: continue하지 않고 캐시/유니버스/워밍업은 유지한다.
+                    else:
+                        state["_pos_limit_reached"] = False
 
                     # cycle ts debug (BTC 15m, prev candle only)
                     cycle_ts = None
@@ -15870,6 +15884,25 @@ def run():
                             wash_short_suite_universe_len = len(wash_short_suite_universe)
                         except Exception:
                             pass
+                    # wash_short_suite: only symbols with negative 24h % change
+                    try:
+                        pct_map = {}
+                        for s in wash_short_suite_universe:
+                            t = tickers.get(s) if isinstance(tickers, dict) else None
+                            if not t:
+                                continue
+                            pct = t.get("percentage")
+                            if pct is None:
+                                continue
+                            try:
+                                pct = float(pct)
+                            except Exception:
+                                continue
+                            pct_map[s] = pct
+                        wash_short_suite_universe = [s for s in wash_short_suite_universe if pct_map.get(s, 0) < 0]
+                        wash_short_suite_universe_len = len(wash_short_suite_universe)
+                    except Exception:
+                        pass
                     swaggy_cfg = SwaggyConfig() if SwaggyConfig else None
                     swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig() if SwaggyAtlasLabConfig else None
                     swaggy_atlas_lab_atlas_cfg = SwaggyAtlasLabAtlasConfig() if SwaggyAtlasLabAtlasConfig else None
