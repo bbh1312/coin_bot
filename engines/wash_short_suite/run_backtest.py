@@ -37,6 +37,16 @@ def _ohlcv_cache_path(root_dir: str, symbol: str, timeframe: str, start_ms: int,
         f"{safe}_{timeframe}_{start_ms}_{end_ms}.csv",
     )
 
+def _entry_kst_info(ts_ms: int) -> Tuple[int, str]:
+    dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc) + timedelta(hours=9)
+    hour = int(dt.strftime("%H"))
+    dow = dt.strftime("%a")
+    return hour, dow
+
+def _fmt_kst(ts_ms: int) -> str:
+    dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc) + timedelta(hours=9)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
 
 def _read_ohlcv_cache(path: str) -> List[list]:
     if not os.path.exists(path):
@@ -368,6 +378,8 @@ def run_backtest():
             symbol_data[sym] = {"trend": rows_trend, "main": rows_main, "exec": rows_exec}
 
     stats = {"entries": 0, "exits": 0, "trades": 0, "wins": 0, "losses": 0, "mfe_sum": 0.0, "mae_sum": 0.0, "hold_sum": 0.0, "net_sum": 0.0}
+    stats_by_hour = {h: {"entries": 0, "tp": 0, "sl": 0} for h in range(24)}
+    stats_by_dow = {d: {"entries": 0, "tp": 0, "sl": 0} for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]}
     stats_by_symbol: Dict[str, Dict[str, float]] = {}
 
     for sym, data in symbol_data.items():
@@ -434,10 +446,11 @@ def run_backtest():
                     exit_reason = "TP"
                     exit_px = tp_price
                 else:
-                    elapsed_min = (ts_ex[i] - trade["entry_ts"]) / 60000.0
-                    if elapsed_min >= cfg.time_stop_minutes:
-                        exit_reason = "TIME"
-                        exit_px = close
+                    if cfg.time_stop_minutes > 0:
+                        elapsed_min = (ts_ex[i] - trade["entry_ts"]) / 60000.0
+                        if elapsed_min >= cfg.time_stop_minutes:
+                            exit_reason = "TIME"
+                            exit_px = close
 
                 if exit_reason:
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
@@ -453,6 +466,18 @@ def run_backtest():
                     sym_stats["mae_sum"] += trade["mae"]
                     sym_stats["hold_sum"] += trade["hold_bars"]
                     sym_stats["net_sum"] += pnl_pct
+                    entry_hour = trade.get("entry_hour")
+                    entry_dow = trade.get("entry_dow")
+                    if isinstance(entry_hour, int) and entry_hour in stats_by_hour:
+                        if exit_reason == "TP":
+                            stats_by_hour[entry_hour]["tp"] += 1
+                        elif exit_reason == "SL":
+                            stats_by_hour[entry_hour]["sl"] += 1
+                    if isinstance(entry_dow, str) and entry_dow in stats_by_dow:
+                        if exit_reason == "TP":
+                            stats_by_dow[entry_dow]["tp"] += 1
+                        elif exit_reason == "SL":
+                            stats_by_dow[entry_dow]["sl"] += 1
                     if pnl_pct > 0:
                         stats["wins"] += 1
                         sym_stats["wins"] += 1
@@ -526,9 +551,23 @@ def run_backtest():
                 continue
 
             entry_px = float(entry["close"])
-            trade = {"entry_px": entry_px, "entry_ts": int(ts_ex[i]), "hold_bars": 0, "mfe": 0.0, "mae": 0.0}
+            entry_ts = int(ts_ex[i])
+            entry_hour, entry_dow = _entry_kst_info(entry_ts)
+            trade = {
+                "entry_px": entry_px,
+                "entry_ts": entry_ts,
+                "entry_hour": entry_hour,
+                "entry_dow": entry_dow,
+                "hold_bars": 0,
+                "mfe": 0.0,
+                "mae": 0.0,
+            }
             stats["entries"] += 1
             sym_stats["entries"] += 1
+            if entry_hour in stats_by_hour:
+                stats_by_hour[entry_hour]["entries"] += 1
+            if entry_dow in stats_by_dow:
+                stats_by_dow[entry_dow]["entries"] += 1
 
         stats_by_symbol[sym] = sym_stats
 
@@ -564,6 +603,28 @@ def run_backtest():
     )
     print(total_line)
     _log(total_line)
+    print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
+    _log("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
+    for hour in range(24):
+        row = stats_by_hour.get(hour, {"entries": 0, "tp": 0, "sl": 0})
+        entries = int(row["entries"])
+        tp = int(row["tp"])
+        sl = int(row["sl"])
+        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
+        line = f"[BACKTEST] HOUR {hour:02d} entries={entries} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
+        print(line)
+        _log(line)
+    print("[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate")
+    _log("[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate")
+    for dow in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
+        row = stats_by_dow.get(dow, {"entries": 0, "tp": 0, "sl": 0})
+        entries = int(row["entries"])
+        tp = int(row["tp"])
+        sl = int(row["sl"])
+        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
+        line = f"[BACKTEST] DOW {dow} entries={entries} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
+        print(line)
+        _log(line)
 
 
 if __name__ == "__main__":

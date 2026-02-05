@@ -286,6 +286,10 @@ def parse_args():
     parser.add_argument("--sl-pct", type=float, default=0.02)
     parser.add_argument("--tp-pct", type=float, default=0.02)
     parser.add_argument("--timeout-bars", type=int, default=40)
+    parser.add_argument("--rsi-thresholds", type=str, default="", help="override thresholds JSON, e.g. '{\"3m\":80,\"5m\":80,\"15m\":78,\"1h\":77}'")
+    parser.add_argument("--rsi3m-downturn-threshold", type=float, default=None, help="3m RSI downturn threshold")
+    parser.add_argument("--vol-surge-lookback", type=int, default=None, help="5m volume surge lookback bars")
+    parser.add_argument("--vol-surge-mult", type=float, default=None, help="5m volume surge multiplier")
     parser.add_argument("--fee-rate", type=float, default=0.0)
     parser.add_argument("--slippage-pct", type=float, default=0.0)
     parser.add_argument("--position-usdt", type=float, default=100.0)
@@ -473,6 +477,22 @@ def main() -> None:
     exchange.load_markets()
 
     cfg = RsiConfig()
+    if args.rsi_thresholds:
+        try:
+            parsed = json.loads(args.rsi_thresholds)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(args.rsi_thresholds)
+            except Exception:
+                parsed = None
+        if isinstance(parsed, dict):
+            cfg.thresholds = parsed
+    if args.rsi3m_downturn_threshold is not None:
+        cfg.rsi3m_downturn_threshold = float(args.rsi3m_downturn_threshold)
+    if args.vol_surge_lookback is not None:
+        cfg.vol_surge_lookback = int(args.vol_surge_lookback)
+    if args.vol_surge_mult is not None:
+        cfg.vol_surge_mult = float(args.vol_surge_mult)
     engine = RsiEngine(cfg)
     if not symbols and args.symbols_from_common_cache:
         cache_dir = args.common_cache_dir.strip() or os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
@@ -903,14 +923,15 @@ def main() -> None:
         avg_mfe = (trade_stats["mfe_sum"] / trades) if trades > 0 else 0.0
         avg_mae = (trade_stats["mae_sum"] / trades) if trades > 0 else 0.0
         avg_hold = (trade_stats["hold_sum"] / trades) if trades > 0 else 0.0
-        summary_line = (
-            f"[BACKTEST] {symbol} trades={trades} wins={wins} losses={losses} "
-            f"winrate={win_rate:.2f}% tp={tp} sl={sl} "
-            f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}"
-        )
-        log_fp.write(summary_line + "\n")
-        log_fp.flush()
-        print(summary_line)
+        if trades > 0:
+            summary_line = (
+                f"[BACKTEST] {symbol} trades={trades} wins={wins} losses={losses} "
+                f"winrate={win_rate:.2f}% tp={tp} sl={sl} "
+                f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f}"
+            )
+            log_fp.write(summary_line + "\n")
+            log_fp.flush()
+            print(summary_line)
         total["trades"] += trades
         total["wins"] += wins
         total["losses"] += losses

@@ -39,9 +39,7 @@ from engine_runner import (
     SWAGGY_ATLAS_LAB_V2_ENABLED,
     ST_FLIP_V1_ENABLED,
     ST_FLIP_ALERT_ONLY,
-    RUNUP_WASHOUT_SHORT_3M_ENABLED,
     SATURDAY_TRADE_ENABLED,
-    ATLAS_RS_FAIL_SHORT_ENABLED,
     RSI_ENABLED,
     DCA_ENABLED,
     DCA_PCT,
@@ -88,11 +86,7 @@ COMMAND_DEFS = [
     {"cmd": "/noise_reverse_v1", "key": "_noise_reverse_v1_enabled", "label": "Noise Reverse V1", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
-    {"cmd": "/st_flip_v1", "key": "_st_flip_v1_enabled", "label": "ST Flip V1", "type": "toggle"},
-    {"cmd": "/st_flip_v1_alert", "key": "_st_flip_v1_alert_only", "label": "ST Flip V1 Alert Only", "type": "toggle"},
-    {"cmd": "/runup_washout_short_3m", "key": "_runup_washout_short_3m_enabled", "label": "Runup Washout Short 3M", "type": "toggle"},
     {"cmd": "/wash_short_suite", "key": "_wash_short_suite_enabled", "label": "Wash Short Suite", "type": "toggle"},
-    {"cmd": "/atlas_rs_fail_short", "key": "_atlas_rs_fail_short_enabled", "label": "Atlas RS Fail Short", "type": "toggle"},
     {"cmd": "/rsi", "key": "_rsi_enabled", "label": "RSI", "type": "toggle"},
     {"cmd": "/dca", "key": "_dca_enabled", "label": "DCA", "type": "toggle"},
     {"cmd": "/dca_pct", "key": "_dca_pct", "label": "DCA 진입 금액(%)", "type": "number", "step": 0.1},
@@ -132,6 +126,10 @@ def _normalize_engine_exit_overrides(raw: dict) -> dict:
                 continue
             tp = cfg.get("tp")
             sl = cfg.get("sl")
+            if isinstance(tp, str):
+                tp = tp.strip().replace("%", "")
+            if isinstance(sl, str):
+                sl = sl.strip().replace("%", "")
             try:
                 tp = float(tp)
                 sl = float(sl)
@@ -272,9 +270,6 @@ DEFAULTS = {
     "_max_open_positions": MAX_OPEN_POSITIONS,
     "_entry_usdt": USDT_PER_TRADE,
     "_noise_reverse_v1_enabled": NOISE_REVERSE_V1_ENABLED,
-    "_st_flip_v1_enabled": ST_FLIP_V1_ENABLED if "ST_FLIP_V1_ENABLED" in globals() else False,
-    "_st_flip_v1_alert_only": ST_FLIP_ALERT_ONLY if "ST_FLIP_ALERT_ONLY" in globals() else False,
-    "_runup_washout_short_3m_enabled": RUNUP_WASHOUT_SHORT_3M_ENABLED,
     "_rsi_enabled": RSI_ENABLED,
     "_dca_enabled": DCA_ENABLED,
     "_dca_pct": DCA_PCT,
@@ -282,7 +277,6 @@ DEFAULTS = {
     "_dca_second_pct": DCA_SECOND_PCT,
     "_dca_third_pct": DCA_THIRD_PCT,
     "_exit_cooldown_hours": EXIT_COOLDOWN_HOURS,
-    "_atlas_rs_fail_short_enabled": ATLAS_RS_FAIL_SHORT_ENABLED,
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
     "_swaggy_atlas_lab_v2_enabled": SWAGGY_ATLAS_LAB_V2_ENABLED,
     "_auto_exit_long_tp_pct": AUTO_EXIT_LONG_TP_PCT,
@@ -1104,7 +1098,11 @@ def command():
                     try:
                         parsed = ast.literal_eval(value)
                     except Exception:
-                        return jsonify({"status": "invalid json", "key": key}), 400
+                        try:
+                            cleaned = re.sub(r",\\s*([}\\]])", r"\\1", str(value))
+                            parsed = json.loads(cleaned)
+                        except Exception:
+                            return jsonify({"status": "invalid json", "key": key}), 400
                 if not isinstance(parsed, dict):
                     return jsonify({"status": "json must be object", "key": key}), 400
             if key == "_engine_exit_overrides":
