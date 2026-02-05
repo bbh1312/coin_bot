@@ -381,6 +381,7 @@ def run_backtest():
     stats_by_hour = {h: {"entries": 0, "tp": 0, "sl": 0} for h in range(24)}
     stats_by_dow = {d: {"entries": 0, "tp": 0, "sl": 0} for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]}
     stats_by_symbol: Dict[str, Dict[str, float]] = {}
+    trades_out: List[dict] = []
 
     for sym, data in symbol_data.items():
         df_tr = pd.DataFrame(data["trend"], columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
@@ -484,6 +485,16 @@ def run_backtest():
                     else:
                         stats["losses"] += 1
                         sym_stats["losses"] += 1
+                    trades_out.append(
+                        {
+                            "symbol": sym,
+                            "entry_ts": int(trade["entry_ts"]),
+                            "exit_ts": int(ts_ex[i]),
+                            "pnl_pct": pnl_pct * 100.0,
+                            "result": "WIN" if pnl_pct > 0 else "LOSS",
+                            "reason": exit_reason,
+                        }
+                    )
                     trade = None
                     cooldown_left = max(cooldown_left, cfg.cooldown_bars)
                 continue
@@ -603,6 +614,17 @@ def run_backtest():
     )
     print(total_line)
     _log(total_line)
+    if trades_out:
+        print("[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts")
+        _log("[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts")
+        for tr in trades_out:
+            line = (
+                f"[BACKTEST] TRADE {tr['symbol']} result={tr['result']} "
+                f"pnl_pct={tr['pnl_pct']:.2f}% entry_ts={_fmt_kst(tr['entry_ts'])} "
+                f"exit_ts={_fmt_kst(tr['exit_ts'])}"
+            )
+            print(line)
+            _log(line)
     print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
     _log("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
     for hour in range(24):
