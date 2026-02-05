@@ -95,6 +95,7 @@ try:
         st_flip_compute_signal = None
         StFlipConfig = None
     from engines.wash_short_suite.engine import WashShortSuiteConfig
+    from engines.bull_pullback_long_v1.engine import BullPullbackLongConfig
 except Exception as _import_err:
     SwaggyEngine = None
     SwaggyConfig = None
@@ -102,6 +103,7 @@ except Exception as _import_err:
     format_cut_top = None
     format_zone_stats = None
     WashShortSuiteConfig = None
+    BullPullbackLongConfig = None
     AtlasRsFailShortEngine = None
     AtlasRsFailShortConfig = None
     st_flip_compute_signal = None
@@ -561,6 +563,8 @@ def _realtime_only_required() -> bool:
         return True
     if WASH_SHORT_SUITE_ENABLED:
         return True
+    if BULL_PULLBACK_LONG_V1_ENABLED:
+        return True
     if ST_FLIP_V1_ENABLED or ST_FLIP_ALERT_ONLY:
         return True
     if DIV15M_LONG_ENABLED or DIV15M_SHORT_ENABLED or ONLY_DIV15M_SHORT:
@@ -705,6 +709,9 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
 
 def close_short_market(symbol: str) -> dict:
     res = _EXEC_CLOSE_SHORT_MARKET(symbol)
+    admin_status = _extract_status(res)
+    if admin_status == "skip":
+        return res
     followers = FOLLOWER_CONTEXTS
     if not followers:
         return res
@@ -724,6 +731,8 @@ def close_short_market(symbol: str) -> dict:
         except Exception:
             pass
         follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_short_market(symbol)})
+    if not any(call.get("fn") for call in follower_calls):
+        return res
     _broadcast_followers("close_short_market", follower_calls, {"symbol": symbol})
     return res
 
@@ -747,10 +756,15 @@ def _close_followers_short_only(symbol: str) -> None:
         except Exception:
             pass
         follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_short_market(symbol)})
+    if not any(call.get("fn") for call in follower_calls):
+        return
     _broadcast_followers("close_short_market", follower_calls, {"symbol": symbol})
 
 def close_long_market(symbol: str) -> dict:
     res = _EXEC_CLOSE_LONG_MARKET(symbol)
+    admin_status = _extract_status(res)
+    if admin_status == "skip":
+        return res
     followers = FOLLOWER_CONTEXTS
     if not followers:
         return res
@@ -770,7 +784,10 @@ def close_long_market(symbol: str) -> dict:
         except Exception:
             pass
         follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_long_market(symbol)})
+    if not any(call.get("fn") for call in follower_calls):
+        return res
     _broadcast_followers("close_long_market", follower_calls, {"symbol": symbol})
+    return res
     return res
 
 def _close_followers_long_only(symbol: str) -> None:
@@ -816,6 +833,8 @@ def close_long_market_qty(symbol: str, qty: float) -> dict:
         except Exception:
             pass
         follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_long_market_qty(symbol, qty)})
+    if not any(call.get("fn") for call in follower_calls):
+        return res
     _broadcast_followers("close_long_market_qty", follower_calls, {"symbol": symbol})
     return res
 
@@ -840,6 +859,8 @@ def close_short_market_qty(symbol: str, qty: float) -> dict:
         except Exception:
             pass
         follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_short_market_qty(symbol, qty)})
+    if not any(call.get("fn") for call in follower_calls):
+        return res
     _broadcast_followers("close_short_market_qty", follower_calls, {"symbol": symbol})
     return res
 
@@ -960,6 +981,7 @@ NOISE_REVERSE_V1_ENABLED = os.getenv("NOISE_REVERSE_V1_ENABLED", "0") == "1"
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = os.getenv("SRP_ST_REGIME_PULLBACK_V1_ENABLED", "0") == "1"
 WASH_SHORT_SUITE_ENABLED = os.getenv("WASH_SHORT_SUITE_ENABLED", "0") == "1"
 ST_FLIP_V1_ENABLED = os.getenv("ST_FLIP_V1_ENABLED", "0") == "1"
+BULL_PULLBACK_LONG_V1_ENABLED = os.getenv("BULL_PULLBACK_LONG_V1_ENABLED", "0") == "1"
 # Backtest-baseline params (kept identical to backtest)
 ANTI_ALPHA_EMA_LEN = 200
 ANTI_ALPHA_RSI_LEN = 14
@@ -1209,6 +1231,11 @@ COMMON_WARMUP_DAYS = int(os.getenv("COMMON_WARMUP_DAYS", "1"))
 COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m,3m").split(",") if tf.strip())
 COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "30"))
 COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "false", "off", "no")
+COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
+COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "8"))
+COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "40"))
+COMMON_WARMUP_NOTIFY_COOLDOWN_SEC = int(os.getenv("COMMON_WARMUP_NOTIFY_COOLDOWN_SEC", "3600"))
+_COMMON_WARMUP_NOTIFY_TS_MEM = 0.0
 COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "40"))
 COMMON_UNIVERSE_LOG_PATH = ""
 COMMON_WARMUP_LOG_PATH = ""
@@ -1541,6 +1568,8 @@ def _build_common_universe(tickers: dict, symbols: list) -> list:
     shared_top_n = cfg_vals.get("universe_top_n")
     if not isinstance(shared_top_n, int):
         shared_top_n = rsi_cfg.universe_top_n if rsi_cfg else 50
+    if COMMON_UNIVERSE_TOP_N:
+        shared_top_n = COMMON_UNIVERSE_TOP_N
     anchors = ("BTC/USDT:USDT", "ETH/USDT:USDT")
     if build_universe_from_tickers:
         shared_universe = build_universe_from_tickers(
@@ -1568,7 +1597,7 @@ def _build_common_universe(tickers: dict, symbols: list) -> list:
                 continue
             pct_all_map[s] = pct
             qv_all_map[s] = qv
-        shared_universe = [s for s, _ in sorted(pct_all_map.items(), key=lambda x: abs(x[1]), reverse=True)]
+        shared_universe = [s for s, p in sorted(pct_all_map.items(), key=lambda x: x[1]) if p < 0]
         shared_universe = [s for s in shared_universe if qv_all_map.get(s, 0) >= shared_min_qv]
         shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
         if shared_top_n:
@@ -1768,6 +1797,56 @@ def _date_str_kst(ts: float) -> str:
         return dt.strftime("%Y-%m-%d")
     except Exception:
         return "unknown"
+
+def _reset_common_warmup_state(state: dict) -> None:
+    state["_common_warmup_start_ts"] = time.time()
+    state["_common_warmup_done"] = False
+    state.pop("_common_warmup_plan", None)
+    state.pop("_common_warmup_idx", None)
+    state.pop("_common_warmup_ts_logged", None)
+    state.pop("_common_warmup_progress_ts", None)
+    state.pop("_common_warmup_missing_pass", None)
+    state.pop("_common_warmup_backoff_until", None)
+    state.pop("_common_warmup_backoff_secs", None)
+    meta = state.setdefault("_meta", {}) if isinstance(state, dict) else {}
+    if isinstance(meta, dict):
+        meta.pop("common_warmup_notified", None)
+        meta.pop("common_warmup_notified_day", None)
+        meta.pop("common_warmup_last_notify_ts", None)
+
+def _maybe_daily_refresh_common_universe(state: dict, tickers: dict, symbols: list) -> bool:
+    if not COMMON_UNIVERSE_REFRESH_ENABLED:
+        return False
+    try:
+        now_kst = _kst_now()
+        if now_kst.hour < COMMON_UNIVERSE_REFRESH_HOUR:
+            return False
+        today = now_kst.strftime("%Y-%m-%d")
+        if state.get("_common_universe_refresh_date") == today:
+            return False
+    except Exception:
+        return False
+    try:
+        refreshed = _build_common_universe(tickers, symbols)
+        state["_common_universe"] = list(refreshed)
+        state["_common_universe_ready"] = True
+        state["_common_universe_refresh_date"] = today
+        if COMMON_UNIVERSE_LOG_PATH and refreshed:
+            try:
+                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE daily_refresh size={len(refreshed)}"])
+                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, refreshed)
+            except Exception:
+                pass
+        try:
+            os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
+            with open(os.path.join("logs", "common_universe", "latest.txt"), "w", encoding="utf-8") as f:
+                f.write("\n".join(refreshed))
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"[common-universe] daily refresh failed: {e}")
+        return False
 
 def _report_day_str(ts: float) -> str:
     try:
@@ -6007,6 +6086,324 @@ def _run_srp_st_regime_pullback_v1_cycle(
     )
     return result
 
+def _run_bull_pullback_long_v1_cycle(
+    bull_universe,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"entries": 0}
+    if not BULL_PULLBACK_LONG_V1_ENABLED or not bull_universe or BullPullbackLongConfig is None:
+        return result
+    cfg = BullPullbackLongConfig()
+    start_ts = time.time()
+    checked = 0
+    no_signal = 0
+    no_data = 0
+    gate_stats = {
+        "btc_fail": 0,
+        "trend_fail": 0,
+        "pullback_fail": 0,
+        "exec_fail": 0,
+        "cooldown": 0,
+        "already_in_pos": 0,
+        "no_data_tr": 0,
+        "no_data_main": 0,
+        "no_data_exec": 0,
+    }
+
+    def _bull_skip(sym: str, reason: str) -> None:
+        _append_entry_gate_log("bull_pullback_long_v1", sym, reason, side="LONG")
+
+    # BTC filter (market safety)
+    if cfg.btc_filter and cfg.btc_symbol:
+        min_btc_1h = max(cfg.ema_trend_slow + 10, cfg.ema_trend_mid + 10, cfg.ema_trend_fast + 10)
+        min_btc_15m = max(cfg.btc_rsi_len + 5, 80)
+        min_btc_1m = 3
+        min_btc_5m = max(cfg.btc_atr_lookback + 5, cfg.btc_atr_len + 10)
+        df_btc_1h = cycle_cache.get_df(cfg.btc_symbol, cfg.tf_trend, limit=min_btc_1h)
+        df_btc_15m = cycle_cache.get_df(cfg.btc_symbol, "15m", limit=min_btc_15m)
+        df_btc_1m = cycle_cache.get_df(cfg.btc_symbol, "1m", limit=min_btc_1m)
+        df_btc_5m = cycle_cache.get_df(cfg.btc_symbol, "5m", limit=min_btc_5m)
+        btc_1h = df_btc_1h.iloc[:-1] if isinstance(df_btc_1h, pd.DataFrame) and len(df_btc_1h) > 1 else None
+        btc_15m = df_btc_15m.iloc[:-1] if isinstance(df_btc_15m, pd.DataFrame) and len(df_btc_15m) > 1 else None
+        btc_1m = df_btc_1m.iloc[:-1] if isinstance(df_btc_1m, pd.DataFrame) and len(df_btc_1m) > 1 else None
+        btc_5m = df_btc_5m.iloc[:-1] if isinstance(df_btc_5m, pd.DataFrame) and len(df_btc_5m) > 1 else None
+        if (
+            btc_1h is None or len(btc_1h) < min_btc_1h
+            or btc_15m is None or len(btc_15m) < min_btc_15m
+            or btc_1m is None or len(btc_1m) < 2
+            or btc_5m is None or len(btc_5m) < min_btc_5m
+        ):
+            gate_stats["btc_fail"] += len(bull_universe)
+            return result
+        ema20_btc = ema(btc_1h["close"], cfg.ema_trend_fast)
+        ema60_btc = ema(btc_1h["close"], cfg.ema_trend_mid)
+        idx_btc = len(btc_1h) - 1
+        if float(btc_1h.iloc[idx_btc]["close"]) <= float(ema60_btc.iloc[idx_btc]):
+            gate_stats["btc_fail"] += len(bull_universe)
+            return result
+        if float(ema20_btc.iloc[idx_btc]) < float(ema60_btc.iloc[idx_btc]):
+            gate_stats["btc_fail"] += len(bull_universe)
+            return result
+        rsi_btc_15m = _adv_rsi(btc_15m["close"], cfg.btc_rsi_len)
+        if float(rsi_btc_15m.iloc[-1]) < float(cfg.btc_rsi_min):
+            gate_stats["btc_fail"] += len(bull_universe)
+            return result
+        prev_close = float(btc_1m.iloc[-2]["close"])
+        cur_close = float(btc_1m.iloc[-1]["close"])
+        if prev_close > 0:
+            chg_1m = (cur_close / prev_close - 1.0) * 100.0
+            if chg_1m <= float(cfg.btc_drop_1m_pct):
+                gate_stats["btc_fail"] += len(bull_universe)
+                return result
+        atr_5m = atr(btc_5m, cfg.btc_atr_len)
+        atr_now = float(atr_5m.iloc[-1]) if not np.isnan(atr_5m.iloc[-1]) else 0.0
+        atr_avg = float(atr_5m.iloc[-cfg.btc_atr_lookback :].mean()) if len(atr_5m) >= cfg.btc_atr_lookback else float(atr_5m.mean())
+        if atr_avg > 0 and (atr_now / atr_avg) > float(cfg.btc_atr_mult_max):
+            gate_stats["btc_fail"] += len(bull_universe)
+            return result
+
+    for symbol in bull_universe:
+        checked += 1
+        st = state.get(symbol, {}) if isinstance(state, dict) else {}
+        if _is_in_pos_side(st, "LONG"):
+            gate_stats["already_in_pos"] += 1
+            continue
+        cooldown_until = st.get("bull_pullback_long_v1_cooldown_until")
+        if isinstance(cooldown_until, (int, float)) and time.time() < float(cooldown_until):
+            gate_stats["cooldown"] += 1
+            continue
+
+        # load data
+        min_tr = max(cfg.ema_trend_slow + 10, cfg.ema_trend_mid + 10, cfg.ema_trend_fast + 10)
+        min_main = max(cfg.bb_len + 5, cfg.fib_lookback + 5, cfg.ema_trend_fast + 10, cfg.atr_len + 5)
+        min_exec = max(cfg.rsi_len + 5, cfg.ema_exec_mid + 5, 50)
+        df_tr = cycle_cache.get_df(symbol, cfg.tf_trend, limit=min_tr)
+        df_main = cycle_cache.get_df(symbol, cfg.tf_main, limit=min_main)
+        df_ex = cycle_cache.get_df(symbol, cfg.tf_exec, limit=min_exec)
+
+        df_tr_sig = df_tr.iloc[:-1] if isinstance(df_tr, pd.DataFrame) and len(df_tr) > 1 else None
+        df_main_sig = df_main.iloc[:-1] if isinstance(df_main, pd.DataFrame) and len(df_main) > 1 else None
+        df_ex_sig = df_ex.iloc[:-1] if isinstance(df_ex, pd.DataFrame) and len(df_ex) > 1 else None
+        if (
+            df_tr_sig is None
+            or df_main_sig is None
+            or df_ex_sig is None
+            or len(df_tr_sig) < min_tr
+            or len(df_main_sig) < min_main
+            or len(df_ex_sig) < min_exec
+        ):
+            no_data += 1
+            if df_tr_sig is None or len(df_tr_sig) < min_tr:
+                gate_stats["no_data_tr"] += 1
+            if df_main_sig is None or len(df_main_sig) < min_main:
+                gate_stats["no_data_main"] += 1
+            if df_ex_sig is None or len(df_ex_sig) < min_exec:
+                gate_stats["no_data_exec"] += 1
+            continue
+
+        # trend filter (1h)
+        idx_tr = len(df_tr_sig) - 1
+        ema20_tr = ema(df_tr_sig["close"], cfg.ema_trend_fast)
+        ema60_tr = ema(df_tr_sig["close"], cfg.ema_trend_mid)
+        ema120_tr = ema(df_tr_sig["close"], cfg.ema_trend_slow)
+        slope_len = max(1, int(cfg.ema_trend_slope_len))
+        if idx_tr - slope_len <= 0:
+            gate_stats["trend_fail"] += 1
+            continue
+        trend_ok = (
+            float(df_tr_sig.iloc[idx_tr]["close"]) > float(ema120_tr.iloc[idx_tr])
+            and float(ema20_tr.iloc[idx_tr]) > float(ema60_tr.iloc[idx_tr])
+            and (ema20_tr.iloc[idx_tr] - ema20_tr.iloc[idx_tr - slope_len]) > 0
+        )
+        if not trend_ok:
+            gate_stats["trend_fail"] += 1
+            continue
+
+        # main frame setup (15m)
+        idx_main = len(df_main_sig) - 1
+        close_main = float(df_main_sig.iloc[idx_main]["close"])
+        open_main = float(df_main_sig.iloc[idx_main]["open"])
+        vol_main = float(df_main_sig.iloc[idx_main]["volume"])
+        vol_sma_main = df_main_sig["volume"].astype(float).rolling(cfg.vol_sma_len).mean()
+        vol_avg = float(vol_sma_main.iloc[idx_main]) if not np.isnan(vol_sma_main.iloc[idx_main]) else 0.0
+        vol_pullback_ok = True
+        if open_main > close_main and vol_avg > 0:
+            vol_pullback_ok = (vol_main / vol_avg) <= cfg.vol_pullback_max
+
+        swing_start = max(0, idx_main - cfg.fib_lookback + 1)
+        swing_high = float(df_main_sig["high"].iloc[swing_start: idx_main + 1].max())
+        swing_low = float(df_main_sig["low"].iloc[swing_start: idx_main + 1].min())
+        fibs = _fib_levels_up(swing_high, swing_low)
+        fib_382 = fibs.get("0.382")
+        fib_50 = fibs.get("0.5")
+        fib_618 = fibs.get("0.618")
+
+        bb_mid, bb_upper, bb_lower = _bbands(df_main_sig["close"], cfg.bb_len, cfg.bb_std)
+        bbm = float(bb_mid.iloc[idx_main]) if not np.isnan(bb_mid.iloc[idx_main]) else close_main
+        bbl = float(bb_lower.iloc[idx_main]) if not np.isnan(bb_lower.iloc[idx_main]) else close_main
+        prev_close_main = float(df_main_sig.iloc[idx_main - 1]["close"]) if idx_main > 0 else close_main
+        fakeout = prev_close_main < bbm and close_main > bbm
+        fib_norm_ok = False
+        if isinstance(fib_382, (int, float)) and isinstance(fib_50, (int, float)):
+            low_zone = min(fib_382, fib_50) * (1.0 - cfg.fib_eps)
+            high_zone = max(fib_382, fib_50) * (1.0 + cfg.fib_eps)
+            fib_norm_ok = low_zone <= close_main <= high_zone
+
+        deep_zone_ok = False
+        if isinstance(fib_618, (int, float)):
+            low_zone = float(fib_618) * (1.0 - cfg.fib_eps)
+            high_zone = float(fib_618) * (1.0 + cfg.fib_eps)
+            deep_zone_ok = low_zone <= close_main <= high_zone
+        if close_main <= bbl:
+            deep_zone_ok = True
+
+        # exec frame (1m)
+        idx_ex = len(df_ex_sig) - 1
+        ex = df_ex_sig.iloc[idx_ex]
+        ex_open = float(ex["open"])
+        ex_close = float(ex["close"])
+        ex_high = float(ex["high"])
+        ex_low = float(ex["low"])
+        ex_range = max(ex_high - ex_low, 1e-9)
+        lower_wick = min(ex_open, ex_close) - ex_low
+        lower_wick_ratio = lower_wick / ex_range
+        ema10_ex = ema(df_ex_sig["close"], cfg.ema_exec_fast)
+        ema20_ex = ema(df_ex_sig["close"], cfg.ema_exec_mid)
+        ema_touch = False
+        if not np.isnan(ema10_ex.iloc[idx_ex]) and ex_low <= float(ema10_ex.iloc[idx_ex]) * (1.0 + cfg.exec_ema_touch_eps):
+            ema_touch = True
+        if not np.isnan(ema20_ex.iloc[idx_ex]) and ex_low <= float(ema20_ex.iloc[idx_ex]) * (1.0 + cfg.exec_ema_touch_eps):
+            ema_touch = True
+
+        rsi_ex = _adv_rsi(df_ex_sig["close"], cfg.rsi_len)
+        rsi_now = float(rsi_ex.iloc[idx_ex])
+        rsi_prev = float(rsi_ex.iloc[idx_ex - 1]) if idx_ex > 0 else rsi_now
+
+        pullback_gain = 0.0
+        if idx_main >= 1:
+            pb_low = float(df_main_sig["low"].iloc[max(0, idx_main - 1): idx_main + 1].min())
+            pb_high = float(df_main_sig["high"].iloc[max(0, idx_main - 1): idx_main + 1].max())
+            if pb_low > 0:
+                pullback_gain = (pb_high - pb_low) / pb_low
+
+        aggressive_ok = (
+            ema_touch
+            and lower_wick_ratio >= cfg.exec_wick_min
+            and cfg.rsi_aggr_min <= rsi_now <= cfg.rsi_aggr_max
+            and (rsi_now >= rsi_prev)
+        )
+        normal_ok = fakeout and fib_norm_ok
+        deep_ok = deep_zone_ok and cfg.rsi_deep_min <= rsi_now <= cfg.rsi_deep_max and ex_close > ex_open
+
+        if not vol_pullback_ok:
+            gate_stats["pullback_fail"] += 1
+            no_signal += 1
+            continue
+        if pullback_gain < cfg.pullback_gain_min:
+            gate_stats["pullback_fail"] += 1
+            no_signal += 1
+            continue
+
+        entry_type = None
+        support_price = None
+        if aggressive_ok:
+            entry_type = "aggressive"
+            support_price = float(ema20_ex.iloc[idx_ex]) if not np.isnan(ema20_ex.iloc[idx_ex]) else ex_low
+        elif normal_ok:
+            entry_type = "normal"
+            support_price = float(bbm)
+        elif deep_ok:
+            entry_type = "deep"
+            support_price = float(fib_618) if isinstance(fib_618, (int, float)) else float(bbl)
+
+        if not entry_type:
+            gate_stats["exec_fail"] += 1
+            no_signal += 1
+            continue
+
+        if not _entry_guard_acquire(
+            state,
+            symbol,
+            ttl_sec=5.0,
+            key=f"bull_pullback_long_v1:{symbol}:LONG",
+            engine="bull_pullback_long_v1",
+            side="LONG",
+        ):
+            continue
+
+        usdt = _resolve_entry_usdt()
+        if usdt <= 0 or not _admin_is_active():
+            no_signal += 1
+            continue
+
+        atr_main = atr(df_main_sig, cfg.atr_len)
+        atr_px = float(atr_main.iloc[idx_main]) if not np.isnan(atr_main.iloc[idx_main]) else 0.0
+        entry_px = float(ex_close)
+        if support_price is None:
+            support_price = entry_px
+        sl_price = support_price - (atr_px * cfg.sl_atr_mult if atr_px > 0 else entry_px * 0.01)
+        tp_pct = None
+        if isinstance(swing_high, (int, float)) and swing_high > entry_px:
+            tp_pct = (float(swing_high) - entry_px) / entry_px * 100.0
+        if not isinstance(tp_pct, (int, float)) or tp_pct <= 0:
+            tp_pct = float(cfg.tp_fallback_pct) * 100.0
+
+        req_id = _enqueue_entry_request(
+            state,
+            symbol=symbol,
+            side="LONG",
+            engine="BULL_PULLBACK_LONG_V1",
+            reason="bull_pullback_long_v1",
+            usdt=usdt,
+            live=LONG_LIVE_TRADING,
+            alert_reason="bull_pullback_long_v1",
+            entry_price_hint=entry_px,
+            meta={
+                "sl_price": float(sl_price),
+                "tp_pct": float(tp_pct),
+                "entry_type": entry_type,
+            },
+        )
+        if not req_id:
+            no_signal += 1
+            continue
+
+        if (not MANAGE_WS_MODE) and not (isinstance(state, dict) and state.get("_manage_ws_mode")):
+            _send_entry_alert(
+                send_alert,
+                side="LONG",
+                symbol=symbol,
+                engine="BULL_PULLBACK_LONG_V1",
+                entry_price=entry_px,
+                usdt=usdt,
+                reason=_display_engine_label("BULL_PULLBACK_LONG_V1"),
+                sl=f"{float(sl_price):.6g}",
+                tp=None,
+                entry_order_id=req_id,
+                extras=[f"타입: {entry_type}"],
+                state=state,
+            )
+
+        result["entries"] += 1
+        if isinstance(state, dict):
+            st = state.get(symbol, {})
+            if not isinstance(st, dict):
+                st = {}
+            cooldown_sec = cfg.cooldown_bars * 60
+            st["bull_pullback_long_v1_cooldown_until"] = time.time() + cooldown_sec
+            state[symbol] = st
+
+    elapsed = time.time() - start_ts
+    _append_entry_log(
+        f"bull_pullback_long_v1/bull_pullback_long_v1-{time.strftime('%Y%m%d')}.log",
+        f"BULL_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} "
+        f"no_signal={no_signal} no_data={no_data} gates={gate_stats}",
+    )
+    return result
+
+
 def _run_wash_short_suite_cycle(
     wash_universe,
     state,
@@ -6106,11 +6503,12 @@ def _run_wash_short_suite_cycle(
         i_ex = len(df_ex_sig) - 1
         row_ex = df_ex_sig.iloc[i_ex]
         ts_ms = int(row_ex["ts"])
+        latest_ts_ms = int(df_ex.iloc[-1]["ts"])
         sym_state = wash_state.setdefault(symbol, {})
-        if sym_state.get("last_eval_ts") == ts_ms:
+        if sym_state.get("last_eval_ts") == latest_ts_ms:
             gate_stats["skip_stale_ts"] += 1
             continue
-        sym_state["last_eval_ts"] = ts_ms
+        sym_state["last_eval_ts"] = latest_ts_ms
 
         ema20_tr = ema(df_tr_sig["close"], cfg.ema_fast)
         ema60_tr = ema(df_tr_sig["close"], cfg.ema_mid)
@@ -6174,7 +6572,7 @@ def _run_wash_short_suite_cycle(
 
         # Step 3: exec trigger
         rsi_ex = _adv_rsi(df_ex_sig["close"], cfg.rsi_len)
-        vol_sma_ex = df_ex_sig["volume"].astype(float).rolling(cfg.vol_sma_len).mean()
+        vol_sma_ex = df_ex["volume"].astype(float).rolling(cfg.vol_sma_len).mean()
         rsi_now = float(rsi_ex.iloc[i_ex])
         rsi_prev = float(rsi_ex.iloc[i_ex - 1]) if i_ex > 0 else rsi_now
         rsi_turn = cfg.rsi_min <= rsi_now <= cfg.rsi_max and (rsi_now + cfg.rsi_lower_high_delta) < rsi_prev
@@ -6207,6 +6605,13 @@ def _run_wash_short_suite_cycle(
         entry_rng = max(entry_high - entry_low, 1e-9)
         entry_close_pos = (entry_close - entry_low) / entry_rng
         entry_vol = float(entry["volume"])
+        if i_ex + 1 >= len(vol_sma_ex):
+            no_data += 1
+            gate_stats["skip_eval"] += 1
+            gate_stats["no_data_exec"] += 1
+            if len(no_data_samples) < 5:
+                no_data_samples.append(f"{symbol} entry_vol_missing ex_len={len(df_ex)} i_ex={i_ex}")
+            continue
         entry_vol_avg = float(vol_sma_ex.iloc[i_ex + 1]) if not np.isnan(vol_sma_ex.iloc[i_ex + 1]) else 0.0
         entry_vol_ratio = (entry_vol / entry_vol_avg) if entry_vol_avg > 0 else 0.0
         if entry_high > float(cur["high"]) * cfg.entry_block_high_mult:
@@ -6249,20 +6654,21 @@ def _run_wash_short_suite_cycle(
             place_short_sl_px(symbol, float(sl_price))
         except Exception:
             pass
-        _send_entry_alert(
-            send_alert,
-            side="SHORT",
-            symbol=symbol,
-            engine="WASH_SHORT_SUITE",
-            entry_price=entry_px,
-            usdt=usdt,
-            reason=_display_engine_label("WASH_SHORT_SUITE"),
-            sl=f"{float(sl_price):.6g}",
-            tp=f"{float(tp_price):.6g}",
-            entry_order_id=req_id,
-            extras=["기준: Wash Short Suite"],
-            state=state,
-        )
+        if (not MANAGE_WS_MODE) and not (isinstance(state, dict) and state.get("_manage_ws_mode")):
+            _send_entry_alert(
+                send_alert,
+                side="SHORT",
+                symbol=symbol,
+                engine="WASH_SHORT_SUITE",
+                entry_price=entry_px,
+                usdt=usdt,
+                reason=_display_engine_label("WASH_SHORT_SUITE"),
+                sl=f"{float(sl_price):.6g}",
+                tp=f"{float(tp_price):.6g}",
+                entry_order_id=req_id,
+                extras=["기준: Wash Short Suite"],
+                state=state,
+            )
         result["entries"] += 1
 
     elapsed = time.time() - start_ts
@@ -7149,6 +7555,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "ST_FLIP_V1"
     if key in ("wash_short_suite", "wash_suite"):
         return "WASH_SHORT_SUITE"
+    if key in ("bull_pullback_long_v1", "bull_pullback_long"):
+        return "BULL_PULLBACK_LONG_V1"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -7171,6 +7579,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "short_entry"
     if label == "WASH_SHORT_SUITE":
         return "wash_short_suite"
+    if label == "BULL_PULLBACK_LONG_V1":
+        return "bull_pullback_long_v1"
     if label == "SCALP":
         return "long_entry"
     if label == "MANUAL":
@@ -7201,6 +7611,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "SRP_ST_REGIME_PULLBACK_V1": "SRP-ST풀백v1",
         "ST_FLIP_V1": "ST플립v1",
         "WASH_SHORT_SUITE": "워시숏슈트",
+        "BULL_PULLBACK_LONG_V1": "불풀백롱v1",
     }
     return overrides.get(name, name)
 
@@ -7232,6 +7643,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return ST_FLIP_V1_ENABLED
     if key == "WASH_SHORT_SUITE":
         return WASH_SHORT_SUITE_ENABLED
+    if key == "BULL_PULLBACK_LONG_V1":
+        return BULL_PULLBACK_LONG_V1_ENABLED
     if key in ("RSI", "SCALP"):
         return RSI_ENABLED
     if key in ("MANUAL", "UNKNOWN", ""):
@@ -9963,6 +10376,7 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             "NOISE_REVERSE_V1",
             "ST_FLIP_V1",
             "WASH_SHORT_SUITE",
+            "BULL_PULLBACK_LONG_V1",
             "MANUAL",
             "UNKNOWN",
         }
@@ -10017,8 +10431,8 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
                 )
                 status[req_id] = {"status": "failed", "ts": time.time(), "reason": "off_window"}
                 continue
-        ok = _execute_manage_entry_request(state, req, send_telegram)
-        status[req_id] = {"status": "done" if ok else "failed", "ts": time.time()}
+        ok, reason = _execute_manage_entry_request(state, req, send_telegram)
+        status[req_id] = {"status": "done" if ok else "failed", "ts": time.time(), "reason": reason}
 
 def _record_position_event(
     symbol: str,
@@ -10332,15 +10746,15 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                 except Exception:
                     pass
 
-def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool:
+def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tuple[bool, str]:
     symbol = req.get("symbol")
     side = str(req.get("side") or "").upper()
     if not symbol or side not in ("LONG", "SHORT"):
-        return False
+        return False, "bad_request"
     engine = str(req.get("engine") or "").upper()
     if engine and not _is_engine_enabled(engine):
         _clear_manage_pending(state, symbol, side)
-        return False
+        return False, "engine_disabled"
     try:
         refresh_positions_cache(force=True)
     except Exception:
@@ -10367,7 +10781,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
     if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS and not is_multi_req:
         _clear_manage_pending(state, symbol, side)
         _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, f"pos_limit={cur_total}/{MAX_OPEN_POSITIONS}", side=side)
-        return False
+        return False, "pos_limit"
     try:
         if side == "SHORT" and get_short_position_amount(symbol) > 0 and not is_multi_req:
             _clear_manage_pending(state, symbol, side)
@@ -10376,7 +10790,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
                 _append_swaggy_no_atlas_log(
                     f"SWAGGY_NO_ATLAS_MANAGE_SKIP sym={symbol} side={side} reason=ALREADY_IN_POSITION"
                 )
-            return True
+            return True, "already_in_position"
         if side == "LONG" and get_long_position_amount(symbol) > 0 and not is_multi_req:
             _clear_manage_pending(state, symbol, side)
             _append_entry_gate_log(engine.lower() if engine else "unknown", symbol, "already_in_position", side=side)
@@ -10384,7 +10798,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
                 _append_swaggy_no_atlas_log(
                     f"SWAGGY_NO_ATLAS_MANAGE_SKIP sym={symbol} side={side} reason=ALREADY_IN_POSITION"
                 )
-            return True
+            return True, "already_in_position"
     except Exception:
         pass
     live = bool(req.get("live"))
@@ -10402,7 +10816,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
     except Exception as e:
         print(f"[manage-queue] execute failed sym={symbol} side={side} err={e}")
         _clear_manage_pending(state, symbol, side)
-        return False
+        return False, "execute_failed"
     entry_order_id = _order_id_from_res(res)
     fill_price = res.get("last") or (res.get("order") or {}).get("average") or (res.get("order") or {}).get("price")
     qty = res.get("amount") or (res.get("order") or {}).get("amount")
@@ -10459,7 +10873,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         cur_engine = str(req.get("engine") or "").upper()
         if recent_ts and (time.time() - recent_ts) <= 120.0 and (not cur_engine or cur_engine == recent_engine):
             _clear_manage_pending(state, symbol, side)
-            return True
+            return True, "duplicate_alert_skipped"
 
     sl_disp = None
     tp_disp = None
@@ -10505,7 +10919,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> bool
         state=state,
     )
     _clear_manage_pending(state, symbol, side)
-    return True
+    return True, "ok"
 
 
 def _adv_place_be_stop_all(symbol: str, side: str, entry_px: float) -> None:
@@ -11559,7 +11973,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
-    global ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, WASH_SHORT_SUITE_ENABLED
+    global ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, WASH_SHORT_SUITE_ENABLED, BULL_PULLBACK_LONG_V1_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -11613,6 +12027,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_swaggy_no_atlas_delay_vol_mult",
         "_swaggy_no_atlas_delay_vol_ma",
         "_swaggy_no_atlas_delay_sweep_lookback",
+        "_bull_pullback_long_v1_enabled",
         "_adv_trend_enabled",
         "_adv_trend_min_qv",
         "_adv_trend_universe_top_n",
@@ -11745,6 +12160,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         state["_srp_st_regime_pullback_v1_enabled"] = False
     if (not skip_keys or "_wash_short_suite_enabled" not in skip_keys) and isinstance(state.get("_wash_short_suite_enabled"), bool):
         WASH_SHORT_SUITE_ENABLED = bool(state.get("_wash_short_suite_enabled"))
+    if (not skip_keys or "_bull_pullback_long_v1_enabled" not in skip_keys) and isinstance(state.get("_bull_pullback_long_v1_enabled"), bool):
+        BULL_PULLBACK_LONG_V1_ENABLED = bool(state.get("_bull_pullback_long_v1_enabled"))
     if (not skip_keys or "_adv_trend_min_qv" not in skip_keys) and isinstance(state.get("_adv_trend_min_qv"), (int, float)):
         ADV_TREND_MIN_QV = float(state.get("_adv_trend_min_qv"))
     if (not skip_keys or "_adv_trend_universe_top_n" not in skip_keys) and isinstance(state.get("_adv_trend_universe_top_n"), (int, float)):
@@ -12016,6 +12433,7 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_st_flip_v1_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_rsi_enabled",
+        "_bull_pullback_long_v1_enabled",
         "_dtfx_enabled",
         "_atlas_rs_fail_short_enabled",
         "_tg_offset",
@@ -12496,7 +12914,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, WASH_SHORT_SUITE_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, WASH_SHORT_SUITE_ENABLED, BULL_PULLBACK_LONG_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     if not BOT_TOKEN:
@@ -13127,6 +13545,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"st_flip={'ON' if ST_FLIP_V1_ENABLED else 'OFF'}(alert_only={'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}) "
                             f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
                             f"wash_suite={'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'} "
+                            f"bull_pullback={'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'} "
                             f"swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
                             f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -13139,6 +13558,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             "--------------\n"
                             f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
                             f"/wash_short_suite(추가진입): {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
+                            f"/bull_pullback_long_v1(롱): {'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -13192,12 +13612,14 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"st_flip={'ON' if ST_FLIP_V1_ENABLED else 'OFF'}(alert_only={'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}) "
                         f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
                         f"wash_suite={'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'} "
+                        f"bull_pullback={'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'} "
                         f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
                         f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
                         ""
                         "--------------\n"
                         f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
                         f"/wash_short_suite(추가진입): {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
+                        f"/bull_pullback_long_v1(롱): {'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'}\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
                         f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                         ""
@@ -13698,6 +14120,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] wash_short_suite cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
+                if (cmd in ("/bull_pullback_long_v1", "bull_pullback_long_v1", "bull_pullback_long")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        BULL_PULLBACK_LONG_V1_ENABLED = True
+                        state["_bull_pullback_long_v1_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ bull_pullback_long_v1 ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        BULL_PULLBACK_LONG_V1_ENABLED = False
+                        state["_bull_pullback_long_v1_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ bull_pullback_long_v1 OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ bull_pullback_long_v1 상태: {'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'}\n"
+                            "사용법: /bull_pullback_long_v1 on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] bull_pullback_long_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
                 if (cmd in ("/loss_hedge_engine", "loss_hedge_engine")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -13972,6 +14417,25 @@ def _adv_atr(df: pd.DataFrame, length: int) -> pd.Series:
 
 def atr(df: pd.DataFrame, length: int) -> pd.Series:
     return _adv_atr(df, length)
+
+def _bbands(series: pd.Series, length: int, std_mult: float) -> tuple[pd.Series, pd.Series, pd.Series]:
+    mid = series.rolling(length).mean()
+    std = series.rolling(length).std()
+    upper = mid + (std_mult * std)
+    lower = mid - (std_mult * std)
+    return mid, upper, lower
+
+def _fib_levels_up(swing_high: float, swing_low: float) -> dict:
+    if not isinstance(swing_high, (int, float)) or not isinstance(swing_low, (int, float)):
+        return {}
+    if swing_high <= swing_low:
+        return {}
+    diff = swing_high - swing_low
+    return {
+        "0.382": swing_high - diff * 0.382,
+        "0.5": swing_high - diff * 0.5,
+        "0.618": swing_high - diff * 0.618,
+    }
 
 def _adv_mfi(df: pd.DataFrame, length: int) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -14669,6 +15133,7 @@ def run():
     global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, RATE_LIMIT_LOG_TS, _LAST_ACCOUNT_REFRESH_TS
     global TOTAL_CYCLES, TOTAL_ELAPSED, TOTAL_REST_CALLS, TOTAL_429_COUNT
     global MANAGE_LOOP_ENABLED, MANAGE_WS_MODE
+    global COMMON_WARMUP_DONE, COMMON_UNIVERSE_READY, COMMON_UNIVERSE, _COMMON_WARMUP_NOTIFY_TS_MEM
     _install_error_hooks()
     print("[시작] RSI 스캐너 초기화 중...")
     symbols = get_symbols()
@@ -14788,7 +15253,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, BULL_PULLBACK_LONG_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global REALTIME_ONLY_ENABLED
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS, SWAGGY_NO_ATLAS_USE_WICK_BREAK
@@ -15019,6 +15484,10 @@ def run():
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
         state["_dtfx_enabled"] = DTFX_ENABLED
+    if isinstance(state.get("_bull_pullback_long_v1_enabled"), bool):
+        BULL_PULLBACK_LONG_V1_ENABLED = bool(state.get("_bull_pullback_long_v1_enabled"))
+    else:
+        state["_bull_pullback_long_v1_enabled"] = BULL_PULLBACK_LONG_V1_ENABLED
     if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
         state["_swaggy_no_atlas_enabled"] = False
     if isinstance(state.get("_swaggy_atlas_lab_v2_enabled"), dict):
@@ -15081,7 +15550,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /noise_reverse_v1 on|off|status, /wash_short_suite on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /noise_reverse_v1 on|off|status, /wash_short_suite on|off|status, /bull_pullback_long_v1 on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -15341,6 +15810,14 @@ def run():
                         time.sleep(10)
                         continue
 
+                    # daily common universe refresh (KST)
+                    if _maybe_daily_refresh_common_universe(state, tickers, symbols):
+                        COMMON_UNIVERSE = list(state.get("_common_universe") or [])
+                        COMMON_UNIVERSE_READY = True
+                        COMMON_WARMUP_DONE = False
+                        _reset_common_warmup_state(state)
+                        print(f"[common-universe] daily refresh done size={len(COMMON_UNIVERSE)}")
+
                     if not COMMON_UNIVERSE_READY or not isinstance(state.get("_common_universe"), list):
                         COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
                         state["_common_universe"] = list(COMMON_UNIVERSE)
@@ -15385,6 +15862,14 @@ def run():
                     atlas_rs_fail_short_universe = list(shared_universe)
                     wash_short_suite_universe = list(shared_universe)
                     wash_short_suite_universe_len = len(wash_short_suite_universe)
+                    wash_universe_path = os.getenv("WASH_SHORT_SUITE_UNIVERSE_FILE", "").strip()
+                    if wash_universe_path:
+                        try:
+                            with open(wash_universe_path, "r", encoding="utf-8") as f:
+                                wash_short_suite_universe = [line.strip() for line in f.read().splitlines() if line.strip()]
+                            wash_short_suite_universe_len = len(wash_short_suite_universe)
+                        except Exception:
+                            pass
                     swaggy_cfg = SwaggyConfig() if SwaggyConfig else None
                     swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig() if SwaggyAtlasLabConfig else None
                     swaggy_atlas_lab_atlas_cfg = SwaggyAtlasLabAtlasConfig() if SwaggyAtlasLabAtlasConfig else None
@@ -15419,7 +15904,19 @@ def run():
                                 print(f"[common-warmup] progress {idx}/{len(plan)}")
                                 time.sleep(1.0)
                             continue
-                        if not state.get("_common_warmup_notified"):
+                        now_ts = time.time()
+                        today_kst = _date_str_kst(now_ts)
+                        recently_notified = False
+                        if _COMMON_WARMUP_NOTIFY_TS_MEM and (now_ts - _COMMON_WARMUP_NOTIFY_TS_MEM) < COMMON_WARMUP_NOTIFY_COOLDOWN_SEC:
+                            recently_notified = True
+                        meta = state.setdefault("_meta", {}) if isinstance(state, dict) else {}
+                        last_ts = meta.get("common_warmup_last_notify_ts") if isinstance(meta, dict) else None
+                        if isinstance(last_ts, (int, float)) and (now_ts - float(last_ts)) < COMMON_WARMUP_NOTIFY_COOLDOWN_SEC:
+                            recently_notified = True
+                        already_today = False
+                        if isinstance(meta, dict):
+                            already_today = bool(meta.get("common_warmup_notified")) and meta.get("common_warmup_notified_day") == today_kst
+                        if (not already_today) and not recently_notified:
                             try:
                                 start_ts = float(state.get("_common_warmup_start_ts") or state.get("_startup_ts") or time.time())
                                 elapsed = max(0, time.time() - start_ts)
@@ -15428,7 +15925,12 @@ def run():
                                 send_telegram(f"✅ 공통 워밍업 완료 (경과 {mins}m {secs}s)")
                             except Exception:
                                 pass
-                            state["_common_warmup_notified"] = True
+                            if isinstance(meta, dict):
+                                meta["common_warmup_notified"] = True
+                                meta["common_warmup_notified_day"] = today_kst
+                                meta["common_warmup_last_notify_ts"] = now_ts
+                            _COMMON_WARMUP_NOTIFY_TS_MEM = now_ts
+                            save_state(state)
 
                     if heavy_scan:
                         universe_union = list(
@@ -15563,6 +16065,10 @@ def run():
                         mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_atlas_lab_v2_cfg.vp_lookback_1h))
                     if ADV_TREND_ENABLED:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), 672)
+                    if BULL_PULLBACK_LONG_V1_ENABLED and BullPullbackLongConfig:
+                        bcfg = BullPullbackLongConfig()
+                        mid_plan["15m"] = max(mid_plan.get("15m", 0), int(bcfg.fib_lookback + 20))
+                        mid_plan["1h"] = max(mid_plan.get("1h", 0), int(bcfg.ema_trend_slow + 30))
                     if atlas_rs_fail_short_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
                     if atlas_cfg:
@@ -15693,6 +16199,10 @@ def run():
                             if wcfg:
                                 w_min = max(int(wcfg.vol_sma_len) + 20, 200) + 1
                                 ltf_plan.setdefault(str(wcfg.tf_exec or "1m"), w_min)
+                        if BULL_PULLBACK_LONG_V1_ENABLED and BullPullbackLongConfig:
+                            bcfg = BullPullbackLongConfig()
+                            ltf_min = max(int(bcfg.rsi_len) + 10, int(bcfg.ema_exec_mid) + 10, 80)
+                            ltf_plan.setdefault(str(bcfg.tf_exec or "1m"), ltf_min)
                         if ltf_plan:
                             rt_stats = _prefetch_ohlcv_for_cycle(
                                 list(set((noise_reverse_universe or []) + (srp_universe or []) + (st_flip_universe or []))),
@@ -15826,6 +16336,8 @@ def run():
                     srp_thread = None
                     wash_result = {}
                     wash_thread = None
+                    bull_pullback_result = {}
+                    bull_pullback_thread = None
                     dtfx_result = {}
                     dtfx_thread = None
                     atlas_rs_fail_short_result = {}
@@ -15969,6 +16481,18 @@ def run():
                             daemon=True,
                         )
                         wash_thread.start()
+                    if BULL_PULLBACK_LONG_V1_ENABLED and new_1m_bar:
+                        bull_pullback_thread = threading.Thread(
+                            target=lambda: bull_pullback_result.update(
+                                _run_bull_pullback_long_v1_cycle(
+                                    wash_short_suite_universe,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        bull_pullback_thread.start()
                     if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
                         dtfx_thread = threading.Thread(
                             target=lambda: dtfx_result.update(
@@ -16666,7 +17190,7 @@ def run():
                         shared_top_n = "N/A"
                     anchors_disp = "BTC/USDT:USDT,ETH/USDT:USDT"
                     print(
-                        f"[universe] rule=qVol>={int(shared_min_qv):,} sort=abs(pct) topN={shared_top_n} anchors={anchors_disp} "
+                        f"[universe] rule=qVol>={int(shared_min_qv):,} sort=decline(pct) topN={shared_top_n} anchors={anchors_disp} "
                         f"shared={shared_universe_len} rsi={rsi_universe_len} struct={universe_structure_len} "
                         f"union={universe_union_len}"
                     )

@@ -30,8 +30,10 @@ def build_universe_from_tickers(
             continue
         if qv < min_quote_volume_usdt:
             continue
-        candidates.append((sym, abs(pct)))
-    candidates.sort(key=lambda x: x[1], reverse=True)
+        if pct >= 0:
+            continue
+        candidates.append((sym, pct))
+    candidates.sort(key=lambda x: x[1])
 
     result: List[str] = []
     for sym in anchors:

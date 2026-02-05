@@ -87,6 +87,7 @@ COMMAND_DEFS = [
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
     {"cmd": "/wash_short_suite", "key": "_wash_short_suite_enabled", "label": "Wash Short Suite", "type": "toggle"},
+    {"cmd": "/bull_pullback_long_v1", "key": "_bull_pullback_long_v1_enabled", "label": "Bull Pullback Long V1", "type": "toggle"},
     {"cmd": "/rsi", "key": "_rsi_enabled", "label": "RSI", "type": "toggle"},
     {"cmd": "/dca", "key": "_dca_enabled", "label": "DCA", "type": "toggle"},
     {"cmd": "/dca_pct", "key": "_dca_pct", "label": "DCA 진입 금액(%)", "type": "number", "step": 0.1},

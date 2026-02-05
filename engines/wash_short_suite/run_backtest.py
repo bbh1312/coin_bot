@@ -14,7 +14,7 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from engines.universe import build_universe_from_tickers
+from engines.backtest_common import calc_warmup_window, load_common_universe, log_warmup_info
 from engines.wash_short_suite.engine import WashShortSuiteConfig
 
 
@@ -310,28 +310,21 @@ def run_backtest():
 
     days = int(args.days)
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
 
-    universe: List[str] = []
-    if universe_arg in ("common", "common_universe"):
-        latest_path = os.path.join(ROOT_DIR, "logs", "common_universe", "latest.txt")
-        if os.path.exists(latest_path):
-            with open(latest_path, "r", encoding="utf-8") as f:
-                universe = [line.strip() for line in f.read().splitlines() if line.strip()]
-        if not universe and not cache_only:
-            tickers = exchange.fetch_tickers()
-            universe = build_universe_from_tickers(tickers, min_quote_volume_usdt=8_000_000.0, top_n=50)
-    elif universe_arg.startswith("top"):
-        try:
-            tickers = exchange.fetch_tickers()
-            universe = build_universe_from_tickers(tickers, min_quote_volume_usdt=8_000_000.0, top_n=50)
-            n = int(universe_arg.replace("top", ""))
-            universe = universe[:n]
-        except Exception:
-            pass
-    else:
-        tickers = exchange.fetch_tickers()
-        universe = build_universe_from_tickers(tickers, min_quote_volume_usdt=8_000_000.0, top_n=50)
+    min_tr = max(cfg.ema_slow + 20, 180)
+    min_main = max(cfg.ema_slow + cfg.swing_lookback, 200)
+    min_exec = max(cfg.vol_sma_len + 20, 200)
+    start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(
+        days,
+        end_ms,
+        {
+            cfg.tf_trend: min_tr,
+            cfg.tf_main: min_main,
+            cfg.tf_exec: min_exec,
+        },
+    )
+
+    universe = load_common_universe(universe_arg, exchange, cache_only)
 
     base_dir = os.path.join(ROOT_DIR, "logs", "wash_short_suite", "backtest")
     _ensure_dir(base_dir)
@@ -377,7 +370,23 @@ def run_backtest():
         if rows_trend and rows_main and rows_exec:
             symbol_data[sym] = {"trend": rows_trend, "main": rows_main, "exec": rows_exec}
 
-    stats = {"entries": 0, "exits": 0, "trades": 0, "wins": 0, "losses": 0, "mfe_sum": 0.0, "mae_sum": 0.0, "hold_sum": 0.0, "net_sum": 0.0}
+    entry_usdt = 10.0
+    stats = {
+        "entries": 0,
+        "exits": 0,
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "mfe_sum": 0.0,
+        "mae_sum": 0.0,
+        "hold_sum": 0.0,
+        "net_sum": 0.0,
+        "tp_sum": 0.0,
+        "sl_sum": 0.0,
+        "net_sum_usdt": 0.0,
+        "tp_sum_usdt": 0.0,
+        "sl_sum_usdt": 0.0,
+    }
     stats_by_hour = {h: {"entries": 0, "tp": 0, "sl": 0} for h in range(24)}
     stats_by_dow = {d: {"entries": 0, "tp": 0, "sl": 0} for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]}
     stats_by_symbol: Dict[str, Dict[str, float]] = {}
@@ -411,7 +420,22 @@ def run_backtest():
 
         trade: Optional[dict] = None
         cooldown_left = 0
-        sym_stats = {"entries": 0, "exits": 0, "trades": 0, "wins": 0, "losses": 0, "mfe_sum": 0.0, "mae_sum": 0.0, "hold_sum": 0.0, "net_sum": 0.0}
+        sym_stats = {
+            "entries": 0,
+            "exits": 0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "mfe_sum": 0.0,
+            "mae_sum": 0.0,
+            "hold_sum": 0.0,
+            "net_sum": 0.0,
+            "tp_sum": 0.0,
+            "sl_sum": 0.0,
+            "net_sum_usdt": 0.0,
+            "tp_sum_usdt": 0.0,
+            "sl_sum_usdt": 0.0,
+        }
 
         for i in range(1, len(df_ex)):
             sig_idx = i - 1 if args.use_confirmed else i
@@ -461,12 +485,26 @@ def run_backtest():
                     stats["mae_sum"] += trade["mae"]
                     stats["hold_sum"] += trade["hold_bars"]
                     stats["net_sum"] += pnl_pct
+                    stats["net_sum_usdt"] += pnl_pct * entry_usdt
+                    if exit_reason == "TP":
+                        stats["tp_sum"] += pnl_pct
+                        stats["tp_sum_usdt"] += pnl_pct * entry_usdt
+                    elif exit_reason == "SL":
+                        stats["sl_sum"] += pnl_pct
+                        stats["sl_sum_usdt"] += pnl_pct * entry_usdt
                     sym_stats["exits"] += 1
                     sym_stats["trades"] += 1
                     sym_stats["mfe_sum"] += trade["mfe"]
                     sym_stats["mae_sum"] += trade["mae"]
                     sym_stats["hold_sum"] += trade["hold_bars"]
                     sym_stats["net_sum"] += pnl_pct
+                    sym_stats["net_sum_usdt"] += pnl_pct * entry_usdt
+                    if exit_reason == "TP":
+                        sym_stats["tp_sum"] += pnl_pct
+                        sym_stats["tp_sum_usdt"] += pnl_pct * entry_usdt
+                    elif exit_reason == "SL":
+                        sym_stats["sl_sum"] += pnl_pct
+                        sym_stats["sl_sum_usdt"] += pnl_pct * entry_usdt
                     entry_hour = trade.get("entry_hour")
                     entry_dow = trade.get("entry_dow")
                     if isinstance(entry_hour, int) and entry_hour in stats_by_hour:
@@ -563,6 +601,8 @@ def run_backtest():
 
             entry_px = float(entry["close"])
             entry_ts = int(ts_ex[i])
+            if entry_ts < eval_start_ms:
+                continue
             entry_hour, entry_dow = _entry_kst_info(entry_ts)
             trade = {
                 "entry_px": entry_px,
@@ -591,10 +631,17 @@ def run_backtest():
         avg_mae = s["mae_sum"] / trades if trades > 0 else 0.0
         avg_hold = s["hold_sum"] / trades if trades > 0 else 0.0
         net_sum = s["net_sum"]
+        tp_sum = s.get("tp_sum", 0.0)
+        sl_sum = s.get("sl_sum", 0.0)
+        net_sum_usdt = s.get("net_sum_usdt", 0.0)
+        tp_sum_usdt = s.get("tp_sum_usdt", 0.0)
+        sl_sum_usdt = s.get("sl_sum_usdt", 0.0)
         line = (
             f"[BACKTEST] {sym} entries={int(s['entries'])} exits={int(s['exits'])} trades={trades} "
             f"wins={wins} losses={losses} winrate={winrate:.2f}% "
-            f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f} net_sum={net_sum:.3f}"
+            f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f} "
+            f"tp_sum={tp_sum:.3f} sl_sum={sl_sum:.3f} net_sum={net_sum:.3f} "
+            f"tp_sum_usdt={tp_sum_usdt:.3f} sl_sum_usdt={sl_sum_usdt:.3f} net_sum_usdt={net_sum_usdt:.3f}"
         )
         print(line)
         _log(line)
@@ -607,13 +654,21 @@ def run_backtest():
     total_avg_mae = stats["mae_sum"] / total_trades if total_trades > 0 else 0.0
     total_avg_hold = stats["hold_sum"] / total_trades if total_trades > 0 else 0.0
     total_net_sum = stats["net_sum"]
+    total_tp_sum = stats.get("tp_sum", 0.0)
+    total_sl_sum = stats.get("sl_sum", 0.0)
+    total_net_sum_usdt = stats.get("net_sum_usdt", 0.0)
+    total_tp_sum_usdt = stats.get("tp_sum_usdt", 0.0)
+    total_sl_sum_usdt = stats.get("sl_sum_usdt", 0.0)
     total_line = (
         f"[BACKTEST] TOTAL entries={int(stats['entries'])} exits={int(stats['exits'])} trades={total_trades} "
         f"wins={total_wins} losses={total_losses} winrate={total_winrate:.2f}% "
-        f"avg_mfe={total_avg_mfe:.4f} avg_mae={total_avg_mae:.4f} avg_hold={total_avg_hold:.1f} net_sum={total_net_sum:.3f}"
+        f"avg_mfe={total_avg_mfe:.4f} avg_mae={total_avg_mae:.4f} avg_hold={total_avg_hold:.1f} "
+        f"tp_sum={total_tp_sum:.3f} sl_sum={total_sl_sum:.3f} net_sum={total_net_sum:.3f} "
+        f"tp_sum_usdt={total_tp_sum_usdt:.3f} sl_sum_usdt={total_sl_sum_usdt:.3f} net_sum_usdt={total_net_sum_usdt:.3f}"
     )
     print(total_line)
     _log(total_line)
+    log_warmup_info(_log, warmup_days, warmup_minutes, days)
     if trades_out:
         print("[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts")
         _log("[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts")
