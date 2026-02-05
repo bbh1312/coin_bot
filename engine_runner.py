@@ -1209,7 +1209,7 @@ COMMON_WARMUP_DAYS = int(os.getenv("COMMON_WARMUP_DAYS", "1"))
 COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m,3m").split(",") if tf.strip())
 COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "30"))
 COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "false", "off", "no")
-COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "30"))
+COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "40"))
 COMMON_UNIVERSE_LOG_PATH = ""
 COMMON_WARMUP_LOG_PATH = ""
 COMMON_WARMUP_CACHE_DIR = os.getenv("COMMON_WARMUP_CACHE_DIR", "").strip()
@@ -6028,6 +6028,11 @@ def _run_wash_short_suite_cycle(
         "no_data_tr": 0,
         "no_data_main": 0,
         "no_data_exec": 0,
+        "skip_eval": 0,
+        "skip_stale_ts": 0,
+        "pass_trend": 0,
+        "pass_pullback": 0,
+        "pass_trigger": 0,
     }
     candidate_counts: Dict[str, int] = {}
     no_data_samples: List[str] = []
@@ -6068,6 +6073,7 @@ def _run_wash_short_suite_cycle(
         df_ex = cycle_cache.get_df(symbol, tf_exec, limit=min_exec_fetch)
         if df_tr.empty or df_main.empty or df_ex.empty:
             no_data += 1
+            gate_stats["skip_eval"] += 1
             if df_tr.empty:
                 gate_stats["no_data_tr"] += 1
             if df_main.empty:
@@ -6084,6 +6090,7 @@ def _run_wash_short_suite_cycle(
         df_ex_sig = df_ex.iloc[:-1]
         if len(df_tr_sig) < min_tr or len(df_main_sig) < min_main or len(df_ex_sig) < min_exec:
             no_data += 1
+            gate_stats["skip_eval"] += 1
             if len(df_tr_sig) < min_tr:
                 gate_stats["no_data_tr"] += 1
             if len(df_main_sig) < min_main:
@@ -6101,6 +6108,7 @@ def _run_wash_short_suite_cycle(
         ts_ms = int(row_ex["ts"])
         sym_state = wash_state.setdefault(symbol, {})
         if sym_state.get("last_eval_ts") == ts_ms:
+            gate_stats["skip_stale_ts"] += 1
             continue
         sym_state["last_eval_ts"] = ts_ms
 
@@ -6123,6 +6131,7 @@ def _run_wash_short_suite_cycle(
         idx_main = int(np.searchsorted(ts_main, ts_ms, side="right") - 1)
         if idx_tr <= 0 or idx_main <= 0:
             no_data += 1
+            gate_stats["skip_eval"] += 1
             if idx_tr <= 0:
                 gate_stats["no_data_tr"] += 1
             if idx_main <= 0:
@@ -6146,6 +6155,7 @@ def _run_wash_short_suite_cycle(
             gate_stats["trend_fail"] += 1
             no_signal += 1
             continue
+        gate_stats["pass_trend"] += 1
 
         # Step 2: pullback zone
         swing_start = max(0, idx_main - cfg.swing_lookback)
@@ -6160,6 +6170,7 @@ def _run_wash_short_suite_cycle(
             gate_stats["pullback_fail"] += 1
             no_signal += 1
             continue
+        gate_stats["pass_pullback"] += 1
 
         # Step 3: exec trigger
         rsi_ex = _adv_rsi(df_ex_sig["close"], cfg.rsi_len)
@@ -6178,11 +6189,13 @@ def _run_wash_short_suite_cycle(
             gate_stats["trigger_fail"] += 1
             no_signal += 1
             continue
+        gate_stats["pass_trigger"] += 1
         candidate_counts[symbol] = int(candidate_counts.get(symbol, 0)) + 1
 
         # Entry block on next bar
         if i_ex + 1 >= len(df_ex):
             no_data += 1
+            gate_stats["skip_eval"] += 1
             gate_stats["no_data_exec"] += 1
             if len(no_data_samples) < 5:
                 no_data_samples.append(f"{symbol} entry_bar_missing ex_len={len(df_ex)} i_ex={i_ex}")
@@ -15675,6 +15688,11 @@ def run():
                                 ltf_plan[tf_key] = max(int(ltf_plan.get(tf_key) or 0), st_min)
                             else:
                                 ltf_plan[tf_key] = st_min
+                        if WASH_SHORT_SUITE_ENABLED and wash_short_suite_universe:
+                            wcfg = WashShortSuiteConfig() if WashShortSuiteConfig else None
+                            if wcfg:
+                                w_min = max(int(wcfg.vol_sma_len) + 20, 200) + 1
+                                ltf_plan.setdefault(str(wcfg.tf_exec or "1m"), w_min)
                         if ltf_plan:
                             rt_stats = _prefetch_ohlcv_for_cycle(
                                 list(set((noise_reverse_universe or []) + (srp_universe or []) + (st_flip_universe or []))),
