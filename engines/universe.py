@@ -7,7 +7,7 @@ def build_universe_from_tickers(
     tickers: Dict[str, dict],
     symbols: Optional[Iterable[str]] = None,
     min_quote_volume_usdt: float = 30_000_000.0,
-    top_n: Optional[int] = 40,
+    top_n: Optional[int] = 50,
     anchors: Sequence[str] = ("BTC/USDT:USDT", "ETH/USDT:USDT"),
 ) -> List[str]:
     if not isinstance(tickers, dict) or not tickers:
@@ -30,10 +30,8 @@ def build_universe_from_tickers(
             continue
         if qv < min_quote_volume_usdt:
             continue
-        if pct >= 0:
-            continue
-        candidates.append((sym, pct))
-    candidates.sort(key=lambda x: x[1])
+        candidates.append((sym, abs(pct)))
+    candidates.sort(key=lambda x: x[1], reverse=True)
 
     result: List[str] = []
     for sym in anchors:

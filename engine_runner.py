@@ -1233,7 +1233,7 @@ COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "30"))
 COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "false", "off", "no")
 COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
 COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "8"))
-COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "40"))
+COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "50"))
 COMMON_WARMUP_NOTIFY_COOLDOWN_SEC = int(os.getenv("COMMON_WARMUP_NOTIFY_COOLDOWN_SEC", "3600"))
 _COMMON_WARMUP_NOTIFY_TS_MEM = 0.0
 COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "40"))
@@ -1597,7 +1597,7 @@ def _build_common_universe(tickers: dict, symbols: list) -> list:
                 continue
             pct_all_map[s] = pct
             qv_all_map[s] = qv
-        shared_universe = [s for s, p in sorted(pct_all_map.items(), key=lambda x: x[1]) if p < 0]
+        shared_universe = [s for s, _ in sorted(pct_all_map.items(), key=lambda x: abs(x[1]), reverse=True)]
         shared_universe = [s for s in shared_universe if qv_all_map.get(s, 0) >= shared_min_qv]
         shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
         if shared_top_n:
