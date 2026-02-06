@@ -10762,6 +10762,22 @@ def _detect_position_events(state: dict, send_telegram) -> None:
         pos_syms = list_open_position_symbols(force=True)
     except Exception:
         return
+    current_keys = set()
+    for side_key, side_label in (("short", "SHORT"), ("long", "LONG")):
+        syms = pos_syms.get(side_key) or set()
+        for sym in syms:
+            if sym:
+                current_keys.add(f"{sym}|{side_label}")
+    if not state.get("_manual_follow_initialized"):
+        state["_manual_follow_seen"] = {k: time.time() for k in current_keys}
+        state["_manual_follow_initialized"] = True
+    seen = state.get("_manual_follow_seen")
+    if not isinstance(seen, dict):
+        seen = {}
+        state["_manual_follow_seen"] = seen
+    stale_keys = [k for k in seen.keys() if k not in current_keys]
+    for k in stale_keys:
+        seen.pop(k, None)
     def _recent_entry_event(symbol: str, side: str, now_ts: float, window_sec: float = 180.0) -> Optional[dict]:
         report_date = _report_day_str(now_ts)
         _by_id, by_symbol = _load_entry_events_map(report_date)
@@ -10795,6 +10811,16 @@ def _detect_position_events(state: dict, send_telegram) -> None:
         prev = snap.get(key) if isinstance(snap, dict) else None
         prev_qty = prev.get("qty") if isinstance(prev, dict) else None
         prev_entry = prev.get("entry") if isinstance(prev, dict) else None
+        if isinstance(prev, dict):
+            st_side = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+            last_exit_ts = None
+            if isinstance(st_side, dict):
+                last_exit_ts = st_side.get(f"last_exit_ts_{side.lower()}") or st_side.get("last_exit_ts")
+            prev_ts = prev.get("ts")
+            if isinstance(last_exit_ts, (int, float)) and isinstance(prev_ts, (int, float)) and float(last_exit_ts) > float(prev_ts):
+                prev_qty = None
+                prev_entry = None
+                snap.pop(key, None)
         qty = None
         avg_entry = None
         mark = None
@@ -10857,6 +10883,63 @@ def _detect_position_events(state: dict, send_telegram) -> None:
                     tp=None,
                     state=state,
                 )
+                seen_key = f"{symbol}|{side}"
+                if seen_key not in seen and FOLLOWER_CONTEXTS:
+                    if _entry_blocked_now(ENTRY_BLOCK_HOURS):
+                        try:
+                            send_telegram(f"⛔ manual follow blocked (entry_block_hours) {symbol} {side}")
+                        except Exception:
+                            pass
+                    else:
+                        follower_calls = []
+                        active_names = _active_account_names()
+                        def _skip_result(reason: str):
+                            return {"status": "skip", "reason": reason}
+                        for acct in FOLLOWER_CONTEXTS:
+                            if active_names and str(acct.name) not in active_names:
+                                follower_calls.append({"acct": acct, "fn": lambda r="inactive": _skip_result(r)})
+                                continue
+                            follower_state = load_state_from(acct.state_path)
+                            admin_follow_enabled = follower_state.get("_admin_follow_enabled")
+                            if admin_follow_enabled is None:
+                                admin_follow_enabled = True
+                            manual_entry_enabled = follower_state.get("_admin_manual_entry_enabled")
+                            if manual_entry_enabled is None:
+                                manual_entry_enabled = True
+                            if not admin_follow_enabled:
+                                follower_calls.append({"acct": acct, "fn": lambda r="admin_follow_disabled": _skip_result(r)})
+                                continue
+                            if not manual_entry_enabled:
+                                follower_calls.append({"acct": acct, "fn": lambda r="manual_entry_disabled": _skip_result(r)})
+                                continue
+                            pct = None
+                            try:
+                                pct = float(getattr(acct.settings, "entry_pct", USDT_PER_TRADE))
+                            except Exception:
+                                pct = None
+                            usdt_amount = _resolve_entry_usdt_for_executor(acct.executor, pct)
+                            if not isinstance(usdt_amount, (int, float)) or usdt_amount <= 0:
+                                follower_calls.append({"acct": acct, "fn": lambda r="entry_usdt_unavailable": _skip_result(r)})
+                                continue
+                            leverage = int(getattr(acct.settings, "leverage", LEVERAGE))
+                            margin_mode = str(getattr(acct.settings, "margin_mode", MARGIN_MODE))
+                            if side == "LONG":
+                                follower_calls.append({
+                                    "acct": acct,
+                                    "fn": lambda a=acct, u=usdt_amount, lev=leverage, mm=margin_mode: a.executor.long_market(
+                                        symbol, usdt_amount=u, leverage=lev, margin_mode=mm
+                                    ),
+                                })
+                            else:
+                                follower_calls.append({
+                                    "acct": acct,
+                                    "fn": lambda a=acct, u=usdt_amount, lev=leverage, mm=margin_mode: a.executor.short_market(
+                                        symbol, usdt_amount=u, leverage=lev, margin_mode=mm
+                                    ),
+                                })
+                        if follower_calls:
+                            _broadcast_followers("long_market" if side == "LONG" else "short_market", follower_calls, {"symbol": symbol})
+                seen[seen_key] = time.time()
         elif prev_qty is not None and qty is not None:
             if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > prev_qty * 1.0001:
                 if not managed:
