@@ -178,7 +178,9 @@ def run_backtest() -> None:
     parser.add_argument("--limit-entry", action="store_true", default=True)
     parser.add_argument("--limit-offset-atr", type=float, default=0.05)
     parser.add_argument("--retest-max-depth-atr", type=float, default=1.15)
-    parser.add_argument("--retest-wait-next-high", action="store_true", default=True)
+    parser.add_argument("--retest-wait-next-high", action="store_true", default=False)
+    parser.add_argument("--fail-wick-max", type=float, default=0.45)
+    parser.add_argument("--fail-require-ema", action="store_true", default=False)
     parser.add_argument("--stop-atr-mult", type=float, default=0.35)
     parser.add_argument("--min-hold-bars", type=int, default=3)
     parser.add_argument("--tp-min-pct", type=float, default=0.015)
@@ -531,7 +533,9 @@ def run_backtest() -> None:
                 ema_now = ema_ltf.iloc[sig_idx]
                 if np.isnan(atr_now) or np.isnan(ema_now):
                     continue
-                retest_touch = float(df["high"].iloc[sig_idx]) >= float(ema_now) - float(args.retest_ema_tol) * float(atr_now)
+                if break_level is None:
+                    continue
+                retest_touch = float(df["high"].iloc[sig_idx]) >= float(break_level) - float(args.retest_ema_tol) * float(atr_now)
                 if retest_touch:
                     retest_active = True
                     retest_high = float(df["high"].iloc[sig_idx]) if retest_high is None else max(retest_high, float(df["high"].iloc[sig_idx]))
@@ -544,7 +548,12 @@ def run_backtest() -> None:
                     close_now = float(df["close"].iloc[sig_idx])
                     open_now = float(df["open"].iloc[sig_idx])
                     upper_wick = _upper_wick_ratio(df.iloc[sig_idx])
-                    fail_candle = close_now < open_now and upper_wick <= 0.3 and close_now < float(ema_now)
+                    prev_low = float(df["low"].iloc[sig_idx - 1])
+                    fail_candle = close_now < open_now and upper_wick <= float(args.fail_wick_max) and close_now < float(break_level)
+                    if bool(args.fail_require_ema):
+                        fail_candle = fail_candle and close_now < float(ema_now)
+                    else:
+                        fail_candle = fail_candle and (low_now < prev_low)
                     if bool(args.retest_wait_next_high) and retest_touch_idx is not None:
                         if sig_idx <= retest_touch_idx:
                             fail_candle = False
@@ -562,11 +571,11 @@ def run_backtest() -> None:
                         entry_px = close_now
                         entry_type = "market"
                         limit_filled = False
-                        if bool(args.limit_entry) and break_level is not None:
+                        if bool(args.limit_entry):
                             offset = float(args.limit_offset_atr)
                             if retest_seen_count >= 5 and entry_count == 0:
                                 offset *= 1.2
-                            entry_limit = min(float(ema_now), float(break_level)) - offset * float(atr_now)
+                            entry_limit = float(break_level) - offset * float(atr_now)
                             entry_type = "limit"
                             if low_now <= entry_limit:
                                 entry_px = entry_limit

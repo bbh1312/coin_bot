@@ -35,6 +35,61 @@ def _ensure_broadcast_contexts() -> None:
     except Exception:
         pass
 
+def _follow_manual_entry(symbol: str, side: str) -> None:
+    if not symbol or side not in ("LONG", "SHORT"):
+        return
+    _ensure_broadcast_contexts()
+    if not er.FOLLOWER_CONTEXTS:
+        return
+    follower_calls = []
+    active_names = er._active_account_names()
+    def _skip_result(reason: str):
+        return {"status": "skip", "reason": reason}
+    for acct in er.FOLLOWER_CONTEXTS:
+        if active_names and str(acct.name) not in active_names:
+            follower_calls.append({"acct": acct, "fn": lambda r="inactive": _skip_result(r)})
+            continue
+        follower_state = er.load_state_from(acct.state_path)
+        admin_follow_enabled = follower_state.get("_admin_follow_enabled")
+        if admin_follow_enabled is None:
+            admin_follow_enabled = True
+        manual_entry_enabled = follower_state.get("_admin_manual_entry_enabled")
+        if manual_entry_enabled is None:
+            manual_entry_enabled = True
+        if not admin_follow_enabled:
+            follower_calls.append({"acct": acct, "fn": lambda r="admin_follow_disabled": _skip_result(r)})
+            continue
+        if not manual_entry_enabled:
+            follower_calls.append({"acct": acct, "fn": lambda r="manual_entry_disabled": _skip_result(r)})
+            continue
+        pct = None
+        try:
+            pct = float(getattr(acct.settings, "entry_pct", er.USDT_PER_TRADE))
+        except Exception:
+            pct = None
+        usdt_amount = er._resolve_entry_usdt_for_executor(acct.executor, pct)
+        if not isinstance(usdt_amount, (int, float)) or usdt_amount <= 0:
+            follower_calls.append({"acct": acct, "fn": lambda r="entry_usdt_unavailable": _skip_result(r)})
+            continue
+        leverage = int(getattr(acct.settings, "leverage", er.LEVERAGE))
+        margin_mode = str(getattr(acct.settings, "margin_mode", er.MARGIN_MODE))
+        if side == "LONG":
+            follower_calls.append({
+                "acct": acct,
+                "fn": lambda a=acct, u=usdt_amount, lev=leverage, mm=margin_mode: a.executor.long_market(
+                    symbol, usdt_amount=u, leverage=lev, margin_mode=mm
+                ),
+            })
+        else:
+            follower_calls.append({
+                "acct": acct,
+                "fn": lambda a=acct, u=usdt_amount, lev=leverage, mm=margin_mode: a.executor.short_market(
+                    symbol, usdt_amount=u, leverage=lev, margin_mode=mm
+                ),
+            })
+    if follower_calls:
+        er._broadcast_followers("long_market" if side == "LONG" else "short_market", follower_calls, {"symbol": symbol})
+
 def _is_startup_position(state: dict, symbol: str) -> bool:
     if not symbol or not isinstance(state, dict):
         return False
@@ -1523,6 +1578,7 @@ def main():
                                 tp=None,
                                 state=state,
                             )
+                            _follow_manual_entry(symbol, "LONG")
                             st[alert_key] = True
                             st[f"{alert_key}_ts"] = now_ts
                             st[f"{alert_key}_reason"] = "sent"
@@ -1589,6 +1645,7 @@ def main():
                                 tp=None,
                                 state=state,
                             )
+                            _follow_manual_entry(symbol, "SHORT")
                             st[alert_key] = True
                             st[f"{alert_key}_ts"] = now_ts
                             st[f"{alert_key}_reason"] = "sent"
@@ -1681,6 +1738,7 @@ def main():
                                             tp=None,
                                             state=state,
                                         )
+                                        _follow_manual_entry(symbol, "LONG")
                                         st[alert_key] = True
                                         st[f"{alert_key}_ts"] = now_ts
                                         st[f"{alert_key}_reason"] = "sent"
@@ -1774,6 +1832,7 @@ def main():
                                             tp=None,
                                             state=state,
                                         )
+                                        _follow_manual_entry(symbol, "SHORT")
                                         st[alert_key] = True
                                         st[f"{alert_key}_ts"] = now_ts
                                         st[f"{alert_key}_reason"] = "sent"
