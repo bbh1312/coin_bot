@@ -1,3 +1,3 @@
-from .engine import TopFailShortConfig
+from .engine import TopFailShortV1Config
 
-__all__ = ["TopFailShortConfig"]
+__all__ = ["TopFailShortV1Config"]

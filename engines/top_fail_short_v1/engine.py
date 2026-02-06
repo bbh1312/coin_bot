@@ -2,26 +2,33 @@ from dataclasses import dataclass
 
 
 @dataclass
-class TopFailShortConfig:
-    tf: str = "3m"
-    runup_bars: int = 40
-    runup_min_pct: float = 4.0
-    runup_top_pct: float = 10.0
-    touch_lookback: int = 40
-    touch_band_pct: float = 0.15
-    touch_min: int = 3
-    fake_break_lookback: int = 6
-    range_avg_lookback: int = 10
-    range_mult: float = 1.2
-    upper_wick_min: float = 0.45
-    close_pos_max: float = 0.35
-    entry_mode: str = "break"
-    entry_retrace_min: float = 0.382
-    entry_retrace_max: float = 0.5
-    sl_pad_pct: float = 0.1
-    tp1_r: float = 0.5
-    tp2_r: float = 1.0
-    tp1_frac: float = 0.4
-    tp2_frac: float = 0.3
-    max_retries: int = 2
-    cooldown_bars: int = 5
+class TopFailShortV1Config:
+    tf_ltf: str = "3m"
+    tf_mtf: str = "15m"
+    tf_htf: str = "1h"
+    universe_24h_change: float = 20.0
+    universe_7d_mult: float = 3.0
+    min_quote_vol_24h: float = 0.0
+    stall_high_lookback: int = 6
+    stall_wick_min: float = 0.5
+    stall_min_count: int = 2
+    mtf_require_weak_close: bool = False
+    ema_len: int = 20
+    swing_lookback: int = 30
+    atr_len: int = 14
+    wash_atr_mult: float = 1.3
+    vol_spike_mult: float = 1.8
+    vol_sma_len: int = 20
+    retest_ema_tol: float = 0.1
+    limit_entry: bool = True
+    limit_offset_atr: float = 0.15
+    retest_max_depth_atr: float = 1.15
+    retest_wait_next_high: bool = False
+    fail_wick_max: float = 0.30
+    fail_require_ema: bool = False
+    stop_atr_mult: float = 0.35
+    min_hold_bars: int = 3
+    tp_min_pct: float = 0.015
+    tp_r_mult: float = 0.9
+    max_wait_bars: int = 60
+    cooldown_bars: int = 20

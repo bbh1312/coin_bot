@@ -28,6 +28,9 @@ class WashShortSuiteConfig:
     vol_sma_len: int = 20
     vol_pullback_max: float = 0.8
     vol_reversal_min: float = 0.4
+    btc_ema_guard_len: int = 10
+    btc_ema_fast: int = 7
+    btc_ema_slow: int = 20
     entry_block_high_mult: float = 1.01
     entry_block_close_pos: float = 0.7
     entry_block_vol_ratio: float = 1.5

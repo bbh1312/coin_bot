@@ -269,6 +269,9 @@ def parse_args():
     p.add_argument("--log-path", type=str, default="")
     p.add_argument("--no-btc-guard", action="store_true")
     p.add_argument("--btc-ema-len", type=int, default=20)
+    p.add_argument("--btc-ema-guard-len", type=int, default=10)
+    p.add_argument("--btc-ema-fast", type=int, default=7)
+    p.add_argument("--btc-ema-slow", type=int, default=20)
     p.add_argument("--btc-rsi-len", type=int, default=14)
     p.add_argument("--btc-rsi-min", type=float, default=48.0)
     return p.parse_args()
@@ -505,7 +508,7 @@ def run_backtest():
             if idx_tr <= 0 or idx_main <= 0:
                 continue
 
-            # BTC safety guard (block shorts when BTC 15m close > EMA10)
+            # BTC safety guard (block shorts when BTC 15m close > EMA10 or EMA7>EMA20)
             if (
                 not args.no_btc_guard
                 and btc_ts_15m is not None
@@ -516,9 +519,13 @@ def run_backtest():
                     btc_close_15m = btc_df_15m["close"].astype(float)
                     start_idx = max(0, idx_btc_15m - 288 + 1)
                     window = btc_close_15m.iloc[start_idx : idx_btc_15m + 1]
-                    btc_ema10_15m = window.ewm(span=10, adjust=False).mean().iloc[-1]
+                    btc_ema10_15m = window.ewm(span=int(args.btc_ema_guard_len), adjust=False).mean().iloc[-1]
+                    btc_ema7_15m = window.ewm(span=int(args.btc_ema_fast), adjust=False).mean().iloc[-1]
+                    btc_ema20_15m = window.ewm(span=int(args.btc_ema_slow), adjust=False).mean().iloc[-1]
                     btc_px_15m = float(window.iloc[-1])
                     if btc_px_15m > float(btc_ema10_15m):
+                        continue
+                    if btc_ema7_15m > btc_ema20_15m:
                         continue
 
             if trade:

@@ -3,7 +3,7 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import ccxt
@@ -41,6 +41,73 @@ def _read_common_warmup(path: str) -> List[list]:
         return df[["ts", "open", "high", "low", "close", "volume"]].values.tolist()
     except Exception:
         return []
+
+
+def _parse_ts_arg(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone(timedelta(hours=9)))
+            return int(dt.astimezone(timezone.utc).timestamp() * 1000)
+        except Exception:
+            continue
+    return None
+
+
+def _has_gaps(rows: List[list], tf_ms: int, start_ms: int, end_ms: int) -> bool:
+    if not rows:
+        return True
+    rows_sorted = sorted(rows, key=lambda r: int(r[0]))
+    if int(rows_sorted[0][0]) > start_ms + tf_ms:
+        return True
+    if int(rows_sorted[-1][0]) < end_ms - tf_ms:
+        return True
+    prev = int(rows_sorted[0][0])
+    for row in rows_sorted[1:]:
+        ts = int(row[0])
+        if ts - prev > tf_ms:
+            return True
+        prev = ts
+    return False
+
+
+def _fetch_ohlcv_rest(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1500,
+) -> List[list]:
+    out: List[list] = []
+    since = start_ms
+    tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+    last_ts = None
+    while since < end_ms:
+        batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+        if not batch:
+            break
+        for row in batch:
+            ts = int(row[0])
+            if ts > end_ms:
+                continue
+            if last_ts is None or ts > last_ts:
+                out.append(row)
+                last_ts = ts
+        new_last = int(batch[-1][0])
+        if last_ts is None or new_last == last_ts:
+            since = new_last + tf_ms
+        else:
+            since = last_ts + tf_ms
+    return out
 
 
 def _ohlcv_cache_path(root_dir: str, symbol: str, timeframe: str, start_ms: int, end_ms: int) -> str:
@@ -87,41 +154,41 @@ def _fetch_ohlcv_all(
     use_common_warmup: bool = False,
     common_warmup_dir: str = "",
     cache_only: bool = False,
+    fill_missing: bool = False,
 ) -> List[list]:
     if use_common_warmup and common_warmup_dir:
         safe = _sanitize_symbol(symbol)
         warmup_path = os.path.join(common_warmup_dir, f"{safe}_{timeframe}.csv")
         warmup_rows = _read_common_warmup(warmup_path)
         if warmup_rows:
-            return [r for r in warmup_rows if start_ms <= int(r[0]) <= end_ms]
+            filtered = [r for r in warmup_rows if start_ms <= int(r[0]) <= end_ms]
+            if not fill_missing or cache_only:
+                return filtered
+            tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+            if not _has_gaps(filtered, tf_ms, start_ms, end_ms):
+                return filtered
+            rest_rows = _fetch_ohlcv_rest(exchange, symbol, timeframe, start_ms, end_ms, limit=limit)
+            if rest_rows:
+                cache_path = _ohlcv_cache_path(ROOT_DIR, symbol, timeframe, start_ms, end_ms)
+                _write_ohlcv_cache(cache_path, rest_rows)
+                return rest_rows
         if cache_only:
             return []
     cache_path = _ohlcv_cache_path(ROOT_DIR, symbol, timeframe, start_ms, end_ms)
     cached = _read_ohlcv_cache(cache_path)
     if cached:
-        return cached
+        if not fill_missing or cache_only:
+            return cached
+        tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+        if not _has_gaps(cached, tf_ms, start_ms, end_ms):
+            return cached
+        rest_rows = _fetch_ohlcv_rest(exchange, symbol, timeframe, start_ms, end_ms, limit=limit)
+        if rest_rows:
+            _write_ohlcv_cache(cache_path, rest_rows)
+            return rest_rows
     if cache_only:
         return []
-    out: List[list] = []
-    since = start_ms
-    tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
-    last_ts = None
-    while since < end_ms:
-        batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-        if not batch:
-            break
-        for row in batch:
-            ts = int(row[0])
-            if ts > end_ms:
-                continue
-            if last_ts is None or ts > last_ts:
-                out.append(row)
-                last_ts = ts
-        new_last = int(batch[-1][0])
-        if last_ts is None or new_last == last_ts:
-            since = new_last + tf_ms
-        else:
-            since = last_ts + tf_ms
+    out = _fetch_ohlcv_rest(exchange, symbol, timeframe, start_ms, end_ms, limit=limit)
     _write_ohlcv_cache(cache_path, out)
     return out
 
@@ -165,8 +232,9 @@ def run_backtest() -> None:
     parser.add_argument("--min-quote-vol-24h", type=float, default=0.0)
 
     parser.add_argument("--stall-high-lookback", type=int, default=6)
-    parser.add_argument("--stall-wick-min", type=float, default=0.45)
+    parser.add_argument("--stall-wick-min", type=float, default=0.5)
     parser.add_argument("--stall-min-count", type=int, default=2)
+    parser.add_argument("--mtf-require-weak-close", action="store_true", default=False)
 
     parser.add_argument("--ema-len", type=int, default=20)
     parser.add_argument("--swing-lookback", type=int, default=30)
@@ -175,11 +243,14 @@ def run_backtest() -> None:
     parser.add_argument("--vol-spike-mult", type=float, default=1.8)
     parser.add_argument("--vol-sma-len", type=int, default=20)
     parser.add_argument("--retest-ema-tol", type=float, default=0.1)
+    parser.add_argument("--start", type=str, default="")
+    parser.add_argument("--end", type=str, default="")
+    parser.add_argument("--fill-missing", action="store_true", default=False)
     parser.add_argument("--limit-entry", action="store_true", default=True)
-    parser.add_argument("--limit-offset-atr", type=float, default=0.13)
+    parser.add_argument("--limit-offset-atr", type=float, default=0.15)
     parser.add_argument("--retest-max-depth-atr", type=float, default=1.15)
     parser.add_argument("--retest-wait-next-high", action="store_true", default=False)
-    parser.add_argument("--fail-wick-max", type=float, default=0.4)
+    parser.add_argument("--fail-wick-max", type=float, default=0.30)
     parser.add_argument("--fail-require-ema", action="store_true", default=False)
     parser.add_argument("--stop-atr-mult", type=float, default=0.35)
     parser.add_argument("--min-hold-bars", type=int, default=3)
@@ -191,7 +262,7 @@ def run_backtest() -> None:
     args = parser.parse_args()
 
     exchange = ccxt.binance({"enableRateLimit": True})
-    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    end_ms = _parse_ts_arg(args.end) or int(datetime.now(timezone.utc).timestamp() * 1000)
 
     ltf_tf = str(args.ltf_tf).strip()
     mtf_tf = str(args.mtf_tf).strip()
@@ -201,11 +272,17 @@ def run_backtest() -> None:
     min_mtf = max(args.ema_len + 5, 60)
     min_htf = max(args.stall_high_lookback + 5, 180)
 
-    start_ms, eval_start_ms, _, _ = calc_warmup_window(
-        args.days,
-        end_ms,
-        {ltf_tf: min_ltf, mtf_tf: min_mtf, htf_tf: min_htf},
-    )
+    start_arg_ms = _parse_ts_arg(args.start)
+    if start_arg_ms is None:
+        start_ms, eval_start_ms, _, _ = calc_warmup_window(
+            args.days,
+            end_ms,
+            {ltf_tf: min_ltf, mtf_tf: min_mtf, htf_tf: min_htf},
+        )
+    else:
+        eval_start_ms = start_arg_ms
+        warmup_minutes = max(min_ltf * 3, min_mtf * 15, min_htf * 60)
+        start_ms = eval_start_ms - int(warmup_minutes * 60 * 1000)
 
     universe = load_common_universe(args.universe, exchange, args.cache_only)
     base_dir = os.path.join(ROOT_DIR, "logs", "top_fail_short_v1", "backtest")
@@ -234,6 +311,7 @@ def run_backtest() -> None:
             use_common_warmup=use_common,
             common_warmup_dir=common_dir,
             cache_only=args.cache_only,
+            fill_missing=args.fill_missing,
         )
         rows_mtf = _fetch_ohlcv_all(
             exchange,
@@ -244,6 +322,7 @@ def run_backtest() -> None:
             use_common_warmup=use_common,
             common_warmup_dir=common_dir,
             cache_only=args.cache_only,
+            fill_missing=args.fill_missing,
         )
         rows_htf = _fetch_ohlcv_all(
             exchange,
@@ -254,6 +333,7 @@ def run_backtest() -> None:
             use_common_warmup=use_common,
             common_warmup_dir=common_dir,
             cache_only=args.cache_only,
+            fill_missing=args.fill_missing,
         )
         if not rows_ltf or not rows_mtf or not rows_htf:
             continue
@@ -494,7 +574,11 @@ def run_backtest() -> None:
             if top_stall:
                 cur_close_mtf = float(df_mtf["close"].iloc[idx_mtf])
                 cur_ema_mtf = float(ema_mtf.iloc[idx_mtf])
-                washdown_armed = bool(cur_close_mtf < cur_ema_mtf)
+                if bool(args.mtf_require_weak_close):
+                    prev_close_mtf = float(df_mtf["close"].iloc[idx_mtf - 1])
+                    washdown_armed = bool(cur_close_mtf < cur_ema_mtf and cur_close_mtf < prev_close_mtf)
+                else:
+                    washdown_armed = bool(cur_close_mtf < cur_ema_mtf)
             else:
                 washdown_armed = False
             if washdown_armed:
