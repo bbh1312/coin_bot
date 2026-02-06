@@ -1353,6 +1353,9 @@ COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "40"))
 COMMON_UNIVERSE_LOG_PATH = ""
 COMMON_WARMUP_LOG_PATH = ""
 COMMON_WARMUP_CACHE_DIR = os.getenv("COMMON_WARMUP_CACHE_DIR", "").strip()
+COMMON_GAP_REPAIR_ENABLED = os.getenv("COMMON_GAP_REPAIR_ENABLED", "1") not in ("0", "false", "off", "no")
+COMMON_GAP_REPAIR_INTERVAL_SEC = int(os.getenv("COMMON_GAP_REPAIR_INTERVAL_SEC", "60"))
+COMMON_GAP_REPAIR_MAX_FETCH = int(os.getenv("COMMON_GAP_REPAIR_MAX_FETCH", "6"))
 NOISE_REVERSE_USE_COMMON_CACHE = os.getenv("NOISE_REVERSE_USE_COMMON_CACHE", "0") == "1"
 NOISE_REVERSE_FILE_CACHE: dict = {}
 NOISE_REVERSE_FILE_CACHE_USED: dict = {}
@@ -1886,6 +1889,69 @@ def _warmup_common_cache(state: dict, exchange, universe: list) -> bool:
             except Exception:
                 pass
     return done_all
+
+def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list) -> None:
+    if not COMMON_GAP_REPAIR_ENABLED:
+        return
+    if not universe:
+        return
+    if not COMMON_WARMUP_TFS:
+        return
+    try:
+        now = time.time()
+        last_ts = _coerce_state_float(state.get("_common_gap_repair_ts", 0.0))
+    except Exception:
+        now = time.time()
+        last_ts = 0.0
+    if COMMON_GAP_REPAIR_INTERVAL_SEC > 0 and (now - last_ts) < COMMON_GAP_REPAIR_INTERVAL_SEC:
+        return
+    state["_common_gap_repair_ts"] = now
+    checked = 0
+    candidates = 0
+    repaired = 0
+    for sym in universe:
+        for tf in COMMON_WARMUP_TFS:
+            checked += 1
+            try:
+                limit = _tf_bars_for_days(tf, COMMON_WARMUP_DAYS)
+            except Exception:
+                limit = 0
+            if limit <= 0:
+                continue
+            file_ts = _read_warmup_ts(sym, tf)
+            file_has = isinstance(file_ts, list) and len(file_ts) >= limit
+            file_gap = _has_time_gaps_ts(file_ts, tf, tail=limit) if file_has else True
+            if not file_has or file_gap:
+                candidates += 1
+                try:
+                    data = _fetch_ohlcv_range(exchange, sym, tf, limit)
+                    if data:
+                        cycle_cache.set_raw(sym, tf, data)
+                        _dump_common_warmup_ohlcv(sym, tf, data)
+                        repaired += 1
+                        if COMMON_WARMUP_LOG_PATH:
+                            _append_log_lines(
+                                COMMON_WARMUP_LOG_PATH,
+                                [f"GAP_REPAIR_OK sym={sym} tf={tf} bars={len(data)} need={limit}"],
+                            )
+                    else:
+                        if COMMON_WARMUP_LOG_PATH:
+                            _append_log_lines(
+                                COMMON_WARMUP_LOG_PATH,
+                                [f"GAP_REPAIR_EMPTY sym={sym} tf={tf} need={limit}"],
+                            )
+                except Exception as e:
+                    if COMMON_WARMUP_LOG_PATH:
+                        _append_log_lines(
+                            COMMON_WARMUP_LOG_PATH,
+                            [f"GAP_REPAIR_FAIL sym={sym} tf={tf} err={e}"],
+                        )
+                if COMMON_GAP_REPAIR_MAX_FETCH > 0 and repaired >= COMMON_GAP_REPAIR_MAX_FETCH:
+                    break
+        if COMMON_GAP_REPAIR_MAX_FETCH > 0 and repaired >= COMMON_GAP_REPAIR_MAX_FETCH:
+            break
+    if repaired:
+        print(f"[common-gap] repaired {repaired}/{candidates} checked={checked}")
 
 def _kst_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=9)
@@ -16924,6 +16990,12 @@ def run():
                                 meta["common_warmup_last_notify_ts"] = now_ts
                             _COMMON_WARMUP_NOTIFY_TS_MEM = now_ts
                             save_state(state)
+
+                    # periodic gap repair for common warmup cache (non-blocking)
+                    try:
+                        _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                    except Exception:
+                        pass
 
                     if heavy_scan:
                         universe_union = list(
