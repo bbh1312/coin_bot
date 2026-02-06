@@ -10945,10 +10945,35 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
         pos_syms = list_open_position_symbols(force=True)
     except Exception:
         return
+    current_keys = set()
     for side_key, side_label in (("short", "SHORT"), ("long", "LONG")):
         syms = pos_syms.get(side_key) or set()
         for sym in syms:
+            if sym:
+                current_keys.add(f"{sym}|{side_label}")
+    if not state.get("_manual_follow_initialized"):
+        state["_manual_follow_seen"] = {k: time.time() for k in current_keys}
+        state["_manual_follow_initialized"] = True
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        return
+    seen = state.get("_manual_follow_seen")
+    if not isinstance(seen, dict):
+        seen = {}
+        state["_manual_follow_seen"] = seen
+    stale_keys = [k for k in seen.keys() if k not in current_keys]
+    for k in stale_keys:
+        seen.pop(k, None)
+    for side_key, side_label in (("short", "SHORT"), ("long", "LONG")):
+        syms = pos_syms.get(side_key) or set()
+        for sym in syms:
+            seen_key = f"{sym}|{side_label}"
+            if seen_key in seen:
+                continue
             if _get_open_trade(state, side_label, sym):
+                seen[seen_key] = time.time()
                 continue
             detail = get_short_position_detail(sym) if side_label == "SHORT" else get_long_position_detail(sym)
             if not isinstance(detail, dict):
@@ -11056,6 +11081,7 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                             })
                     if follower_calls:
                         _broadcast_followers("long_market" if side_label == "LONG" else "short_market", follower_calls, {"symbol": sym})
+            seen[seen_key] = time.time()
             _send_entry_alert(
                 send_telegram,
                 side=side_label,

@@ -180,6 +180,8 @@ def run_backtest() -> None:
     parser.add_argument("--retest-max-depth-atr", type=float, default=1.0)
     parser.add_argument("--retest-wait-next-high", action="store_true", default=True)
     parser.add_argument("--stop-atr-mult", type=float, default=0.35)
+    parser.add_argument("--min-hold-bars", type=int, default=3)
+    parser.add_argument("--tp-min-pct", type=float, default=0.015)
     parser.add_argument("--max-wait-bars", type=int, default=60)
     parser.add_argument("--cooldown-bars", type=int, default=20)
 
@@ -391,7 +393,7 @@ def run_backtest() -> None:
                     cooldown = args.cooldown_bars
                     continue
 
-                if low <= trade["tp_price"]:
+                if trade["hold_bars"] >= int(args.min_hold_bars) and low <= trade["tp_price"]:
                     exit_px = trade["tp_price"]
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
                     stats["exits"] += 1
@@ -561,11 +563,14 @@ def run_backtest() -> None:
                         entry_type = "market"
                         limit_filled = False
                         if bool(args.limit_entry) and break_level is not None:
-                            entry_limit = min(float(ema_now), float(break_level)) - float(args.limit_offset_atr) * float(atr_now)
-                            entry_type = "limit"
-                            if low_now <= entry_limit:
-                                entry_px = entry_limit
-                                limit_filled = True
+                        offset = float(args.limit_offset_atr)
+                        if retest_seen_count >= 5 and entry_count == 0:
+                            offset *= 1.2
+                        entry_limit = min(float(ema_now), float(break_level)) - offset * float(atr_now)
+                        entry_type = "limit"
+                        if low_now <= entry_limit:
+                            entry_px = entry_limit
+                            limit_filled = True
                             else:
                                 entry_window = False
                                 retest_active = False
@@ -583,7 +588,7 @@ def run_backtest() -> None:
                             retest_touch_idx = None
                             retest_touch_high = None
                             continue
-                        tp_price = entry_px - 0.7 * r
+                        tp_price = entry_px - max(0.7 * r, float(args.tp_min_pct) * entry_px)
                         trade = {
                             "entry_px": entry_px,
                             "sl_price": sl_price,
