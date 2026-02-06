@@ -14,7 +14,12 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from engines.backtest_common import calc_warmup_window, load_common_universe
+from engines.backtest_common import (
+    calc_warmup_window,
+    load_common_universe,
+    format_backtest_summary,
+    print_time_summaries,
+)
 from engines.top_fail_short_v1.engine import TopFailShortConfig
 
 
@@ -240,6 +245,7 @@ def run_backtest() -> None:
     parser.add_argument("--ltf-strong-close-pos-max", type=float, default=0.25)
     parser.add_argument("--htf-confirmed-only", action="store_true", default=True)
     parser.add_argument("--htf-gate-mode", type=str, default="confirm")
+    parser.add_argument("--print-ready-counts", action="store_true")
     args = parser.parse_args()
 
     cfg = TopFailShortConfig(
@@ -366,6 +372,7 @@ def run_backtest() -> None:
     }
     entry_usdt = 10.0
     stats_by_symbol: Dict[str, Dict[str, float]] = {}
+    trades_out: List[dict] = []
 
     for sym, df in data_by_sym.items():
         ts = df["ts"].astype(int).to_numpy()
@@ -419,7 +426,7 @@ def run_backtest() -> None:
                 # SL
                 if high >= trade["sl_price"]:
                     exit_px = trade["sl_price"]
-                    pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"] * trade["remaining"]
+                    pnl_pct = trade["realized"] + (trade["entry_px"] - exit_px) / trade["entry_px"] * trade["remaining"]
                     stats["exits"] += 1
                     stats["trades"] += 1
                     stats["mfe_sum"] += trade["mfe"]
@@ -440,6 +447,16 @@ def run_backtest() -> None:
                     sym_stats["sl_sum_usdt"] += pnl_pct * entry_usdt
                     stats["losses"] += 1
                     sym_stats["losses"] += 1
+                    trades_out.append(
+                        {
+                            "symbol": sym,
+                            "entry_ts": int(trade["entry_ts"]),
+                            "exit_ts": int(ts[i]),
+                            "pnl_pct": pnl_pct * 100.0,
+                            "result": "LOSS",
+                            "reason": "SL",
+                        }
+                    )
                     trade = None
                     retries += 1
                     cooldown = cfg.cooldown_bars
@@ -491,6 +508,16 @@ def run_backtest() -> None:
                     else:
                         stats["losses"] += 1
                         sym_stats["losses"] += 1
+                    trades_out.append(
+                        {
+                            "symbol": sym,
+                            "entry_ts": int(trade["entry_ts"]),
+                            "exit_ts": int(ts[i]),
+                            "pnl_pct": total_pnl * 100.0,
+                            "result": "WIN" if total_pnl > 0 else "LOSS",
+                            "reason": "TP",
+                        }
+                    )
                     trade = None
                     cooldown = cfg.cooldown_bars
                 continue
@@ -643,6 +670,7 @@ def run_backtest() -> None:
                 "mfe": 0.0,
                 "mae": 0.0,
                 "hold_bars": 0,
+                "entry_ts": ts_ms,
             }
             stats["entries"] += 1
             sym_stats["entries"] += 1
@@ -661,13 +689,9 @@ def run_backtest() -> None:
             sym_stats["avg_mfe"] = sym_stats["mfe_sum"] / trades
             sym_stats["avg_mae"] = sym_stats["mae_sum"] / trades
             sym_stats["avg_hold"] = sym_stats["hold_sum"] / trades
-            _log(
-                f"[BACKTEST] {sym} entries={sym_stats['entries']} exits={sym_stats['exits']} "
-                f"trades={trades} wins={sym_stats['wins']} losses={sym_stats['losses']} "
-                f"winrate={sym_stats['winrate']:.2f}% avg_mfe={sym_stats['avg_mfe']:.4f} "
-                f"avg_mae={sym_stats['avg_mae']:.4f} avg_hold={sym_stats['avg_hold']:.1f} "
-                f"net_sum={sym_stats['net_sum']:.3f}"
-            )
+            line = format_backtest_summary(sym, sym_stats)
+            print(line)
+            _log(line)
         stats_by_symbol[sym] = sym_stats
 
     trades = stats["trades"]
@@ -675,18 +699,14 @@ def run_backtest() -> None:
     avg_mfe = stats["mfe_sum"] / trades if trades > 0 else 0.0
     avg_mae = stats["mae_sum"] / trades if trades > 0 else 0.0
     avg_hold = stats["hold_sum"] / trades if trades > 0 else 0.0
-    print(
-        f"[BACKTEST] TOTAL entries={stats['entries']} exits={stats['exits']} trades={trades} "
-        f"wins={stats['wins']} losses={stats['losses']} winrate={winrate:.2f}% "
-        f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f} "
-        f"tp_sum={stats['tp_sum']:.3f} sl_sum={stats['sl_sum']:.3f} net_sum={stats['net_sum']:.3f} "
-        f"tp_sum_usdt={stats['tp_sum_usdt']:.3f} sl_sum_usdt={stats['sl_sum_usdt']:.3f} net_sum_usdt={stats['net_sum_usdt']:.3f}"
-    )
-    print(
-        f"[BACKTEST] READY_COUNTS v1_ready={v1_ready_count} htf_confirm={htf_confirm_count} "
-        f"pass_htf_alignment={pass_htf_alignment} pass_htf_body={pass_htf_body} "
-        f"pass_htf_distance={pass_htf_distance} final_ready={final_ready_count}"
-    )
+    print(format_backtest_summary(None, stats))
+    print_time_summaries(trades_out, _log)
+    if args.print_ready_counts:
+        print(
+            f"[BACKTEST] READY_COUNTS v1_ready={v1_ready_count} htf_confirm={htf_confirm_count} "
+            f"pass_htf_alignment={pass_htf_alignment} pass_htf_body={pass_htf_body} "
+            f"pass_htf_distance={pass_htf_distance} final_ready={final_ready_count}"
+        )
     print(f"[BACKTEST] WARMUP auto days={warmup_days} minutes={warmup_minutes} eval_days={args.days}")
 
 

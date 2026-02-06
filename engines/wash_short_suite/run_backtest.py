@@ -14,7 +14,13 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from engines.backtest_common import calc_warmup_window, load_common_universe, log_warmup_info
+from engines.backtest_common import (
+    calc_warmup_window,
+    load_common_universe,
+    log_warmup_info,
+    format_backtest_summary,
+    print_time_summaries,
+)
 from engines.wash_short_suite.engine import WashShortSuiteConfig
 
 
@@ -704,13 +710,7 @@ def run_backtest():
         net_sum_usdt = s.get("net_sum_usdt", 0.0)
         tp_sum_usdt = s.get("tp_sum_usdt", 0.0)
         sl_sum_usdt = s.get("sl_sum_usdt", 0.0)
-        line = (
-            f"[BACKTEST] {sym} entries={int(s['entries'])} exits={int(s['exits'])} trades={trades} "
-            f"wins={wins} losses={losses} winrate={winrate:.2f}% "
-            f"avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f} "
-            f"tp_sum={tp_sum:.3f} sl_sum={sl_sum:.3f} net_sum={net_sum:.3f} "
-            f"tp_sum_usdt={tp_sum_usdt:.3f} sl_sum_usdt={sl_sum_usdt:.3f} net_sum_usdt={net_sum_usdt:.3f}"
-        )
+        line = format_backtest_summary(sym, s)
         print(line)
         _log(line)
 
@@ -727,13 +727,7 @@ def run_backtest():
     total_net_sum_usdt = stats.get("net_sum_usdt", 0.0)
     total_tp_sum_usdt = stats.get("tp_sum_usdt", 0.0)
     total_sl_sum_usdt = stats.get("sl_sum_usdt", 0.0)
-    total_line = (
-        f"[BACKTEST] TOTAL entries={int(stats['entries'])} exits={int(stats['exits'])} trades={total_trades} "
-        f"wins={total_wins} losses={total_losses} winrate={total_winrate:.2f}% "
-        f"avg_mfe={total_avg_mfe:.4f} avg_mae={total_avg_mae:.4f} avg_hold={total_avg_hold:.1f} "
-        f"tp_sum={total_tp_sum:.3f} sl_sum={total_sl_sum:.3f} net_sum={total_net_sum:.3f} "
-        f"tp_sum_usdt={total_tp_sum_usdt:.3f} sl_sum_usdt={total_sl_sum_usdt:.3f} net_sum_usdt={total_net_sum_usdt:.3f}"
-    )
+    total_line = format_backtest_summary(None, stats)
     print(total_line)
     _log(total_line)
     log_warmup_info(_log, warmup_days, warmup_minutes, days)
@@ -748,28 +742,7 @@ def run_backtest():
             )
             print(line)
             _log(line)
-    print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
-    _log("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
-    for hour in range(24):
-        row = stats_by_hour.get(hour, {"entries": 0, "tp": 0, "sl": 0})
-        entries = int(row["entries"])
-        tp = int(row["tp"])
-        sl = int(row["sl"])
-        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
-        line = f"[BACKTEST] HOUR {hour:02d} entries={entries} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
-        print(line)
-        _log(line)
-    print("[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate")
-    _log("[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate")
-    for dow in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
-        row = stats_by_dow.get(dow, {"entries": 0, "tp": 0, "sl": 0})
-        entries = int(row["entries"])
-        tp = int(row["tp"])
-        sl = int(row["sl"])
-        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
-        line = f"[BACKTEST] DOW {dow} entries={entries} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
-        print(line)
-        _log(line)
+    print_time_summaries(trades_out, _log)
 
 
 if __name__ == "__main__":
