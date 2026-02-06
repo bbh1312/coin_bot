@@ -96,6 +96,7 @@ COMMAND_DEFS = [
     {"cmd": "/dca3", "key": "_dca_third_pct", "label": "DCA3(%)", "type": "number", "step": 0.1},
     {"cmd": "/exit_cd_h", "key": "_exit_cooldown_hours", "label": "재진입 시간(h)", "type": "number", "step": 0.1},
     {"cmd": "/entry_usdt", "key": "_entry_usdt", "label": "진입 금액(%)", "type": "number", "step": 0.1},
+    {"cmd": "/entry_block_hours", "key": "_entry_block_hours", "label": "진입 금지 시간(시,CSV)", "type": "text"},
     {"cmd": "/l_exit_tp", "key": "_auto_exit_long_tp_pct", "label": "롱 TP (%)", "type": "number", "step": 0.1},
     {"cmd": "/l_exit_sl", "key": "_auto_exit_long_sl_pct", "label": "롱 SL (%)", "type": "number", "step": 0.1},
     {"cmd": "/s_exit_tp", "key": "_auto_exit_short_tp_pct", "label": "숏 TP (%)", "type": "number", "step": 0.1},
@@ -167,6 +168,7 @@ def _build_account_contexts_web(include_inactive: bool = False) -> list[AccountC
 
         settings = AccountSettings(
             entry_pct=float(_get_setting("entry_pct", defaults["entry_pct"])),
+            entry_block_hours=str(_get_setting("entry_block_hours", defaults.get("entry_block_hours", "")) or ""),
             dry_run=_coerce_bool(_get_setting("dry_run", defaults["dry_run"])),
             auto_exit=_coerce_bool(_get_setting("auto_exit", defaults["auto_exit"])),
             max_positions=int(_get_setting("max_positions", defaults["max_positions"])),
@@ -213,6 +215,13 @@ def _build_account_contexts_web(include_inactive: bool = False) -> list[AccountC
         )
     return contexts
 
+def _normalize_entry_block_hours_value(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, (int, float)):
+        return str(int(val))
+    return str(val).strip()
+
 def _sync_admin_settings_from_state(state: dict) -> None:
     if not isinstance(state, dict):
         return
@@ -224,6 +233,7 @@ def _sync_admin_settings_from_state(state: dict) -> None:
         return
     mapping = {
         "_entry_usdt": ("entry_pct", float),
+        "_entry_block_hours": ("entry_block_hours", _normalize_entry_block_hours_value),
         "_auto_exit": ("auto_exit", int),
         "_max_open_positions": ("max_positions", int),
         "_exit_cooldown_hours": ("exit_cooldown_h", float),
@@ -270,6 +280,7 @@ DEFAULTS = {
     "_realtime_only": REALTIME_ONLY_ENABLED,
     "_max_open_positions": MAX_OPEN_POSITIONS,
     "_entry_usdt": USDT_PER_TRADE,
+    "_entry_block_hours": "",
     "_noise_reverse_v1_enabled": NOISE_REVERSE_V1_ENABLED,
     "_rsi_enabled": RSI_ENABLED,
     "_dca_enabled": DCA_ENABLED,

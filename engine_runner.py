@@ -241,6 +241,8 @@ MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "
 MANUAL_ALERT_TTL_SEC = float(os.getenv("MANUAL_ALERT_TTL_SEC", "3600"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 USDT_PER_TRADE = float(os.getenv("ENTRY_USDT_PCT", "8.0"))
+ENTRY_BLOCK_HOURS_RAW = os.getenv("ENTRY_BLOCK_HOURS", "").strip()
+ENTRY_BLOCK_HOURS = []
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "cross").lower().strip()
 POS_CHECK_MIN_SEC = float(os.getenv("POS_CHECK_MIN_SEC", "20"))
@@ -271,6 +273,58 @@ def _parse_action_allowlist(val: str) -> set:
         return set()
     items = [s.strip() for s in val.split(",") if s.strip()]
     return set(items)
+
+def _parse_entry_block_hours(val: Optional[str]) -> list:
+    if not isinstance(val, str):
+        return []
+    raw = val.replace(" ", "").replace("|", ",").replace(";", ",")
+    if not raw:
+        return []
+    out = []
+    seen = set()
+    for part in raw.split(","):
+        if not part:
+            continue
+        try:
+            hour = int(float(part))
+        except Exception:
+            continue
+        if hour < 0 or hour > 23:
+            continue
+        if hour in seen:
+            continue
+        seen.add(hour)
+        out.append(hour)
+    return sorted(out)
+
+ENTRY_BLOCK_HOURS = _parse_entry_block_hours(ENTRY_BLOCK_HOURS_RAW)
+
+def _format_entry_block_hours(hours: Optional[list]) -> str:
+    if not hours:
+        return ""
+    try:
+        return ",".join([str(int(h)) for h in sorted(set(hours))])
+    except Exception:
+        return ""
+
+def _entry_blocked_now(hours: Optional[list], now_ts: Optional[float] = None) -> bool:
+    if not hours:
+        return False
+    if now_ts is None:
+        now_ts = time.time()
+    dt = datetime.fromtimestamp(float(now_ts), tz=timezone.utc) + timedelta(hours=9)
+    return int(dt.hour) in set(int(h) for h in hours if isinstance(h, (int, float)))
+
+def _entry_block_window_text(hours: Optional[list]) -> str:
+    if not hours:
+        return ""
+    try:
+        parts = []
+        for h in sorted(set(int(x) for x in hours if isinstance(x, (int, float)))):
+            parts.append(f"{h:02d}:00~{(h + 1) % 24:02d}:00")
+        return ", ".join(parts)
+    except Exception:
+        return ""
 
 def _infer_symbol_from_args(args, kwargs) -> Optional[str]:
     if "symbol" in kwargs:
@@ -309,6 +363,7 @@ def _refresh_admin_settings_from_db(state: Optional[dict] = None) -> None:
     global AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT, DCA_ENABLED, DCA_PCT
     global DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC
     global LIVE_TRADING
+    global ENTRY_BLOCK_HOURS
     try:
         admin_id = accounts_db.get_account_id_by_name("admin")
     except Exception:
@@ -322,6 +377,11 @@ def _refresh_admin_settings_from_db(state: Optional[dict] = None) -> None:
     if not settings:
         return
     try:
+        block_hours = settings.get("entry_block_hours")
+        if isinstance(block_hours, str):
+            ENTRY_BLOCK_HOURS = _parse_entry_block_hours(block_hours)
+            if isinstance(state, dict):
+                state["_entry_block_hours"] = _format_entry_block_hours(ENTRY_BLOCK_HOURS)
         entry_pct = settings.get("entry_pct")
         if isinstance(entry_pct, (int, float)) and entry_pct > 0:
             USDT_PER_TRADE = float(entry_pct)
@@ -603,6 +663,9 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
     if not _admin_is_active():
         _set_last_entry_broadcast(symbol, "SHORT", "skip", False, [])
         return {"status": "skip", "reason": "admin_inactive", "symbol": symbol}
+    if _entry_blocked_now(ENTRY_BLOCK_HOURS):
+        _set_last_entry_broadcast(symbol, "SHORT", "skip", False, [])
+        return {"status": "skip", "reason": "entry_block_hours", "symbol": symbol}
     try:
         res = _EXEC_SHORT_MARKET(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
     except Exception:
@@ -692,6 +755,9 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
     if not _admin_is_active():
         _set_last_entry_broadcast(symbol, "LONG", "skip", False, [])
         return {"status": "skip", "reason": "admin_inactive", "symbol": symbol}
+    if _entry_blocked_now(ENTRY_BLOCK_HOURS):
+        _set_last_entry_broadcast(symbol, "LONG", "skip", False, [])
+        return {"status": "skip", "reason": "entry_block_hours", "symbol": symbol}
     try:
         res = _EXEC_LONG_MARKET(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
     except Exception:
@@ -7001,6 +7067,10 @@ def _entry_guard_acquire(
     engine: Optional[str] = None,
     side: Optional[str] = None,
 ) -> bool:
+    if _entry_blocked_now(ENTRY_BLOCK_HOURS):
+        hours_text = _format_entry_block_hours(ENTRY_BLOCK_HOURS)
+        _append_entry_gate_log(engine or "unknown", symbol, f"entry_block_hours={hours_text}", side=side)
+        return False
     guard = _get_entry_guard(state)
     now = time.time()
     gkey = key or symbol
@@ -7273,6 +7343,10 @@ def _enqueue_entry_request(
     allow_over_max: bool = False,
     meta: Optional[dict] = None,
 ) -> Optional[str]:
+    if _entry_blocked_now(ENTRY_BLOCK_HOURS):
+        hours_text = _format_entry_block_hours(ENTRY_BLOCK_HOURS)
+        _append_entry_gate_log(engine.lower(), symbol, f"entry_block_hours={hours_text}", side=side)
+        return None
     if _is_manage_pending(state, symbol, side):
         _append_entry_gate_log(engine.lower(), symbol, f"pending_request side={side}", side=side)
         return None
@@ -10927,6 +11001,61 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                 entry_order_id=None,
                 meta={"reason": "manual_entry"},
             )
+            if FOLLOWER_CONTEXTS:
+                if _entry_blocked_now(ENTRY_BLOCK_HOURS):
+                    try:
+                        send_telegram(f"⛔ manual follow blocked (entry_block_hours) {sym} {side_label}")
+                    except Exception:
+                        pass
+                else:
+                    follower_calls = []
+                    active_names = _active_account_names()
+                    def _skip_result(reason: str):
+                        return {"status": "skip", "reason": reason}
+                    for acct in FOLLOWER_CONTEXTS:
+                        if active_names and str(acct.name) not in active_names:
+                            follower_calls.append({"acct": acct, "fn": lambda r="inactive": _skip_result(r)})
+                            continue
+                        follower_state = load_state_from(acct.state_path)
+                        admin_follow_enabled = follower_state.get("_admin_follow_enabled")
+                        if admin_follow_enabled is None:
+                            admin_follow_enabled = True
+                        manual_entry_enabled = follower_state.get("_admin_manual_entry_enabled")
+                        if manual_entry_enabled is None:
+                            manual_entry_enabled = True
+                        if not admin_follow_enabled:
+                            follower_calls.append({"acct": acct, "fn": lambda r="admin_follow_disabled": _skip_result(r)})
+                            continue
+                        if not manual_entry_enabled:
+                            follower_calls.append({"acct": acct, "fn": lambda r="manual_entry_disabled": _skip_result(r)})
+                            continue
+                        pct = None
+                        try:
+                            pct = float(getattr(acct.settings, "entry_pct", USDT_PER_TRADE))
+                        except Exception:
+                            pct = None
+                        usdt_amount = _resolve_entry_usdt_for_executor(acct.executor, pct)
+                        if not isinstance(usdt_amount, (int, float)) or usdt_amount <= 0:
+                            follower_calls.append({"acct": acct, "fn": lambda r="entry_usdt_unavailable": _skip_result(r)})
+                            continue
+                        leverage = int(getattr(acct.settings, "leverage", LEVERAGE))
+                        margin_mode = str(getattr(acct.settings, "margin_mode", MARGIN_MODE))
+                        if side_label == "LONG":
+                            follower_calls.append({
+                                "acct": acct,
+                                "fn": lambda a=acct, u=usdt_amount, lev=leverage, mm=margin_mode: a.executor.long_market(
+                                    sym, usdt_amount=u, leverage=lev, margin_mode=mm
+                                ),
+                            })
+                        else:
+                            follower_calls.append({
+                                "acct": acct,
+                                "fn": lambda a=acct, u=usdt_amount, lev=leverage, mm=margin_mode: a.executor.short_market(
+                                    sym, usdt_amount=u, leverage=lev, margin_mode=mm
+                                ),
+                            })
+                    if follower_calls:
+                        _broadcast_followers("long_market" if side_label == "LONG" else "short_market", follower_calls, {"symbol": sym})
             _send_entry_alert(
                 send_telegram,
                 side=side_label,
@@ -12215,6 +12344,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
+    global ENTRY_BLOCK_HOURS
     try:
         disk = load_state_from(state_path) if state_path else load_state()
     except Exception:
@@ -12232,6 +12362,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_long_live",
         "_max_open_positions",
         "_entry_usdt",
+        "_entry_block_hours",
         "_dca_enabled",
         "_dca_pct",
         "_dca_first_pct",
@@ -12376,6 +12507,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
             pass
     if (not skip_keys or "_entry_usdt" not in skip_keys) and isinstance(state.get("_entry_usdt"), (int, float)):
         USDT_PER_TRADE = float(state.get("_entry_usdt"))
+    if (not skip_keys or "_entry_block_hours" not in skip_keys) and isinstance(state.get("_entry_block_hours"), str):
+        ENTRY_BLOCK_HOURS = _parse_entry_block_hours(state.get("_entry_block_hours"))
     if (not skip_keys or "_swaggy_atlas_lab_enabled" not in skip_keys) and isinstance(state.get("_swaggy_atlas_lab_enabled"), bool):
         SWAGGY_ATLAS_LAB_ENABLED = bool(state.get("_swaggy_atlas_lab_enabled"))
     if (not skip_keys or "_swaggy_atlas_lab_v2_enabled" not in skip_keys) and isinstance(state.get("_swaggy_atlas_lab_v2_enabled"), bool):
@@ -13154,6 +13287,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, WASH_SHORT_SUITE_ENABLED, BULL_PULLBACK_LONG_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
+    global ENTRY_BLOCK_HOURS
     if not BOT_TOKEN:
         return
     # manage_ws 프로세스에서 contexts가 비어있는 경우가 있어 주기적으로 리프레시
@@ -13802,6 +13936,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/exit_cd_h(재진입시간h): {EXIT_COOLDOWN_HOURS:.2f}h\n"
                             "--------------\n"
                             f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
+                            f"/entry_block_hours(진입금지시간): {_entry_block_window_text(ENTRY_BLOCK_HOURS) or '없음'}\n"
                             f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                             f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
                             f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
@@ -13869,6 +14004,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/exit_cd_h(재진입시간h): {EXIT_COOLDOWN_HOURS:.2f}h\n"
                         "--------------\n"
                         f"/entry_usdt(진입비율%): {USDT_PER_TRADE:.2f}%\n"
+                        f"/entry_block_hours(진입금지시간): {_entry_block_window_text(ENTRY_BLOCK_HOURS) or '없음'}\n"
                         f"/dca(추가진입): {'ON' if DCA_ENABLED else 'OFF'} | /dca_pct: {DCA_PCT:.2f}%\n"
                         f"/dca1: {DCA_FIRST_PCT:.2f}% | /dca2: {DCA_SECOND_PCT:.2f}% | /dca3: {DCA_THIRD_PCT:.2f}%\n"
                         f"/l_exit_tp: {_fmt_pct_safe(AUTO_EXIT_LONG_TP_PCT)} | /l_exit_sl: {_fmt_pct_safe(AUTO_EXIT_LONG_SL_PCT)}\n"
@@ -14009,6 +14145,42 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] entry_usdt cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/entry_block_hours", "entry_block_hours")) and not responded:
+                    parts = text.split(maxsplit=1)
+                    arg_raw = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if not arg_raw or str(arg_raw).strip().lower() in ("status", "help"):
+                        windows = _entry_block_window_text(ENTRY_BLOCK_HOURS)
+                        resp = f"ℹ️ entry_block_hours: {windows or '없음'}\n사용법: /entry_block_hours 2,3,4,7,9"
+                    else:
+                        parsed = _parse_entry_block_hours(str(arg_raw))
+                        if parsed:
+                            ENTRY_BLOCK_HOURS = parsed
+                            state["_entry_block_hours"] = _format_entry_block_hours(parsed)
+                            state_dirty = True
+                            try:
+                                admin_id = accounts_db.get_account_id_by_name("admin")
+                                if admin_id:
+                                    accounts_db.update_account_setting(admin_id, "entry_block_hours", _format_entry_block_hours(parsed))
+                            except Exception:
+                                pass
+                            windows = _entry_block_window_text(parsed)
+                            resp = f"✅ entry_block_hours set: {windows}"
+                        else:
+                            ENTRY_BLOCK_HOURS = []
+                            state["_entry_block_hours"] = ""
+                            state_dirty = True
+                            try:
+                                admin_id = accounts_db.get_account_id_by_name("admin")
+                                if admin_id:
+                                    accounts_db.update_account_setting(admin_id, "entry_block_hours", "")
+                            except Exception:
+                                pass
+                            resp = "✅ entry_block_hours cleared"
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] entry_block_hours cmd 처리 send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/dca", "dca")) and not responded:
                     parts = lower.split()
@@ -15038,6 +15210,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_long_live",
                 "_max_open_positions",
                 "_entry_usdt",
+                "_entry_block_hours",
                 "_dca_enabled",
                 "_dca_pct",
                 "_dca_first_pct",
@@ -15113,6 +15286,7 @@ def save_state_to(state: Dict[str, dict], path: str) -> None:
                 "_long_live",
                 "_max_open_positions",
                 "_entry_usdt",
+                "_entry_block_hours",
                 "_dca_enabled",
                 "_dca_pct",
                 "_dca_first_pct",
@@ -15183,6 +15357,7 @@ def _build_account_contexts() -> List[AccountContext]:
             return default_val
         settings = AccountSettings(
             entry_pct=float(_get_setting("entry_pct", defaults["entry_pct"])),
+            entry_block_hours=str(_get_setting("entry_block_hours", defaults.get("entry_block_hours", "")) or ""),
             dry_run=_coerce_bool(_get_setting("dry_run", defaults["dry_run"])),
             auto_exit=_coerce_bool(_get_setting("auto_exit", defaults["auto_exit"])),
             max_positions=int(_get_setting("max_positions", defaults["max_positions"])),
@@ -15817,7 +15992,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /noise_reverse_v1 on|off|status, /wash_short_suite on|off|status, /bull_pullback_long_v1 on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /noise_reverse_v1 on|off|status, /wash_short_suite on|off|status, /bull_pullback_long_v1 on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):

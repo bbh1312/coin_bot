@@ -7,6 +7,7 @@ DB_PATH = os.getenv("ACCOUNTS_DB_PATH", "logs/trades.db")
 
 DEFAULT_SETTINGS = {
     "entry_pct": 30.0,
+    "entry_block_hours": "",
     "dry_run": 1,
     "auto_exit": 0,
     "max_positions": 12,
@@ -51,6 +52,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS account_settings (
                 account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
                 entry_pct REAL NOT NULL,
+                entry_block_hours TEXT NOT NULL DEFAULT "",
                 dry_run INTEGER NOT NULL DEFAULT 1,
                 auto_exit INTEGER NOT NULL DEFAULT 0,
                 max_positions INTEGER NOT NULL DEFAULT 7,
@@ -81,6 +83,18 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts (is_active);
             """
         )
+        cols = set()
+        try:
+            rows = conn.execute("PRAGMA table_info(account_settings)").fetchall()
+            for row in rows:
+                try:
+                    cols.add(row[1])
+                except Exception:
+                    pass
+        except Exception:
+            cols = set()
+        if "entry_block_hours" not in cols:
+            conn.execute('ALTER TABLE account_settings ADD COLUMN entry_block_hours TEXT NOT NULL DEFAULT ""')
         conn.commit()
     finally:
         conn.close()
@@ -128,15 +142,16 @@ def ensure_default_account(name: str = "admin") -> Optional[int]:
         conn.execute(
             """
             INSERT INTO account_settings (
-                account_id, entry_pct, dry_run, auto_exit, max_positions, leverage, margin_mode,
+                account_id, entry_pct, entry_block_hours, dry_run, auto_exit, max_positions, leverage, margin_mode,
                 exit_cooldown_h, long_tp_pct, long_sl_pct, short_tp_pct, short_sl_pct,
                 dca_enabled, dca_pct, dca1_pct, dca2_pct, dca3_pct, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account_id,
                 DEFAULT_SETTINGS["entry_pct"],
+                DEFAULT_SETTINGS["entry_block_hours"],
                 DEFAULT_SETTINGS["dry_run"],
                 DEFAULT_SETTINGS["auto_exit"],
                 DEFAULT_SETTINGS["max_positions"],

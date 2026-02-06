@@ -8,6 +8,7 @@ from telegram_client import TelegramClient
 @dataclass
 class AccountSettings:
     entry_pct: float
+    entry_block_hours: str
     dry_run: bool
     auto_exit: bool
     max_positions: int
