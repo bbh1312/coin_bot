@@ -177,7 +177,7 @@ def run_backtest() -> None:
     parser.add_argument("--retest-ema-tol", type=float, default=0.1)
     parser.add_argument("--limit-entry", action="store_true", default=True)
     parser.add_argument("--limit-offset-atr", type=float, default=0.05)
-    parser.add_argument("--retest-max-depth-atr", type=float, default=1.0)
+    parser.add_argument("--retest-max-depth-atr", type=float, default=1.15)
     parser.add_argument("--retest-wait-next-high", action="store_true", default=True)
     parser.add_argument("--stop-atr-mult", type=float, default=0.35)
     parser.add_argument("--min-hold-bars", type=int, default=3)
@@ -563,14 +563,14 @@ def run_backtest() -> None:
                         entry_type = "market"
                         limit_filled = False
                         if bool(args.limit_entry) and break_level is not None:
-                        offset = float(args.limit_offset_atr)
-                        if retest_seen_count >= 5 and entry_count == 0:
-                            offset *= 1.2
-                        entry_limit = min(float(ema_now), float(break_level)) - offset * float(atr_now)
-                        entry_type = "limit"
-                        if low_now <= entry_limit:
-                            entry_px = entry_limit
-                            limit_filled = True
+                            offset = float(args.limit_offset_atr)
+                            if retest_seen_count >= 5 and entry_count == 0:
+                                offset *= 1.2
+                            entry_limit = min(float(ema_now), float(break_level)) - offset * float(atr_now)
+                            entry_type = "limit"
+                            if low_now <= entry_limit:
+                                entry_px = entry_limit
+                                limit_filled = True
                             else:
                                 entry_window = False
                                 retest_active = False
