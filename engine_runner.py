@@ -6589,20 +6589,20 @@ def _run_wash_short_suite_cycle(
     tf_trend = cfg.tf_trend
     tf_main = cfg.tf_main
     tf_exec = cfg.tf_exec
-    # BTC safety guard for short: block if BTC is strong (1h price > EMA20 AND 15m RSI > 48)
+    # BTC safety guard for short: block if BTC 15m EMA7 > EMA20
     try:
         btc_symbol = "BTC/USDT:USDT"
         btc_1h = cycle_cache.get_df(btc_symbol, "1h", limit=120)
-        btc_15m = cycle_cache.get_df(btc_symbol, "15m", limit=200)
+        btc_15m = cycle_cache.get_df(btc_symbol, "15m", limit=320)
         if (
             btc_1h is not None and not btc_1h.empty and len(btc_1h) >= 30
             and btc_15m is not None and not btc_15m.empty and len(btc_15m) >= 50
         ):
-            btc_close_1h = btc_1h["close"].astype(float)
-            btc_ema20_1h = btc_close_1h.ewm(span=WASH_SHORT_SUITE_BTC_EMA_LEN, adjust=False).mean().iloc[-1]
-            btc_price_1h = float(btc_close_1h.iloc[-1])
-            btc_rsi_15m = _rsi(btc_15m["close"].astype(float), WASH_SHORT_SUITE_BTC_RSI_LEN).iloc[-1]
-            if (btc_price_1h > float(btc_ema20_1h)) and (float(btc_rsi_15m) > WASH_SHORT_SUITE_BTC_RSI_MIN):
+            btc_close_15m = btc_15m["close"].astype(float)
+            btc_close_15m = btc_close_15m.tail(288)
+            btc_ema7_15m = btc_close_15m.ewm(span=7, adjust=False).mean().iloc[-1]
+            btc_ema20_15m = btc_close_15m.ewm(span=20, adjust=False).mean().iloc[-1]
+            if float(btc_ema7_15m) > float(btc_ema20_15m):
                 _append_wash_short_suite_log("WASH_SKIP reason=BTC_STRONG_GUARD")
                 return result
     except Exception:

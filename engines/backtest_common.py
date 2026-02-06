@@ -185,19 +185,34 @@ def print_time_summaries(trades: List[dict], log_fn=None) -> None:
         if callable(log_fn):
             log_fn(line)
 
-    header = "[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate"
+
+def print_trades_by_symbol(trades: List[dict], log_fn=None) -> None:
+    if not trades:
+        return
+    trades_sorted = sorted(trades, key=lambda t: (t.get("symbol") or "", int(t.get("entry_ts") or 0)))
+    header = "[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts"
     try:
         print(header)
     except Exception:
         pass
     if callable(log_fn):
         log_fn(header)
-    for dow in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
-        entries = stats_by_dow[dow]["entries"]
-        tp = stats_by_dow[dow]["tp"]
-        sl = stats_by_dow[dow]["sl"]
-        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
-        line = f"[BACKTEST] DOW {dow} entries={entries} tp={tp} sl={sl} sl_rate={sl_rate:.2f}%"
+    for tr in trades_sorted:
+        symbol = tr.get("symbol") or "UNKNOWN"
+        result = tr.get("result") or tr.get("reason") or "NA"
+        pnl = tr.get("pnl_pct")
+        try:
+            pnl_val = float(pnl)
+            pnl_str = f"{pnl_val:.2f}%"
+        except Exception:
+            pnl_str = "N/A"
+        entry_ts = tr.get("entry_ts")
+        exit_ts = tr.get("exit_ts")
+        entry_dt = _to_kst(int(entry_ts)) if isinstance(entry_ts, (int, float)) else None
+        exit_dt = _to_kst(int(exit_ts)) if isinstance(exit_ts, (int, float)) else None
+        entry_str = entry_dt.strftime("%Y-%m-%d %H:%M") if entry_dt else "N/A"
+        exit_str = exit_dt.strftime("%Y-%m-%d %H:%M") if exit_dt else "N/A"
+        line = f"[BACKTEST] TRADE {symbol} result={result} pnl_pct={pnl_str} entry_ts={entry_str} exit_ts={exit_str}"
         try:
             print(line)
         except Exception:

@@ -20,6 +20,7 @@ from engines.backtest_common import (
     log_warmup_info,
     format_backtest_summary,
     print_time_summaries,
+    print_trades_by_symbol,
 )
 from engines.wash_short_suite.engine import WashShortSuiteConfig
 
@@ -504,21 +505,20 @@ def run_backtest():
             if idx_tr <= 0 or idx_main <= 0:
                 continue
 
-            # BTC safety guard (block shorts when BTC is strong)
+            # BTC safety guard (block shorts when BTC 15m EMA7 > EMA20)
             if (
                 not args.no_btc_guard
-                and btc_ts_1h is not None
                 and btc_ts_15m is not None
-                and btc_ema20_1h is not None
-                and btc_rsi_15m is not None
+                and not btc_df_15m.empty
             ):
-                idx_btc_1h = _map_idx_by_ts(btc_ts_1h, ts)
                 idx_btc_15m = _map_idx_by_ts(btc_ts_15m, ts)
-                if idx_btc_1h > 0 and idx_btc_15m > 0:
-                    btc_price_1h = float(btc_df_1h.at[idx_btc_1h, "close"])
-                    btc_ema = float(btc_ema20_1h.iloc[idx_btc_1h])
-                    btc_rsi = float(btc_rsi_15m.iloc[idx_btc_15m])
-                    if (btc_price_1h > btc_ema) and (btc_rsi > float(args.btc_rsi_min)):
+                if idx_btc_15m > 0:
+                    btc_close_15m = btc_df_15m["close"].astype(float)
+                    start_idx = max(0, idx_btc_15m - 288 + 1)
+                    window = btc_close_15m.iloc[start_idx : idx_btc_15m + 1]
+                    btc_ema7_15m = window.ewm(span=7, adjust=False).mean().iloc[-1]
+                    btc_ema20_15m = window.ewm(span=20, adjust=False).mean().iloc[-1]
+                    if float(btc_ema7_15m) > float(btc_ema20_15m):
                         continue
 
             if trade:
@@ -727,22 +727,12 @@ def run_backtest():
     total_net_sum_usdt = stats.get("net_sum_usdt", 0.0)
     total_tp_sum_usdt = stats.get("tp_sum_usdt", 0.0)
     total_sl_sum_usdt = stats.get("sl_sum_usdt", 0.0)
+    print_trades_by_symbol(trades_out, _log)
+    print_time_summaries(trades_out, _log)
     total_line = format_backtest_summary(None, stats)
     print(total_line)
     _log(total_line)
     log_warmup_info(_log, warmup_days, warmup_minutes, days)
-    if trades_out:
-        print("[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts")
-        _log("[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts")
-        for tr in trades_out:
-            line = (
-                f"[BACKTEST] TRADE {tr['symbol']} result={tr['result']} "
-                f"pnl_pct={tr['pnl_pct']:.2f}% entry_ts={_fmt_kst(tr['entry_ts'])} "
-                f"exit_ts={_fmt_kst(tr['exit_ts'])}"
-            )
-            print(line)
-            _log(line)
-    print_time_summaries(trades_out, _log)
 
 
 if __name__ == "__main__":

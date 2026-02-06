@@ -815,6 +815,11 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
     st["last_exit_ts"] = now_ts
     st["last_exit_reason"] = exit_reason
     state[symbol] = st
+    try:
+        # If admin manually closed, force follower close to sync positions.
+        er._close_followers_long_only(symbol)
+    except Exception:
+        pass
     if report_ok:
         er._update_report_csv(open_tr)
     print(f"[manage-ws] long_manual_close sym={symbol} engine={engine_label}")
@@ -914,6 +919,11 @@ def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: 
     st["last_exit_ts"] = now_ts
     st["last_exit_reason"] = exit_reason
     state[symbol] = st
+    try:
+        # If admin manually closed, force follower close to sync positions.
+        er._close_followers_short_only(symbol)
+    except Exception:
+        pass
     if report_ok:
         er._update_report_csv(open_tr)
     print(f"[manage-ws] short_manual_close sym={symbol} engine={engine_label}")
