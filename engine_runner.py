@@ -6655,7 +6655,7 @@ def _run_wash_short_suite_cycle(
     tf_trend = cfg.tf_trend
     tf_main = cfg.tf_main
     tf_exec = cfg.tf_exec
-    # BTC safety guard for short: block if BTC 15m EMA7 > EMA20
+    # BTC safety guard for short: block if BTC 15m close > EMA10
     try:
         btc_symbol = "BTC/USDT:USDT"
         btc_1h = cycle_cache.get_df(btc_symbol, "1h", limit=120)
@@ -6666,9 +6666,9 @@ def _run_wash_short_suite_cycle(
         ):
             btc_close_15m = btc_15m["close"].astype(float)
             btc_close_15m = btc_close_15m.tail(288)
-            btc_ema7_15m = btc_close_15m.ewm(span=7, adjust=False).mean().iloc[-1]
-            btc_ema20_15m = btc_close_15m.ewm(span=20, adjust=False).mean().iloc[-1]
-            if float(btc_ema7_15m) > float(btc_ema20_15m):
+            btc_ema10_15m = btc_close_15m.ewm(span=10, adjust=False).mean().iloc[-1]
+            btc_px_15m = float(btc_close_15m.iloc[-1])
+            if btc_px_15m > float(btc_ema10_15m):
                 _append_wash_short_suite_log("WASH_SKIP reason=BTC_STRONG_GUARD")
                 return result
     except Exception:

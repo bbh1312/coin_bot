@@ -176,14 +176,15 @@ def run_backtest() -> None:
     parser.add_argument("--vol-sma-len", type=int, default=20)
     parser.add_argument("--retest-ema-tol", type=float, default=0.1)
     parser.add_argument("--limit-entry", action="store_true", default=True)
-    parser.add_argument("--limit-offset-atr", type=float, default=0.05)
+    parser.add_argument("--limit-offset-atr", type=float, default=0.13)
     parser.add_argument("--retest-max-depth-atr", type=float, default=1.15)
     parser.add_argument("--retest-wait-next-high", action="store_true", default=False)
-    parser.add_argument("--fail-wick-max", type=float, default=0.45)
+    parser.add_argument("--fail-wick-max", type=float, default=0.4)
     parser.add_argument("--fail-require-ema", action="store_true", default=False)
     parser.add_argument("--stop-atr-mult", type=float, default=0.35)
     parser.add_argument("--min-hold-bars", type=int, default=3)
     parser.add_argument("--tp-min-pct", type=float, default=0.015)
+    parser.add_argument("--tp-r-mult", type=float, default=0.9)
     parser.add_argument("--max-wait-bars", type=int, default=60)
     parser.add_argument("--cooldown-bars", type=int, default=20)
 
@@ -597,7 +598,7 @@ def run_backtest() -> None:
                             retest_touch_idx = None
                             retest_touch_high = None
                             continue
-                        tp_price = entry_px - max(0.7 * r, float(args.tp_min_pct) * entry_px)
+                        tp_price = entry_px - max(float(args.tp_r_mult) * r, float(args.tp_min_pct) * entry_px)
                         trade = {
                             "entry_px": entry_px,
                             "sl_price": sl_price,
