@@ -812,6 +812,28 @@ def _open_positions_for_account(executor: AccountExecutor, state: dict) -> list[
     return positions
 
 
+def _sum_unrealized_pnl(executor: AccountExecutor, state: dict) -> float | None:
+    total = 0.0
+    has_any = False
+    with executor.activate():
+        sym_map = executor.list_open_position_symbols(force=True)
+        if not (sym_map.get("long") or sym_map.get("short")):
+            return None
+        for sym in sym_map.get("long") or []:
+            detail = executor.get_long_position_detail(sym) or {}
+            pnl = detail.get("pnl")
+            if isinstance(pnl, (int, float)):
+                total += float(pnl)
+                has_any = True
+        for sym in sym_map.get("short") or []:
+            detail = executor.get_short_position_detail(sym) or {}
+            pnl = detail.get("pnl")
+            if isinstance(pnl, (int, float)):
+                total += float(pnl)
+                has_any = True
+    return total if has_any else None
+
+
 def _list_accounts() -> list[dict]:
     accounts_db.ensure_default_account("admin")
     return accounts_db.list_active_accounts()
@@ -894,9 +916,9 @@ def _kst_today_start_ts(now_ts: float | None = None) -> float:
     return (day_start_kst - 9 * 3600) + 9 * 3600
 
 
-def _fetch_realized_pnl_since(ex, since_ts: float) -> tuple[float | None, int, str | None]:
+def _fetch_realized_pnl_range(ex, since_ts: float, end_ts: float | None = None) -> tuple[float | None, int, str | None]:
     start_ms = int(float(since_ts) * 1000)
-    now_ms = int(time.time() * 1000)
+    end_ms = int(float(end_ts) * 1000) if end_ts is not None else int(time.time() * 1000)
     total = 0.0
     count = 0
     income_types = ("REALIZED_PNL", "FUNDING_FEE", "COMMISSION")
@@ -907,7 +929,7 @@ def _fetch_realized_pnl_since(ex, since_ts: float) -> tuple[float | None, int, s
                 params = {
                     "incomeType": income_type,
                     "startTime": since,
-                    "endTime": now_ms,
+                    "endTime": end_ms,
                     "limit": 1000,
                 }
                 if hasattr(ex, "fapiPrivateGetIncome"):
@@ -942,11 +964,15 @@ def _fetch_realized_pnl_since(ex, since_ts: float) -> tuple[float | None, int, s
                 if last_ts is None:
                     break
                 since = last_ts + 1
-                if last_ts >= now_ms:
+                if last_ts >= end_ms:
                     break
     except Exception as e:
         return None, 0, str(e)[:80]
     return total, count, None
+
+
+def _fetch_realized_pnl_since(ex, since_ts: float) -> tuple[float | None, int, str | None]:
+    return _fetch_realized_pnl_range(ex, since_ts, None)
 
 
 @app.route("/")
@@ -991,8 +1017,12 @@ def status():
     if not lite:
         accounts_payload = []
         pnl_today_payload = []
+        pnl_yesterday_payload = []
+        pnl_unreal_payload = []
         pnl_start_ts = _kst_today_start_ts()
         pnl_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_start_ts + 9 * 3600))
+        pnl_yesterday_start_ts = pnl_start_ts - 86400
+        pnl_yesterday_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_yesterday_start_ts + 9 * 3600))
         for acct in _list_accounts_all():
             account_id = int(acct["id"])
             settings = _load_account_settings(account_id)
@@ -1004,11 +1034,19 @@ def status():
             pnl_val = None
             pnl_trades = 0
             pnl_err = None
+            pnl_y_val = None
+            pnl_y_trades = 0
+            pnl_y_err = None
+            pnl_unreal = None
             try:
                 with executor.activate():
                     futures_usdt = executor.get_available_usdt()
                     entry_usdt_available = _entry_usdt_available(executor, float(settings.get("entry_pct") or 0.0))
                     pnl_val, pnl_trades, pnl_err = _fetch_realized_pnl_since(executor.ctx.exchange, pnl_start_ts)
+                    pnl_y_val, pnl_y_trades, pnl_y_err = _fetch_realized_pnl_range(
+                        executor.ctx.exchange, pnl_yesterday_start_ts, pnl_start_ts
+                    )
+                    pnl_unreal = _sum_unrealized_pnl(executor, acct_state)
             except Exception:
                 futures_usdt = None
             admin_follow_enabled = acct_state.get("_admin_follow_enabled")
@@ -1040,8 +1078,32 @@ def status():
                     "is_active": bool(acct.get("is_active", 1)),
                 }
             )
+            pnl_yesterday_payload.append(
+                {
+                    "account_id": account_id,
+                    "name": str(acct.get("name") or account_id),
+                    "pnl": pnl_y_val,
+                    "trades": pnl_y_trades,
+                    "error": pnl_y_err,
+                    "date": pnl_yesterday_date_kst,
+                    "is_active": bool(acct.get("is_active", 1)),
+                }
+            )
+            pnl_unreal_payload.append(
+                {
+                    "account_id": account_id,
+                    "name": str(acct.get("name") or account_id),
+                    "pnl": pnl_unreal,
+                    "trades": 0,
+                    "error": None,
+                    "date": pnl_date_kst,
+                    "is_active": bool(acct.get("is_active", 1)),
+                }
+            )
         payload["accounts"] = accounts_payload
         payload["pnl_today"] = pnl_today_payload
+        payload["pnl_yesterday"] = pnl_yesterday_payload
+        payload["pnl_unrealized"] = pnl_unreal_payload
     else:
         payload["accounts"] = []
         payload["pnl_today"] = []

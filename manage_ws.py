@@ -944,8 +944,17 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
         meta = open_tr.get("meta")
         if isinstance(meta, dict):
             tp_pct = meta.get("tp_pct")
-            if isinstance(tp_pct, (int, float)):
+            if isinstance(tp_pct, (int, float)) and float(tp_pct) > 0:
                 tp_pct = float(tp_pct)
+            elif isinstance(meta.get("tp_price"), (int, float)):
+                try:
+                    tp_price = float(meta.get("tp_price"))
+                    if tp_price > 0:
+                        tp_calc = (float(entry_px) - tp_price) / float(entry_px) * 100.0
+                        if tp_calc > 0:
+                            tp_pct = tp_calc
+                except Exception:
+                    pass
     if not isinstance(tp_pct, (int, float)):
         tp_pct, _ = er._get_engine_exit_thresholds(engine_label, "LONG")
     if not isinstance(tp_pct, (int, float)) or float(tp_pct) <= 0:
@@ -1301,6 +1310,7 @@ def main():
     last_watch_ts = 0.0
     last_reconcile_ts = 0.0
     last_state_save_ts = 0.0
+    last_meta_hydrate_ts = 0.0
     watch_syms = []
     first_watch = True
     last_amt = {}
@@ -1318,6 +1328,15 @@ def main():
         except Exception:
             pass
         er.handle_telegram_commands(state)
+        now_ts = time.time()
+        if (now_ts - last_meta_hydrate_ts) >= 60.0:
+            try:
+                if er._hydrate_open_trade_meta(state, now_ts=now_ts):
+                    if MANAGE_WS_WRITE_STATE:
+                        er.save_state(state)
+            except Exception:
+                pass
+            last_meta_hydrate_ts = now_ts
         if (time.time() - last_cfg_save_ts) >= 2.0:
             try:
                 er._reload_runtime_settings_from_disk(state)

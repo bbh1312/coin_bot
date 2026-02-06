@@ -212,26 +212,36 @@ def _avg_up_volume(df: pd.DataFrame, lookback: int) -> float:
     return float(up["volume"].mean())
 
 
-def _btc_guard(btc_1h: pd.DataFrame, btc_15m: pd.DataFrame, btc_1m: pd.DataFrame, ts_ms: int) -> bool:
-    if btc_1h.empty or btc_15m.empty or btc_1m.empty:
+def _btc_guard(
+    btc_1h: pd.DataFrame,
+    btc_main: pd.DataFrame,
+    btc_1m: pd.DataFrame,
+    ts_ms: int,
+    ema_len: int,
+    rsi_min: float,
+    drop_pct: float,
+    drop_bars: int,
+) -> bool:
+    if btc_1h.empty or btc_main.empty or btc_1m.empty:
         return False
     ts_1h = btc_1h["ts"].astype(int).to_numpy()
-    ts_15m = btc_15m["ts"].astype(int).to_numpy()
+    ts_main = btc_main["ts"].astype(int).to_numpy()
     ts_1m = btc_1m["ts"].astype(int).to_numpy()
     idx_1h = int(np.searchsorted(ts_1h, ts_ms, side="right") - 1)
-    idx_15m = int(np.searchsorted(ts_15m, ts_ms, side="right") - 1)
+    idx_main = int(np.searchsorted(ts_main, ts_ms, side="right") - 1)
     idx_1m = int(np.searchsorted(ts_1m, ts_ms, side="right") - 1)
-    if idx_1h <= 0 or idx_15m <= 0 or idx_1m < 5:
+    if idx_1h <= 0 or idx_main <= 0 or idx_1m < 5:
         return False
-    ema20 = _ema(btc_1h["close"].astype(float), 20)
-    if float(btc_1h["close"].iloc[idx_1h]) <= float(ema20.iloc[idx_1h]):
+    ema_line = _ema(btc_1h["close"].astype(float), ema_len)
+    if float(btc_1h["close"].iloc[idx_1h]) <= float(ema_line.iloc[idx_1h]):
         return False
-    rsi_15 = _rsi(btc_15m["close"].astype(float), 14)
-    if float(rsi_15.iloc[idx_15m]) <= 48.0:
+    rsi_main = _rsi(btc_main["close"].astype(float), 14)
+    if float(rsi_main.iloc[idx_main]) <= rsi_min:
         return False
-    closes = btc_1m["close"].astype(float).iloc[idx_1m - 4: idx_1m + 1].to_numpy()
+    bars = max(int(drop_bars), 1)
+    closes = btc_1m["close"].astype(float).iloc[idx_1m - (bars - 1): idx_1m + 1].to_numpy()
     drops = (closes[1:] - closes[:-1]) / closes[:-1]
-    if np.any(drops <= -0.003):
+    if np.any(drops <= -abs(drop_pct)):
         return False
     return True
 
@@ -247,6 +257,22 @@ def _body_ratio(row: pd.Series) -> float:
 
 def _is_bull_body(row: pd.Series, min_ratio: float) -> bool:
     return float(row["close"]) > float(row["open"]) and _body_ratio(row) >= min_ratio
+
+
+def _lower_wick_ratio(row: pd.Series) -> float:
+    open_ = float(row["open"])
+    close = float(row["close"])
+    low = float(row["low"])
+    body = abs(close - open_)
+    return (min(open_, close) - low) / max(body, 1e-9)
+
+
+def _bull_body_or_long_wick(row: pd.Series, body_min: float, wick_mult: float) -> bool:
+    if float(row["close"]) <= float(row["open"]):
+        return False
+    if _body_ratio(row) >= body_min:
+        return True
+    return _lower_wick_ratio(row) >= wick_mult
 
 
 def _rsi_fast_drop(rsi_series: pd.Series, idx: int, from_level: float, to_level: float, bars: int) -> bool:
@@ -302,6 +328,11 @@ def run_backtest() -> None:
     parser.add_argument("--sl-pct", type=float, default=0.04)
     parser.add_argument("--cooldown-bars", type=int, default=18)
     parser.add_argument("--time-stop-min", type=int, default=120)
+    parser.add_argument("--use-fixed-exit", action="store_true")
+    parser.add_argument("--btc-ema-len", type=int, default=20)
+    parser.add_argument("--btc-rsi-min", type=float, default=48.0)
+    parser.add_argument("--btc-drop-pct", type=float, default=0.003)
+    parser.add_argument("--btc-drop-bars", type=int, default=5)
     parser.add_argument("--lookback-up", type=int, default=14)
     parser.add_argument("--vol-ratio-max", type=float, default=0.5)
     parser.add_argument("--obv-flat-min", type=float, default=0.0)
@@ -310,24 +341,43 @@ def run_backtest() -> None:
     parser.add_argument("--trail-pct", type=float, default=0.01)
     parser.add_argument("--swing-lookback", type=int, default=50)
     parser.add_argument("--body-min", type=float, default=0.6)
+    parser.add_argument("--body-wick-mult", type=float, default=1.5)
+    parser.add_argument("--main-tf", type=str, default="15m")
     parser.add_argument("--rsi-drop-bars", type=int, default=4)
     parser.add_argument("--rsi-drop-from", type=float, default=70.0)
     parser.add_argument("--rsi-drop-to", type=float, default=40.0)
+    parser.add_argument("--rsi-reject-min", type=float, default=45.0)
+    parser.add_argument("--rsi-reject-max", type=float, default=48.0)
+    parser.add_argument("--rsi-reject-lookback", type=int, default=6)
     parser.add_argument("--use-oi", action="store_true")
     parser.add_argument("--oi-cache-dir", type=str, default="")
+    parser.add_argument("--ethbtc-filter", action="store_true")
+    parser.add_argument("--ethbtc-skip", action="store_true")
+    parser.add_argument("--sl-extra-pct", type=float, default=0.004)
+    parser.add_argument("--trigger-mode", type=str, default="all")
     args = parser.parse_args()
 
     exchange = ccxt.binance({"enableRateLimit": True})
 
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
+    main_tf = str(args.main_tf).strip()
+    if main_tf not in {"3m", "5m", "15m"}:
+        raise SystemExit(f"--main-tf unsupported: {main_tf} (use 3m/5m/15m)")
+
     min_tr = 200
     min_main = max(args.swing_lookback, 120)
     min_exec = max(args.lookback_up + 20, 200)
+    min_5m = max(50, 40)
+    tf_map = {"1h": min_tr, main_tf: min_main, "3m": min_exec}
+    if main_tf == "5m":
+        tf_map["5m"] = max(min_main, min_5m)
+    else:
+        tf_map["5m"] = min_5m
     start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(
         args.days,
         end_ms,
-        {"1h": min_tr, "15m": min_main, "3m": min_exec},
+        tf_map,
     )
 
     universe = load_common_universe(args.universe, exchange, args.cache_only)
@@ -346,11 +396,17 @@ def run_backtest() -> None:
 
     # BTC guard data
     btc_1h_rows = _fetch_ohlcv_all(exchange, "BTC/USDT:USDT", "1h", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
-    btc_15_rows = _fetch_ohlcv_all(exchange, "BTC/USDT:USDT", "15m", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
+    btc_main_rows = _fetch_ohlcv_all(exchange, "BTC/USDT:USDT", main_tf, start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
     btc_1m_rows = _fetch_ohlcv_all(exchange, "BTC/USDT:USDT", "1m", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
     btc_1h = pd.DataFrame(btc_1h_rows, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
-    btc_15m = pd.DataFrame(btc_15_rows, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    btc_main = pd.DataFrame(btc_main_rows, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
     btc_1m = pd.DataFrame(btc_1m_rows, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
+
+    ethbtc_main = pd.DataFrame()
+    if args.ethbtc_filter:
+        ethbtc_rows = _fetch_ohlcv_all(exchange, "ETH/BTC", main_tf, start_ms, end_ms, use_common_warmup=False, common_warmup_dir="", cache_only=args.cache_only)
+        if ethbtc_rows:
+            ethbtc_main = pd.DataFrame(ethbtc_rows, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
 
     stats = {
         "entries": 0,
@@ -377,14 +433,19 @@ def run_backtest() -> None:
             oi_path = os.path.join(oi_dir, f"{_sanitize_symbol(sym)}_3m.csv")
             oi_rows = _read_oi_cache(oi_path)
         rows_tr = _fetch_ohlcv_all(exchange, sym, "1h", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
-        rows_main = _fetch_ohlcv_all(exchange, sym, "15m", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
+        rows_main = _fetch_ohlcv_all(exchange, sym, main_tf, start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
         rows_ex = _fetch_ohlcv_all(exchange, sym, "3m", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
+        if main_tf == "5m":
+            rows_5m = rows_main
+        else:
+            rows_5m = _fetch_ohlcv_all(exchange, sym, "5m", start_ms, end_ms, use_common_warmup=use_common, common_warmup_dir=common_dir, cache_only=args.cache_only)
         if not rows_tr or not rows_main or not rows_ex:
             continue
 
         df_tr = pd.DataFrame(rows_tr, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
         df_main = pd.DataFrame(rows_main, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
         df_ex = pd.DataFrame(rows_ex, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
+        df_5m = pd.DataFrame(rows_5m, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True) if rows_5m else pd.DataFrame()
 
         ema20_tr = _ema(df_tr["close"].astype(float), 20)
         ema60_tr = _ema(df_tr["close"].astype(float), 60)
@@ -401,10 +462,12 @@ def run_backtest() -> None:
         rsi_ex = _rsi(df_ex["close"].astype(float), 14)
         atr_ex = _atr(df_ex, 14)
         obv_ex = _obv(df_ex)
+        rsi_5m = _rsi(df_5m["close"].astype(float), 14) if not df_5m.empty else pd.Series(dtype=float)
 
         ts_tr = df_tr["ts"].astype(int).to_numpy()
         ts_main = df_main["ts"].astype(int).to_numpy()
         ts_ex = df_ex["ts"].astype(int).to_numpy()
+        ts_5m = df_5m["ts"].astype(int).to_numpy() if not df_5m.empty else np.array([], dtype=int)
 
         trade: Optional[dict] = None
         cooldown_left = 0
@@ -445,70 +508,49 @@ def run_backtest() -> None:
                 trade["mfe"] = max(trade["mfe"], max(0.0, (high - trade["entry_px"]) / trade["entry_px"]))
                 trade["mae"] = max(trade["mae"], max(0.0, (trade["entry_px"] - low) / trade["entry_px"]))
 
-                sl_price = trade["entry_px"] - max(trade["atr_main"] * 1.5, trade["entry_px"] - trade["prev_low"])
-                if low <= sl_price:
-                    exit_px = sl_price
-                    if trade["tp1_done"]:
-                        pnl_pct = trade["realized_pct"] + (1.0 - args.tp1_ratio) * (exit_px - trade["entry_px"]) / trade["entry_px"]
-                    else:
+                sl_price = trade["entry_px"] - max(trade["atr_main"] * 1.5, trade["entry_px"] - trade["prev_low"] * (1.0 - args.sl_extra_pct))
+                if args.use_fixed_exit:
+                    tp_price = trade["entry_px"] * (1.0 + args.tp_pct)
+                    if low <= sl_price:
+                        exit_px = sl_price
                         pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
-                    stats["exits"] += 1
-                    stats["trades"] += 1
-                    stats["mfe_sum"] += trade["mfe"]
-                    stats["mae_sum"] += trade["mae"]
-                    stats["hold_sum"] += trade["hold_bars"]
-                    stats["net_sum"] += pnl_pct
-                    stats["sl_sum"] += pnl_pct
-                    stats["net_sum_usdt"] += pnl_pct * entry_usdt
-                    stats["sl_sum_usdt"] += pnl_pct * entry_usdt
-                    sym_stats["exits"] += 1
-                    sym_stats["trades"] += 1
-                    sym_stats["mfe_sum"] += trade["mfe"]
-                    sym_stats["mae_sum"] += trade["mae"]
-                    sym_stats["hold_sum"] += trade["hold_bars"]
-                    sym_stats["net_sum"] += pnl_pct
-                    sym_stats["sl_sum"] += pnl_pct
-                    sym_stats["net_sum_usdt"] += pnl_pct * entry_usdt
-                    sym_stats["sl_sum_usdt"] += pnl_pct * entry_usdt
-                    if pnl_pct > 0:
-                        stats["wins"] += 1
-                        sym_stats["wins"] += 1
+                    elif high >= tp_price:
+                        exit_px = tp_price
+                        pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
                     else:
-                        stats["losses"] += 1
-                        sym_stats["losses"] += 1
-                    trade = None
-                    cooldown_left = max(cooldown_left, args.cooldown_bars)
-                    continue
-
-                if not trade["tp1_done"]:
-                    if high >= trade["tp1_level"]:
-                        trade["tp1_done"] = True
-                        trade["realized_pct"] += args.tp1_ratio * (trade["tp1_level"] - trade["entry_px"]) / trade["entry_px"]
-                        trade["peak"] = max(trade["peak"], high)
-                else:
-                    trade["peak"] = max(trade["peak"], high)
-                    trail_stop = trade["peak"] * (1.0 - args.trail_pct)
-                    if low <= trail_stop:
-                        exit_px = trail_stop
-                        pnl_pct = trade["realized_pct"] + (1.0 - args.tp1_ratio) * (exit_px - trade["entry_px"]) / trade["entry_px"]
+                        exit_px = None
+                        pnl_pct = None
+                    if pnl_pct is not None:
                         stats["exits"] += 1
                         stats["trades"] += 1
                         stats["mfe_sum"] += trade["mfe"]
                         stats["mae_sum"] += trade["mae"]
                         stats["hold_sum"] += trade["hold_bars"]
                         stats["net_sum"] += pnl_pct
-                        stats["tp_sum"] += pnl_pct
+                        if pnl_pct > 0:
+                            stats["tp_sum"] += pnl_pct
+                        else:
+                            stats["sl_sum"] += pnl_pct
                         stats["net_sum_usdt"] += pnl_pct * entry_usdt
-                        stats["tp_sum_usdt"] += pnl_pct * entry_usdt
+                        if pnl_pct > 0:
+                            stats["tp_sum_usdt"] += pnl_pct * entry_usdt
+                        else:
+                            stats["sl_sum_usdt"] += pnl_pct * entry_usdt
                         sym_stats["exits"] += 1
                         sym_stats["trades"] += 1
                         sym_stats["mfe_sum"] += trade["mfe"]
                         sym_stats["mae_sum"] += trade["mae"]
                         sym_stats["hold_sum"] += trade["hold_bars"]
                         sym_stats["net_sum"] += pnl_pct
-                        sym_stats["tp_sum"] += pnl_pct
+                        if pnl_pct > 0:
+                            sym_stats["tp_sum"] += pnl_pct
+                        else:
+                            sym_stats["sl_sum"] += pnl_pct
                         sym_stats["net_sum_usdt"] += pnl_pct * entry_usdt
-                        sym_stats["tp_sum_usdt"] += pnl_pct * entry_usdt
+                        if pnl_pct > 0:
+                            sym_stats["tp_sum_usdt"] += pnl_pct * entry_usdt
+                        else:
+                            sym_stats["sl_sum_usdt"] += pnl_pct * entry_usdt
                         if pnl_pct > 0:
                             stats["wins"] += 1
                             sym_stats["wins"] += 1
@@ -518,6 +560,80 @@ def run_backtest() -> None:
                         trade = None
                         cooldown_left = max(cooldown_left, args.cooldown_bars)
                         continue
+                else:
+                    if low <= sl_price:
+                        exit_px = sl_price
+                        if trade["tp1_done"]:
+                            pnl_pct = trade["realized_pct"] + (1.0 - args.tp1_ratio) * (exit_px - trade["entry_px"]) / trade["entry_px"]
+                        else:
+                            pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
+                        stats["exits"] += 1
+                        stats["trades"] += 1
+                        stats["mfe_sum"] += trade["mfe"]
+                        stats["mae_sum"] += trade["mae"]
+                        stats["hold_sum"] += trade["hold_bars"]
+                        stats["net_sum"] += pnl_pct
+                        stats["sl_sum"] += pnl_pct
+                        stats["net_sum_usdt"] += pnl_pct * entry_usdt
+                        stats["sl_sum_usdt"] += pnl_pct * entry_usdt
+                        sym_stats["exits"] += 1
+                        sym_stats["trades"] += 1
+                        sym_stats["mfe_sum"] += trade["mfe"]
+                        sym_stats["mae_sum"] += trade["mae"]
+                        sym_stats["hold_sum"] += trade["hold_bars"]
+                        sym_stats["net_sum"] += pnl_pct
+                        sym_stats["sl_sum"] += pnl_pct
+                        sym_stats["net_sum_usdt"] += pnl_pct * entry_usdt
+                        sym_stats["sl_sum_usdt"] += pnl_pct * entry_usdt
+                        if pnl_pct > 0:
+                            stats["wins"] += 1
+                            sym_stats["wins"] += 1
+                        else:
+                            stats["losses"] += 1
+                            sym_stats["losses"] += 1
+                        trade = None
+                        cooldown_left = max(cooldown_left, args.cooldown_bars)
+                        continue
+
+                if not args.use_fixed_exit:
+                    if not trade["tp1_done"]:
+                        if high >= trade["tp1_level"]:
+                            trade["tp1_done"] = True
+                            trade["realized_pct"] += args.tp1_ratio * (trade["tp1_level"] - trade["entry_px"]) / trade["entry_px"]
+                            trade["peak"] = max(trade["peak"], high)
+                    else:
+                        trade["peak"] = max(trade["peak"], high)
+                        trail_stop = trade["peak"] * (1.0 - args.trail_pct)
+                        if low <= trail_stop:
+                            exit_px = trail_stop
+                            pnl_pct = trade["realized_pct"] + (1.0 - args.tp1_ratio) * (exit_px - trade["entry_px"]) / trade["entry_px"]
+                            stats["exits"] += 1
+                            stats["trades"] += 1
+                            stats["mfe_sum"] += trade["mfe"]
+                            stats["mae_sum"] += trade["mae"]
+                            stats["hold_sum"] += trade["hold_bars"]
+                            stats["net_sum"] += pnl_pct
+                            stats["tp_sum"] += pnl_pct
+                            stats["net_sum_usdt"] += pnl_pct * entry_usdt
+                            stats["tp_sum_usdt"] += pnl_pct * entry_usdt
+                            sym_stats["exits"] += 1
+                            sym_stats["trades"] += 1
+                            sym_stats["mfe_sum"] += trade["mfe"]
+                            sym_stats["mae_sum"] += trade["mae"]
+                            sym_stats["hold_sum"] += trade["hold_bars"]
+                            sym_stats["net_sum"] += pnl_pct
+                            sym_stats["tp_sum"] += pnl_pct
+                            sym_stats["net_sum_usdt"] += pnl_pct * entry_usdt
+                            sym_stats["tp_sum_usdt"] += pnl_pct * entry_usdt
+                            if pnl_pct > 0:
+                                stats["wins"] += 1
+                                sym_stats["wins"] += 1
+                            else:
+                                stats["losses"] += 1
+                                sym_stats["losses"] += 1
+                            trade = None
+                            cooldown_left = max(cooldown_left, args.cooldown_bars)
+                            continue
 
                 if args.time_stop_min > 0:
                     elapsed_min = (ts_ex[i] - trade["entry_ts"]) / 60000.0
@@ -564,8 +680,27 @@ def run_backtest() -> None:
             if ts < eval_start_ms:
                 continue
 
-            if not _btc_guard(btc_1h, btc_15m, btc_1m, ts):
+            if not _btc_guard(
+                btc_1h,
+                btc_main,
+                btc_1m,
+                ts,
+                args.btc_ema_len,
+                args.btc_rsi_min,
+                args.btc_drop_pct,
+                args.btc_drop_bars,
+            ):
                 continue
+
+            if args.ethbtc_filter and not ethbtc_main.empty:
+                ts_eth = ethbtc_main["ts"].astype(int).to_numpy()
+                idx_eth = int(np.searchsorted(ts_eth, ts, side="right") - 1)
+                if idx_eth > 0:
+                    eth_ema20 = _ema(ethbtc_main["close"].astype(float), 20)
+                    eth_ema60 = _ema(ethbtc_main["close"].astype(float), 60)
+                    if float(eth_ema20.iloc[idx_eth]) < float(eth_ema60.iloc[idx_eth]):
+                        if args.ethbtc_skip:
+                            continue
 
             if not (
                 ema120_tr.iloc[idx_tr] < df_tr["close"].iloc[idx_tr]
@@ -623,7 +758,7 @@ def run_backtest() -> None:
                 and rsi_main_now >= 48.0
                 and rsi_main_now >= rsi_main_prev
             )
-            if spring_trap and not _is_bull_body(df_main.iloc[idx_main], args.body_min):
+            if spring_trap and not _bull_body_or_long_wick(df_main.iloc[idx_main], args.body_min, args.body_wick_mult):
                 spring_trap = False
 
             # Trigger C: Golden Pocket
@@ -632,11 +767,20 @@ def run_backtest() -> None:
 
             # Recovery trigger after breakdown
             recovery = last_breakdown_idx is not None and main_close > bbm and obv_ok and vol_ok
-            if recovery and not _is_bull_body(df_main.iloc[idx_main], args.body_min):
+            if recovery and not _bull_body_or_long_wick(df_main.iloc[idx_main], args.body_min, args.body_wick_mult):
                 recovery = False
 
             if not (gap_filler or spring_trap or golden_pocket or recovery):
                 continue
+
+            if ts_5m.size > 0:
+                idx_5m = int(np.searchsorted(ts_5m, ts, side="right") - 1)
+                if idx_5m > 0:
+                    rsi_5m_now = float(rsi_5m.iloc[idx_5m]) if not np.isnan(rsi_5m.iloc[idx_5m]) else 0.0
+                    start_5m = max(0, idx_5m - args.rsi_reject_lookback)
+                    window = rsi_5m.iloc[start_5m: idx_5m + 1]
+                    if (window.min() <= 30.0) and (args.rsi_reject_min <= rsi_5m_now <= args.rsi_reject_max) and (window.max() < 50.0):
+                        continue
 
             if args.use_oi:
                 oi_now = _oi_at(oi_rows, int(df_ex.iloc[sig_idx]["ts"]))

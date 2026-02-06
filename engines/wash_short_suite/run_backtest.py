@@ -244,11 +244,15 @@ def parse_args():
     p.add_argument("--tf-trend", type=str, default="")
     p.add_argument("--tf-main", type=str, default="")
     p.add_argument("--tf-exec", type=str, default="")
+    p.add_argument("--ema-fast", type=int, default=None)
+    p.add_argument("--ema-mid", type=int, default=None)
+    p.add_argument("--ema-slow", type=int, default=None)
     p.add_argument("--tp-pct", type=float, default=None)
     p.add_argument("--sl-pct", type=float, default=None)
     p.add_argument("--adx-min", type=float, default=None)
     p.add_argument("--pullback-eps", type=float, default=None)
     p.add_argument("--fib-eps", type=float, default=None)
+    p.add_argument("--rsi-len", type=int, default=None)
     p.add_argument("--rsi-min", type=float, default=None)
     p.add_argument("--rsi-max", type=float, default=None)
     p.add_argument("--rsi-lower-high-delta", type=float, default=None)
@@ -256,6 +260,10 @@ def parse_args():
     p.add_argument("--time-stop-min", type=int, default=None)
     p.add_argument("--cooldown-bars", type=int, default=None)
     p.add_argument("--log-path", type=str, default="")
+    p.add_argument("--no-btc-guard", action="store_true")
+    p.add_argument("--btc-ema-len", type=int, default=20)
+    p.add_argument("--btc-rsi-len", type=int, default=14)
+    p.add_argument("--btc-rsi-min", type=float, default=48.0)
     return p.parse_args()
 
 
@@ -285,6 +293,12 @@ def run_backtest():
         cfg.tf_main = args.tf_main
     if args.tf_exec:
         cfg.tf_exec = args.tf_exec
+    if args.ema_fast is not None:
+        cfg.ema_fast = args.ema_fast
+    if args.ema_mid is not None:
+        cfg.ema_mid = args.ema_mid
+    if args.ema_slow is not None:
+        cfg.ema_slow = args.ema_slow
     if args.tp_pct is not None:
         cfg.tp_pct = args.tp_pct
     if args.sl_pct is not None:
@@ -295,6 +309,8 @@ def run_backtest():
         cfg.pullback_eps = args.pullback_eps
     if args.fib_eps is not None:
         cfg.fib_eps = args.fib_eps
+    if args.rsi_len is not None:
+        cfg.rsi_len = args.rsi_len
     if args.rsi_min is not None:
         cfg.rsi_min = args.rsi_min
     if args.rsi_max is not None:
@@ -369,6 +385,41 @@ def run_backtest():
         )
         if rows_trend and rows_main and rows_exec:
             symbol_data[sym] = {"trend": rows_trend, "main": rows_main, "exec": rows_exec}
+
+    # BTC safety guard data (1h EMA20 + 15m RSI)
+    btc_df_1h = pd.DataFrame()
+    btc_df_15m = pd.DataFrame()
+    btc_ts_1h = None
+    btc_ts_15m = None
+    btc_ema20_1h = None
+    btc_rsi_15m = None
+    if not args.no_btc_guard:
+        btc_rows_1h = _fetch_ohlcv_all(
+            exchange,
+            "BTC/USDT:USDT",
+            "1h",
+            start_ms,
+            end_ms,
+            use_common_warmup=use_common,
+            common_warmup_dir=common_dir,
+            cache_only=cache_only,
+        )
+        btc_rows_15m = _fetch_ohlcv_all(
+            exchange,
+            "BTC/USDT:USDT",
+            "15m",
+            start_ms,
+            end_ms,
+            use_common_warmup=use_common,
+            common_warmup_dir=common_dir,
+            cache_only=cache_only,
+        )
+        btc_df_1h = pd.DataFrame(btc_rows_1h, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True) if btc_rows_1h else pd.DataFrame()
+        btc_df_15m = pd.DataFrame(btc_rows_15m, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True) if btc_rows_15m else pd.DataFrame()
+        btc_ts_1h = btc_df_1h["ts"].astype(int).to_numpy() if not btc_df_1h.empty else None
+        btc_ts_15m = btc_df_15m["ts"].astype(int).to_numpy() if not btc_df_15m.empty else None
+        btc_ema20_1h = _ema(btc_df_1h["close"].astype(float), int(args.btc_ema_len)) if not btc_df_1h.empty else None
+        btc_rsi_15m = _rsi(btc_df_15m["close"].astype(float), int(args.btc_rsi_len)) if not btc_df_15m.empty else None
 
     entry_usdt = 10.0
     stats = {
@@ -446,6 +497,23 @@ def run_backtest():
             idx_main = _map_idx_by_ts(ts_main, ts)
             if idx_tr <= 0 or idx_main <= 0:
                 continue
+
+            # BTC safety guard (block shorts when BTC is strong)
+            if (
+                not args.no_btc_guard
+                and btc_ts_1h is not None
+                and btc_ts_15m is not None
+                and btc_ema20_1h is not None
+                and btc_rsi_15m is not None
+            ):
+                idx_btc_1h = _map_idx_by_ts(btc_ts_1h, ts)
+                idx_btc_15m = _map_idx_by_ts(btc_ts_15m, ts)
+                if idx_btc_1h > 0 and idx_btc_15m > 0:
+                    btc_price_1h = float(btc_df_1h.at[idx_btc_1h, "close"])
+                    btc_ema = float(btc_ema20_1h.iloc[idx_btc_1h])
+                    btc_rsi = float(btc_rsi_15m.iloc[idx_btc_15m])
+                    if (btc_price_1h > btc_ema) and (btc_rsi > float(args.btc_rsi_min)):
+                        continue
 
             if trade:
                 high = float(df_ex.at[i, "high"])

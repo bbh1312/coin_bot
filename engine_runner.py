@@ -609,6 +609,20 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
         raise
     admin_status = _extract_status(res)
     admin_ok = admin_status == "ok"
+    if admin_ok:
+        try:
+            amt = get_short_position_amount(symbol)
+            if isinstance(amt, (int, float)) and amt <= 0:
+                try:
+                    refresh_positions_cache(force=True)
+                    amt = get_short_position_amount(symbol)
+                except Exception:
+                    amt = amt
+            if isinstance(amt, (int, float)) and amt <= 0:
+                admin_ok = False
+                admin_status = "no_fill"
+        except Exception:
+            pass
     if not admin_ok:
         _set_last_entry_broadcast(symbol, "SHORT", admin_status, admin_ok, [])
         return res
@@ -684,6 +698,20 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
         raise
     admin_status = _extract_status(res)
     admin_ok = admin_status == "ok"
+    if admin_ok:
+        try:
+            amt = get_long_position_amount(symbol)
+            if isinstance(amt, (int, float)) and amt <= 0:
+                try:
+                    refresh_positions_cache(force=True)
+                    amt = get_long_position_amount(symbol)
+                except Exception:
+                    amt = amt
+            if isinstance(amt, (int, float)) and amt <= 0:
+                admin_ok = False
+                admin_status = "no_fill"
+        except Exception:
+            pass
     if not admin_ok:
         _set_last_entry_broadcast(symbol, "LONG", admin_status, admin_ok, [])
         return res
@@ -988,6 +1016,9 @@ ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
 NOISE_REVERSE_V1_ENABLED = os.getenv("NOISE_REVERSE_V1_ENABLED", "0") == "1"
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = os.getenv("SRP_ST_REGIME_PULLBACK_V1_ENABLED", "0") == "1"
 WASH_SHORT_SUITE_ENABLED = os.getenv("WASH_SHORT_SUITE_ENABLED", "0") == "1"
+WASH_SHORT_SUITE_BTC_EMA_LEN = int(os.getenv("WASH_SHORT_SUITE_BTC_EMA_LEN", "20"))
+WASH_SHORT_SUITE_BTC_RSI_LEN = int(os.getenv("WASH_SHORT_SUITE_BTC_RSI_LEN", "14"))
+WASH_SHORT_SUITE_BTC_RSI_MIN = float(os.getenv("WASH_SHORT_SUITE_BTC_RSI_MIN", "48"))
 ST_FLIP_V1_ENABLED = os.getenv("ST_FLIP_V1_ENABLED", "0") == "1"
 BULL_PULLBACK_LONG_V1_ENABLED = os.getenv("BULL_PULLBACK_LONG_V1_ENABLED", "0") == "1"
 # Backtest-baseline params (kept identical to backtest)
@@ -1240,7 +1271,7 @@ COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1
 COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "30"))
 COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "false", "off", "no")
 COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
-COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "8"))
+COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "9"))
 COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "50"))
 COMMON_WARMUP_NOTIFY_COOLDOWN_SEC = int(os.getenv("COMMON_WARMUP_NOTIFY_COOLDOWN_SEC", "3600"))
 _COMMON_WARMUP_NOTIFY_TS_MEM = 0.0
@@ -1871,6 +1902,96 @@ def _get_trade_log(state: Dict[str, dict]) -> list:
         log = []
         state["_trade_log"] = log
     return log
+
+def _hydrate_open_trade_meta(state: Dict[str, dict], now_ts: Optional[float] = None) -> bool:
+    log = _get_trade_log(state)
+    open_trades = [tr for tr in log if isinstance(tr, dict) and tr.get("status") == "open"]
+    if not open_trades:
+        return False
+    _, entry_by_symbol = _load_entry_events_map(None, include_alerts=True)
+    if not isinstance(entry_by_symbol, dict) or not entry_by_symbol:
+        return False
+    changed = False
+    for tr in open_trades:
+        sym = tr.get("symbol")
+        side = (tr.get("side") or "").upper()
+        if not sym or side not in ("LONG", "SHORT"):
+            continue
+        meta = tr.get("meta") if isinstance(tr.get("meta"), dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+        entry_px = tr.get("entry_price")
+        try:
+            entry_px = float(entry_px) if entry_px is not None else None
+        except Exception:
+            entry_px = None
+        recs = entry_by_symbol.get((sym, side))
+        if recs:
+            try:
+                rec = max(recs, key=lambda r: float(r.get("entry_ts") or 0.0))
+            except Exception:
+                rec = recs[-1]
+            rec_meta = rec.get("meta") if isinstance(rec, dict) else None
+            if isinstance(rec_meta, dict):
+                for key in ("tp_pct", "sl_pct", "sl_price", "tp_price"):
+                    if key in rec_meta and rec_meta[key] is not None:
+                        meta[key] = rec_meta[key]
+        # derive pct from price if possible
+        if entry_px and meta.get("tp_pct") is None:
+            tp_price = meta.get("tp_price")
+            if isinstance(tp_price, (int, float)) and float(tp_price) > 0:
+                if side == "SHORT":
+                    tp_pct = (float(entry_px) - float(tp_price)) / float(entry_px) * 100.0
+                    if tp_pct > 0:
+                        meta["tp_pct"] = tp_pct
+                else:
+                    tp_pct = (float(tp_price) - float(entry_px)) / float(entry_px) * 100.0
+                    if tp_pct > 0:
+                        meta["tp_pct"] = tp_pct
+        if entry_px and meta.get("sl_pct") is None:
+            sl_price = meta.get("sl_price")
+            if isinstance(sl_price, (int, float)) and float(sl_price) > 0:
+                if side == "SHORT":
+                    meta["sl_pct"] = (float(sl_price) - float(entry_px)) / float(entry_px) * 100.0
+                else:
+                    meta["sl_pct"] = (float(entry_px) - float(sl_price)) / float(entry_px) * 100.0
+        # engine-specific fallback (WASH_SHORT_SUITE) if still missing
+        engine_label = _engine_label_from_reason((meta or {}).get("reason"))
+        if engine_label == "WASH_SHORT_SUITE" and entry_px and (meta.get("tp_pct") is None or meta.get("sl_pct") is None):
+            try:
+                cfg = WashShortSuiteConfig()
+                df_main = cycle_cache.get_df(sym, cfg.tf_main, limit=max(cfg.ema_slow + cfg.swing_lookback, 220))
+                if df_main is not None and not df_main.empty:
+                    ts_main = df_main["ts"].astype(int).to_numpy()
+                    entry_ts = tr.get("entry_ts")
+                    if isinstance(entry_ts, (int, float)):
+                        idx_main = _map_idx_by_ts(ts_main, int(entry_ts * 1000))
+                    else:
+                        idx_main = len(df_main) - 1
+                    if idx_main > 0:
+                        atr_main = _atr(df_main, cfg.adx_len)
+                        atr_px = float(atr_main.iloc[idx_main]) if not np.isnan(atr_main.iloc[idx_main]) else 0.0
+                        sl_price = entry_px * (1.0 + cfg.sl_pct)
+                        if atr_px > 0:
+                            sl_price = max(sl_price, entry_px + atr_px * cfg.sl_atr_mult)
+                        tp_price = entry_px - atr_px * cfg.tp_atr_mult if atr_px > 0 else entry_px * (1.0 - cfg.tp_pct)
+                        meta["sl_price"] = meta.get("sl_price") or sl_price
+                        # override invalid tp_price for shorts
+                        cur_tp_price = meta.get("tp_price")
+                        invalid_tp = isinstance(cur_tp_price, (int, float)) and float(cur_tp_price) >= float(entry_px)
+                        meta["tp_price"] = tp_price if invalid_tp else (meta.get("tp_price") or tp_price)
+                        tp_pct_calc = ((entry_px - meta["tp_price"]) / entry_px * 100.0) if meta.get("tp_price") else None
+                        if isinstance(tp_pct_calc, (int, float)) and tp_pct_calc > 0:
+                            meta["tp_pct"] = tp_pct_calc
+                        if meta.get("tp_pct") is None:
+                            meta["tp_pct"] = (entry_px - tp_price) / entry_px * 100.0
+                        if meta.get("sl_pct") is None:
+                            meta["sl_pct"] = (meta.get("sl_price") - entry_px) / entry_px * 100.0
+            except Exception:
+                pass
+        tr["meta"] = meta
+        changed = True
+    return changed
 
 def _get_entry_guard(state: Dict[str, dict]) -> Dict[str, float]:
     guard = state.get("_entry_guard")
@@ -6463,6 +6584,24 @@ def _run_wash_short_suite_cycle(
     tf_trend = cfg.tf_trend
     tf_main = cfg.tf_main
     tf_exec = cfg.tf_exec
+    # BTC safety guard for short: block if BTC is strong (1h price > EMA20 AND 15m RSI > 48)
+    try:
+        btc_symbol = "BTC/USDT:USDT"
+        btc_1h = cycle_cache.get_df(btc_symbol, "1h", limit=120)
+        btc_15m = cycle_cache.get_df(btc_symbol, "15m", limit=200)
+        if (
+            btc_1h is not None and not btc_1h.empty and len(btc_1h) >= 30
+            and btc_15m is not None and not btc_15m.empty and len(btc_15m) >= 50
+        ):
+            btc_close_1h = btc_1h["close"].astype(float)
+            btc_ema20_1h = btc_close_1h.ewm(span=WASH_SHORT_SUITE_BTC_EMA_LEN, adjust=False).mean().iloc[-1]
+            btc_price_1h = float(btc_close_1h.iloc[-1])
+            btc_rsi_15m = _rsi(btc_15m["close"].astype(float), WASH_SHORT_SUITE_BTC_RSI_LEN).iloc[-1]
+            if (btc_price_1h > float(btc_ema20_1h)) and (float(btc_rsi_15m) > WASH_SHORT_SUITE_BTC_RSI_MIN):
+                _append_wash_short_suite_log("WASH_SKIP reason=BTC_STRONG_GUARD")
+                return result
+    except Exception:
+        pass
     min_tr = max(cfg.ema_slow + 20, 180)
     min_main = max(cfg.ema_slow + cfg.swing_lookback, 200)
     min_exec = max(cfg.vol_sma_len + 20, 200)
@@ -6637,6 +6776,8 @@ def _run_wash_short_suite_cycle(
         if atr_px > 0:
             sl_price = max(sl_price, entry_px + atr_px * cfg.sl_atr_mult)
         tp_price = entry_px - atr_px * cfg.tp_atr_mult if atr_px > 0 else entry_px * (1.0 - cfg.tp_pct)
+        tp_pct = ((entry_px - tp_price) / entry_px) * 100.0 if entry_px > 0 else None
+        sl_pct = ((sl_price - entry_px) / entry_px) * 100.0 if entry_px > 0 else None
 
         usdt = _resolve_entry_usdt()
         if usdt <= 0 or not _admin_is_active():
@@ -6653,7 +6794,12 @@ def _run_wash_short_suite_cycle(
             live=LIVE_TRADING,
             alert_reason="wash_short_suite",
             entry_price_hint=entry_px,
-            meta={"sl_price": float(sl_price), "tp_price": float(tp_price)},
+            meta={
+                "sl_price": float(sl_price),
+                "tp_price": float(tp_price),
+                "tp_pct": float(tp_pct) if isinstance(tp_pct, (int, float)) else None,
+                "sl_pct": float(sl_pct) if isinstance(sl_pct, (int, float)) else None,
+            },
         )
         if not req_id:
             no_signal += 1
@@ -7490,6 +7636,10 @@ def _backfill_open_trade_from_db(
     meta = {"reason": reason}
     if engine_label:
         meta["engine"] = engine_label
+    if isinstance(rec, dict):
+        rec_meta = rec.get("meta")
+        if isinstance(rec_meta, dict):
+            meta.update(rec_meta)
     _log_trade_entry(
         state,
         side=side,
@@ -10469,6 +10619,65 @@ def _record_position_event(
     except Exception:
         pass
 
+def _ensure_trade_meta_tp_sl(meta: Optional[dict], entry_price: Optional[float], side: str, reason: Optional[str]) -> dict:
+    if not isinstance(meta, dict):
+        meta = {}
+    try:
+        entry = float(entry_price) if isinstance(entry_price, (int, float)) else None
+    except Exception:
+        entry = None
+    if not entry or entry <= 0:
+        return meta
+    side_key = (side or "").upper()
+    tp_pct = meta.get("tp_pct")
+    sl_pct = meta.get("sl_pct")
+    tp_price = meta.get("tp_price")
+    sl_price = meta.get("sl_price")
+
+    # derive pct from price if valid
+    if side_key == "SHORT":
+        if isinstance(tp_price, (int, float)) and tp_price < entry:
+            tp_calc = (entry - float(tp_price)) / entry * 100.0
+            if not isinstance(tp_pct, (int, float)) or tp_pct <= 0:
+                tp_pct = tp_calc
+        if isinstance(sl_price, (int, float)) and sl_price > entry:
+            sl_calc = (float(sl_price) - entry) / entry * 100.0
+            if not isinstance(sl_pct, (int, float)) or sl_pct <= 0:
+                sl_pct = sl_calc
+    elif side_key == "LONG":
+        if isinstance(tp_price, (int, float)) and tp_price > entry:
+            tp_calc = (float(tp_price) - entry) / entry * 100.0
+            if not isinstance(tp_pct, (int, float)) or tp_pct <= 0:
+                tp_pct = tp_calc
+        if isinstance(sl_price, (int, float)) and sl_price < entry:
+            sl_calc = (entry - float(sl_price)) / entry * 100.0
+            if not isinstance(sl_pct, (int, float)) or sl_pct <= 0:
+                sl_pct = sl_calc
+
+    # fallback to engine defaults
+    if not isinstance(tp_pct, (int, float)) or tp_pct <= 0:
+        tp_pct, _ = _get_engine_exit_thresholds(_engine_label_from_reason(reason), side_key)
+    if not isinstance(sl_pct, (int, float)) or sl_pct <= 0:
+        _, sl_pct = _get_engine_exit_thresholds(_engine_label_from_reason(reason), side_key)
+
+    # fill prices from pct if missing/invalid
+    if side_key == "SHORT":
+        if not isinstance(tp_price, (int, float)) or tp_price >= entry:
+            tp_price = entry * (1.0 - float(tp_pct) / 100.0)
+        if not isinstance(sl_price, (int, float)) or sl_price <= entry:
+            sl_price = entry * (1.0 + float(sl_pct) / 100.0)
+    elif side_key == "LONG":
+        if not isinstance(tp_price, (int, float)) or tp_price <= entry:
+            tp_price = entry * (1.0 + float(tp_pct) / 100.0)
+        if not isinstance(sl_price, (int, float)) or sl_price >= entry:
+            sl_price = entry * (1.0 - float(sl_pct) / 100.0)
+
+    meta["tp_pct"] = float(tp_pct)
+    meta["sl_pct"] = float(sl_pct)
+    meta["tp_price"] = float(tp_price)
+    meta["sl_price"] = float(sl_price)
+    return meta
+
 def _detect_position_events(state: dict, send_telegram) -> None:
     try:
         pos_syms = list_open_position_symbols(force=True)
@@ -10847,6 +11056,8 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
     extra_meta = req.get("meta")
     if isinstance(extra_meta, dict):
         meta.update(extra_meta)
+    entry_base = fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint")
+    meta = _ensure_trade_meta_tp_sl(meta, entry_base, side, req.get("reason"))
     _log_trade_entry(
         state,
         side=side,
@@ -10866,7 +11077,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
         qty if isinstance(qty, (int, float)) else None,
         fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
         fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
-        {"source": "manage_queue", "reason": req.get("reason")},
+        {"source": "manage_queue", "reason": req.get("reason"), **(extra_meta if isinstance(extra_meta, dict) else {})},
     )
     try:
         _sync_trade_log_from_db(state, symbol, side)
@@ -11517,12 +11728,19 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     engine_label = _engine_label_from_reason(
                         (open_tr.get("meta") or {}).get("reason") if open_tr else None
                     )
+                if entry_px is None and isinstance(open_tr, dict):
+                    entry_px = open_tr.get("entry_price")
                 tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "SHORT")
                 if isinstance(open_tr, dict):
                     meta = open_tr.get("meta") or {}
                     tp_pct_meta = meta.get("tp_pct")
-                    if isinstance(tp_pct_meta, (int, float)):
+                    if isinstance(tp_pct_meta, (int, float)) and float(tp_pct_meta) > 0:
                         tp_pct = float(tp_pct_meta)
+                    elif isinstance(meta.get("tp_price"), (int, float)) and isinstance(entry_px, (int, float)) and entry_px > 0:
+                        tp_price = float(meta.get("tp_price"))
+                        tp_calc = (float(entry_px) - tp_price) / float(entry_px) * 100.0
+                        if tp_calc > 0:
+                            tp_pct = tp_calc
                 if profit_unlev is not None and profit_unlev >= tp_pct:
                     pnl_usdt = pos_detail.get("pnl") if isinstance(pos_detail, dict) else None
                     try:
@@ -13230,6 +13448,36 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             sym_col = max(sym_col, len(base))
                             eng_col = max(eng_col, len(str(engine)))
                             tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
+                            open_tr = _get_open_trade(state, side, sym)
+                            if isinstance(open_tr, dict):
+                                meta = open_tr.get("meta") or {}
+                                entry_px = open_tr.get("entry_price")
+                                try:
+                                    tp_meta = meta.get("tp_pct")
+                                    if isinstance(tp_meta, (int, float)) and float(tp_meta) > 0:
+                                        tp_pct = float(tp_meta)
+                                except Exception:
+                                    pass
+                                try:
+                                    tp_price_meta = meta.get("tp_price")
+                                    if isinstance(tp_price_meta, (int, float)) and isinstance(entry_px, (int, float)) and entry_px > 0:
+                                        tp_calc = (float(entry_px) - float(tp_price_meta)) / float(entry_px) * 100.0
+                                        if tp_calc > 0:
+                                            tp_pct = tp_calc
+                                except Exception:
+                                    pass
+                                try:
+                                    sl_meta = meta.get("sl_pct")
+                                    if isinstance(sl_meta, (int, float)):
+                                        sl_pct = float(sl_meta)
+                                except Exception:
+                                    pass
+                                try:
+                                    sl_price_meta = meta.get("sl_price")
+                                    if isinstance(sl_price_meta, (int, float)) and isinstance(entry_px, (int, float)) and entry_px > 0:
+                                        sl_pct = (float(sl_price_meta) - float(entry_px)) / float(entry_px) * 100.0
+                                except Exception:
+                                    pass
                             rows.append((base, side, engine, tp_pct, sl_pct))
                     lines = [f"ℹ️ positions total={len(rows)} pid={os.getpid()}"]
                     if not rows:
@@ -15648,6 +15896,16 @@ def run():
                     except Exception:
                         last_pos_check = 0.0
                     force_pos = (now - last_pos_check) >= POS_CHECK_MIN_SEC
+                    # 메타 복구는 포지션 제한과 무관하게 주기적으로 수행
+                    last_meta_hydrate = _coerce_state_float(state.get("_open_trade_meta_hydrate_ts", 0.0))
+                    if (now - last_meta_hydrate) >= 60:
+                        try:
+                            if _hydrate_open_trade_meta(state, now_ts=now):
+                                state["_open_trade_meta_hydrate_ts"] = now
+                            else:
+                                state["_open_trade_meta_hydrate_ts"] = now
+                        except Exception:
+                            pass
                     try:
                         verified = count_open_positions(force=force_pos)
                         if force_pos:

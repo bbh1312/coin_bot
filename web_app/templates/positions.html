@@ -209,6 +209,22 @@
             font-family: "IBM Plex Mono", monospace;
             font-size: 0.85rem;
         }
+        .pnl-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 1rem;
+        }
+        @media (max-width: 840px) {
+            .pnl-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .pnl-subcard {
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 12px;
+            padding: 0.9rem 1rem;
+            background: rgba(15, 23, 42, 0.35);
+        }
         .pnl-card h3 {
             margin: 0 0 0.6rem;
             font-size: 1rem;
@@ -292,12 +308,34 @@
                 <a class="link-btn" href="/positions">Refresh</a>
             </div>
         </header>
-        <section class="card pnl-card" id="pnl-today">
-            <h3>오늘 순이익</h3>
-            <div class="pnl-list">
-                <div class="pnl-row">
-                    <span class="pnl-name">Loading...</span>
-                    <span class="pnl-value">--</span>
+        <section class="card pnl-card">
+            <div class="pnl-grid">
+                <div class="pnl-subcard" id="pnl-unrealized">
+                    <h3>현재 Unrealized PNL</h3>
+                    <div class="pnl-list">
+                        <div class="pnl-row">
+                            <span class="pnl-name">Loading...</span>
+                            <span class="pnl-value">--</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="pnl-subcard" id="pnl-yesterday">
+                    <h3>어제 순이익</h3>
+                    <div class="pnl-list">
+                        <div class="pnl-row">
+                            <span class="pnl-name">Loading...</span>
+                            <span class="pnl-value">--</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="pnl-subcard" id="pnl-today">
+                    <h3>오늘 순이익</h3>
+                    <div class="pnl-list">
+                        <div class="pnl-row">
+                            <span class="pnl-name">Loading...</span>
+                            <span class="pnl-value">--</span>
+                        </div>
+                    </div>
                 </div>
             </div>
         </section>
@@ -391,6 +429,8 @@
         const tabs = document.querySelectorAll(".tab-btn");
         const rows = document.querySelectorAll("tbody tr");
         const pnlTodayBox = document.getElementById("pnl-today");
+        const pnlYesterdayBox = document.getElementById("pnl-yesterday");
+        const pnlUnrealBox = document.getElementById("pnl-unrealized");
         tabs.forEach((btn) => {
             btn.addEventListener("click", () => {
                 tabs.forEach((el) => el.classList.remove("active"));
@@ -412,56 +452,64 @@
             });
         });
 
+        function renderPnlList(container, items) {
+            const pnlList = container.querySelector(".pnl-list");
+            pnlList.innerHTML = "";
+            if (!items.length) {
+                const row = document.createElement("div");
+                row.className = "pnl-row";
+                row.innerHTML = `<span class="pnl-name">no data</span><span class="pnl-value">--</span>`;
+                pnlList.appendChild(row);
+                return;
+            }
+            items.forEach((item) => {
+                const row = document.createElement("div");
+                row.className = "pnl-row";
+                const name = item.name || "unknown";
+                const isActive = item.is_active !== false;
+                if (item.error) {
+                    row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="pnl-value">N/A</span></div>`;
+                } else {
+                    const pnlVal = item.pnl;
+                    const pnlText = typeof pnlVal === "number" ? `${pnlVal >= 0 ? "+" : ""}${pnlVal.toFixed(1)} USDT` : "N/A";
+                    const cls = typeof pnlVal === "number" ? (pnlVal >= 0 ? "pnl-value pos" : "pnl-value neg") : "pnl-value";
+                    row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="${cls}">${pnlText}</span></div>`;
+                }
+                const controls = row.querySelector(".pnl-controls");
+                if (controls) {
+                    const toggle = document.createElement("button");
+                    toggle.className = `pnl-toggle${isActive ? " active" : ""}`;
+                    toggle.textContent = isActive ? "ACTIVE" : "OFF";
+                    toggle.addEventListener("click", async () => {
+                        toggle.disabled = true;
+                        await fetch("/admin/accounts", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                account_id: item.account_id,
+                                is_active: !isActive,
+                            }),
+                        });
+                        await refreshPnlToday();
+                    });
+                    controls.appendChild(toggle);
+                }
+                pnlList.appendChild(row);
+            });
+        }
+
         async function refreshPnlToday() {
             const res = await fetch("/status");
             if (!res.ok) {
                 return;
             }
             const data = await res.json();
-            const pnlList = pnlTodayBox.querySelector(".pnl-list");
             const pnlItems = data.pnl_today || [];
-            pnlList.innerHTML = "";
-            if (!pnlItems.length) {
-                const row = document.createElement("div");
-                row.className = "pnl-row";
-                row.innerHTML = `<span class="pnl-name">no data</span><span class="pnl-value">--</span>`;
-                pnlList.appendChild(row);
-            } else {
-                pnlItems.forEach((item) => {
-                    const row = document.createElement("div");
-                    row.className = "pnl-row";
-                    const name = item.name || "unknown";
-                    const isActive = item.is_active !== false;
-                    if (item.error) {
-                        row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="pnl-value">N/A</span></div>`;
-                    } else {
-                        const pnlVal = item.pnl;
-                        const pnlText = typeof pnlVal === "number" ? `${pnlVal >= 0 ? "+" : ""}${pnlVal.toFixed(1)} USDT` : "N/A";
-                        const cls = typeof pnlVal === "number" ? (pnlVal >= 0 ? "pnl-value pos" : "pnl-value neg") : "pnl-value";
-                        row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="${cls}">${pnlText}</span></div>`;
-                    }
-                    const controls = row.querySelector(".pnl-controls");
-                    if (controls) {
-                        const toggle = document.createElement("button");
-                        toggle.className = `pnl-toggle${isActive ? " active" : ""}`;
-                        toggle.textContent = isActive ? "ACTIVE" : "OFF";
-                        toggle.addEventListener("click", async () => {
-                            toggle.disabled = true;
-                            await fetch("/admin/accounts", {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({
-                                    account_id: item.account_id,
-                                    is_active: !isActive,
-                                }),
-                            });
-                            await refreshPnlToday();
-                        });
-                        controls.appendChild(toggle);
-                    }
-                    pnlList.appendChild(row);
-                });
-            }
+            const pnlYesterdayItems = data.pnl_yesterday || [];
+            const pnlUnrealItems = data.pnl_unrealized || [];
+            renderPnlList(pnlTodayBox, pnlItems);
+            renderPnlList(pnlYesterdayBox, pnlYesterdayItems);
+            renderPnlList(pnlUnrealBox, pnlUnrealItems);
         }
 
         refreshPnlToday();
