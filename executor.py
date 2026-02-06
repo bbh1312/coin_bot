@@ -1345,6 +1345,11 @@ def place_long_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None
         }
         _db_record_order("place_long_sl_px", symbol, "LONG", res, status_override="dry_run")
         return res
+    try:
+        if os.getenv("CANCEL_EXISTING_SL_BEFORE_PLACE", "1") == "1":
+            cancel_conditional_by_side(symbol, "LONG")
+    except Exception:
+        pass
     params = {"stopPrice": float(ctx.exchange.price_to_precision(symbol, sl_px)), "workingType": "MARK_PRICE"}
     try:
         if is_hedge_mode():
@@ -1414,6 +1419,11 @@ def place_short_sl_px(symbol: str, stop_price: float, qty: Optional[float] = Non
         }
         _db_record_order("place_short_sl_px", symbol, "SHORT", res, status_override="dry_run")
         return res
+    try:
+        if os.getenv("CANCEL_EXISTING_SL_BEFORE_PLACE", "1") == "1":
+            cancel_conditional_by_side(symbol, "SHORT")
+    except Exception:
+        pass
     params = {"stopPrice": float(ctx.exchange.price_to_precision(symbol, sl_px)), "workingType": "MARK_PRICE"}
     try:
         if is_hedge_mode():
@@ -1484,7 +1494,15 @@ def cancel_stop_orders(symbol: str) -> dict:
             orders = []
         # Some exchanges separate conditional/stop orders; try extra fetches.
         extra_orders = []
-        for params in ({"type": "stop"}, {"stop": True}, {"trigger": True}):
+        for params in (
+            {"type": "stop"},
+            {"type": "STOP"},
+            {"type": "STOP_MARKET"},
+            {"type": "TAKE_PROFIT_MARKET"},
+            {"type": "TRAILING_STOP_MARKET"},
+            {"stop": True},
+            {"trigger": True},
+        ):
             try:
                 extra_orders.extend(ctx.exchange.fetch_open_orders(symbol, params))
             except Exception:
@@ -1544,7 +1562,26 @@ def cancel_stop_orders(symbol: str) -> dict:
             except Exception:
                 pass
         if stop_count > 0 and canceled == 0:
-            for params in ({"type": "STOP_MARKET"}, {"type": "stop"}, {"stop": True}, {"reduceOnly": True}):
+            for params in (
+                {"type": "STOP_MARKET"},
+                {"type": "TAKE_PROFIT_MARKET"},
+                {"type": "TRAILING_STOP_MARKET"},
+                {"type": "stop"},
+                {"stop": True},
+                {"reduceOnly": True},
+            ):
+                try:
+                    ctx.exchange.cancel_all_orders(symbol, params)
+                except Exception:
+                    continue
+        if stop_count == 0:
+            for params in (
+                {"type": "STOP_MARKET"},
+                {"type": "TAKE_PROFIT_MARKET"},
+                {"type": "TRAILING_STOP_MARKET"},
+                {"type": "stop"},
+                {"stop": True},
+            ):
                 try:
                     ctx.exchange.cancel_all_orders(symbol, params)
                 except Exception:
@@ -1571,7 +1608,17 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
     orders = []
     seen_ids = set()
     fetch_errors = []
-    for params in ({}, {"type": "stop"}, {"stop": True}, {"trigger": True}, {"reduceOnly": True}):
+    for params in (
+        {},
+        {"type": "stop"},
+        {"type": "STOP"},
+        {"type": "STOP_MARKET"},
+        {"type": "TAKE_PROFIT_MARKET"},
+        {"type": "TRAILING_STOP_MARKET"},
+        {"stop": True},
+        {"trigger": True},
+        {"reduceOnly": True},
+    ):
         try:
             batch = ctx.exchange.fetch_open_orders(symbol, params) if params else ctx.exchange.fetch_open_orders(symbol)
         except Exception as e:
@@ -1610,10 +1657,6 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
         pos_side = (info.get("positionSide") or o.get("positionSide") or "").upper()
         if pos_side and side and pos_side != side:
             continue
-        reduce_only = bool(o.get("reduceOnly") or str(info.get("reduceOnly")).lower() == "true")
-        close_position = str(info.get("closePosition")).lower() == "true"
-        if not (reduce_only or close_position):
-            continue
         targets += 1
         params = {}
         if pos_side:
@@ -1637,6 +1680,22 @@ def cancel_conditional_by_side(symbol: str, side: str) -> dict:
                         pass
             except Exception:
                 pass
+    if targets == 0 or canceled == 0:
+        params_list = [
+            {"type": "STOP_MARKET"},
+            {"type": "TAKE_PROFIT_MARKET"},
+            {"type": "TRAILING_STOP_MARKET"},
+            {"type": "stop"},
+            {"stop": True},
+        ]
+        for base_params in params_list:
+            try:
+                params = dict(base_params)
+                if side:
+                    params["positionSide"] = side
+                ctx.exchange.cancel_all_orders(symbol, params)
+            except Exception:
+                continue
     return {
         "status": "ok",
         "action": "cancel_conditional_by_side",

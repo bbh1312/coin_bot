@@ -212,6 +212,53 @@ def _avg_up_volume(df: pd.DataFrame, lookback: int) -> float:
     return float(up["volume"].mean())
 
 
+def _rsi_dynamic_ok(rsi: pd.Series, idx: int, window: int, low_pct: float, margin: float) -> bool:
+    if idx <= 0 or rsi.empty:
+        return False
+    start = max(0, idx - max(int(window), 1) + 1)
+    window_vals = rsi.iloc[start: idx + 1].dropna().to_numpy()
+    if window_vals.size < 5:
+        return False
+    pct = min(max(float(low_pct), 1.0), 50.0)
+    k = max(1, int(round(window_vals.size * (pct / 100.0))))
+    lows = np.sort(window_vals)[:k]
+    avg_low = float(np.mean(lows))
+    if avg_low <= 0:
+        return False
+    threshold = avg_low * (1.0 + float(margin))
+    return float(rsi.iloc[idx]) <= threshold
+
+
+def _poc_price(close: pd.Series, volume: pd.Series, lookback: int, bins: int) -> Optional[float]:
+    if close.empty or volume.empty:
+        return None
+    lb = max(5, int(lookback))
+    recent = close.iloc[-lb:].astype(float).to_numpy()
+    vol = volume.iloc[-lb:].astype(float).to_numpy()
+    if recent.size < 5:
+        return None
+    lo = float(np.min(recent))
+    hi = float(np.max(recent))
+    if hi <= lo:
+        return None
+    b = max(5, int(bins))
+    edges = np.linspace(lo, hi, b + 1)
+    idxs = np.clip(np.digitize(recent, edges) - 1, 0, b - 1)
+    vol_bins = np.zeros(b, dtype=float)
+    for i, v in zip(idxs, vol):
+        vol_bins[int(i)] += float(v)
+    max_i = int(np.argmax(vol_bins))
+    return float((edges[max_i] + edges[max_i + 1]) / 2.0)
+
+
+def _poc_ok(price: float, poc: Optional[float], band: float) -> bool:
+    if poc is None or poc <= 0:
+        return False
+    if price < poc:
+        return False
+    return abs(price - poc) / poc <= float(band)
+
+
 def _btc_guard(
     btc_1h: pd.DataFrame,
     btc_main: pd.DataFrame,
@@ -221,6 +268,7 @@ def _btc_guard(
     rsi_min: float,
     drop_pct: float,
     drop_bars: int,
+    slope_bars: int,
 ) -> bool:
     if btc_1h.empty or btc_main.empty or btc_1m.empty:
         return False
@@ -238,6 +286,18 @@ def _btc_guard(
     rsi_main = _rsi(btc_main["close"].astype(float), 14)
     if float(rsi_main.iloc[idx_main]) <= rsi_min:
         return False
+    if int(slope_bars) > 0:
+        slope_n = max(int(slope_bars), 1)
+        if idx_1h - slope_n < 0:
+            return False
+        ema20 = _ema(btc_1h["close"].astype(float), 20)
+        slope_vals = []
+        for j in range(idx_1h - slope_n + 1, idx_1h + 1):
+            slope_vals.append(float(ema20.iloc[j] - ema20.iloc[j - 1]))
+        if any(s <= 0 for s in slope_vals):
+            return False
+        if len(slope_vals) >= 2 and slope_vals[-1] < slope_vals[-2]:
+            return False
     bars = max(int(drop_bars), 1)
     closes = btc_1m["close"].astype(float).iloc[idx_1m - (bars - 1): idx_1m + 1].to_numpy()
     drops = (closes[1:] - closes[:-1]) / closes[:-1]
@@ -333,6 +393,8 @@ def run_backtest() -> None:
     parser.add_argument("--btc-rsi-min", type=float, default=48.0)
     parser.add_argument("--btc-drop-pct", type=float, default=0.003)
     parser.add_argument("--btc-drop-bars", type=int, default=5)
+    parser.add_argument("--btc-slope-bars", type=int, default=3)
+    parser.add_argument("--btc-filter-off", action="store_true")
     parser.add_argument("--lookback-up", type=int, default=14)
     parser.add_argument("--vol-ratio-max", type=float, default=0.5)
     parser.add_argument("--obv-flat-min", type=float, default=0.0)
@@ -343,6 +405,13 @@ def run_backtest() -> None:
     parser.add_argument("--body-min", type=float, default=0.6)
     parser.add_argument("--body-wick-mult", type=float, default=1.5)
     parser.add_argument("--main-tf", type=str, default="15m")
+    parser.add_argument("--rsi-dyn-hours", type=float, default=24.0)
+    parser.add_argument("--rsi-dyn-low-pct", type=float, default=20.0)
+    parser.add_argument("--rsi-dyn-margin", type=float, default=0.2)
+    parser.add_argument("--use-poc-filter", action="store_true")
+    parser.add_argument("--poc-lookback", type=int, default=60)
+    parser.add_argument("--poc-bins", type=int, default=20)
+    parser.add_argument("--poc-band", type=float, default=0.004)
     parser.add_argument("--rsi-drop-bars", type=int, default=4)
     parser.add_argument("--rsi-drop-from", type=float, default=70.0)
     parser.add_argument("--rsi-drop-to", type=float, default=40.0)
@@ -364,6 +433,8 @@ def run_backtest() -> None:
     main_tf = str(args.main_tf).strip()
     if main_tf not in {"3m", "5m", "15m"}:
         raise SystemExit(f"--main-tf unsupported: {main_tf} (use 3m/5m/15m)")
+    main_tf_minutes = float(exchange.parse_timeframe(main_tf))
+    rsi_dyn_window = int((float(args.rsi_dyn_hours) * 60.0) / max(main_tf_minutes, 1.0))
 
     min_tr = 200
     min_main = max(args.swing_lookback, 120)
@@ -680,17 +751,19 @@ def run_backtest() -> None:
             if ts < eval_start_ms:
                 continue
 
-            if not _btc_guard(
-                btc_1h,
-                btc_main,
-                btc_1m,
-                ts,
-                args.btc_ema_len,
-                args.btc_rsi_min,
-                args.btc_drop_pct,
-                args.btc_drop_bars,
-            ):
-                continue
+            if not args.btc_filter_off:
+                if not _btc_guard(
+                    btc_1h,
+                    btc_main,
+                    btc_1m,
+                    ts,
+                    args.btc_ema_len,
+                    args.btc_rsi_min,
+                    args.btc_drop_pct,
+                    args.btc_drop_bars,
+                    args.btc_slope_bars,
+                ):
+                    continue
 
             if args.ethbtc_filter and not ethbtc_main.empty:
                 ts_eth = ethbtc_main["ts"].astype(int).to_numpy()
@@ -725,6 +798,8 @@ def run_backtest() -> None:
 
             rsi_main_now = float(rsi_main.iloc[idx_main]) if not np.isnan(rsi_main.iloc[idx_main]) else 0.0
             rsi_main_prev = float(rsi_main.iloc[idx_main - 1]) if idx_main > 0 else rsi_main_now
+            if not _rsi_dynamic_ok(rsi_main, idx_main, rsi_dyn_window, args.rsi_dyn_low_pct, args.rsi_dyn_margin):
+                continue
             if _rsi_fast_drop(rsi_main, idx_main, args.rsi_drop_from, args.rsi_drop_to, args.rsi_drop_bars):
                 continue
 
@@ -747,6 +822,11 @@ def run_backtest() -> None:
                 vol_ok = vol_ratio <= args.vol_ratio_max
             else:
                 vol_ok = True
+            if args.use_poc_filter:
+                poc_price = _poc_price(df_main["close"], df_main["volume"], args.poc_lookback, args.poc_bins)
+                poc_ok = _poc_ok(main_close, poc_price, args.poc_band)
+            else:
+                poc_ok = True
 
             # Trigger A: Gap Filler
             gap_filler = float(prev_ex["close"]) < float(ema10_ex.iloc[sig_idx - 1]) and float(cur_ex["close"]) > float(ema10_ex.iloc[sig_idx])
@@ -763,14 +843,30 @@ def run_backtest() -> None:
 
             # Trigger C: Golden Pocket
             gp_hit = any(_in_zone(main_close, lv, 0.002) for lv in fibs) or main_close <= bbl
-            golden_pocket = gp_hit and obv_ok and vol_ok
+            golden_pocket = gp_hit and obv_ok and vol_ok and poc_ok
 
             # Recovery trigger after breakdown
-            recovery = last_breakdown_idx is not None and main_close > bbm and obv_ok and vol_ok
+            recovery = last_breakdown_idx is not None and main_close > bbm and obv_ok and vol_ok and poc_ok
             if recovery and not _bull_body_or_long_wick(df_main.iloc[idx_main], args.body_min, args.body_wick_mult):
                 recovery = False
 
-            if not (gap_filler or spring_trap or golden_pocket or recovery):
+            mode = str(args.trigger_mode).strip().lower()
+            if mode == "spring":
+                trigger_ok = spring_trap
+            elif mode == "recovery":
+                trigger_ok = recovery
+            elif mode == "gap":
+                trigger_ok = gap_filler
+            elif mode in {"gp", "golden"}:
+                trigger_ok = golden_pocket
+            elif mode in {"spring_recovery", "spring+recovery"}:
+                trigger_ok = spring_trap or recovery
+            elif mode == "all":
+                trigger_ok = gap_filler or spring_trap or golden_pocket or recovery
+            else:
+                raise SystemExit(f"--trigger-mode unsupported: {args.trigger_mode}")
+
+            if not trigger_ok:
                 continue
 
             if ts_5m.size > 0:

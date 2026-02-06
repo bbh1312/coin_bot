@@ -253,6 +253,7 @@ _LAST_ACCOUNT_REFRESH_TS = 0.0
 
 ADMIN_ACCOUNT_CONTEXT: Optional[AccountContext] = None
 FOLLOWER_CONTEXTS: List[AccountContext] = []
+FOLLOWERS_SKIP_CONDITIONAL_ORDERS = os.getenv("FOLLOWERS_SKIP_CONDITIONAL_ORDERS", "1") == "1"
 _LAST_ENTRY_BROADCAST = {"ts": 0.0, "symbol": None, "side": None, "line": None}
 _ENTRY_BROADCAST_TTL_SEC = float(os.getenv("ENTRY_BROADCAST_TTL_SEC", "120"))
 
@@ -905,6 +906,8 @@ def place_long_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None
     followers = FOLLOWER_CONTEXTS
     if not followers:
         return res
+    if FOLLOWERS_SKIP_CONDITIONAL_ORDERS:
+        return res
     follower_calls = []
     for acct in followers:
         try:
@@ -928,6 +931,8 @@ def place_short_sl_px(symbol: str, stop_price: float, qty: Optional[float] = Non
     res = _EXEC_PLACE_SHORT_SL_PX(symbol, stop_price, qty=qty)
     followers = FOLLOWER_CONTEXTS
     if not followers:
+        return res
+    if FOLLOWERS_SKIP_CONDITIONAL_ORDERS:
         return res
     follower_calls = []
     for acct in followers:
