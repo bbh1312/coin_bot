@@ -13236,6 +13236,8 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_st_flip_v1_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_rsi_enabled",
+        "_wash_short_suite_enabled",
+        "_top_fail_short_v1_enabled",
         "_bull_pullback_long_v1_enabled",
         "_dtfx_enabled",
         "_atlas_rs_fail_short_enabled",
