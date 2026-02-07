@@ -1151,7 +1151,7 @@ def command():
         if not item:
             return jsonify({"status": "unknown key", "key": key}), 400
         if item["type"] == "toggle":
-            state[key] = bool(value)
+            state[key] = _coerce_bool(value)
         elif item["type"] in ("number", "int"):
             if value is None or str(value).strip() == "":
                 return jsonify({"status": "missing value", "key": key}), 400
