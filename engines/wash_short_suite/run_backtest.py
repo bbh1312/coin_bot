@@ -22,7 +22,12 @@ from engines.backtest_common import (
     print_time_summaries,
     print_trades_by_symbol,
 )
-from engines.wash_short_suite.engine import WashShortSuiteConfig
+from engines.wash_short_suite.engine import (
+    WashShortSuiteConfig,
+    wash_btc_guard,
+    wash_map_idx_by_ts,
+    wash_short_entry_signal,
+)
 
 
 def _ensure_dir(path: str) -> None:
@@ -90,6 +95,10 @@ def _read_common_warmup(path: str) -> List[list]:
         return []
 
 
+def _read_snapshot(path: str) -> List[list]:
+    return _read_common_warmup(path)
+
+
 def _fetch_ohlcv_all(
     exchange: ccxt.Exchange,
     symbol: str,
@@ -100,7 +109,26 @@ def _fetch_ohlcv_all(
     use_common_warmup: bool = False,
     common_warmup_dir: str = "",
     cache_only: bool = False,
+    snapshot_dir: str = "",
+    snapshot_only: bool = False,
+    common_only: bool = False,
 ) -> List[list]:
+    if common_only:
+        use_common_warmup = True
+        cache_only = True
+        snapshot_dir = ""
+        snapshot_only = False
+    if snapshot_dir:
+        safe = _sanitize_symbol(symbol)
+        snap_path = os.path.join(snapshot_dir, f"{safe}_{timeframe}.csv")
+        snap_rows = _read_snapshot(snap_path)
+        if snap_rows:
+            if snapshot_only:
+                return snap_rows
+            filtered = [r for r in snap_rows if start_ms <= int(r[0]) <= end_ms]
+            return filtered
+        if snapshot_only:
+            return []
     if use_common_warmup and common_warmup_dir:
         safe = _sanitize_symbol(symbol)
         warmup_path = os.path.join(common_warmup_dir, f"{safe}_{timeframe}.csv")
@@ -109,6 +137,8 @@ def _fetch_ohlcv_all(
             return [r for r in warmup_rows if start_ms <= int(r[0]) <= end_ms]
         if cache_only:
             return []
+    if common_only:
+        return []
     cache_path = _ohlcv_cache_path(ROOT_DIR, symbol, timeframe, start_ms, end_ms)
     cached = _read_ohlcv_cache(cache_path)
     if cached:
@@ -248,6 +278,10 @@ def parse_args():
     p.add_argument("--common-warmup-dir", type=str, default="")
     p.add_argument("--use-live-cache", action="store_true")
     p.add_argument("--cache-only", action="store_true")
+    p.add_argument("--common-only", action="store_true")
+    p.add_argument("--common-only", action="store_true")
+    p.add_argument("--snapshot-dir", type=str, default="")
+    p.add_argument("--snapshot-only", action="store_true")
     p.add_argument("--tf-trend", type=str, default="")
     p.add_argument("--tf-main", type=str, default="")
     p.add_argument("--tf-exec", type=str, default="")
@@ -289,8 +323,8 @@ def run_backtest():
     )
     universe_arg = (args.universe or "").strip().lower()
     use_live_cache = bool(args.use_live_cache)
-    use_common = bool(args.use_common_warmup) or use_live_cache
-    cache_only = bool(args.cache_only)
+    use_common = bool(args.use_common_warmup) or use_live_cache or bool(args.common_only)
+    cache_only = bool(args.cache_only) or bool(args.common_only)
     common_dir = args.common_warmup_dir or os.getenv("COMMON_WARMUP_CACHE_DIR", "")
 
     if not (cache_only and universe_arg in ("common", "common_universe")):
@@ -372,6 +406,9 @@ def run_backtest():
             use_common_warmup=use_common,
             common_warmup_dir=common_dir,
             cache_only=cache_only,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_only=args.snapshot_only,
+            common_only=args.common_only,
         )
         rows_main = _fetch_ohlcv_all(
             exchange,
@@ -382,6 +419,9 @@ def run_backtest():
             use_common_warmup=use_common,
             common_warmup_dir=common_dir,
             cache_only=cache_only,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_only=args.snapshot_only,
+            common_only=args.common_only,
         )
         rows_exec = _fetch_ohlcv_all(
             exchange,
@@ -392,6 +432,9 @@ def run_backtest():
             use_common_warmup=use_common,
             common_warmup_dir=common_dir,
             cache_only=cache_only,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_only=args.snapshot_only,
+            common_only=args.common_only,
         )
         if rows_trend and rows_main and rows_exec:
             symbol_data[sym] = {"trend": rows_trend, "main": rows_main, "exec": rows_exec}
@@ -399,10 +442,6 @@ def run_backtest():
     # BTC safety guard data (1h EMA20 + 15m RSI)
     btc_df_1h = pd.DataFrame()
     btc_df_15m = pd.DataFrame()
-    btc_ts_1h = None
-    btc_ts_15m = None
-    btc_ema20_1h = None
-    btc_rsi_15m = None
     if not args.no_btc_guard:
         btc_rows_1h = _fetch_ohlcv_all(
             exchange,
@@ -413,6 +452,9 @@ def run_backtest():
             use_common_warmup=use_common,
             common_warmup_dir=common_dir,
             cache_only=cache_only,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_only=args.snapshot_only,
+            common_only=args.common_only,
         )
         btc_rows_15m = _fetch_ohlcv_all(
             exchange,
@@ -423,13 +465,12 @@ def run_backtest():
             use_common_warmup=use_common,
             common_warmup_dir=common_dir,
             cache_only=cache_only,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_only=args.snapshot_only,
+            common_only=args.common_only,
         )
         btc_df_1h = pd.DataFrame(btc_rows_1h, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True) if btc_rows_1h else pd.DataFrame()
         btc_df_15m = pd.DataFrame(btc_rows_15m, columns=["ts", "open", "high", "low", "close", "volume"]).reset_index(drop=True) if btc_rows_15m else pd.DataFrame()
-        btc_ts_1h = btc_df_1h["ts"].astype(int).to_numpy() if not btc_df_1h.empty else None
-        btc_ts_15m = btc_df_15m["ts"].astype(int).to_numpy() if not btc_df_15m.empty else None
-        btc_ema20_1h = _ema(btc_df_1h["close"].astype(float), int(args.btc_ema_len)) if not btc_df_1h.empty else None
-        btc_rsi_15m = _rsi(btc_df_15m["close"].astype(float), int(args.btc_rsi_len)) if not btc_df_15m.empty else None
 
     entry_usdt = 10.0
     stats = {
@@ -460,24 +501,12 @@ def run_backtest():
         if df_tr.empty or df_main.empty or df_ex.empty:
             continue
 
-        ema20_tr = _ema(df_tr["close"].astype(float), cfg.ema_fast)
-        ema60_tr = _ema(df_tr["close"].astype(float), cfg.ema_mid)
-        ema120_tr = _ema(df_tr["close"].astype(float), cfg.ema_slow)
-        adx_tr, pdi_tr, mdi_tr = _adx(df_tr, cfg.adx_len)
-
-        ema20_main = _ema(df_main["close"].astype(float), cfg.ema_fast)
-        ema60_main = _ema(df_main["close"].astype(float), cfg.ema_mid)
-        ema120_main = _ema(df_main["close"].astype(float), cfg.ema_slow)
-        adx_main, pdi_main, mdi_main = _adx(df_main, cfg.adx_len)
-        bb_mid = _bb_mid(df_main["close"].astype(float), cfg.ema_fast)
-        atr_main = _atr(df_main, cfg.adx_len)
-
-        rsi_ex = _rsi(df_ex["close"].astype(float), cfg.rsi_len)
-        vol_sma_ex = df_ex["volume"].astype(float).rolling(cfg.vol_sma_len).mean()
-
-        ts_tr = df_tr["ts"].astype(int).to_numpy()
-        ts_main = df_main["ts"].astype(int).to_numpy()
-        ts_ex = df_ex["ts"].astype(int).to_numpy()
+        df_tr_sig = df_tr.iloc[:-1] if args.use_confirmed else df_tr
+        df_main_sig = df_main.iloc[:-1] if args.use_confirmed else df_main
+        df_ex_sig = df_ex.iloc[:-1] if args.use_confirmed else df_ex
+        ts_tr = df_tr_sig["ts"].astype(int).to_numpy()
+        ts_main = df_main_sig["ts"].astype(int).to_numpy()
+        ts_ex = df_ex_sig["ts"].astype(int).to_numpy()
 
         trade: Optional[dict] = None
         cooldown_left = 0
@@ -498,35 +527,26 @@ def run_backtest():
             "sl_sum_usdt": 0.0,
         }
 
-        for i in range(1, len(df_ex)):
+        for i in range(1, len(df_ex_sig)):
             sig_idx = i - 1 if args.use_confirmed else i
             if sig_idx <= 0:
                 continue
             ts = int(ts_ex[sig_idx])
-            idx_tr = _map_idx_by_ts(ts_tr, ts)
-            idx_main = _map_idx_by_ts(ts_main, ts)
+            idx_tr = wash_map_idx_by_ts(ts_tr, ts)
+            idx_main = wash_map_idx_by_ts(ts_main, ts)
             if idx_tr <= 0 or idx_main <= 0:
                 continue
 
             # BTC safety guard (block shorts when BTC 15m close > EMA10 or EMA7>EMA20)
-            if (
-                not args.no_btc_guard
-                and btc_ts_15m is not None
-                and not btc_df_15m.empty
-            ):
-                idx_btc_15m = _map_idx_by_ts(btc_ts_15m, ts)
-                if idx_btc_15m > 0:
-                    btc_close_15m = btc_df_15m["close"].astype(float)
-                    start_idx = max(0, idx_btc_15m - 288 + 1)
-                    window = btc_close_15m.iloc[start_idx : idx_btc_15m + 1]
-                    btc_ema10_15m = window.ewm(span=int(args.btc_ema_guard_len), adjust=False).mean().iloc[-1]
-                    btc_ema7_15m = window.ewm(span=int(args.btc_ema_fast), adjust=False).mean().iloc[-1]
-                    btc_ema20_15m = window.ewm(span=int(args.btc_ema_slow), adjust=False).mean().iloc[-1]
-                    btc_px_15m = float(window.iloc[-1])
-                    if btc_px_15m > float(btc_ema10_15m):
-                        continue
-                    if btc_ema7_15m > btc_ema20_15m:
-                        continue
+            if not args.no_btc_guard and btc_df_15m is not None and not btc_df_15m.empty:
+                if wash_btc_guard(
+                    btc_df_15m,
+                    ts,
+                    int(args.btc_ema_guard_len),
+                    int(args.btc_ema_fast),
+                    int(args.btc_ema_slow),
+                ):
+                    continue
 
             if trade:
                 high = float(df_ex.at[i, "high"])
@@ -536,11 +556,8 @@ def run_backtest():
                 trade["mfe"] = max(trade["mfe"], max(0.0, (trade["entry_px"] - low) / trade["entry_px"]))
                 trade["mae"] = max(trade["mae"], max(0.0, (high - trade["entry_px"]) / trade["entry_px"]))
 
-                sl_price = trade["entry_px"] * (1.0 + cfg.sl_pct)
-                atr_px = float(atr_main.iloc[idx_main]) if not np.isnan(atr_main.iloc[idx_main]) else 0.0
-                if atr_px > 0:
-                    sl_price = max(sl_price, trade["entry_px"] + atr_px * cfg.sl_atr_mult)
-                tp_price = trade["entry_px"] - atr_px * cfg.tp_atr_mult if atr_px > 0 else trade["entry_px"] * (1.0 - cfg.tp_pct)
+                sl_price = float(trade.get("sl_price", trade["entry_px"] * (1.0 + cfg.sl_pct)))
+                tp_price = float(trade.get("tp_price", trade["entry_px"] * (1.0 - cfg.tp_pct)))
 
                 exit_reason = None
                 exit_px = None
@@ -622,66 +639,22 @@ def run_backtest():
                 cooldown_left -= 1
                 continue
 
-            # Step 1: trend filter (1h + 15m)
-            trend_ok = (
-                ema20_tr.iloc[idx_tr] < ema60_tr.iloc[idx_tr] < ema120_tr.iloc[idx_tr]
-                and adx_tr.iloc[idx_tr] > cfg.adx_min
-                and mdi_tr.iloc[idx_tr] > pdi_tr.iloc[idx_tr]
-                and float(df_tr.at[idx_tr, "close"]) < float(ema60_tr.iloc[idx_tr])
-                and ema20_main.iloc[idx_main] < ema60_main.iloc[idx_main] < ema120_main.iloc[idx_main]
-                and adx_main.iloc[idx_main] > cfg.adx_min
-                and mdi_main.iloc[idx_main] > pdi_main.iloc[idx_main]
-                and float(df_main.at[idx_main, "close"]) < float(ema60_main.iloc[idx_main])
+            entry_info, reason = wash_short_entry_signal(
+                df_tr_sig,
+                df_main_sig,
+                df_ex,
+                df_ex_sig,
+                sig_idx,
+                idx_tr,
+                idx_main,
+                cfg,
+                entry_offset=1 if args.use_confirmed else 0,
             )
-            if not trend_ok:
+            if not entry_info:
                 continue
 
-            # Step 2: pullback zone (15m)
-            swing_start = max(0, idx_main - cfg.swing_lookback)
-            swing_high = float(df_main["high"].iloc[swing_start: idx_main + 1].max())
-            swing_low = float(df_main["low"].iloc[swing_start: idx_main + 1].min())
-            fibs = _fib_levels(swing_high, swing_low)
-            ema_mid = float(ema20_main.iloc[idx_main])
-            bbm = float(bb_mid.iloc[idx_main]) if not np.isnan(bb_mid.iloc[idx_main]) else ema_mid
-            levels = fibs + [ema_mid, bbm, swing_low]
-            price = float(df_main.at[idx_main, "close"])
-            if not any(_in_zone(price, lv, cfg.pullback_eps) for lv in levels):
-                continue
-
-            # Step 3: exec trigger
-            rsi_now = float(rsi_ex.iloc[sig_idx])
-            rsi_prev = float(rsi_ex.iloc[sig_idx - 1]) if sig_idx > 0 else rsi_now
-            rsi_turn = cfg.rsi_min <= rsi_now <= cfg.rsi_max and (rsi_now + cfg.rsi_lower_high_delta) < rsi_prev
-            cur = df_ex.iloc[sig_idx]
-            prev = df_ex.iloc[sig_idx - 1]
-            candle_ok = _is_shooting_star(cur) or _is_bear_engulf(prev, cur)
-
-            vol_now = float(cur["volume"])
-            vol_avg = float(vol_sma_ex.iloc[sig_idx]) if not np.isnan(vol_sma_ex.iloc[sig_idx]) else 0.0
-            vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 0.0
-            pullback_ok = vol_ratio >= cfg.vol_reversal_min
-
-            if not (rsi_turn and candle_ok and pullback_ok):
-                continue
-
-            # Entry block checks on next bar
-            entry = df_ex.iloc[i]
-            entry_high = float(entry["high"])
-            entry_low = float(entry["low"])
-            entry_close = float(entry["close"])
-            entry_rng = max(entry_high - entry_low, 1e-9)
-            entry_close_pos = (entry_close - entry_low) / entry_rng
-            entry_vol = float(entry["volume"])
-            entry_vol_avg = float(vol_sma_ex.iloc[i]) if not np.isnan(vol_sma_ex.iloc[i]) else 0.0
-            entry_vol_ratio = (entry_vol / entry_vol_avg) if entry_vol_avg > 0 else 0.0
-
-            if entry_high > float(cur["high"]) * cfg.entry_block_high_mult:
-                continue
-            if entry_close_pos >= cfg.entry_block_close_pos and entry_vol_ratio >= cfg.entry_block_vol_ratio:
-                continue
-
-            entry_px = float(entry["close"])
-            entry_ts = int(ts_ex[i])
+            entry_px = float(entry_info["entry_px"])
+            entry_ts = int(entry_info["entry_ts"])
             if entry_ts < eval_start_ms:
                 continue
             entry_hour, entry_dow = _entry_kst_info(entry_ts)
@@ -690,6 +663,8 @@ def run_backtest():
                 "entry_ts": entry_ts,
                 "entry_hour": entry_hour,
                 "entry_dow": entry_dow,
+                "sl_price": float(entry_info["sl_price"]),
+                "tp_price": float(entry_info["tp_price"]),
                 "hold_bars": 0,
                 "mfe": 0.0,
                 "mae": 0.0,

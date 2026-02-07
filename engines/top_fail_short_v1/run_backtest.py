@@ -20,6 +20,10 @@ from engines.backtest_common import (
     format_backtest_summary,
     print_time_summaries,
 )
+from engines.top_fail_short_v1.engine import (
+    TopFailShortV1Config,
+    top_fail_short_entry_signal,
+)
 
 
 def _ensure_dir(path: str) -> None:
@@ -133,6 +137,10 @@ def _read_ohlcv_cache(path: str) -> List[list]:
         return []
 
 
+def _read_snapshot(path: str) -> List[list]:
+    return _read_common_warmup(path)
+
+
 def _write_ohlcv_cache(path: str, rows: List[list]) -> None:
     if not rows:
         return
@@ -155,7 +163,30 @@ def _fetch_ohlcv_all(
     common_warmup_dir: str = "",
     cache_only: bool = False,
     fill_missing: bool = False,
+    snapshot_dir: str = "",
+    snapshot_only: bool = False,
+    common_only: bool = False,
 ) -> List[list]:
+    if common_only:
+        use_common_warmup = True
+        cache_only = True
+        snapshot_dir = ""
+        snapshot_only = False
+    if snapshot_dir:
+        safe = _sanitize_symbol(symbol)
+        snap_path = os.path.join(snapshot_dir, f"{safe}_{timeframe}.csv")
+        snap_rows = _read_snapshot(snap_path)
+        if snap_rows:
+            if snapshot_only:
+                return snap_rows
+            filtered = [r for r in snap_rows if start_ms <= int(r[0]) <= end_ms]
+            if not fill_missing or cache_only:
+                return filtered
+            tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+            if not _has_gaps(filtered, tf_ms, start_ms, end_ms):
+                return filtered
+        if snapshot_only:
+            return []
     if use_common_warmup and common_warmup_dir:
         safe = _sanitize_symbol(symbol)
         warmup_path = os.path.join(common_warmup_dir, f"{safe}_{timeframe}.csv")
@@ -174,6 +205,8 @@ def _fetch_ohlcv_all(
                 return rest_rows
         if cache_only:
             return []
+    if common_only:
+        return []
     cache_path = _ohlcv_cache_path(ROOT_DIR, symbol, timeframe, start_ms, end_ms)
     cached = _read_ohlcv_cache(cache_path)
     if cached:
@@ -221,6 +254,7 @@ def run_backtest() -> None:
     parser.add_argument("--use-confirmed", action="store_true")
     parser.add_argument("--use-live-cache", action="store_true")
     parser.add_argument("--cache-only", action="store_true")
+    parser.add_argument("--common-only", action="store_true")
     parser.add_argument("--common-warmup-dir", type=str, default="")
 
     parser.add_argument("--ltf-tf", type=str, default="3m")
@@ -246,6 +280,8 @@ def run_backtest() -> None:
     parser.add_argument("--start", type=str, default="")
     parser.add_argument("--end", type=str, default="")
     parser.add_argument("--fill-missing", action="store_true", default=False)
+    parser.add_argument("--snapshot-dir", type=str, default="")
+    parser.add_argument("--snapshot-only", action="store_true", default=False)
     parser.add_argument("--limit-entry", action="store_true", default=True)
     parser.add_argument("--limit-offset-atr", type=float, default=0.15)
     parser.add_argument("--retest-max-depth-atr", type=float, default=1.15)
@@ -261,16 +297,47 @@ def run_backtest() -> None:
 
     args = parser.parse_args()
 
+    cfg = TopFailShortV1Config()
+    cfg.tf_ltf = str(args.ltf_tf).strip()
+    cfg.tf_mtf = str(args.mtf_tf).strip()
+    cfg.tf_htf = str(args.htf_tf).strip()
+    cfg.universe_24h_change = float(args.universe_24h_change)
+    cfg.universe_7d_mult = float(args.universe_7d_mult)
+    cfg.min_quote_vol_24h = float(args.min_quote_vol_24h)
+    cfg.stall_high_lookback = int(args.stall_high_lookback)
+    cfg.stall_wick_min = float(args.stall_wick_min)
+    cfg.stall_min_count = int(args.stall_min_count)
+    cfg.mtf_require_weak_close = bool(args.mtf_require_weak_close)
+    cfg.ema_len = int(args.ema_len)
+    cfg.swing_lookback = int(args.swing_lookback)
+    cfg.atr_len = int(args.atr_len)
+    cfg.wash_atr_mult = float(args.wash_atr_mult)
+    cfg.vol_spike_mult = float(args.vol_spike_mult)
+    cfg.vol_sma_len = int(args.vol_sma_len)
+    cfg.retest_ema_tol = float(args.retest_ema_tol)
+    cfg.limit_entry = bool(args.limit_entry)
+    cfg.limit_offset_atr = float(args.limit_offset_atr)
+    cfg.retest_max_depth_atr = float(args.retest_max_depth_atr)
+    cfg.retest_wait_next_high = bool(args.retest_wait_next_high)
+    cfg.fail_wick_max = float(args.fail_wick_max)
+    cfg.fail_require_ema = bool(args.fail_require_ema)
+    cfg.stop_atr_mult = float(args.stop_atr_mult)
+    cfg.min_hold_bars = int(args.min_hold_bars)
+    cfg.tp_min_pct = float(args.tp_min_pct)
+    cfg.tp_r_mult = float(args.tp_r_mult)
+    cfg.max_wait_bars = int(args.max_wait_bars)
+    cfg.cooldown_bars = int(args.cooldown_bars)
+
     exchange = ccxt.binance({"enableRateLimit": True})
     end_ms = _parse_ts_arg(args.end) or int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    ltf_tf = str(args.ltf_tf).strip()
-    mtf_tf = str(args.mtf_tf).strip()
-    htf_tf = str(args.htf_tf).strip()
+    ltf_tf = cfg.tf_ltf
+    mtf_tf = cfg.tf_mtf
+    htf_tf = cfg.tf_htf
 
-    min_ltf = max(args.swing_lookback + 5, args.vol_sma_len + 5, args.atr_len + 5, args.ema_len + 5, 80)
-    min_mtf = max(args.ema_len + 5, 60)
-    min_htf = max(args.stall_high_lookback + 5, 180)
+    min_ltf = max(cfg.swing_lookback + 5, cfg.vol_sma_len + 5, cfg.atr_len + 5, cfg.ema_len + 5, 80)
+    min_mtf = max(cfg.ema_len + 5, 60)
+    min_htf = max(cfg.stall_high_lookback + 5, 180)
 
     start_arg_ms = _parse_ts_arg(args.start)
     if start_arg_ms is None:
@@ -294,8 +361,10 @@ def run_backtest() -> None:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-    use_common = bool(args.use_live_cache)
+    use_common = bool(args.use_live_cache or args.common_only)
     common_dir = args.common_warmup_dir or os.getenv("COMMON_WARMUP_CACHE_DIR", "")
+    if args.common_only:
+        args.cache_only = True
 
     data_by_sym: Dict[str, pd.DataFrame] = {}
     data_by_sym_mtf: Dict[str, pd.DataFrame] = {}
@@ -312,6 +381,9 @@ def run_backtest() -> None:
             common_warmup_dir=common_dir,
             cache_only=args.cache_only,
             fill_missing=args.fill_missing,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_only=args.snapshot_only,
+            common_only=args.common_only,
         )
         rows_mtf = _fetch_ohlcv_all(
             exchange,
@@ -323,6 +395,9 @@ def run_backtest() -> None:
             common_warmup_dir=common_dir,
             cache_only=args.cache_only,
             fill_missing=args.fill_missing,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_only=args.snapshot_only,
+            common_only=args.common_only,
         )
         rows_htf = _fetch_ohlcv_all(
             exchange,
@@ -334,6 +409,9 @@ def run_backtest() -> None:
             common_warmup_dir=common_dir,
             cache_only=args.cache_only,
             fill_missing=args.fill_missing,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_only=args.snapshot_only,
+            common_only=args.common_only,
         )
         if not rows_ltf or not rows_mtf or not rows_htf:
             continue
@@ -375,6 +453,7 @@ def run_backtest() -> None:
     entry_window_count = 0
     retest_seen_count = 0
     entry_count = 0
+    top_state: Dict[str, dict] = {}
 
     for sym, df in data_by_sym.items():
         df_mtf = data_by_sym_mtf.get(sym)
@@ -382,15 +461,11 @@ def run_backtest() -> None:
         if df_mtf is None or df_htf is None:
             continue
 
-        ts = df["ts"].astype(int).to_numpy()
-        ts_mtf = df_mtf["ts"].astype(int).to_numpy()
-        ts_htf = df_htf["ts"].astype(int).to_numpy()
+        df_ltf_sig = df.iloc[:-1] if args.use_confirmed else df
+        df_mtf_sig = df_mtf.iloc[:-1] if args.use_confirmed else df_mtf
+        df_htf_sig = df_htf.iloc[:-1] if args.use_confirmed else df_htf
 
-        ema_ltf = _ema(df["close"].astype(float), args.ema_len)
-        ema_mtf = _ema(df_mtf["close"].astype(float), args.ema_len)
-        atr_ltf = (df["high"] - df["low"]).astype(float).rolling(args.atr_len).mean()
-        vol_sma = df["volume"].astype(float).rolling(args.vol_sma_len).mean()
-        swing_low_prev = df["low"].astype(float).rolling(args.swing_lookback).min().shift(1)
+        ts = df_ltf_sig["ts"].astype(int).to_numpy()
 
         sym_stats = {
             "entries": 0,
@@ -473,10 +548,10 @@ def run_backtest() -> None:
                         }
                     )
                     trade = None
-                    cooldown = args.cooldown_bars
+                    cooldown = cfg.cooldown_bars
                     continue
 
-                if trade["hold_bars"] >= int(args.min_hold_bars) and low <= trade["tp_price"]:
+                if trade["hold_bars"] >= int(cfg.min_hold_bars) and low <= trade["tp_price"]:
                     exit_px = trade["tp_price"]
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
                     stats["exits"] += 1
@@ -513,198 +588,61 @@ def run_backtest() -> None:
                         }
                     )
                     trade = None
-                    cooldown = args.cooldown_bars
+                    cooldown = cfg.cooldown_bars
                 continue
 
             if cooldown > 0:
                 cooldown -= 1
                 continue
 
-            idx_htf = int(np.searchsorted(ts_htf, ts_ms, side="right") - 1)
-            idx_mtf = int(np.searchsorted(ts_mtf, ts_ms, side="right") - 1)
-            if idx_htf <= 0 or idx_mtf <= 0:
-                continue
-
-            close_htf = float(df_htf["close"].iloc[idx_htf])
-            close_prev_htf = float(df_htf["close"].iloc[idx_htf - 1])
-            high_prev_htf = float(df_htf["high"].iloc[idx_htf - 1])
-            high_htf = float(df_htf["high"].iloc[idx_htf])
-
-            u1 = False
-            u2 = False
-            if idx_htf >= 24:
-                c_24h = float(df_htf["close"].iloc[idx_htf - 24])
-                if c_24h > 0:
-                    u1 = ((close_htf - c_24h) / c_24h * 100.0) >= float(args.universe_24h_change)
-            if idx_htf >= 168:
-                low_7d = float(df_htf["low"].iloc[idx_htf - 168: idx_htf + 1].min())
-                if low_7d > 0:
-                    u2 = close_htf >= low_7d * float(args.universe_7d_mult)
-            if not (u1 or u2):
-                top_stall = False
-                washdown_armed = False
-                entry_window = False
-                retest_active = False
-                continue
-            universe_ok_count += 1
-
-            if float(args.min_quote_vol_24h) > 0 and idx_htf >= 24:
-                qv = (df_htf["close"].iloc[idx_htf - 23: idx_htf + 1].astype(float) * df_htf["volume"].iloc[idx_htf - 23: idx_htf + 1].astype(float)).sum()
-                if qv < float(args.min_quote_vol_24h):
-                    top_stall = False
-                    washdown_armed = False
-                    entry_window = False
-                    retest_active = False
-                    continue
-
-            expanding = close_htf > high_prev_htf
-            conds = 0
-            if close_htf <= close_prev_htf:
-                conds += 1
-            if _upper_wick_ratio(df_htf.iloc[idx_htf]) >= float(args.stall_wick_min):
-                conds += 1
-            if idx_htf >= args.stall_high_lookback:
-                prev_hi = float(df_htf["high"].iloc[idx_htf - args.stall_high_lookback: idx_htf].max())
-                if high_htf <= prev_hi:
-                    conds += 1
-            top_stall = (not expanding) and conds >= int(args.stall_min_count)
-            if top_stall:
+            sym_state = top_state.setdefault(sym, {})
+            entry_info, reason, meta = top_fail_short_entry_signal(
+                df_ltf_sig,
+                df_mtf_sig,
+                df_htf_sig,
+                sig_idx,
+                cfg,
+                sym_state,
+                True,
+            )
+            if meta.get("universe_ok"):
+                universe_ok_count += 1
+            if meta.get("stall_ok"):
                 top_stall_count += 1
-
-            if top_stall:
-                cur_close_mtf = float(df_mtf["close"].iloc[idx_mtf])
-                cur_ema_mtf = float(ema_mtf.iloc[idx_mtf])
-                if bool(args.mtf_require_weak_close):
-                    prev_close_mtf = float(df_mtf["close"].iloc[idx_mtf - 1])
-                    washdown_armed = bool(cur_close_mtf < cur_ema_mtf and cur_close_mtf < prev_close_mtf)
-                else:
-                    washdown_armed = bool(cur_close_mtf < cur_ema_mtf)
-            else:
-                washdown_armed = False
-            if washdown_armed:
+            if meta.get("armed_ok"):
                 washdown_armed_count += 1
+            if meta.get("entry_window"):
+                entry_window_count += 1
+            if meta.get("retest_touch"):
+                retest_seen_count += 1
 
-            if washdown_armed and not entry_window:
-                swing_low = swing_low_prev.iloc[sig_idx]
-                atr_now = atr_ltf.iloc[sig_idx]
-                vol_ma = vol_sma.iloc[sig_idx]
-                if np.isnan(swing_low) or np.isnan(atr_now) or np.isnan(vol_ma):
-                    continue
-                conds = 0
-                if float(df["low"].iloc[sig_idx]) < float(swing_low):
-                    conds += 1
-                if float(df["high"].iloc[sig_idx] - df["low"].iloc[sig_idx]) >= float(args.wash_atr_mult) * float(atr_now):
-                    conds += 1
-                if float(df["volume"].iloc[sig_idx]) >= float(args.vol_spike_mult) * float(vol_ma):
-                    conds += 1
-                if conds >= 1 and float(df["low"].iloc[sig_idx]) < float(swing_low):
-                    entry_window = True
-                    entry_window_start = sig_idx
-                    retest_active = False
-                    retest_high = None
-                    retest_touch_idx = None
-                    retest_touch_high = None
-                    break_level = float(swing_low)
-                    entry_window_count += 1
+            if not entry_info:
+                continue
 
-            if entry_window:
-                if entry_window_start is not None and (sig_idx - entry_window_start) > int(args.max_wait_bars):
-                    entry_window = False
-                    retest_active = False
-                    retest_touch_idx = None
-                    retest_touch_high = None
-                    continue
-                atr_now = atr_ltf.iloc[sig_idx]
-                ema_now = ema_ltf.iloc[sig_idx]
-                if np.isnan(atr_now) or np.isnan(ema_now):
-                    continue
-                if break_level is None:
-                    continue
-                retest_touch = float(df["high"].iloc[sig_idx]) >= float(break_level) - float(args.retest_ema_tol) * float(atr_now)
-                if retest_touch:
-                    retest_active = True
-                    retest_high = float(df["high"].iloc[sig_idx]) if retest_high is None else max(retest_high, float(df["high"].iloc[sig_idx]))
-                    retest_seen_count += 1
-                    if retest_touch_idx is None:
-                        retest_touch_idx = sig_idx
-                        retest_touch_high = float(df["high"].iloc[sig_idx])
-                if retest_active:
-                    low_now = float(df["low"].iloc[sig_idx])
-                    close_now = float(df["close"].iloc[sig_idx])
-                    open_now = float(df["open"].iloc[sig_idx])
-                    upper_wick = _upper_wick_ratio(df.iloc[sig_idx])
-                    prev_low = float(df["low"].iloc[sig_idx - 1])
-                    fail_candle = close_now < open_now and upper_wick <= float(args.fail_wick_max) and close_now < float(break_level)
-                    if bool(args.fail_require_ema):
-                        fail_candle = fail_candle and close_now < float(ema_now)
-                    else:
-                        fail_candle = fail_candle and (low_now < prev_low)
-                    if bool(args.retest_wait_next_high) and retest_touch_idx is not None:
-                        if sig_idx <= retest_touch_idx:
-                            fail_candle = False
-                        elif retest_touch_high is not None and float(df["high"].iloc[sig_idx]) > float(retest_touch_high):
-                            fail_candle = False
-                    if fail_candle:
-                        if break_level is not None:
-                            retest_depth = (float(retest_high) - float(break_level)) / float(atr_now) if atr_now > 0 else 0.0
-                            if retest_depth > float(args.retest_max_depth_atr):
-                                entry_window = False
-                                retest_active = False
-                                retest_touch_idx = None
-                                retest_touch_high = None
-                                continue
-                        entry_px = close_now
-                        entry_type = "market"
-                        limit_filled = False
-                        if bool(args.limit_entry):
-                            offset = float(args.limit_offset_atr)
-                            if retest_seen_count >= 5 and entry_count == 0:
-                                offset *= 1.2
-                            entry_limit = float(break_level) - offset * float(atr_now)
-                            entry_type = "limit"
-                            if low_now <= entry_limit:
-                                entry_px = entry_limit
-                                limit_filled = True
-                            else:
-                                entry_window = False
-                                retest_active = False
-                                retest_touch_idx = None
-                                retest_touch_high = None
-                                continue
-                        stop_high = float(retest_high) if retest_high is not None else float(df["high"].iloc[sig_idx])
-                        sl_candidate = stop_high
-                        ema_stop = float(ema_now) + 0.3 * float(atr_now)
-                        sl_price = max(sl_candidate, ema_stop)
-                        r = sl_price - entry_px
-                        if r <= 0:
-                            entry_window = False
-                            retest_active = False
-                            retest_touch_idx = None
-                            retest_touch_high = None
-                            continue
-                        tp_price = entry_px - max(float(args.tp_r_mult) * r, float(args.tp_min_pct) * entry_px)
-                        trade = {
-                            "entry_px": entry_px,
-                            "sl_price": sl_price,
-                            "tp_price": tp_price,
-                            "mfe": 0.0,
-                            "mae": 0.0,
-                            "hold_bars": 0,
-                            "entry_ts": ts_ms,
-                            "entry_type": entry_type,
-                            "limit_filled": limit_filled,
-                            "retest_depth_atr": (float(retest_high) - float(break_level)) / float(atr_now) if break_level is not None and atr_now > 0 else 0.0,
-                        }
-                        stats["entries"] += 1
-                        sym_stats["entries"] += 1
-                        entry_count += 1
-                        entry_window = False
-                        retest_active = False
-                        retest_touch_idx = None
-                        retest_touch_high = None
-                        entry_count += 1
-                        entry_window = False
-                        retest_active = False
+            entry_px = float(entry_info["entry_px"])
+            entry_type = entry_info.get("entry_type") or "market"
+            limit_filled = True if entry_type == "limit" else False
+            trade = {
+                "entry_px": entry_px,
+                "sl_price": float(entry_info["sl_price"]),
+                "tp_price": float(entry_info["tp_price"]),
+                "mfe": 0.0,
+                "mae": 0.0,
+                "hold_bars": 0,
+                "entry_ts": int(entry_info["entry_ts"]),
+                "entry_type": entry_type,
+                "limit_filled": limit_filled,
+                "retest_depth_atr": entry_info.get("retest_depth_atr"),
+            }
+            stats["entries"] += 1
+            sym_stats["entries"] += 1
+            entry_count += 1
+            sym_state["cooldown_left"] = int(cfg.cooldown_bars)
+            sym_state["entry_window_start"] = None
+            sym_state["break_level"] = None
+            sym_state["retest_high"] = None
+            sym_state["retest_wait"] = False
+            sym_state["retest_touch_high"] = None
 
         trades = sym_stats["trades"]
         if trades > 0:

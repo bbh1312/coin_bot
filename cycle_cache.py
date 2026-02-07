@@ -8,6 +8,7 @@ RAW_OHLCV: Dict[Tuple[str, str], dict] = {}
 DF_CACHE: Dict[Tuple[str, str, int], pd.DataFrame] = {}
 IND_CACHE: Dict[Tuple[str, str, Tuple[Any, ...]], Any] = {}
 FETCHER: Optional[Callable[[str, str, int], Optional[list]]] = None
+SNAPSHOT_HOOK: Optional[Callable[[str, str, list], None]] = None
 DISK_CACHE_DIR = os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
 DISK_CACHE_ENABLED = os.getenv("COMMON_OHLCV_CACHE_ENABLED", "1") not in ("0", "false", "off", "no")
 WARMUP_CACHE_DIR = os.getenv("COMMON_WARMUP_CACHE_DIR", os.path.join("logs", "common_warmup", "ohlcv"))
@@ -91,6 +92,11 @@ def drop_raw_by_tf(tfs) -> None:
 def set_raw(symbol: str, tf: str, data: list) -> None:
     RAW_OHLCV[(symbol, tf)] = {"ts": time.time(), "data": data}
     _write_disk_cache(symbol, tf, len(data), data)
+    try:
+        if SNAPSHOT_HOOK:
+            SNAPSHOT_HOOK(symbol, tf, data)
+    except Exception:
+        pass
     # Raw data updated; drop derived caches for this symbol/tf so next get_df/get_ind recompute.
     for key in list(DF_CACHE.keys()):
         if key[0] == symbol and key[1] == tf:
@@ -120,6 +126,11 @@ def is_fresh(symbol: str, tf: str, ttl_sec: int) -> bool:
 def set_fetcher(fetcher: Optional[Callable[[str, str, int], Optional[list]]]) -> None:
     global FETCHER
     FETCHER = fetcher
+
+
+def set_snapshot_hook(hook: Optional[Callable[[str, str, list], None]]) -> None:
+    global SNAPSHOT_HOOK
+    SNAPSHOT_HOOK = hook
 
 
 def get_df(symbol: str, tf: str, limit: int, force: bool = False) -> pd.DataFrame:

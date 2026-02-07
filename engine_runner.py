@@ -94,8 +94,16 @@ try:
     else:
         st_flip_compute_signal = None
         StFlipConfig = None
-    from engines.wash_short_suite.engine import WashShortSuiteConfig
-    from engines.top_fail_short_v1.engine import TopFailShortV1Config
+    from engines.wash_short_suite.engine import (
+        WashShortSuiteConfig,
+        wash_btc_guard,
+        wash_map_idx_by_ts,
+        wash_short_entry_signal,
+    )
+    from engines.top_fail_short_v1.engine import (
+        TopFailShortV1Config,
+        top_fail_short_entry_signal,
+    )
     from engines.bull_pullback_long_v1.engine import BullPullbackLongConfig
 except Exception as _import_err:
     SwaggyEngine = None
@@ -104,7 +112,11 @@ except Exception as _import_err:
     format_cut_top = None
     format_zone_stats = None
     WashShortSuiteConfig = None
+    wash_btc_guard = None
+    wash_map_idx_by_ts = None
+    wash_short_entry_signal = None
     TopFailShortV1Config = None
+    top_fail_short_entry_signal = None
     BullPullbackLongConfig = None
     AtlasRsFailShortEngine = None
     AtlasRsFailShortConfig = None
@@ -1088,6 +1100,7 @@ ADV_TREND_PULLBACK_PIVOT = int(os.getenv("ADV_TREND_PULLBACK_PIVOT", "3"))
 ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
 NOISE_REVERSE_V1_ENABLED = os.getenv("NOISE_REVERSE_V1_ENABLED", "0") == "1"
 TOP_FAIL_SHORT_V1_ENABLED = os.getenv("TOP_FAIL_SHORT_V1_ENABLED", "0") == "1"
+TOP_FAIL_SHORT_USE_CONFIRMED = True
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = os.getenv("SRP_ST_REGIME_PULLBACK_V1_ENABLED", "0") == "1"
 WASH_SHORT_SUITE_ENABLED = os.getenv("WASH_SHORT_SUITE_ENABLED", "0") == "1"
 WASH_SHORT_SUITE_BTC_EMA_LEN = int(os.getenv("WASH_SHORT_SUITE_BTC_EMA_LEN", "20"))
@@ -1356,6 +1369,8 @@ COMMON_WARMUP_CACHE_DIR = os.getenv("COMMON_WARMUP_CACHE_DIR", "").strip()
 COMMON_GAP_REPAIR_ENABLED = os.getenv("COMMON_GAP_REPAIR_ENABLED", "1") not in ("0", "false", "off", "no")
 COMMON_GAP_REPAIR_INTERVAL_SEC = int(os.getenv("COMMON_GAP_REPAIR_INTERVAL_SEC", "60"))
 COMMON_GAP_REPAIR_MAX_FETCH = int(os.getenv("COMMON_GAP_REPAIR_MAX_FETCH", "6"))
+LIVE_OHLCV_SNAPSHOT_ENABLED = os.getenv("LIVE_OHLCV_SNAPSHOT_ENABLED", "1") not in ("0", "false", "off", "no")
+LIVE_OHLCV_SNAPSHOT_DIR = os.getenv("LIVE_OHLCV_SNAPSHOT_DIR", "").strip()
 NOISE_REVERSE_USE_COMMON_CACHE = os.getenv("NOISE_REVERSE_USE_COMMON_CACHE", "0") == "1"
 NOISE_REVERSE_FILE_CACHE: dict = {}
 NOISE_REVERSE_FILE_CACHE_USED: dict = {}
@@ -1501,6 +1516,70 @@ def _append_common_warmup_ohlcv(sym: str, tf: str, data: list) -> None:
                     continue
                 f.write(f"{ts},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n")
                 last_ts = ts
+    except Exception:
+        pass
+
+def _append_live_snapshot_ohlcv(sym: str, tf: str, data: list) -> None:
+    if not LIVE_OHLCV_SNAPSHOT_ENABLED:
+        return
+    if not data:
+        return
+    base_dir = LIVE_OHLCV_SNAPSHOT_DIR
+    if not base_dir:
+        return
+    safe = sym.replace("/", "_").replace(":", "_")
+    path = os.path.join(base_dir, f"{safe}_{tf}.csv")
+    try:
+        last_ts = None
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                try:
+                    f.seek(-4096, os.SEEK_END)
+                except Exception:
+                    f.seek(0, os.SEEK_SET)
+                tail = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+                if tail:
+                    last = tail[-1].split(",")
+                    if last and last[0].isdigit():
+                        last_ts = int(last[0])
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("ts,open,high,low,close,volume\n")
+        with open(path, "a", encoding="utf-8") as f:
+            for row in data:
+                if not row or len(row) < 6:
+                    continue
+                ts = int(row[0])
+                if last_ts is not None and ts <= last_ts:
+                    continue
+                f.write(f"{ts},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n")
+                last_ts = ts
+    except Exception:
+        pass
+
+def _write_snapshot_csv(path: str, df: "pd.DataFrame") -> None:
+    if not path or df is None or df.empty:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df[["ts", "open", "high", "low", "close", "volume"]].to_csv(path, index=False)
+    except Exception:
+        pass
+
+def _snapshot_entry_ohlcv(entry_id: str, symbol: str, tf: str, df: "pd.DataFrame") -> None:
+    if not LIVE_OHLCV_SNAPSHOT_ENABLED:
+        return
+    if not LIVE_OHLCV_SNAPSHOT_DIR:
+        return
+    if not entry_id:
+        return
+    try:
+        run_dir = os.path.dirname(LIVE_OHLCV_SNAPSHOT_DIR)
+        base_dir = os.path.join(run_dir, "signals", str(entry_id), "ohlcv")
+        safe = symbol.replace("/", "_").replace(":", "_")
+        path = os.path.join(base_dir, f"{safe}_{tf}.csv")
+        _write_snapshot_csv(path, df)
     except Exception:
         pass
 
@@ -6686,7 +6765,14 @@ def _run_wash_short_suite_cycle(
     cycle_id: Optional[int] = None,
 ):
     result = {"entries": 0}
-    if not WASH_SHORT_SUITE_ENABLED or not wash_universe or WashShortSuiteConfig is None:
+    if (
+        not WASH_SHORT_SUITE_ENABLED
+        or not wash_universe
+        or WashShortSuiteConfig is None
+        or wash_short_entry_signal is None
+        or wash_map_idx_by_ts is None
+        or wash_btc_guard is None
+    ):
         return result
     start_ts = time.time()
     checked = 0
@@ -6730,29 +6816,13 @@ def _run_wash_short_suite_cycle(
     tf_trend = cfg.tf_trend
     tf_main = cfg.tf_main
     tf_exec = cfg.tf_exec
-    # BTC safety guard for short: block if BTC 15m close > EMA10 or EMA7>EMA20 (bull alignment)
+    btc_15m = None
     try:
         btc_symbol = "BTC/USDT:USDT"
-        btc_1h = cycle_cache.get_df(btc_symbol, "1h", limit=120)
         btc_15m = cycle_cache.get_df(btc_symbol, "15m", limit=320)
-        if (
-            btc_1h is not None and not btc_1h.empty and len(btc_1h) >= 30
-            and btc_15m is not None and not btc_15m.empty and len(btc_15m) >= 50
-        ):
-            btc_close_15m = btc_15m["close"].astype(float)
-            btc_close_15m = btc_close_15m.tail(288)
-            btc_ema10_15m = btc_close_15m.ewm(span=cfg.btc_ema_guard_len, adjust=False).mean().iloc[-1]
-            btc_ema7_15m = btc_close_15m.ewm(span=cfg.btc_ema_fast, adjust=False).mean().iloc[-1]
-            btc_ema20_15m = btc_close_15m.ewm(span=cfg.btc_ema_slow, adjust=False).mean().iloc[-1]
-            btc_px_15m = float(btc_close_15m.iloc[-1])
-            if btc_px_15m > float(btc_ema10_15m):
-                _append_wash_short_suite_log("WASH_SKIP reason=BTC_STRONG_GUARD")
-                return result
-            if btc_ema7_15m > btc_ema20_15m:
-                _append_wash_short_suite_log("WASH_SKIP reason=BTC_EMA_BULL_ALIGN")
-                return result
     except Exception:
-        pass
+        btc_15m = None
+    btc_guard_logged = False
     min_tr = max(cfg.ema_slow + 20, 180)
     min_main = max(cfg.ema_slow + cfg.swing_lookback, 200)
     min_exec = max(cfg.vol_sma_len + 20, 200)
@@ -6808,23 +6878,10 @@ def _run_wash_short_suite_cycle(
             continue
         sym_state["last_eval_ts"] = latest_ts_ms
 
-        ema20_tr = ema(df_tr_sig["close"], cfg.ema_fast)
-        ema60_tr = ema(df_tr_sig["close"], cfg.ema_mid)
-        ema120_tr = ema(df_tr_sig["close"], cfg.ema_slow)
-        adx_tr, pdi_tr, mdi_tr = _wash_adx_di(df_tr_sig, cfg.adx_len)
-
-        ema20_main = ema(df_main_sig["close"], cfg.ema_fast)
-        ema60_main = ema(df_main_sig["close"], cfg.ema_mid)
-        ema120_main = ema(df_main_sig["close"], cfg.ema_slow)
-        adx_main, pdi_main, mdi_main = _wash_adx_di(df_main_sig, cfg.adx_len)
-        bb_mid = _wash_bb_mid(df_main_sig["close"], cfg.ema_fast)
-        atr_main = atr(df_main_sig, cfg.adx_len)
-
         ts_tr = df_tr_sig["ts"].astype(int).to_numpy()
         ts_main = df_main_sig["ts"].astype(int).to_numpy()
-        ts_ex = df_ex_sig["ts"].astype(int).to_numpy()
-        idx_tr = int(np.searchsorted(ts_tr, ts_ms, side="right") - 1)
-        idx_main = int(np.searchsorted(ts_main, ts_ms, side="right") - 1)
+        idx_tr = wash_map_idx_by_ts(ts_tr, ts_ms)
+        idx_main = wash_map_idx_by_ts(ts_main, ts_ms)
         if idx_tr <= 0 or idx_main <= 0:
             no_data += 1
             gate_stats["skip_eval"] += 1
@@ -6836,99 +6893,56 @@ def _run_wash_short_suite_cycle(
                 no_data_samples.append(f"{symbol} idx tr={idx_tr} main={idx_main}")
             continue
 
-        # Step 1: trend filter
-        trend_ok = (
-            ema20_tr.iloc[idx_tr] < ema60_tr.iloc[idx_tr] < ema120_tr.iloc[idx_tr]
-            and adx_tr.iloc[idx_tr] > cfg.adx_min
-            and mdi_tr.iloc[idx_tr] > pdi_tr.iloc[idx_tr]
-            and float(df_tr_sig.iloc[idx_tr]["close"]) < float(ema60_tr.iloc[idx_tr])
-            and ema20_main.iloc[idx_main] < ema60_main.iloc[idx_main] < ema120_main.iloc[idx_main]
-            and adx_main.iloc[idx_main] > cfg.adx_min
-            and mdi_main.iloc[idx_main] > pdi_main.iloc[idx_main]
-            and float(df_main_sig.iloc[idx_main]["close"]) < float(ema60_main.iloc[idx_main])
+        if btc_15m is not None and not btc_15m.empty:
+            if wash_btc_guard(
+                btc_15m,
+                ts_ms,
+                cfg.btc_ema_guard_len,
+                cfg.btc_ema_fast,
+                cfg.btc_ema_slow,
+            ):
+                gate_stats["skip_eval"] += 1
+                if not btc_guard_logged:
+                    _append_wash_short_suite_log("WASH_SKIP reason=BTC_GUARD")
+                    btc_guard_logged = True
+                continue
+
+        entry_info, reason = wash_short_entry_signal(
+            df_tr_sig,
+            df_main_sig,
+            df_ex,
+            df_ex_sig,
+            i_ex,
+            idx_tr,
+            idx_main,
+            cfg,
         )
-        if not trend_ok:
-            gate_stats["trend_fail"] += 1
+        if not entry_info:
             no_signal += 1
+            if reason == "trend_fail":
+                gate_stats["trend_fail"] += 1
+            elif reason == "pullback_fail":
+                gate_stats["pullback_fail"] += 1
+            elif reason == "trigger_fail":
+                gate_stats["trigger_fail"] += 1
+            elif reason == "entry_block_fail":
+                gate_stats["entry_block_fail"] += 1
+            elif reason == "no_data_exec":
+                no_data += 1
+                gate_stats["skip_eval"] += 1
+                gate_stats["no_data_exec"] += 1
+                if len(no_data_samples) < 5:
+                    no_data_samples.append(f"{symbol} entry_bar_missing ex_len={len(df_ex)} i_ex={i_ex}")
+            else:
+                gate_stats["skip_eval"] += 1
             continue
-        gate_stats["pass_trend"] += 1
-
-        # Step 2: pullback zone
-        swing_start = max(0, idx_main - cfg.swing_lookback)
-        swing_high = float(df_main_sig["high"].iloc[swing_start: idx_main + 1].max())
-        swing_low = float(df_main_sig["low"].iloc[swing_start: idx_main + 1].min())
-        fibs = _wash_fib_levels(swing_high, swing_low)
-        ema_mid = float(ema20_main.iloc[idx_main])
-        bbm = float(bb_mid.iloc[idx_main]) if not np.isnan(bb_mid.iloc[idx_main]) else ema_mid
-        levels = fibs + [ema_mid, bbm, swing_low]
-        price = float(df_main_sig.iloc[idx_main]["close"])
-        if not any(_wash_in_zone(price, lv, cfg.pullback_eps) for lv in levels):
-            gate_stats["pullback_fail"] += 1
-            no_signal += 1
-            continue
-        gate_stats["pass_pullback"] += 1
-
-        # Step 3: exec trigger
-        rsi_ex = _adv_rsi(df_ex_sig["close"], cfg.rsi_len)
-        vol_sma_ex = df_ex["volume"].astype(float).rolling(cfg.vol_sma_len).mean()
-        rsi_now = float(rsi_ex.iloc[i_ex])
-        rsi_prev = float(rsi_ex.iloc[i_ex - 1]) if i_ex > 0 else rsi_now
-        rsi_turn = cfg.rsi_min <= rsi_now <= cfg.rsi_max and (rsi_now + cfg.rsi_lower_high_delta) < rsi_prev
-        cur = df_ex_sig.iloc[i_ex]
-        prev = df_ex_sig.iloc[i_ex - 1]
-        candle_ok = _wash_is_shooting_star(cur) or _wash_is_bear_engulf(prev, cur)
-        vol_now = float(cur["volume"])
-        vol_avg = float(vol_sma_ex.iloc[i_ex]) if not np.isnan(vol_sma_ex.iloc[i_ex]) else 0.0
-        vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 0.0
-        pullback_ok = vol_ratio >= cfg.vol_reversal_min
-        if not (rsi_turn and candle_ok and pullback_ok):
-            gate_stats["trigger_fail"] += 1
-            no_signal += 1
-            continue
-        gate_stats["pass_trigger"] += 1
         candidate_counts[symbol] = int(candidate_counts.get(symbol, 0)) + 1
 
-        # Entry block on next bar
-        if i_ex + 1 >= len(df_ex):
-            no_data += 1
-            gate_stats["skip_eval"] += 1
-            gate_stats["no_data_exec"] += 1
-            if len(no_data_samples) < 5:
-                no_data_samples.append(f"{symbol} entry_bar_missing ex_len={len(df_ex)} i_ex={i_ex}")
-            continue
-        entry = df_ex.iloc[i_ex + 1]
-        entry_high = float(entry["high"])
-        entry_low = float(entry["low"])
-        entry_close = float(entry["close"])
-        entry_rng = max(entry_high - entry_low, 1e-9)
-        entry_close_pos = (entry_close - entry_low) / entry_rng
-        entry_vol = float(entry["volume"])
-        if i_ex + 1 >= len(vol_sma_ex):
-            no_data += 1
-            gate_stats["skip_eval"] += 1
-            gate_stats["no_data_exec"] += 1
-            if len(no_data_samples) < 5:
-                no_data_samples.append(f"{symbol} entry_vol_missing ex_len={len(df_ex)} i_ex={i_ex}")
-            continue
-        entry_vol_avg = float(vol_sma_ex.iloc[i_ex + 1]) if not np.isnan(vol_sma_ex.iloc[i_ex + 1]) else 0.0
-        entry_vol_ratio = (entry_vol / entry_vol_avg) if entry_vol_avg > 0 else 0.0
-        if entry_high > float(cur["high"]) * cfg.entry_block_high_mult:
-            gate_stats["entry_block_fail"] += 1
-            no_signal += 1
-            continue
-        if entry_close_pos >= cfg.entry_block_close_pos and entry_vol_ratio >= cfg.entry_block_vol_ratio:
-            gate_stats["entry_block_fail"] += 1
-            no_signal += 1
-            continue
-
-        entry_px = float(entry_close)
-        atr_px = float(atr_main.iloc[idx_main]) if not np.isnan(atr_main.iloc[idx_main]) else 0.0
-        sl_price = entry_px * (1.0 + cfg.sl_pct)
-        if atr_px > 0:
-            sl_price = max(sl_price, entry_px + atr_px * cfg.sl_atr_mult)
-        tp_price = entry_px - atr_px * cfg.tp_atr_mult if atr_px > 0 else entry_px * (1.0 - cfg.tp_pct)
-        tp_pct = ((entry_px - tp_price) / entry_px) * 100.0 if entry_px > 0 else None
-        sl_pct = ((sl_price - entry_px) / entry_px) * 100.0 if entry_px > 0 else None
+        entry_px = float(entry_info["entry_px"])
+        sl_price = float(entry_info["sl_price"])
+        tp_price = float(entry_info["tp_price"])
+        tp_pct = entry_info.get("tp_pct")
+        sl_pct = entry_info.get("sl_pct")
 
         usdt = _resolve_entry_usdt()
         if usdt <= 0 or not _admin_is_active():
@@ -6955,6 +6969,12 @@ def _run_wash_short_suite_cycle(
         if not req_id:
             no_signal += 1
             continue
+        try:
+            _snapshot_entry_ohlcv(req_id, symbol, tf_trend, df_tr)
+            _snapshot_entry_ohlcv(req_id, symbol, tf_main, df_main)
+            _snapshot_entry_ohlcv(req_id, symbol, tf_exec, df_ex)
+        except Exception:
+            pass
         try:
             place_short_sl_px(symbol, float(sl_price))
         except Exception:
@@ -7007,7 +7027,12 @@ def _run_top_fail_short_v1_cycle(
     cycle_id: Optional[int] = None,
 ):
     result = {"entries": 0}
-    if not TOP_FAIL_SHORT_V1_ENABLED or not top_fail_universe or TopFailShortV1Config is None:
+    if (
+        not TOP_FAIL_SHORT_V1_ENABLED
+        or not top_fail_universe
+        or TopFailShortV1Config is None
+        or top_fail_short_entry_signal is None
+    ):
         return result
     start_ts = time.time()
     checked = 0
@@ -7062,9 +7087,14 @@ def _run_top_fail_short_v1_cycle(
             if df_htf.empty:
                 gate_stats["no_data_htf"] += 1
             continue
-        df_ltf_sig = df_ltf.iloc[:-1]
-        df_mtf_sig = df_mtf.iloc[:-1]
-        df_htf_sig = df_htf.iloc[:-1]
+        if TOP_FAIL_SHORT_USE_CONFIRMED:
+            df_ltf_sig = df_ltf.iloc[:-1]
+            df_mtf_sig = df_mtf.iloc[:-1]
+            df_htf_sig = df_htf.iloc[:-1]
+        else:
+            df_ltf_sig = df_ltf
+            df_mtf_sig = df_mtf
+            df_htf_sig = df_htf
         if len(df_ltf_sig) < min_ltf or len(df_mtf_sig) < min_mtf or len(df_htf_sig) < min_htf:
             no_data += 1
             if len(df_ltf_sig) < min_ltf:
@@ -7089,202 +7119,45 @@ def _run_top_fail_short_v1_cycle(
             continue
 
         sig_idx = len(df_ltf_sig) - 1
-        row_ltf = df_ltf_sig.iloc[sig_idx]
-        ts_ms = int(row_ltf["ts"])
-
-        ts_mtf = df_mtf_sig["ts"].astype(int).to_numpy()
-        ts_htf = df_htf_sig["ts"].astype(int).to_numpy()
-        idx_mtf = int(np.searchsorted(ts_mtf, ts_ms, side="right") - 1)
-        idx_htf = int(np.searchsorted(ts_htf, ts_ms, side="right") - 1)
-        if idx_mtf <= 0 or idx_htf <= 0:
-            no_data += 1
-            if idx_mtf <= 0:
-                gate_stats["no_data_mtf"] += 1
-            if idx_htf <= 0:
+        entry_info, reason, _meta = top_fail_short_entry_signal(
+            df_ltf_sig,
+            df_mtf_sig,
+            df_htf_sig,
+            sig_idx,
+            cfg,
+            sym_state,
+            True,
+        )
+        if not entry_info:
+            no_signal += 1
+            if reason == "universe_fail":
+                gate_stats["universe_fail"] += 1
+            elif reason == "stall_fail":
+                gate_stats["stall_fail"] += 1
+            elif reason == "armed_fail":
+                gate_stats["armed_fail"] += 1
+            elif reason == "entry_window_fail":
+                gate_stats["entry_window_fail"] += 1
+            elif reason == "retest_fail":
+                gate_stats["retest_fail"] += 1
+            elif reason == "fail_candle_fail":
+                gate_stats["fail_candle_fail"] += 1
+            elif reason == "depth_fail":
+                gate_stats["depth_fail"] += 1
+            elif reason == "no_data_ltf":
+                no_data += 1
+                gate_stats["no_data_ltf"] += 1
+            elif reason == "no_data_htf":
+                no_data += 1
                 gate_stats["no_data_htf"] += 1
             continue
 
-        close_htf = float(df_htf_sig["close"].iloc[idx_htf])
-        close_prev_htf = float(df_htf_sig["close"].iloc[idx_htf - 1])
-        high_prev_htf = float(df_htf_sig["high"].iloc[idx_htf - 1])
-        high_htf = float(df_htf_sig["high"].iloc[idx_htf])
-
-        u1 = False
-        u2 = False
-        if idx_htf >= 24:
-            c_24h = float(df_htf_sig["close"].iloc[idx_htf - 24])
-            if c_24h > 0:
-                u1 = ((close_htf - c_24h) / c_24h * 100.0) >= float(cfg.universe_24h_change)
-        if idx_htf >= 168:
-            low_7d = float(df_htf_sig["low"].iloc[idx_htf - 168: idx_htf + 1].min())
-            if low_7d > 0:
-                u2 = close_htf >= low_7d * float(cfg.universe_7d_mult)
-        if not (u1 or u2):
-            gate_stats["universe_fail"] += 1
-            no_signal += 1
-            continue
-
-        if float(cfg.min_quote_vol_24h) > 0 and idx_htf >= 24:
-            qv = (df_htf_sig["close"].iloc[idx_htf - 23: idx_htf + 1].astype(float)
-                  * df_htf_sig["volume"].iloc[idx_htf - 23: idx_htf + 1].astype(float)).sum()
-            if qv < float(cfg.min_quote_vol_24h):
-                gate_stats["universe_fail"] += 1
-                no_signal += 1
-                continue
-
-        expanding = close_htf > high_prev_htf
-        if expanding:
-            gate_stats["stall_fail"] += 1
-            no_signal += 1
-            continue
-        stall_count = 0
-        if close_htf <= close_prev_htf:
-            stall_count += 1
-        if _wash_upper_wick_ratio(df_htf_sig.iloc[idx_htf]) >= float(cfg.stall_wick_min):
-            stall_count += 1
-        if idx_htf >= cfg.stall_high_lookback:
-            prev_hi = float(df_htf_sig["high"].iloc[idx_htf - cfg.stall_high_lookback: idx_htf].max())
-            if high_htf <= prev_hi:
-                stall_count += 1
-        if stall_count < int(cfg.stall_min_count):
-            gate_stats["stall_fail"] += 1
-            no_signal += 1
-            continue
-
-        cur_close_mtf = float(df_mtf_sig["close"].iloc[idx_mtf])
-        cur_ema_mtf = float(ema(df_mtf_sig["close"], cfg.ema_len).iloc[idx_mtf])
-        if cfg.mtf_require_weak_close:
-            prev_close_mtf = float(df_mtf_sig["close"].iloc[idx_mtf - 1])
-            washdown_armed = bool(cur_close_mtf < cur_ema_mtf and cur_close_mtf < prev_close_mtf)
-        else:
-            washdown_armed = bool(cur_close_mtf < cur_ema_mtf)
-        if not washdown_armed:
-            gate_stats["armed_fail"] += 1
-            no_signal += 1
-            continue
-
-        atr_ltf = (df_ltf_sig["high"] - df_ltf_sig["low"]).astype(float).rolling(cfg.atr_len).mean()
-        vol_sma = df_ltf_sig["volume"].astype(float).rolling(cfg.vol_sma_len).mean()
-        swing_low_prev = df_ltf_sig["low"].astype(float).rolling(cfg.swing_lookback).min().shift(1)
-        atr_now = atr_ltf.iloc[sig_idx]
-        vol_ma = vol_sma.iloc[sig_idx]
-        swing_low = swing_low_prev.iloc[sig_idx]
-        if np.isnan(atr_now) or np.isnan(vol_ma) or np.isnan(swing_low):
-            gate_stats["entry_window_fail"] += 1
-            no_signal += 1
-            continue
-        conds = 0
-        if float(df_ltf_sig["high"].iloc[sig_idx] - df_ltf_sig["low"].iloc[sig_idx]) >= float(cfg.wash_atr_mult) * float(atr_now):
-            conds += 1
-        if float(df_ltf_sig["volume"].iloc[sig_idx]) >= float(cfg.vol_spike_mult) * float(vol_ma):
-            conds += 1
-        if conds >= 1 and float(df_ltf_sig["low"].iloc[sig_idx]) < float(swing_low):
-            entry_window = True
-        else:
-            entry_window = False
-
-        entry_window_start = sym_state.get("entry_window_start")
-        break_level = sym_state.get("break_level")
-        retest_high = sym_state.get("retest_high")
-        retest_touch_high = sym_state.get("retest_touch_high")
-        retest_wait = bool(sym_state.get("retest_wait"))
-
-        if entry_window:
-            if entry_window_start is None:
-                entry_window_start = sig_idx
-            break_level = float(swing_low)
-        if entry_window_start is None or break_level is None:
-            gate_stats["entry_window_fail"] += 1
-            no_signal += 1
-            sym_state["entry_window_start"] = None
-            sym_state["break_level"] = None
-            sym_state["retest_high"] = None
-            sym_state["retest_wait"] = False
-            sym_state["retest_touch_high"] = None
-            continue
-        if (sig_idx - int(entry_window_start)) > int(cfg.max_wait_bars):
-            sym_state["entry_window_start"] = None
-            sym_state["break_level"] = None
-            sym_state["retest_high"] = None
-            sym_state["retest_wait"] = False
-            sym_state["retest_touch_high"] = None
-            gate_stats["entry_window_fail"] += 1
-            no_signal += 1
-            continue
-
-        ema_now = ema(df_ltf_sig["close"], cfg.ema_len).iloc[sig_idx]
-        retest_touch = float(df_ltf_sig["high"].iloc[sig_idx]) >= float(break_level) - float(cfg.retest_ema_tol) * float(atr_now)
-        if retest_touch:
-            touch_high = float(df_ltf_sig["high"].iloc[sig_idx])
-            if retest_high is None or touch_high > float(retest_high):
-                retest_high = touch_high
-            if cfg.retest_wait_next_high:
-                if retest_wait and retest_touch_high is not None and touch_high > float(retest_touch_high):
-                    retest_touch_high = touch_high
-                elif not retest_wait:
-                    retest_touch_high = touch_high
-                retest_wait = True
-
-        if retest_touch and retest_high is not None:
-            retest_depth = (float(retest_high) - float(break_level)) / float(atr_now) if atr_now > 0 else 0.0
-            if retest_depth > float(cfg.retest_max_depth_atr):
-                gate_stats["depth_fail"] += 1
-                no_signal += 1
-                sym_state["retest_high"] = retest_high
-                sym_state["retest_wait"] = retest_wait
-                sym_state["retest_touch_high"] = retest_touch_high
-                continue
-
-        if cfg.retest_wait_next_high and retest_wait:
-            if retest_touch_high is not None:
-                cur_high = float(df_ltf_sig["high"].iloc[sig_idx])
-                if cur_high > float(retest_touch_high):
-                    gate_stats["retest_fail"] += 1
-                    no_signal += 1
-                    sym_state["retest_high"] = retest_high
-                    sym_state["retest_wait"] = retest_wait
-                    sym_state["retest_touch_high"] = retest_touch_high
-                    continue
-            retest_wait = False
-
-        open_now = float(df_ltf_sig["open"].iloc[sig_idx])
-        close_now = float(df_ltf_sig["close"].iloc[sig_idx])
-        if close_now >= open_now:
-            gate_stats["fail_candle_fail"] += 1
-            no_signal += 1
-            continue
-        if _wash_upper_wick_ratio(df_ltf_sig.iloc[sig_idx]) > float(cfg.fail_wick_max):
-            gate_stats["fail_candle_fail"] += 1
-            no_signal += 1
-            continue
-        if close_now >= float(break_level):
-            gate_stats["fail_candle_fail"] += 1
-            no_signal += 1
-            continue
-        if cfg.fail_require_ema and close_now >= float(ema_now):
-            gate_stats["fail_candle_fail"] += 1
-            no_signal += 1
-            continue
-
-        if retest_high is None:
-            gate_stats["retest_fail"] += 1
-            no_signal += 1
-            continue
-
-        entry_limit = float(break_level) - float(cfg.limit_offset_atr) * float(atr_now)
-        entry_px = float(entry_limit)
-        sl_candidate = float(retest_high)
-        ema_stop = float(ema_now) + 0.3 * float(atr_now)
-        sl_price = max(sl_candidate, ema_stop)
-        r_val = sl_price - entry_px
-        if r_val <= 0:
-            gate_stats["fail_candle_fail"] += 1
-            no_signal += 1
-            continue
-        tp_dist = max(float(cfg.tp_r_mult) * r_val, float(cfg.tp_min_pct) * entry_px)
-        tp_price = entry_px - tp_dist
-        tp_pct = ((entry_px - tp_price) / entry_px) * 100.0 if entry_px > 0 else None
-        sl_pct = ((sl_price - entry_px) / entry_px) * 100.0 if entry_px > 0 else None
+        entry_px = float(entry_info["entry_px"])
+        sl_price = float(entry_info["sl_price"])
+        tp_price = float(entry_info["tp_price"])
+        tp_pct = entry_info.get("tp_pct")
+        sl_pct = entry_info.get("sl_pct")
+        entry_type = entry_info.get("entry_type") or "limit"
 
         usdt = _resolve_entry_usdt()
         if usdt <= 0 or not _admin_is_active():
@@ -7306,12 +7179,18 @@ def _run_top_fail_short_v1_cycle(
                 "tp_price": float(tp_price),
                 "tp_pct": float(tp_pct) if isinstance(tp_pct, (int, float)) else None,
                 "sl_pct": float(sl_pct) if isinstance(sl_pct, (int, float)) else None,
-                "entry_type": "limit",
+                "entry_type": entry_type,
             },
         )
         if not req_id:
             no_signal += 1
             continue
+        try:
+            _snapshot_entry_ohlcv(req_id, symbol, tf_ltf, df_ltf)
+            _snapshot_entry_ohlcv(req_id, symbol, tf_mtf, df_mtf)
+            _snapshot_entry_ohlcv(req_id, symbol, tf_htf, df_htf)
+        except Exception:
+            pass
         try:
             place_short_sl_px(symbol, float(sl_price))
         except Exception:
@@ -16203,7 +16082,7 @@ def run():
         state.pop("_common_warmup_ts_logged", None)
         state.pop("_common_warmup_progress_ts", None)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    global COMMON_UNIVERSE_LOG_PATH, COMMON_WARMUP_LOG_PATH
+    global COMMON_UNIVERSE_LOG_PATH, COMMON_WARMUP_LOG_PATH, LIVE_OHLCV_SNAPSHOT_DIR
     try:
         os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
         os.makedirs(os.path.join("logs", "common_warmup"), exist_ok=True)
@@ -16212,6 +16091,12 @@ def run():
     except Exception:
         COMMON_UNIVERSE_LOG_PATH = ""
         COMMON_WARMUP_LOG_PATH = ""
+    try:
+        if not LIVE_OHLCV_SNAPSHOT_DIR:
+            LIVE_OHLCV_SNAPSHOT_DIR = os.path.join("logs", "live_snapshots", run_id, "ohlcv")
+        os.makedirs(LIVE_OHLCV_SNAPSHOT_DIR, exist_ok=True)
+    except Exception:
+        LIVE_OHLCV_SNAPSHOT_DIR = ""
     try:
         _reload_runtime_settings_from_disk(state)
     except Exception:
@@ -16222,6 +16107,7 @@ def run():
                 return _fetch_ohlcv_range(exchange, sym, tf, limit)
             return _fetch_ohlcv_with_retry(exchange, sym, tf, limit)
         cycle_cache.set_fetcher(_cycle_cache_fetcher)
+        cycle_cache.set_snapshot_hook(_append_live_snapshot_ohlcv)
     except Exception:
         pass
     # common universe init (once at startup)
