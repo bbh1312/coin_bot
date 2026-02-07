@@ -99,6 +99,25 @@ def _read_snapshot(path: str) -> List[list]:
     return _read_common_warmup(path)
 
 
+def _parse_ts_arg(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone(timedelta(hours=9)))
+            return int(dt.astimezone(timezone.utc).timestamp() * 1000)
+        except Exception:
+            continue
+    return None
+
+
 def _fetch_ohlcv_all(
     exchange: ccxt.Exchange,
     symbol: str,
@@ -279,7 +298,8 @@ def parse_args():
     p.add_argument("--use-live-cache", action="store_true")
     p.add_argument("--cache-only", action="store_true")
     p.add_argument("--common-only", action="store_true")
-    p.add_argument("--common-only", action="store_true")
+    p.add_argument("--start", type=str, default="")
+    p.add_argument("--end", type=str, default="")
     p.add_argument("--snapshot-dir", type=str, default="")
     p.add_argument("--snapshot-only", action="store_true")
     p.add_argument("--tf-trend", type=str, default="")
@@ -369,20 +389,27 @@ def run_backtest():
         cfg.cooldown_bars = args.cooldown_bars
 
     days = int(args.days)
-    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    end_ms = _parse_ts_arg(args.end) or int(datetime.now(timezone.utc).timestamp() * 1000)
 
     min_tr = max(cfg.ema_slow + 20, 180)
     min_main = max(cfg.ema_slow + cfg.swing_lookback, 200)
     min_exec = max(cfg.vol_sma_len + 20, 200)
-    start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(
-        days,
-        end_ms,
-        {
-            cfg.tf_trend: min_tr,
-            cfg.tf_main: min_main,
-            cfg.tf_exec: min_exec,
-        },
-    )
+    start_arg_ms = _parse_ts_arg(args.start)
+    if start_arg_ms is None:
+        start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(
+            days,
+            end_ms,
+            {
+                cfg.tf_trend: min_tr,
+                cfg.tf_main: min_main,
+                cfg.tf_exec: min_exec,
+            },
+        )
+    else:
+        eval_start_ms = start_arg_ms
+        warmup_minutes = max(min_tr * 60, min_main * 15, min_exec * 1)
+        start_ms = eval_start_ms - int(warmup_minutes * 60 * 1000)
+        warmup_days = int(warmup_minutes // (60 * 24))
 
     universe = load_common_universe(universe_arg, exchange, cache_only)
 
@@ -537,7 +564,7 @@ def run_backtest():
             if idx_tr <= 0 or idx_main <= 0:
                 continue
 
-            # BTC safety guard (block shorts when BTC 15m close > EMA10 or EMA7>EMA20)
+            # BTC safety guard (block shorts when BTC 15m close > EMA14 or EMA7>EMA20)
             if not args.no_btc_guard and btc_df_15m is not None and not btc_df_15m.empty:
                 if wash_btc_guard(
                     btc_df_15m,

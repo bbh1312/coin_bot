@@ -273,7 +273,7 @@ def run_backtest() -> None:
     parser.add_argument("--ema-len", type=int, default=20)
     parser.add_argument("--swing-lookback", type=int, default=30)
     parser.add_argument("--atr-len", type=int, default=14)
-    parser.add_argument("--wash-atr-mult", type=float, default=1.3)
+    parser.add_argument("--wash-atr-mult", type=float, default=1.1)
     parser.add_argument("--vol-spike-mult", type=float, default=1.8)
     parser.add_argument("--vol-sma-len", type=int, default=20)
     parser.add_argument("--retest-ema-tol", type=float, default=0.1)
@@ -284,9 +284,9 @@ def run_backtest() -> None:
     parser.add_argument("--snapshot-only", action="store_true", default=False)
     parser.add_argument("--limit-entry", action="store_true", default=True)
     parser.add_argument("--limit-offset-atr", type=float, default=0.15)
-    parser.add_argument("--retest-max-depth-atr", type=float, default=1.15)
+    parser.add_argument("--retest-max-depth-atr", type=float, default=1.3)
     parser.add_argument("--retest-wait-next-high", action="store_true", default=False)
-    parser.add_argument("--fail-wick-max", type=float, default=0.30)
+    parser.add_argument("--fail-wick-max", type=float, default=0.35)
     parser.add_argument("--fail-require-ema", action="store_true", default=False)
     parser.add_argument("--stop-atr-mult", type=float, default=0.35)
     parser.add_argument("--min-hold-bars", type=int, default=3)
@@ -466,6 +466,7 @@ def run_backtest() -> None:
         df_htf_sig = df_htf.iloc[:-1] if args.use_confirmed else df_htf
 
         ts = df_ltf_sig["ts"].astype(int).to_numpy()
+        ts_full = df["ts"].astype(int).to_numpy()
 
         sym_stats = {
             "entries": 0,
@@ -538,7 +539,7 @@ def run_backtest() -> None:
                         {
                             "symbol": sym,
                             "entry_ts": int(trade["entry_ts"]),
-                            "exit_ts": int(ts[i]),
+                            "exit_ts": int(ts_full[i]) if i < len(ts_full) else int(df.at[i, "ts"]),
                             "pnl_pct": pnl_pct * 100.0,
                             "result": "LOSS",
                             "reason": "SL",
@@ -578,7 +579,7 @@ def run_backtest() -> None:
                         {
                             "symbol": sym,
                             "entry_ts": int(trade["entry_ts"]),
-                            "exit_ts": int(ts[i]),
+                            "exit_ts": int(ts_full[i]) if i < len(ts_full) else int(df.at[i, "ts"]),
                             "pnl_pct": pnl_pct * 100.0,
                             "result": "WIN",
                             "reason": "TP",
