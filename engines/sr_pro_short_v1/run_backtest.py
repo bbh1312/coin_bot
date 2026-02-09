@@ -162,8 +162,19 @@ def run_backtest() -> None:
     parser.add_argument("--ema200-filter", action="store_true")
     parser.add_argument("--retest-bars", type=int, default=6)
     parser.add_argument("--retest-atr-mult", type=float, default=0.25)
+    parser.add_argument("--retest-near-atr-mult", type=float, default=0.15)
+    parser.add_argument("--retest-wick-max", type=float, default=0.4)
+    parser.add_argument("--retest-dyn", action="store_true")
+    parser.add_argument("--retest-dyn-th", type=float, default=0.6)
+    parser.add_argument("--retest-dyn-bars", type=int, default=10)
+    parser.add_argument("--shallow-atr-mult", type=float, default=0.35)
+    parser.add_argument("--shallow-wick-max", type=float, default=0.35)
+    parser.add_argument("--shallow-dvf-max", type=float, default=0.0)
     parser.add_argument("--sl-buffer", type=float, default=0.006)
     parser.add_argument("--tp-mult", type=float, default=0.976)
+    parser.add_argument("--tp-mult-weak", type=float, default=0.982)
+    parser.add_argument("--sl-min-weak", type=float, default=1.0015)
+    parser.add_argument("--freeze-zones", action="store_true")
     parser.add_argument("--log-gates", action="store_true")
     parser.add_argument("--debug-zone", action="store_true")
     args = parser.parse_args()
@@ -266,12 +277,32 @@ def run_backtest() -> None:
         "zone_touch": 0,
         "lh_15m": 0,
         "break_3m": 0,
+        "break_3m_strong": 0,
+        "break_3m_weak": 0,
         "retest_seen": 0,
         "retest_pass_close": 0,
         "retest_pass_low": 0,
+        "retest_fail_far": 0,
+        "retest_fail_shallow": 0,
+        "entry_by_pass_close": 0,
+        "entry_by_pass_low": 0,
         "reject_pass_1h": 0,
         "reject_pass_15m": 0,
         "ema200_pass": 0,
+        "entries_strong": 0,
+        "entries_weak": 0,
+        "wins_strong": 0,
+        "wins_weak": 0,
+        "losses_strong": 0,
+        "losses_weak": 0,
+        "net_strong": 0.0,
+        "net_weak": 0.0,
+        "mfe_strong_sum": 0.0,
+        "mfe_weak_sum": 0.0,
+        "mae_strong_sum": 0.0,
+        "mae_weak_sum": 0.0,
+        "hold_strong_sum": 0.0,
+        "hold_weak_sum": 0.0,
     }
 
     for sym, frames in data.items():
@@ -298,11 +329,15 @@ def run_backtest() -> None:
         dvf = _ema(dv, cfg.delta_len)
         vol_ema = _ema(volume_1h, cfg.delta_len)
         atr_3m = _atr(df_3m, 14)
+        atr_15m = _atr(df_15m, 14)
 
         zones: List[Zone] = []
 
         # build zones from full 1h history first (pivot-based)
-        for i1 in range(len(df_1h)):
+        zone_end_idx = len(df_1h)
+        if args.freeze_zones:
+            zone_end_idx = int(np.searchsorted(df_1h["ts"].values, eval_start_ms, side="right"))
+        for i1 in range(zone_end_idx):
             lb = cfg.lookback
             ph = _pivot_high(high_1h, lb, lb, i1)
             pl = _pivot_low(low_1h, lb, lb, i1)
@@ -362,6 +397,14 @@ def run_backtest() -> None:
         retest_active = False
         retest_level = 0.0
         retest_until = -1
+        entries_by_day: Dict[str, int] = {}
+
+        if args.log_gates:
+            print(
+                f"[BACKTEST_START_STATE] {sym} in_position=False cooldown=0 "
+                f"zones_total={len(zones)} zones_res={len([z for z in zones if z.side==1])} "
+                f"zones_sup={len([z for z in zones if z.side==-1])}"
+            )
 
         for i3 in range(3, len(df_3m) - 1):
             ts = int(ts_3m[i3])
@@ -399,6 +442,18 @@ def run_backtest() -> None:
                     stats["net_sum"] += pnl_pct
                     stats["sl_sum"] += pnl_pct
                     stats["losses"] += 1
+                    if trade.get("track") == "strong":
+                        gate_counts["losses_strong"] += 1
+                        gate_counts["net_strong"] += pnl_pct
+                        gate_counts["mfe_strong_sum"] += trade["mfe"]
+                        gate_counts["mae_strong_sum"] += trade["mae"]
+                        gate_counts["hold_strong_sum"] += trade["hold_bars"]
+                    elif trade.get("track") == "weak":
+                        gate_counts["losses_weak"] += 1
+                        gate_counts["net_weak"] += pnl_pct
+                        gate_counts["mfe_weak_sum"] += trade["mfe"]
+                        gate_counts["mae_weak_sum"] += trade["mae"]
+                        gate_counts["hold_weak_sum"] += trade["hold_bars"]
                     trades_out.append(
                         {
                             "symbol": sym,
@@ -420,6 +475,18 @@ def run_backtest() -> None:
                     stats["net_sum"] += pnl_pct
                     stats["tp_sum"] += pnl_pct
                     stats["wins"] += 1
+                    if trade.get("track") == "strong":
+                        gate_counts["wins_strong"] += 1
+                        gate_counts["net_strong"] += pnl_pct
+                        gate_counts["mfe_strong_sum"] += trade["mfe"]
+                        gate_counts["mae_strong_sum"] += trade["mae"]
+                        gate_counts["hold_strong_sum"] += trade["hold_bars"]
+                    elif trade.get("track") == "weak":
+                        gate_counts["wins_weak"] += 1
+                        gate_counts["net_weak"] += pnl_pct
+                        gate_counts["mfe_weak_sum"] += trade["mfe"]
+                        gate_counts["mae_weak_sum"] += trade["mae"]
+                        gate_counts["hold_weak_sum"] += trade["hold_bars"]
                     trades_out.append(
                         {
                             "symbol": sym,
@@ -526,15 +593,29 @@ def run_backtest() -> None:
                 float(df_3m.at[i3 - 2, "low"]),
                 float(df_3m.at[i3 - 3, "low"]),
             ]
-            if close_now >= min(low_prev):
+            low_min = min(low_prev)
+            strong_break = close_now < low_min
+            weak_break = (float(df_3m.at[i3, "low"]) < low_min) and (close_now >= low_min) and (close_now < float(df_3m.at[i3, "open"]))
+            if not strong_break and not weak_break:
                 if args.log_gates:
                     gate_counts["break_3m"] += 1
                 continue
+            if args.log_gates:
+                if strong_break:
+                    gate_counts["break_3m_strong"] += 1
+                elif weak_break:
+                    gate_counts["break_3m_weak"] += 1
 
             # arm retest after break
-            retest_level = min(low_prev)
+            retest_level = low_min
             retest_active = True
-            retest_until = i3 + max(1, int(args.retest_bars))
+            retest_bars = max(1, int(args.retest_bars))
+            if args.retest_dyn:
+                atr3 = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
+                atr15 = float(atr_15m.iloc[idx_15m]) if not np.isnan(atr_15m.iloc[idx_15m]) else 0.0
+                if atr15 > 0 and (atr3 / atr15) < float(args.retest_dyn_th):
+                    retest_bars = max(retest_bars, int(args.retest_dyn_bars))
+            retest_until = i3 + retest_bars
             if args.log_gates:
                 gate_counts["retest_seen"] += 1
 
@@ -549,7 +630,7 @@ def run_backtest() -> None:
                         nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                         sl_raw = nearest.top * (1.0 + cfg.sl_buffer)
                         sl_price = max(sl_raw, entry_px * 1.002)
-                        tp_price = entry_px * cfg.tp_mult
+                        tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
                         trade = {
                             "entry_px": entry_px,
                             "sl_price": sl_price,
@@ -558,19 +639,39 @@ def run_backtest() -> None:
                             "mae": 0.0,
                             "hold_bars": 0,
                             "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                            "track": "strong" if strong_break else "weak",
                         }
                         stats["entries"] += 1
+                        if args.log_gates:
+                            gate_counts["entry_by_pass_close"] += 1
+                            if strong_break:
+                                gate_counts["entries_strong"] += 1
+                            else:
+                                gate_counts["entries_weak"] += 1
+                        day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
+                        entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
                         retest_active = False
                     else:
                         low_now = float(df_3m.at[i3, "low"])
                         if low_now < retest_level and close_now < float(df_3m.at[i3, "open"]):
+                            rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
+                            upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
+                            wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+                            if wick_ratio > float(args.retest_wick_max):
+                                if args.log_gates:
+                                    gate_counts["retest_fail_shallow"] += 1
+                                retest_active = True
+                                if i3 >= retest_until:
+                                    retest_active = False
+                                continue
                             if args.log_gates:
                                 gate_counts["retest_pass_low"] += 1
                             entry_px = float(df_3m.at[i3 + 1, "open"])
                             nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                             sl_raw = nearest.top * (1.0 + cfg.sl_buffer)
-                            sl_price = max(sl_raw, entry_px * 1.002)
-                            tp_price = entry_px * cfg.tp_mult
+                            sl_min = entry_px * (1.002 if strong_break else float(args.sl_min_weak))
+                            sl_price = max(sl_raw, sl_min)
+                            tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
                             trade = {
                                 "entry_px": entry_px,
                                 "sl_price": sl_price,
@@ -579,10 +680,60 @@ def run_backtest() -> None:
                                 "mae": 0.0,
                                 "hold_bars": 0,
                                 "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                                "track": "strong" if strong_break else "weak",
                             }
                             stats["entries"] += 1
+                            if args.log_gates:
+                                gate_counts["entry_by_pass_low"] += 1
+                                if strong_break:
+                                    gate_counts["entries_strong"] += 1
+                                else:
+                                    gate_counts["entries_weak"] += 1
+                            day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
+                            entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
                             retest_active = False
+                        else:
+                            near_limit = retest_level + (atr_now * float(args.retest_near_atr_mult))
+                            if high_now < near_limit and close_now < float(df_3m.at[i3, "open"]):
+                                if args.log_gates:
+                                    gate_counts["retest_fail_shallow"] += 1
+                            shallow_limit = retest_level + (atr_now * float(args.shallow_atr_mult))
+                            if (
+                                weak_break
+                                and high_now < shallow_limit
+                                and close_now < float(df_3m.at[i3, "open"])
+                                and dvf_norm <= float(args.shallow_dvf_max)
+                            ):
+                                rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
+                                upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
+                                wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+                                if wick_ratio <= float(args.shallow_wick_max):
+                                    entry_px = float(df_3m.at[i3 + 1, "open"])
+                                    nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
+                                    sl_raw = nearest.top * (1.0 + cfg.sl_buffer)
+                                    sl_min = entry_px * float(args.sl_min_weak)
+                                    sl_price = max(sl_raw, sl_min)
+                                    tp_price = entry_px * float(args.tp_mult_weak)
+                                    trade = {
+                                        "entry_px": entry_px,
+                                        "sl_price": sl_price,
+                                        "tp_price": tp_price,
+                                        "mfe": 0.0,
+                                        "mae": 0.0,
+                                        "hold_bars": 0,
+                                        "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                                        "track": "weak",
+                                    }
+                                    stats["entries"] += 1
+                                    if args.log_gates:
+                                        gate_counts["entry_by_pass_low"] += 1
+                                        gate_counts["entries_weak"] += 1
+                                    day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
+                                    entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                                    retest_active = False
                 if i3 >= retest_until:
+                    if args.log_gates:
+                        gate_counts["retest_fail_far"] += 1
                     retest_active = False
 
     print("[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts")
@@ -598,13 +749,37 @@ def run_backtest() -> None:
             f"zone_touch={gate_counts['zone_touch']} "
             f"lh_15m={gate_counts['lh_15m']} "
             f"break_3m={gate_counts['break_3m']} "
+            f"break_strong={gate_counts['break_3m_strong']} "
+            f"break_weak={gate_counts['break_3m_weak']} "
             f"retest_seen={gate_counts['retest_seen']} "
             f"retest_pass_close={gate_counts['retest_pass_close']} "
             f"retest_pass_low={gate_counts['retest_pass_low']} "
+            f"retest_fail_far={gate_counts['retest_fail_far']} "
+            f"retest_fail_shallow={gate_counts['retest_fail_shallow']} "
+            f"entry_by_pass_close={gate_counts['entry_by_pass_close']} "
+            f"entry_by_pass_low={gate_counts['entry_by_pass_low']} "
             f"reject_pass_1h={gate_counts['reject_pass_1h']} "
             f"reject_pass_15m={gate_counts['reject_pass_15m']} "
-            f"ema200_pass={gate_counts['ema200_pass']}"
+            f"ema200_pass={gate_counts['ema200_pass']} "
+            f"entries_strong={gate_counts['entries_strong']} "
+            f"entries_weak={gate_counts['entries_weak']} "
+            f"wins_strong={gate_counts['wins_strong']} "
+            f"wins_weak={gate_counts['wins_weak']} "
+            f"losses_strong={gate_counts['losses_strong']} "
+            f"losses_weak={gate_counts['losses_weak']} "
+            f"net_strong={gate_counts['net_strong']:.3f} "
+            f"net_weak={gate_counts['net_weak']:.3f} "
+            f"mfe_strong={gate_counts['mfe_strong_sum']:.3f} "
+            f"mfe_weak={gate_counts['mfe_weak_sum']:.3f} "
+            f"mae_strong={gate_counts['mae_strong_sum']:.3f} "
+            f"mae_weak={gate_counts['mae_weak_sum']:.3f} "
+            f"hold_strong={gate_counts['hold_strong_sum']:.1f} "
+            f"hold_weak={gate_counts['hold_weak_sum']:.1f}"
         )
+        if entries_by_day:
+            print("[BACKTEST] ENTRIES_BY_DAY")
+            for day in sorted(entries_by_day.keys()):
+                print(f"[BACKTEST] {day} entries={entries_by_day[day]}")
 
 
 def _ts_kst(ts_ms: int) -> str:
