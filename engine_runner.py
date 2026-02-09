@@ -1087,7 +1087,7 @@ ADV_TREND_PULLBACK_WAIT_BARS = int(os.getenv("ADV_TREND_PULLBACK_WAIT_BARS", "4"
 ADV_TREND_PULLBACK_PIVOT = int(os.getenv("ADV_TREND_PULLBACK_PIVOT", "3"))
 
 ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
-NOISE_REVERSE_V1_ENABLED = os.getenv("NOISE_REVERSE_V1_ENABLED", "0") == "1"
+NOISE_REVERSE_V1_ENABLED = False
 TOP_FAIL_SHORT_V1_ENABLED = os.getenv("TOP_FAIL_SHORT_V1_ENABLED", "0") == "1"
 TOP_FAIL_SHORT_USE_CONFIRMED = True
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = os.getenv("SRP_ST_REGIME_PULLBACK_V1_ENABLED", "0") == "1"
@@ -1095,8 +1095,8 @@ WASH_SHORT_SUITE_ENABLED = os.getenv("WASH_SHORT_SUITE_ENABLED", "0") == "1"
 WASH_SHORT_SUITE_BTC_EMA_LEN = int(os.getenv("WASH_SHORT_SUITE_BTC_EMA_LEN", "20"))
 WASH_SHORT_SUITE_BTC_RSI_LEN = int(os.getenv("WASH_SHORT_SUITE_BTC_RSI_LEN", "14"))
 WASH_SHORT_SUITE_BTC_RSI_MIN = float(os.getenv("WASH_SHORT_SUITE_BTC_RSI_MIN", "48"))
-ST_FLIP_V1_ENABLED = os.getenv("ST_FLIP_V1_ENABLED", "0") == "1"
-BULL_PULLBACK_LONG_V1_ENABLED = os.getenv("BULL_PULLBACK_LONG_V1_ENABLED", "0") == "1"
+ST_FLIP_V1_ENABLED = False
+BULL_PULLBACK_LONG_V1_ENABLED = False
 # Backtest-baseline params (kept identical to backtest)
 ANTI_ALPHA_EMA_LEN = 200
 ANTI_ALPHA_RSI_LEN = 14
@@ -1133,7 +1133,7 @@ ST_FLIP_EMA_LONG_LEN = int(os.getenv("ST_FLIP_EMA_LONG_LEN", "200"))
 ST_FLIP_ST_PERIOD = int(os.getenv("ST_FLIP_ST_PERIOD", "10"))
 ST_FLIP_ST_MULT = float(os.getenv("ST_FLIP_ST_MULT", "3.0"))
 ST_FLIP_LOOKBACK = int(os.getenv("ST_FLIP_LOOKBACK", "200"))
-ST_FLIP_ALERT_ONLY = os.getenv("ST_FLIP_ALERT_ONLY", "0") == "1"
+ST_FLIP_ALERT_ONLY = False
 ST_FLIP_ADX_LEN = int(os.getenv("ST_FLIP_ADX_LEN", "14"))
 ST_FLIP_ADX_MIN = float(os.getenv("ST_FLIP_ADX_MIN", "25"))
 ST_FLIP_PSAR_STEP = float(os.getenv("ST_FLIP_PSAR_STEP", "0.02"))
@@ -2906,18 +2906,6 @@ def _append_anti_alpha_log(line: str) -> None:
     date_tag = time.strftime("%Y-%m-%d")
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("anti_alpha_v1", f"anti_alpha_v1-{date_tag}.log")
-    _append_log_lines(path, [f"{ts} {line}"])
-
-def _append_noise_reverse_log(line: str) -> None:
-    date_tag = time.strftime("%Y-%m-%d")
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    path = os.path.join("noise_reverse_v1", f"noise_reverse_v1-{date_tag}.log")
-    _append_log_lines(path, [f"{ts} {line}"])
-
-def _append_st_flip_log(line: str) -> None:
-    date_tag = time.strftime("%Y-%m-%d")
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    path = os.path.join("st_flip_v1", f"st_flip_v1-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
 def _append_srp_st_log(line: str) -> None:
@@ -5542,598 +5530,6 @@ def _run_anti_alpha_cycle(
     )
     return result
 
-def _run_noise_reverse_v1_cycle(
-    noise_universe,
-    state,
-    send_alert,
-    cycle_id: Optional[int] = None,
-):
-    result = {"long_hits": 0, "short_hits": 0}
-    if not NOISE_REVERSE_V1_ENABLED or not noise_universe:
-        return result
-    start_ts = time.time()
-    checked = 0
-    entries = 0
-    skips = 0
-    no_signal = 0
-    no_data = 0
-    gate_stats = {
-        "vol_spike": 0,
-        "disparity": 0,
-        "break": 0,
-        "nan": 0,
-    }
-    debug_logged = 0
-    debug_syms = set()
-    try:
-        debug_syms = {
-            s.strip()
-            for s in os.getenv("NOISE_REVERSE_DEBUG_SYMBOLS", "").split(",")
-            if s.strip()
-        }
-    except Exception:
-        debug_syms = set()
-
-    def _nr_skip(msg: str) -> None:
-        nonlocal skips
-        skips += 1
-        _append_noise_reverse_log(msg)
-
-    _append_noise_reverse_log(
-        f"NOISE_REVERSE_CYCLE_START cycle_id={cycle_id} universe={len(noise_universe)}"
-    )
-    if NOISE_REVERSE_USE_COMMON_CACHE and not state.get("_nr_common_cache_logged"):
-        try:
-            _append_noise_reverse_log(
-                f"NOISE_REVERSE_CACHE mode=common_file dir={_common_warmup_cache_dir()}"
-            )
-        except Exception:
-            pass
-        state["_nr_common_cache_logged"] = True
-    try:
-        refresh_positions_cache(force=True)
-    except Exception:
-        pass
-    open_total = count_open_positions(force=True)
-    if not isinstance(open_total, int):
-        open_total = _count_open_positions_state(state)
-
-    now_ts = time.time()
-    if not SATURDAY_TRADE_ENABLED and _is_saturday_kst(now_ts):
-        _nr_skip("NOISE_REVERSE_SKIP reason=SATURDAY_OFF")
-        return result
-
-    hedge_mode = False
-    try:
-        hedge_mode = is_hedge_mode()
-    except Exception:
-        hedge_mode = False
-
-    lookback = int(NOISE_REVERSE_LOOKBACK)
-    ma_len = int(NOISE_REVERSE_MA_LEN)
-    vol_len = int(NOISE_REVERSE_VOL_SMA_LEN)
-    min_len = max(lookback + 2, ma_len + 2, vol_len + 2, 120)
-    ltf_limit = max(min_len + 5, 140)
-
-    sleep_sec = 1.0
-    symbols = list(noise_universe or [])
-
-    def _compute_signal(symbol: str) -> dict:
-        df_1m = None
-        used_file = False
-        if NOISE_REVERSE_USE_COMMON_CACHE:
-            df_1m = _load_common_warmup_ohlcv(symbol, "1m", ltf_limit)
-            if df_1m is not None:
-                used_file = True
-            if df_1m is None and symbol in debug_syms:
-                _append_noise_reverse_log(
-                    f"NOISE_REVERSE_CACHE source=file-none sym={symbol}"
-                )
-        if df_1m is None and NOISE_REVERSE_USE_COMMON_CACHE:
-            if symbol in debug_syms:
-                _append_noise_reverse_log(
-                    f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=file_only"
-                )
-            return {"symbol": symbol, "status": "no_data"}
-        if df_1m is None:
-            df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit)
-            if not df_1m.empty and "ts" in df_1m.columns:
-                try:
-                    last_ts = int(df_1m["ts"].iloc[-1])
-                    now_ms = int(time.time() * 1000)
-                    if now_ms - last_ts > 120_000:
-                        df_1m = cycle_cache.get_df(symbol, "1m", limit=ltf_limit, force=True)
-                except Exception:
-                    pass
-        if symbol in debug_syms and not NOISE_REVERSE_SOURCE_LOGGED.get(symbol):
-            try:
-                _append_noise_reverse_log(
-                    f"NOISE_REVERSE_CACHE source={'file' if used_file else 'cycle'} sym={symbol}"
-                )
-            except Exception:
-                pass
-            NOISE_REVERSE_SOURCE_LOGGED[symbol] = True
-        if df_1m.empty:
-            if symbol in debug_syms:
-                _append_noise_reverse_log(f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=empty_df")
-            return {"symbol": symbol, "status": "no_data"}
-        if len(df_1m) < min_len:
-            if symbol in debug_syms:
-                _append_noise_reverse_log(
-                    f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=short_df len={len(df_1m)} need={min_len}"
-                )
-            return {"symbol": symbol, "status": "no_data"}
-        df_sig = df_1m.iloc[:-1]
-        if len(df_sig) < min_len - 1:
-            if symbol in debug_syms:
-                _append_noise_reverse_log(
-                    f"NOISE_REVERSE_TRACE sym={symbol} status=no_data reason=short_sig len={len(df_sig)} need={min_len-1}"
-                )
-            return {"symbol": symbol, "status": "no_data"}
-
-        ma20 = df_sig["close"].rolling(ma_len).mean()
-        vol_sma = df_sig["volume"].rolling(vol_len).mean()
-        hi100 = df_sig["high"].rolling(lookback).max().shift(1)
-        lo100 = df_sig["low"].rolling(lookback).min().shift(1)
-
-        row = df_sig.iloc[-1]
-        ts = int(row["ts"]) if "ts" in row else 0
-        open_px = float(row["open"])
-        close_px = float(row["close"])
-        high_px = float(row["high"])
-        low_px = float(row["low"])
-        vol_now = float(row["volume"])
-        ma20_val = float(ma20.iloc[-1]) if pd.notna(ma20.iloc[-1]) else None
-        vol_sma_val = float(vol_sma.iloc[-1]) if pd.notna(vol_sma.iloc[-1]) else None
-        hi100_val = float(hi100.iloc[-1]) if pd.notna(hi100.iloc[-1]) else None
-        lo100_val = float(lo100.iloc[-1]) if pd.notna(lo100.iloc[-1]) else None
-
-        if (
-            not isinstance(ma20_val, (int, float))
-            or not isinstance(vol_sma_val, (int, float))
-            or not isinstance(hi100_val, (int, float))
-            or not isinstance(lo100_val, (int, float))
-        ):
-            if symbol in debug_syms:
-                _append_noise_reverse_log(
-                    f"NOISE_REVERSE_TRACE sym={symbol} status=nan ma20={ma20_val} vol_sma={vol_sma_val} hi100={hi100_val} lo100={lo100_val}"
-                )
-            return {"symbol": symbol, "status": "nan"}
-
-        vol_spike = vol_sma_val > 0 and vol_now >= vol_sma_val * float(NOISE_REVERSE_VOL_SPIKE_MULT)
-        entry_side = None
-        if vol_spike:
-            if high_px > hi100_val and close_px > ma20_val * (1.0 + float(NOISE_REVERSE_DISPARITY_PCT)):
-                entry_side = "LONG"
-            elif low_px < lo100_val and close_px < ma20_val * (1.0 - float(NOISE_REVERSE_DISPARITY_PCT)):
-                entry_side = "SHORT"
-        base_side = entry_side
-        if entry_side and NOISE_REVERSE_INVERT_SIDE:
-            entry_side = "SHORT" if entry_side == "LONG" else "LONG"
-        if symbol in debug_syms:
-            _append_noise_reverse_log(
-                "NOISE_REVERSE_TRACE sym=%s ts=%d o=%.6g h=%.6g l=%.6g c=%.6g ma20=%.6g hi100=%.6g lo100=%.6g "
-                "vol=%.4g vol_ma=%.4g vol_mult=%.3g disp=%.4g vol_spike=%s base=%s entry=%s source=%s"
-                % (
-                    symbol,
-                    ts,
-                    open_px,
-                    high_px,
-                    low_px,
-                    close_px,
-                    ma20_val,
-                    hi100_val,
-                    lo100_val,
-                    vol_now,
-                    vol_sma_val,
-                    float(NOISE_REVERSE_VOL_SPIKE_MULT),
-                    float(NOISE_REVERSE_DISPARITY_PCT),
-                    int(bool(vol_spike)),
-                    base_side or "",
-                    entry_side or "",
-                    "file" if used_file else "cycle",
-                )
-            )
-
-        return {
-            "symbol": symbol,
-            "status": "ok",
-            "entry_side": entry_side,
-            "base_side": base_side,
-            "vol_spike": bool(vol_spike),
-            "ts": ts,
-            "open": open_px,
-            "high": high_px,
-            "low": low_px,
-            "close": close_px,
-            "ma20": ma20_val,
-            "hi100": hi100_val,
-            "lo100": lo100_val,
-            "vol_now": vol_now,
-            "vol_sma": vol_sma_val,
-        }
-
-    results_map: Dict[str, dict] = {}
-    if symbols:
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            future_map = {ex.submit(_compute_signal, sym): sym for sym in symbols}
-            for fut in as_completed(future_map):
-                try:
-                    res = fut.result()
-                except Exception:
-                    continue
-                if isinstance(res, dict) and res.get("symbol"):
-                    results_map[res["symbol"]] = res
-
-    for symbol in symbols:
-        checked += 1
-        sig = results_map.get(symbol, {"status": "no_data"})
-        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
-        if _both_sides_open(st) and not hedge_mode:
-            time.sleep(sleep_sec)
-            continue
-        try:
-            long_amt = get_long_position_amount(symbol)
-        except Exception:
-            long_amt = 0.0
-        try:
-            short_amt = get_short_position_amount(symbol)
-        except Exception:
-            short_amt = 0.0
-        st["in_pos_long"] = bool(long_amt > 0)
-        st["in_pos_short"] = bool(short_amt > 0)
-        st["in_pos"] = bool(st.get("in_pos_long") or st.get("in_pos_short"))
-        now_seen = time.time()
-        if long_amt > 0:
-            _set_last_entry_state(st, "LONG", now_seen)
-        if short_amt > 0:
-            _set_last_entry_state(st, "SHORT", now_seen)
-        state[symbol] = st
-
-        if isinstance(open_total, int) and open_total >= MAX_OPEN_POSITIONS:
-            _nr_skip(
-                f"NOISE_REVERSE_SKIP sym={symbol} reason=MAX_POS open={open_total} max={MAX_OPEN_POSITIONS}"
-            )
-            break
-
-        if sig.get("status") == "no_data":
-            no_data += 1
-            time.sleep(sleep_sec)
-            continue
-        if sig.get("status") == "nan":
-            gate_stats["nan"] += 1
-            no_signal += 1
-            time.sleep(sleep_sec)
-            continue
-        sig_ts = int(sig.get("ts") or 0)
-        if sig_ts > 0:
-            last_ts = int(st.get("nr_last_ts") or 0)
-            if last_ts == sig_ts:
-                stale_count = int(st.get("nr_stale_count") or 0) + 1
-                st["nr_stale_count"] = stale_count
-                if stale_count in (3, 6, 10):
-                    _append_noise_reverse_log(
-                        "NOISE_REVERSE_STALE sym=%s ts=%d count=%d close=%.6g ma20=%.6g vol=%.4g vol_ma=%.4g"
-                        % (
-                            symbol,
-                            sig_ts,
-                            stale_count,
-                            float(sig.get("close") or 0.0),
-                            float(sig.get("ma20") or 0.0),
-                            float(sig.get("vol_now") or 0.0),
-                            float(sig.get("vol_sma") or 0.0),
-                        )
-                    )
-            else:
-                st["nr_last_ts"] = sig_ts
-                st["nr_stale_count"] = 0
-            state[symbol] = st
-        entry_side = sig.get("entry_side")
-        if not sig.get("vol_spike"):
-            gate_stats["vol_spike"] += 1
-        if entry_side is None:
-            no_signal += 1
-            if debug_logged < 3:
-                debug_logged += 1
-                close_px = float(sig.get("close") or 0.0)
-                ma20_val = float(sig.get("ma20") or 0.0)
-                hi100_val = float(sig.get("hi100") or 0.0)
-                lo100_val = float(sig.get("lo100") or 0.0)
-                vol_now = float(sig.get("vol_now") or 0.0)
-                vol_sma_val = float(sig.get("vol_sma") or 0.0)
-                sig_ts = int(sig.get("ts") or 0)
-                sig_open = float(sig.get("open") or 0.0)
-                sig_high = float(sig.get("high") or 0.0)
-                sig_low = float(sig.get("low") or 0.0)
-                fail_parts = []
-                if not sig.get("vol_spike"):
-                    fail_parts.append("vol_spike")
-                if close_px >= ma20_val * (1.0 - float(NOISE_REVERSE_DISPARITY_PCT)) and close_px <= ma20_val * (1.0 + float(NOISE_REVERSE_DISPARITY_PCT)):
-                    fail_parts.append("disparity")
-                if not (float(sig.get("close") or 0.0) > 0 and (float(sig.get("hi100") or 0.0) > 0 or float(sig.get("lo100") or 0.0) > 0)):
-                    fail_parts.append("break")
-                _append_noise_reverse_log(
-                    "NOISE_REVERSE_DEBUG sym=%s ts=%d o=%.6g h=%.6g l=%.6g c=%.6g "
-                    "ma20=%.6g hi100=%.6g lo100=%.6g vol=%.4g vol_ma=%.4g "
-                    "vol_mult=%.3g disp=%.4g fails=%s"
-                    % (
-                        symbol,
-                        sig_ts,
-                        sig_open,
-                        sig_high,
-                        sig_low,
-                        close_px,
-                        ma20_val,
-                        hi100_val,
-                        lo100_val,
-                        vol_now,
-                        vol_sma_val,
-                        float(NOISE_REVERSE_VOL_SPIKE_MULT),
-                        float(NOISE_REVERSE_DISPARITY_PCT),
-                        ",".join(fail_parts) if fail_parts else "none",
-                    )
-                )
-            time.sleep(sleep_sec)
-            continue
-
-        if entry_side == "LONG" and long_amt > 0:
-            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=ALREADY_IN_POSITION side={entry_side}")
-            _append_entry_gate_log("noise_reverse_v1", symbol, "already_in_position", side=entry_side)
-            time.sleep(sleep_sec)
-            continue
-        if entry_side == "SHORT" and short_amt > 0:
-            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=ALREADY_IN_POSITION side={entry_side}")
-            _append_entry_gate_log("noise_reverse_v1", symbol, "already_in_position", side=entry_side)
-            time.sleep(sleep_sec)
-            continue
-
-        if _exit_cooldown_blocked(state, symbol, "noise_reverse_v1", entry_side):
-            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=EXIT_COOLDOWN side={entry_side}")
-            _append_entry_gate_log("noise_reverse_v1", symbol, "exit_cooldown", side=entry_side)
-            time.sleep(sleep_sec)
-            continue
-
-        if not _entry_guard_acquire(
-            state,
-            symbol,
-            ttl_sec=5.0,
-            key=f"noise_reverse_v1:{symbol}:{entry_side}",
-            engine="noise_reverse_v1",
-            side=entry_side,
-        ):
-            time.sleep(sleep_sec)
-            continue
-
-        usdt = _resolve_entry_usdt()
-        if usdt <= 0:
-            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=NO_BALANCE side={entry_side}")
-            time.sleep(sleep_sec)
-            continue
-
-        if not _admin_is_active():
-            _nr_skip(f"NOISE_REVERSE_SKIP sym={symbol} reason=ADMIN_INACTIVE side={entry_side}")
-            time.sleep(sleep_sec)
-            continue
-
-        pending = _is_manage_pending(state, symbol, entry_side)
-        cur_total = None
-        try:
-            cur_total = count_open_positions(force=True)
-        except Exception:
-            cur_total = None
-        if not isinstance(cur_total, int):
-            cur_total = _count_open_positions_state(state)
-        if pending:
-            _nr_skip(f"NOISE_REVERSE_ENTRY_FAIL sym={symbol} side={entry_side} reason=PENDING")
-            time.sleep(sleep_sec)
-            continue
-        if isinstance(cur_total, int) and cur_total >= MAX_OPEN_POSITIONS:
-            _nr_skip(f"NOISE_REVERSE_ENTRY_FAIL sym={symbol} side={entry_side} reason=MAX_POS {cur_total}/{MAX_OPEN_POSITIONS}")
-            time.sleep(sleep_sec)
-            continue
-        req_id = _enqueue_entry_request(
-            state,
-            symbol=symbol,
-            side=entry_side,
-            engine="NOISE_REVERSE_V1",
-            reason="noise_reverse_v1",
-            usdt=usdt,
-            live=(LONG_LIVE_TRADING if entry_side == "LONG" else LIVE_TRADING),
-            alert_reason="noise_reverse_v1",
-        )
-        if not req_id:
-            _nr_skip(f"NOISE_REVERSE_ENTRY_FAIL sym={symbol} side={entry_side} reason=ENQUEUE_FAIL")
-            time.sleep(sleep_sec)
-            continue
-
-        close_px = float(sig.get("close") or 0.0)
-        ma20_val = float(sig.get("ma20") or 0.0)
-        hi100_val = float(sig.get("hi100") or 0.0)
-        lo100_val = float(sig.get("lo100") or 0.0)
-        vol_now = float(sig.get("vol_now") or 0.0)
-        vol_sma_val = float(sig.get("vol_sma") or 0.0)
-        base_side = sig.get("base_side")
-        _append_noise_reverse_log(
-            f"NOISE_REVERSE_ENTRY sym={symbol} side={entry_side} base={base_side} close={close_px:.6g} "
-            f"ma20={ma20_val:.6g} hi100={hi100_val:.6g} lo100={lo100_val:.6g} "
-            f"vol={vol_now:.4g} vol_ma={vol_sma_val:.4g} spike={int(bool(sig.get('vol_spike')))}"
-        )
-        if entry_side == "LONG":
-            result["long_hits"] += 1
-        else:
-            result["short_hits"] += 1
-        entries += 1
-        time.sleep(sleep_sec)
-
-    elapsed = time.time() - start_ts
-    _append_noise_reverse_log(
-        f"NOISE_REVERSE_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={entries} "
-        f"skips={skips} no_signal={no_signal} no_data={no_data}"
-    )
-    _append_noise_reverse_log(
-        "NOISE_REVERSE_GATES " + " ".join([f"{k}={v}" for k, v in gate_stats.items()])
-    )
-    return result
-
-def _run_st_flip_v1_cycle(
-    st_flip_universe,
-    state,
-    send_alert,
-    cycle_id: Optional[int] = None,
-):
-    result = {"long_hits": 0, "short_hits": 0}
-    alert_only = bool(ST_FLIP_ALERT_ONLY) and not ST_FLIP_V1_ENABLED
-    if (not ST_FLIP_V1_ENABLED and not alert_only) or not st_flip_universe or not st_flip_compute_signal:
-        return result
-    start_ts = time.time()
-    checked = 0
-    entries = 0
-    no_signal = 0
-    no_data = 0
-    _append_st_flip_log(
-        f"ST_FLIP_CYCLE_START cycle_id={cycle_id} universe={len(st_flip_universe)}"
-    )
-    try:
-        refresh_positions_cache(force=True)
-    except Exception:
-        pass
-
-    min_len = max(ST_FLIP_LOOKBACK, ST_FLIP_EMA_LEN + 5, ST_FLIP_EMA_LONG_LEN + 5, ST_FLIP_ST_PERIOD + 5, 120)
-    fetch_len = min_len + 1  # drop last bar (confirmed) and still keep min_len
-    for symbol in list(st_flip_universe or []):
-        checked += 1
-        df = cycle_cache.get_df(symbol, ST_FLIP_LTF, limit=fetch_len)
-        if df is None or df.empty:
-            no_data += 1
-            continue
-        df_sig = df.iloc[:-1]
-        if df_sig.empty or len(df_sig) < min_len:
-            no_data += 1
-            continue
-        sig = st_flip_compute_signal(
-            df_sig,
-            period=int(ST_FLIP_ST_PERIOD),
-            mult=float(ST_FLIP_ST_MULT),
-            ema_len=int(ST_FLIP_EMA_LEN),
-            ema_long_len=int(ST_FLIP_EMA_LONG_LEN),
-            adx_len=int(ST_FLIP_ADX_LEN),
-            adx_min=float(ST_FLIP_ADX_MIN),
-            psar_step=float(ST_FLIP_PSAR_STEP),
-            psar_max=float(ST_FLIP_PSAR_MAX),
-            vol_sma_len=int(ST_FLIP_VOL_SMA_LEN),
-            vol_mult=float(ST_FLIP_VOL_MULT),
-            rsi_len=int(ST_FLIP_RSI_LEN),
-            rsi_min=float(ST_FLIP_RSI_MIN),
-            rsi_max=float(ST_FLIP_RSI_MAX),
-            rsi_mom_min=float(ST_FLIP_RSI_MOM_MIN),
-            body_pct_min=float(ST_FLIP_BODY_PCT_MIN),
-            adx_off=bool(ST_FLIP_ADX_OFF),
-            psar_off=bool(ST_FLIP_PSAR_OFF),
-            vol_off=bool(ST_FLIP_VOL_OFF),
-            rsi_off=bool(ST_FLIP_RSI_OFF),
-        )
-        if not sig or sig.close is None or sig.ema120 is None:
-            no_signal += 1
-            continue
-        entry_side = None
-        if sig.flip_up and sig.close > sig.ema120 and sig.filter_up:
-            entry_side = "LONG"
-        elif sig.flip_down and sig.close < sig.ema120 and sig.filter_down:
-            entry_side = "SHORT"
-        if not entry_side:
-            no_signal += 1
-            continue
-
-        st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
-        if st.get("in_pos"):
-            _append_entry_gate_log("st_flip_v1", symbol, "already_in_position", side=entry_side)
-            no_signal += 1
-            continue
-        if _exit_cooldown_blocked(state, symbol, "st_flip_v1", entry_side):
-            _append_entry_gate_log("st_flip_v1", symbol, "exit_cooldown", side=entry_side)
-            no_signal += 1
-            continue
-
-        guard_key = f"st_flip_v1:{symbol}:{entry_side}"
-        lock_ok, lock_owner, lock_age = _entry_lock_acquire(state, symbol, owner="st_flip_v1", side=entry_side)
-        if not lock_ok:
-            _append_st_flip_log(
-                f"ST_FLIP_ENTRY_FAIL sym={symbol} side={entry_side} reason=LOCK held_by={lock_owner} age={lock_age:.1f}"
-            )
-            no_signal += 1
-            continue
-        if not _entry_guard_acquire(state, symbol, key=guard_key, engine="st_flip_v1", side=entry_side):
-            _entry_lock_release(state, symbol, owner="st_flip_v1", side=entry_side)
-            _append_st_flip_log(
-                f"ST_FLIP_ENTRY_FAIL sym={symbol} side={entry_side} reason=GUARD"
-            )
-            no_signal += 1
-            continue
-
-        req_id = None
-        if not alert_only:
-            req_id = _enqueue_entry_request(
-                state=state,
-                symbol=symbol,
-                side=entry_side,
-                engine="ST_FLIP_V1",
-                reason="st_flip_v1",
-                usdt=USDT_PER_TRADE,
-                live=(LONG_LIVE_TRADING if entry_side == "LONG" else LIVE_TRADING),
-                alert_reason="st_flip_v1",
-                entry_price_hint=float(sig.close),
-            meta={
-                "flip_up": sig.flip_up,
-                "flip_down": sig.flip_down,
-                "st_dir_last": sig.st_dir_last,
-                "st_dir_prev": sig.st_dir_prev,
-                "ema120": sig.ema120,
-                "close": sig.close,
-                "adx": sig.adx,
-                "psar": sig.psar,
-                "vol_ratio": sig.vol_ratio,
-                "rsi": sig.rsi,
-                "tf": ST_FLIP_LTF,
-            },
-        )
-            if not req_id:
-                _entry_lock_release(state, symbol, owner="st_flip_v1", side=entry_side)
-                _append_st_flip_log(
-                    f"ST_FLIP_ENTRY_FAIL sym={symbol} side={entry_side} reason=ENQUEUE_FAIL"
-                )
-                no_signal += 1
-                continue
-
-        _send_entry_alert(
-            send_alert,
-            side=entry_side,
-            symbol=symbol,
-            engine="ST_FLIP_V1",
-            entry_price=float(sig.close),
-            usdt=USDT_PER_TRADE,
-            reason="st_flip_v1",
-            live=(LONG_LIVE_TRADING if entry_side == "LONG" else LIVE_TRADING),
-            state=state,
-        )
-        entries += 1
-        if entry_side == "LONG":
-            result["long_hits"] += 1
-        else:
-            result["short_hits"] += 1
-        _append_st_flip_log(
-            f"ST_FLIP_ENTRY sym={symbol} side={entry_side} close={sig.close:.6g} ema120={sig.ema120:.6g} "
-            f"st_prev={sig.st_dir_prev} st_last={sig.st_dir_last} req_id={req_id} alert_only={int(alert_only)}"
-        )
-        if alert_only:
-            _entry_lock_release(state, symbol, owner="st_flip_v1", side=entry_side)
-
-    elapsed = time.time() - start_ts
-    _append_st_flip_log(
-        f"ST_FLIP_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={entries} "
-        f"no_signal={no_signal} no_data={no_data}"
-    )
-    return result
-
 def _run_srp_st_regime_pullback_v1_cycle(
     srp_universe,
     state,
@@ -6428,324 +5824,6 @@ def _run_srp_st_regime_pullback_v1_cycle(
         "SRP_GATES " + " ".join([f"{k}={v}" for k, v in gate_stats.items()])
     )
     return result
-
-def _run_bull_pullback_long_v1_cycle(
-    bull_universe,
-    state,
-    send_alert,
-    cycle_id: Optional[int] = None,
-):
-    result = {"entries": 0}
-    if not BULL_PULLBACK_LONG_V1_ENABLED or not bull_universe or BullPullbackLongConfig is None:
-        return result
-    cfg = BullPullbackLongConfig()
-    start_ts = time.time()
-    checked = 0
-    no_signal = 0
-    no_data = 0
-    gate_stats = {
-        "btc_fail": 0,
-        "trend_fail": 0,
-        "pullback_fail": 0,
-        "exec_fail": 0,
-        "cooldown": 0,
-        "already_in_pos": 0,
-        "no_data_tr": 0,
-        "no_data_main": 0,
-        "no_data_exec": 0,
-    }
-
-    def _bull_skip(sym: str, reason: str) -> None:
-        _append_entry_gate_log("bull_pullback_long_v1", sym, reason, side="LONG")
-
-    # BTC filter (market safety)
-    if cfg.btc_filter and cfg.btc_symbol:
-        min_btc_1h = max(cfg.ema_trend_slow + 10, cfg.ema_trend_mid + 10, cfg.ema_trend_fast + 10)
-        min_btc_15m = max(cfg.btc_rsi_len + 5, 80)
-        min_btc_1m = 3
-        min_btc_5m = max(cfg.btc_atr_lookback + 5, cfg.btc_atr_len + 10)
-        df_btc_1h = cycle_cache.get_df(cfg.btc_symbol, cfg.tf_trend, limit=min_btc_1h)
-        df_btc_15m = cycle_cache.get_df(cfg.btc_symbol, "15m", limit=min_btc_15m)
-        df_btc_1m = cycle_cache.get_df(cfg.btc_symbol, "1m", limit=min_btc_1m)
-        df_btc_5m = cycle_cache.get_df(cfg.btc_symbol, "5m", limit=min_btc_5m)
-        btc_1h = df_btc_1h.iloc[:-1] if isinstance(df_btc_1h, pd.DataFrame) and len(df_btc_1h) > 1 else None
-        btc_15m = df_btc_15m.iloc[:-1] if isinstance(df_btc_15m, pd.DataFrame) and len(df_btc_15m) > 1 else None
-        btc_1m = df_btc_1m.iloc[:-1] if isinstance(df_btc_1m, pd.DataFrame) and len(df_btc_1m) > 1 else None
-        btc_5m = df_btc_5m.iloc[:-1] if isinstance(df_btc_5m, pd.DataFrame) and len(df_btc_5m) > 1 else None
-        if (
-            btc_1h is None or len(btc_1h) < min_btc_1h
-            or btc_15m is None or len(btc_15m) < min_btc_15m
-            or btc_1m is None or len(btc_1m) < 2
-            or btc_5m is None or len(btc_5m) < min_btc_5m
-        ):
-            gate_stats["btc_fail"] += len(bull_universe)
-            return result
-        ema20_btc = ema(btc_1h["close"], cfg.ema_trend_fast)
-        ema60_btc = ema(btc_1h["close"], cfg.ema_trend_mid)
-        idx_btc = len(btc_1h) - 1
-        if float(btc_1h.iloc[idx_btc]["close"]) <= float(ema60_btc.iloc[idx_btc]):
-            gate_stats["btc_fail"] += len(bull_universe)
-            return result
-        if float(ema20_btc.iloc[idx_btc]) < float(ema60_btc.iloc[idx_btc]):
-            gate_stats["btc_fail"] += len(bull_universe)
-            return result
-        rsi_btc_15m = _adv_rsi(btc_15m["close"], cfg.btc_rsi_len)
-        if float(rsi_btc_15m.iloc[-1]) < float(cfg.btc_rsi_min):
-            gate_stats["btc_fail"] += len(bull_universe)
-            return result
-        prev_close = float(btc_1m.iloc[-2]["close"])
-        cur_close = float(btc_1m.iloc[-1]["close"])
-        if prev_close > 0:
-            chg_1m = (cur_close / prev_close - 1.0) * 100.0
-            if chg_1m <= float(cfg.btc_drop_1m_pct):
-                gate_stats["btc_fail"] += len(bull_universe)
-                return result
-        atr_5m = atr(btc_5m, cfg.btc_atr_len)
-        atr_now = float(atr_5m.iloc[-1]) if not np.isnan(atr_5m.iloc[-1]) else 0.0
-        atr_avg = float(atr_5m.iloc[-cfg.btc_atr_lookback :].mean()) if len(atr_5m) >= cfg.btc_atr_lookback else float(atr_5m.mean())
-        if atr_avg > 0 and (atr_now / atr_avg) > float(cfg.btc_atr_mult_max):
-            gate_stats["btc_fail"] += len(bull_universe)
-            return result
-
-    for symbol in bull_universe:
-        checked += 1
-        st = state.get(symbol, {}) if isinstance(state, dict) else {}
-        if _is_in_pos_side(st, "LONG"):
-            gate_stats["already_in_pos"] += 1
-            continue
-        cooldown_until = st.get("bull_pullback_long_v1_cooldown_until")
-        if isinstance(cooldown_until, (int, float)) and time.time() < float(cooldown_until):
-            gate_stats["cooldown"] += 1
-            continue
-
-        # load data
-        min_tr = max(cfg.ema_trend_slow + 10, cfg.ema_trend_mid + 10, cfg.ema_trend_fast + 10)
-        min_main = max(cfg.bb_len + 5, cfg.fib_lookback + 5, cfg.ema_trend_fast + 10, cfg.atr_len + 5)
-        min_exec = max(cfg.rsi_len + 5, cfg.ema_exec_mid + 5, 50)
-        df_tr = cycle_cache.get_df(symbol, cfg.tf_trend, limit=min_tr)
-        df_main = cycle_cache.get_df(symbol, cfg.tf_main, limit=min_main)
-        df_ex = cycle_cache.get_df(symbol, cfg.tf_exec, limit=min_exec)
-
-        df_tr_sig = df_tr.iloc[:-1] if isinstance(df_tr, pd.DataFrame) and len(df_tr) > 1 else None
-        df_main_sig = df_main.iloc[:-1] if isinstance(df_main, pd.DataFrame) and len(df_main) > 1 else None
-        df_ex_sig = df_ex.iloc[:-1] if isinstance(df_ex, pd.DataFrame) and len(df_ex) > 1 else None
-        if (
-            df_tr_sig is None
-            or df_main_sig is None
-            or df_ex_sig is None
-            or len(df_tr_sig) < min_tr
-            or len(df_main_sig) < min_main
-            or len(df_ex_sig) < min_exec
-        ):
-            no_data += 1
-            if df_tr_sig is None or len(df_tr_sig) < min_tr:
-                gate_stats["no_data_tr"] += 1
-            if df_main_sig is None or len(df_main_sig) < min_main:
-                gate_stats["no_data_main"] += 1
-            if df_ex_sig is None or len(df_ex_sig) < min_exec:
-                gate_stats["no_data_exec"] += 1
-            continue
-
-        # trend filter (1h)
-        idx_tr = len(df_tr_sig) - 1
-        ema20_tr = ema(df_tr_sig["close"], cfg.ema_trend_fast)
-        ema60_tr = ema(df_tr_sig["close"], cfg.ema_trend_mid)
-        ema120_tr = ema(df_tr_sig["close"], cfg.ema_trend_slow)
-        slope_len = max(1, int(cfg.ema_trend_slope_len))
-        if idx_tr - slope_len <= 0:
-            gate_stats["trend_fail"] += 1
-            continue
-        trend_ok = (
-            float(df_tr_sig.iloc[idx_tr]["close"]) > float(ema120_tr.iloc[idx_tr])
-            and float(ema20_tr.iloc[idx_tr]) > float(ema60_tr.iloc[idx_tr])
-            and (ema20_tr.iloc[idx_tr] - ema20_tr.iloc[idx_tr - slope_len]) > 0
-        )
-        if not trend_ok:
-            gate_stats["trend_fail"] += 1
-            continue
-
-        # main frame setup (15m)
-        idx_main = len(df_main_sig) - 1
-        close_main = float(df_main_sig.iloc[idx_main]["close"])
-        open_main = float(df_main_sig.iloc[idx_main]["open"])
-        vol_main = float(df_main_sig.iloc[idx_main]["volume"])
-        vol_sma_main = df_main_sig["volume"].astype(float).rolling(cfg.vol_sma_len).mean()
-        vol_avg = float(vol_sma_main.iloc[idx_main]) if not np.isnan(vol_sma_main.iloc[idx_main]) else 0.0
-        vol_pullback_ok = True
-        if open_main > close_main and vol_avg > 0:
-            vol_pullback_ok = (vol_main / vol_avg) <= cfg.vol_pullback_max
-
-        swing_start = max(0, idx_main - cfg.fib_lookback + 1)
-        swing_high = float(df_main_sig["high"].iloc[swing_start: idx_main + 1].max())
-        swing_low = float(df_main_sig["low"].iloc[swing_start: idx_main + 1].min())
-        fibs = _fib_levels_up(swing_high, swing_low)
-        fib_382 = fibs.get("0.382")
-        fib_50 = fibs.get("0.5")
-        fib_618 = fibs.get("0.618")
-
-        bb_mid, bb_upper, bb_lower = _bbands(df_main_sig["close"], cfg.bb_len, cfg.bb_std)
-        bbm = float(bb_mid.iloc[idx_main]) if not np.isnan(bb_mid.iloc[idx_main]) else close_main
-        bbl = float(bb_lower.iloc[idx_main]) if not np.isnan(bb_lower.iloc[idx_main]) else close_main
-        prev_close_main = float(df_main_sig.iloc[idx_main - 1]["close"]) if idx_main > 0 else close_main
-        fakeout = prev_close_main < bbm and close_main > bbm
-        fib_norm_ok = False
-        if isinstance(fib_382, (int, float)) and isinstance(fib_50, (int, float)):
-            low_zone = min(fib_382, fib_50) * (1.0 - cfg.fib_eps)
-            high_zone = max(fib_382, fib_50) * (1.0 + cfg.fib_eps)
-            fib_norm_ok = low_zone <= close_main <= high_zone
-
-        deep_zone_ok = False
-        if isinstance(fib_618, (int, float)):
-            low_zone = float(fib_618) * (1.0 - cfg.fib_eps)
-            high_zone = float(fib_618) * (1.0 + cfg.fib_eps)
-            deep_zone_ok = low_zone <= close_main <= high_zone
-        if close_main <= bbl:
-            deep_zone_ok = True
-
-        # exec frame (1m)
-        idx_ex = len(df_ex_sig) - 1
-        ex = df_ex_sig.iloc[idx_ex]
-        ex_open = float(ex["open"])
-        ex_close = float(ex["close"])
-        ex_high = float(ex["high"])
-        ex_low = float(ex["low"])
-        ex_range = max(ex_high - ex_low, 1e-9)
-        lower_wick = min(ex_open, ex_close) - ex_low
-        lower_wick_ratio = lower_wick / ex_range
-        ema10_ex = ema(df_ex_sig["close"], cfg.ema_exec_fast)
-        ema20_ex = ema(df_ex_sig["close"], cfg.ema_exec_mid)
-        ema_touch = False
-        if not np.isnan(ema10_ex.iloc[idx_ex]) and ex_low <= float(ema10_ex.iloc[idx_ex]) * (1.0 + cfg.exec_ema_touch_eps):
-            ema_touch = True
-        if not np.isnan(ema20_ex.iloc[idx_ex]) and ex_low <= float(ema20_ex.iloc[idx_ex]) * (1.0 + cfg.exec_ema_touch_eps):
-            ema_touch = True
-
-        rsi_ex = _adv_rsi(df_ex_sig["close"], cfg.rsi_len)
-        rsi_now = float(rsi_ex.iloc[idx_ex])
-        rsi_prev = float(rsi_ex.iloc[idx_ex - 1]) if idx_ex > 0 else rsi_now
-
-        pullback_gain = 0.0
-        if idx_main >= 1:
-            pb_low = float(df_main_sig["low"].iloc[max(0, idx_main - 1): idx_main + 1].min())
-            pb_high = float(df_main_sig["high"].iloc[max(0, idx_main - 1): idx_main + 1].max())
-            if pb_low > 0:
-                pullback_gain = (pb_high - pb_low) / pb_low
-
-        aggressive_ok = (
-            ema_touch
-            and lower_wick_ratio >= cfg.exec_wick_min
-            and cfg.rsi_aggr_min <= rsi_now <= cfg.rsi_aggr_max
-            and (rsi_now >= rsi_prev)
-        )
-        normal_ok = fakeout and fib_norm_ok
-        deep_ok = deep_zone_ok and cfg.rsi_deep_min <= rsi_now <= cfg.rsi_deep_max and ex_close > ex_open
-
-        if not vol_pullback_ok:
-            gate_stats["pullback_fail"] += 1
-            no_signal += 1
-            continue
-        if pullback_gain < cfg.pullback_gain_min:
-            gate_stats["pullback_fail"] += 1
-            no_signal += 1
-            continue
-
-        entry_type = None
-        support_price = None
-        if aggressive_ok:
-            entry_type = "aggressive"
-            support_price = float(ema20_ex.iloc[idx_ex]) if not np.isnan(ema20_ex.iloc[idx_ex]) else ex_low
-        elif normal_ok:
-            entry_type = "normal"
-            support_price = float(bbm)
-        elif deep_ok:
-            entry_type = "deep"
-            support_price = float(fib_618) if isinstance(fib_618, (int, float)) else float(bbl)
-
-        if not entry_type:
-            gate_stats["exec_fail"] += 1
-            no_signal += 1
-            continue
-
-        if not _entry_guard_acquire(
-            state,
-            symbol,
-            ttl_sec=5.0,
-            key=f"bull_pullback_long_v1:{symbol}:LONG",
-            engine="bull_pullback_long_v1",
-            side="LONG",
-        ):
-            continue
-
-        usdt = _resolve_entry_usdt()
-        if usdt <= 0 or not _admin_is_active():
-            no_signal += 1
-            continue
-
-        atr_main = atr(df_main_sig, cfg.atr_len)
-        atr_px = float(atr_main.iloc[idx_main]) if not np.isnan(atr_main.iloc[idx_main]) else 0.0
-        entry_px = float(ex_close)
-        if support_price is None:
-            support_price = entry_px
-        sl_price = support_price - (atr_px * cfg.sl_atr_mult if atr_px > 0 else entry_px * 0.01)
-        tp_pct = None
-        if isinstance(swing_high, (int, float)) and swing_high > entry_px:
-            tp_pct = (float(swing_high) - entry_px) / entry_px * 100.0
-        if not isinstance(tp_pct, (int, float)) or tp_pct <= 0:
-            tp_pct = float(cfg.tp_fallback_pct) * 100.0
-
-        req_id = _enqueue_entry_request(
-            state,
-            symbol=symbol,
-            side="LONG",
-            engine="BULL_PULLBACK_LONG_V1",
-            reason="bull_pullback_long_v1",
-            usdt=usdt,
-            live=LONG_LIVE_TRADING,
-            alert_reason="bull_pullback_long_v1",
-            entry_price_hint=entry_px,
-            meta={
-                "sl_price": float(sl_price),
-                "tp_pct": float(tp_pct),
-                "entry_type": entry_type,
-            },
-        )
-        if not req_id:
-            no_signal += 1
-            continue
-
-        if (not MANAGE_WS_MODE) and not (isinstance(state, dict) and state.get("_manage_ws_mode")):
-            _send_entry_alert(
-                send_alert,
-                side="LONG",
-                symbol=symbol,
-                engine="BULL_PULLBACK_LONG_V1",
-                entry_price=entry_px,
-                usdt=usdt,
-                reason=_display_engine_label("BULL_PULLBACK_LONG_V1"),
-                sl=f"{float(sl_price):.6g}",
-                tp=None,
-                entry_order_id=req_id,
-                extras=[f"타입: {entry_type}"],
-                state=state,
-            )
-
-        result["entries"] += 1
-        if isinstance(state, dict):
-            st = state.get(symbol, {})
-            if not isinstance(st, dict):
-                st = {}
-            cooldown_sec = cfg.cooldown_bars * 60
-            st["bull_pullback_long_v1_cooldown_until"] = time.time() + cooldown_sec
-            state[symbol] = st
-
-    elapsed = time.time() - start_ts
-    _append_entry_log(
-        f"bull_pullback_long_v1/bull_pullback_long_v1-{time.strftime('%Y%m%d')}.log",
-        f"BULL_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} "
-        f"no_signal={no_signal} no_data={no_data} gates={gate_stats}",
-    )
-    return result
-
 
 def _run_wash_short_suite_cycle(
     wash_universe,
@@ -8090,18 +7168,12 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "ADVANCED_TREND_FOLLOWER"
     if key in ("anti_alpha_v1", "anti_alpha"):
         return "ANTI_ALPHA_V1"
-    if key in ("noise_reverse_v1", "noise_reverse"):
-        return "NOISE_REVERSE_V1"
     if key in ("srp_st_regime_pullback_v1", "srp_st"):
         return "SRP_ST_REGIME_PULLBACK_V1"
-    if key in ("st_flip_v1", "st_flip"):
-        return "ST_FLIP_V1"
     if key in ("wash_short_suite", "wash_suite"):
         return "WASH_SHORT_SUITE"
     if key in ("top_fail_short_v1", "top_fail_short"):
         return "TOP_FAIL_SHORT_V1"
-    if key in ("bull_pullback_long_v1", "bull_pullback_long"):
-        return "BULL_PULLBACK_LONG_V1"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -8126,8 +7198,6 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "wash_short_suite"
     if label == "TOP_FAIL_SHORT_V1":
         return "top_fail_short_v1"
-    if label == "BULL_PULLBACK_LONG_V1":
-        return "bull_pullback_long_v1"
     if label == "SCALP":
         return "long_entry"
     if label == "MANUAL":
@@ -8136,12 +7206,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "advanced_trend_follower"
     if label == "ANTI_ALPHA_V1":
         return "anti_alpha_v1"
-    if label == "NOISE_REVERSE_V1":
-        return "noise_reverse_v1"
     if label == "SRP_ST_REGIME_PULLBACK_V1":
         return "srp_st_regime_pullback_v1"
-    if label == "ST_FLIP_V1":
-        return "st_flip_v1"
     return None
 
 def _display_engine_label(label: Optional[str]) -> str:
@@ -8154,12 +7220,9 @@ def _display_engine_label(label: Optional[str]) -> str:
         "LOSS_HEDGE_ENGINE": "손실방지엔진",
         "ADVANCED_TREND_FOLLOWER": "슈퍼트랜드 반전",
         "ANTI_ALPHA_V1": "안티알파v1",
-        "NOISE_REVERSE_V1": "노이즈리버스v1",
         "SRP_ST_REGIME_PULLBACK_V1": "SRP-ST풀백v1",
-        "ST_FLIP_V1": "ST플립v1",
         "WASH_SHORT_SUITE": "워시숏슈트",
         "TOP_FAIL_SHORT_V1": "탑페일숏v1",
-        "BULL_PULLBACK_LONG_V1": "불풀백롱v1",
     }
     return overrides.get(name, name)
 
@@ -12778,7 +11841,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
-    global ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, TOP_FAIL_SHORT_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, WASH_SHORT_SUITE_ENABLED, BULL_PULLBACK_LONG_V1_ENABLED
+    global ANTI_ALPHA_V1_ENABLED, TOP_FAIL_SHORT_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, WASH_SHORT_SUITE_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -12834,7 +11897,6 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_swaggy_no_atlas_delay_vol_mult",
         "_swaggy_no_atlas_delay_vol_ma",
         "_swaggy_no_atlas_delay_sweep_lookback",
-        "_bull_pullback_long_v1_enabled",
         "_adv_trend_enabled",
         "_adv_trend_min_qv",
         "_adv_trend_universe_top_n",
@@ -12845,17 +11907,12 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_adv_trend_mfi_long_max",
         "_adv_trend_mfi_short_min",
         "_anti_alpha_v1_enabled",
-        "_noise_reverse_v1_enabled",
         "_top_fail_short_v1_enabled",
-        "_st_flip_v1_enabled",
-        "_st_flip_v1_alert_only",
         "_srp_st_regime_pullback_v1_enabled",
         "_wash_short_suite_enabled",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
-        "_noise_reverse_v1_enabled",
         "_top_fail_short_v1_enabled",
-        "_st_flip_v1_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_wash_short_suite_enabled",
         "_rsi_enabled",
@@ -12960,21 +12017,13 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         ADV_TREND_ENABLED = bool(state.get("_adv_trend_enabled"))
     if (not skip_keys or "_anti_alpha_v1_enabled" not in skip_keys) and isinstance(state.get("_anti_alpha_v1_enabled"), bool):
         ANTI_ALPHA_V1_ENABLED = bool(state.get("_anti_alpha_v1_enabled"))
-    if (not skip_keys or "_noise_reverse_v1_enabled" not in skip_keys) and isinstance(state.get("_noise_reverse_v1_enabled"), bool):
-        NOISE_REVERSE_V1_ENABLED = bool(state.get("_noise_reverse_v1_enabled"))
     if (not skip_keys or "_top_fail_short_v1_enabled" not in skip_keys) and isinstance(state.get("_top_fail_short_v1_enabled"), bool):
         TOP_FAIL_SHORT_V1_ENABLED = bool(state.get("_top_fail_short_v1_enabled"))
-    if (not skip_keys or "_st_flip_v1_enabled" not in skip_keys) and isinstance(state.get("_st_flip_v1_enabled"), bool):
-        ST_FLIP_V1_ENABLED = bool(state.get("_st_flip_v1_enabled"))
-    if (not skip_keys or "_st_flip_v1_alert_only" not in skip_keys) and isinstance(state.get("_st_flip_v1_alert_only"), bool):
-        ST_FLIP_ALERT_ONLY = bool(state.get("_st_flip_v1_alert_only"))
     if (not skip_keys or "_srp_st_regime_pullback_v1_enabled" not in skip_keys) and isinstance(state.get("_srp_st_regime_pullback_v1_enabled"), bool):
         SRP_ST_REGIME_PULLBACK_V1_ENABLED = False
         state["_srp_st_regime_pullback_v1_enabled"] = False
     if (not skip_keys or "_wash_short_suite_enabled" not in skip_keys) and isinstance(state.get("_wash_short_suite_enabled"), bool):
         WASH_SHORT_SUITE_ENABLED = bool(state.get("_wash_short_suite_enabled"))
-    if (not skip_keys or "_bull_pullback_long_v1_enabled" not in skip_keys) and isinstance(state.get("_bull_pullback_long_v1_enabled"), bool):
-        BULL_PULLBACK_LONG_V1_ENABLED = bool(state.get("_bull_pullback_long_v1_enabled"))
     if (not skip_keys or "_adv_trend_min_qv" not in skip_keys) and isinstance(state.get("_adv_trend_min_qv"), (int, float)):
         ADV_TREND_MIN_QV = float(state.get("_adv_trend_min_qv"))
     if (not skip_keys or "_adv_trend_universe_top_n" not in skip_keys) and isinstance(state.get("_adv_trend_universe_top_n"), (int, float)):
@@ -13242,13 +12291,10 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_swaggy_d1_overext_atr_mult",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
-        "_noise_reverse_v1_enabled",
-        "_st_flip_v1_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_rsi_enabled",
         "_wash_short_suite_enabled",
         "_top_fail_short_v1_enabled",
-        "_bull_pullback_long_v1_enabled",
         "_dtfx_enabled",
         "_atlas_rs_fail_short_enabled",
         "_tg_offset",
@@ -13729,7 +12775,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, TOP_FAIL_SHORT_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, ST_FLIP_V1_ENABLED, ST_FLIP_ALERT_ONLY, WASH_SHORT_SUITE_ENABLED, BULL_PULLBACK_LONG_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, TOP_FAIL_SHORT_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, WASH_SHORT_SUITE_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     global ENTRY_BLOCK_HOURS
@@ -15648,9 +14694,6 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_swaggy_d1_overext_atr_mult",
                 "_loss_hedge_engine_enabled",
                 "_loss_hedge_interval_min",
-                "_noise_reverse_v1_enabled",
-                "_st_flip_v1_enabled",
-                "_st_flip_v1_alert_only",
                 "_srp_st_regime_pullback_v1_enabled",
                 "_dtfx_enabled",
                 "_rsi_enabled",
@@ -15719,7 +14762,6 @@ def save_state_to(state: Dict[str, dict], path: str) -> None:
                 "_div15m_long_enabled",
                 "_div15m_short_enabled",
                 "_rsi_enabled",
-                "_st_flip_v1_enabled",
                 "_runtime_cfg_ts",
             ]
             for key in runtime_keys:
@@ -16123,7 +15165,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, NOISE_REVERSE_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, BULL_PULLBACK_LONG_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global REALTIME_ONLY_ENABLED
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS, SWAGGY_NO_ATLAS_USE_WICK_BREAK
@@ -16354,10 +15396,6 @@ def run():
         DTFX_ENABLED = bool(state.get("_dtfx_enabled"))
     else:
         state["_dtfx_enabled"] = DTFX_ENABLED
-    if isinstance(state.get("_bull_pullback_long_v1_enabled"), bool):
-        BULL_PULLBACK_LONG_V1_ENABLED = bool(state.get("_bull_pullback_long_v1_enabled"))
-    else:
-        state["_bull_pullback_long_v1_enabled"] = BULL_PULLBACK_LONG_V1_ENABLED
     if isinstance(state.get("_top_fail_short_v1_enabled"), bool):
         TOP_FAIL_SHORT_V1_ENABLED = bool(state.get("_top_fail_short_v1_enabled"))
     else:
@@ -16905,8 +15943,6 @@ def run():
                         and swaggy_universe
                     )
                     adv_trend_ran = bool(heavy_scan and ADV_TREND_ENABLED and adv_trend_universe)
-                    noise_reverse_ran = bool(NOISE_REVERSE_V1_ENABLED and noise_reverse_universe and (not heavy_scan) and new_1m_bar)
-                    st_flip_ran = bool((ST_FLIP_V1_ENABLED or ST_FLIP_ALERT_ONLY) and st_flip_universe and (not heavy_scan) and new_1m_bar)
                     wash_short_suite_ran = bool(WASH_SHORT_SUITE_ENABLED and wash_short_suite_universe and (not heavy_scan) and new_1m_bar)
                     top_fail_short_ran = bool(TOP_FAIL_SHORT_V1_ENABLED and top_fail_short_universe and (not heavy_scan) and new_3m_bar)
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
@@ -16977,10 +16013,6 @@ def run():
                         mid_plan["1h"] = max(mid_plan.get("1h", 0), int(swaggy_atlas_lab_v2_cfg.vp_lookback_1h))
                     if ADV_TREND_ENABLED:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), 672)
-                    if BULL_PULLBACK_LONG_V1_ENABLED and BullPullbackLongConfig:
-                        bcfg = BullPullbackLongConfig()
-                        mid_plan["15m"] = max(mid_plan.get("15m", 0), int(bcfg.fib_lookback + 20))
-                        mid_plan["1h"] = max(mid_plan.get("1h", 0), int(bcfg.ema_trend_slow + 30))
                     if atlas_rs_fail_short_cfg:
                         mid_plan["15m"] = max(mid_plan.get("15m", 0), int(atlas_rs_fail_short_cfg.ltf_limit))
                     if atlas_cfg:
@@ -17350,7 +16382,6 @@ def run():
                     if NOISE_REVERSE_V1_ENABLED and (not heavy_scan) and new_1m_bar:
                         noise_reverse_thread = threading.Thread(
                             target=lambda: noise_reverse_result.update(
-                                _run_noise_reverse_v1_cycle(
                                     noise_reverse_universe,
                                     state,
                                     send_telegram,
@@ -17362,7 +16393,6 @@ def run():
                     if (ST_FLIP_V1_ENABLED or ST_FLIP_ALERT_ONLY) and (not heavy_scan) and new_1m_bar:
                         st_flip_thread = threading.Thread(
                             target=lambda: st_flip_result.update(
-                                _run_st_flip_v1_cycle(
                                     st_flip_universe,
                                     state,
                                     send_telegram,
@@ -17414,7 +16444,6 @@ def run():
                     if BULL_PULLBACK_LONG_V1_ENABLED and new_1m_bar:
                         bull_pullback_thread = threading.Thread(
                             target=lambda: bull_pullback_result.update(
-                                _run_bull_pullback_long_v1_cycle(
                                     wash_short_suite_universe,
                                     state,
                                     send_telegram,
