@@ -37428,7 +37428,6 @@
     "in_pos_short": false,
     "in_pos": false
   },
-  "_noise_reverse_v1_enabled": false,
   "_srp_st_regime_pullback_v1_enabled": false,
   "C98/USDT:USDT": {
     "in_pos_long": false,
@@ -37706,8 +37705,6 @@
     "last_entry": 0.0,
     "last_ok": false
   },
-  "_st_flip_v1_enabled": false,
-  "_st_flip_v1_alert_only": false,
   "_wash_short_suite_enabled": true,
   "_last_rt_15m_open": {
     "in_pos_long": false,
@@ -37925,11 +37922,6 @@
     "entry_alerted_short_engine": "WASH_SHORT_SUITE",
     "entry_alerted_short_reason": "wash_short_suite",
     "entry_alerted_short_order_id": "8582158848"
-  },
-  "_bull_pullback_long_v1_enabled": {
-    "in_pos_long": false,
-    "in_pos_short": false,
-    "in_pos": false
   },
   "_common_universe_refresh_date": {
     "in_pos_long": false,

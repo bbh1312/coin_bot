@@ -82,6 +82,7 @@ COMMAND_DEFS = [
     {"cmd": "/sat_trade", "key": "_sat_trade", "label": "토요일 진입", "type": "toggle"},
     {"cmd": "/realtime_only", "key": "_realtime_only", "label": "Realtime Only (헤비스캔 OFF)", "type": "toggle"},
     {"cmd": "/top_fail_short_v1", "key": "_top_fail_short_v1_enabled", "label": "Top Fail Short V1", "type": "toggle"},
+    {"cmd": "/hod_fail_short_v1", "key": "_hod_fail_short_v1_enabled", "label": "HOD Fail Short V1", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
     {"cmd": "/wash_short_suite", "key": "_wash_short_suite_enabled", "label": "Wash Short Suite", "type": "toggle"},

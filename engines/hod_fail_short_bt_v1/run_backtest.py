@@ -156,9 +156,10 @@ def run_backtest() -> None:
     parser.add_argument("--htf-tf", type=str, default="15m")
 
     parser.add_argument("--hod-fail-min", type=int, default=6)
-    parser.add_argument("--near-hod-band", type=float, default=0.0015)
-    parser.add_argument("--retest-band", type=float, default=0.006)
-    parser.add_argument("--retest-break", type=float, default=0.002)
+    parser.add_argument("--near-hod-band", type=float, default=0.001)
+    parser.add_argument("--use-full-env", action="store_true")
+    parser.add_argument("--retest-band", type=float, default=0.0035)
+    parser.add_argument("--retest-break", type=float, default=0.001)
 
     parser.add_argument("--ext-ema7-max", type=float, default=0.007)
     parser.add_argument("--ignore-extension", action="store_true")
@@ -168,24 +169,34 @@ def run_backtest() -> None:
     parser.add_argument("--touch-break", type=float, default=0.0003)
     parser.add_argument("--touch-max", type=int, default=4)
     parser.add_argument("--mfi-len", type=int, default=14)
-    parser.add_argument("--mfi-hot", type=float, default=60.0)
+    parser.add_argument("--mfi-hot", type=float, default=52.0)
     parser.add_argument("--mfi-hot-rise", action="store_true")
     parser.add_argument("--uptrend-consec-bull", type=int, default=3)
     parser.add_argument("--ema20-slope-mult", type=float, default=0.0002)
+    parser.add_argument("--uptrend-min-flags", type=int, default=2)
+    parser.add_argument("--uptrend-use-consec", type=int, default=1)
+    parser.add_argument("--uptrend-use-hhhl", type=int, default=1)
+    parser.add_argument("--uptrend-use-ema20", type=int, default=1)
+    parser.add_argument("--block-uptrend", type=int, default=1)
+    parser.add_argument("--block-below-ema120", type=int, default=0)
+    parser.add_argument("--block-volume-expand", type=int, default=0)
+    parser.add_argument("--block-hod-fatigue", type=int, default=0)
 
     parser.add_argument("--wash-atr-mult", type=float, default=1.25)
     parser.add_argument("--vol-spike-mult", type=float, default=1.3)
     parser.add_argument("--fail-wick-max", type=float, default=0.25)
     parser.add_argument("--use-break-low", action="store_true")
-    parser.add_argument("--retrace-atr", type=float, default=0.25)
+    parser.add_argument("--retrace-atr", type=float, default=0.20)
     parser.add_argument("--wash-wick-min", type=float, default=0.45)
     parser.add_argument("--wash-close-pos-max", type=float, default=0.35)
-    parser.add_argument("--pathb-hod-drop", type=float, default=0.006)
-    parser.add_argument("--pathb-ema-fail-k", type=int, default=3)
+    parser.add_argument("--pathb-hod-drop", type=float, default=0.010)
+    parser.add_argument("--pathb-ema-fail-k", type=int, default=2)
+    parser.add_argument("--lower-high-delta", type=float, default=0.0015)
+    parser.add_argument("--lower-high-window", type=int, default=8)
 
-    parser.add_argument("--sl-atr-mult", type=float, default=0.3)
-    parser.add_argument("--tp-r1", type=float, default=1.0)
-    parser.add_argument("--tp-r2", type=float, default=2.0)
+    parser.add_argument("--sl-atr-mult", type=float, default=0.4)
+    parser.add_argument("--tp-r1", type=float, default=1.2)
+    parser.add_argument("--tp-r2", type=float, default=1.5)
 
     parser.add_argument("--start", type=str, default="")
     parser.add_argument("--end", type=str, default="")
@@ -212,6 +223,15 @@ def run_backtest() -> None:
     mfi_hot_rise = bool(args.mfi_hot_rise)
     uptrend_consec_bull = int(args.uptrend_consec_bull)
     ema20_slope_mult = float(args.ema20_slope_mult)
+    uptrend_min_flags = int(args.uptrend_min_flags)
+    use_uptrend_consec = int(args.uptrend_use_consec) == 1
+    use_uptrend_hhhl = int(args.uptrend_use_hhhl) == 1
+    use_uptrend_ema20 = int(args.uptrend_use_ema20) == 1
+    block_uptrend = int(args.block_uptrend) == 1
+    block_below_ema120 = int(args.block_below_ema120) == 1
+    block_volume_expand = int(args.block_volume_expand) == 1
+    block_hod_fatigue = int(args.block_hod_fatigue) == 1
+    use_full_env = bool(args.use_full_env)
     cfg.wash_atr_mult = float(args.wash_atr_mult)
     cfg.vol_spike_mult = float(args.vol_spike_mult)
     cfg.fail_wick_max = float(args.fail_wick_max)
@@ -221,6 +241,8 @@ def run_backtest() -> None:
     wash_close_pos_max = float(args.wash_close_pos_max)
     pathb_hod_drop = float(args.pathb_hod_drop)
     pathb_ema_fail_k = int(args.pathb_ema_fail_k)
+    lower_high_delta = float(args.lower_high_delta)
+    lower_high_window = int(args.lower_high_window)
     cfg.sl_atr_mult = float(args.sl_atr_mult)
     cfg.tp_r1 = float(args.tp_r1)
     cfg.tp_r2 = float(args.tp_r2)
@@ -298,6 +320,7 @@ def run_backtest() -> None:
     wins_by_mfi_bucket = {}
     mae_by_mfi_bucket = {}
     net_by_mfi_bucket = {}
+    net_sum_by_mfi_bucket = {}
     delay_entries = 0
     delay_missed = 0
     entry_path_break_low = 0
@@ -480,16 +503,23 @@ def run_backtest() -> None:
 
                 obv_weak = float(env["obv_slope"].iloc[idx_15m]) < 0
 
-                env_on = (
-                    hod is not None
-                    and hod_fail_count >= cfg.hod_fail_min
-                    and near_hod_attempt
-                    and rsi_weak
-                    and obv_weak
-                )
+                # ENV context (A-mode or full)
+                if use_full_env:
+                    env_on = (
+                        hod is not None
+                        and hod_fail_count >= cfg.hod_fail_min
+                        and near_hod_attempt
+                        and rsi_weak
+                        and obv_weak
+                    )
+                else:
+                    env_on = (
+                        hod is not None
+                        and hod_fail_count >= cfg.hod_fail_min
+                    )
 
                 last_block_flags = []
-                # BLOCK_UPTREND_15M
+                # BLOCK_UPTREND_15M (disabled in A-mode)
                 consec_bull_count = 0
                 if idx_15m >= 0:
                     for j in range(idx_15m, -1, -1):
@@ -515,25 +545,28 @@ def run_backtest() -> None:
                 close_gt_ema20 = c > ema20
                 ema20_rising = ema20_slope > ema20_slope_thr
                 uptrend_subflags = []
-                if consecutive_bull:
+                if use_uptrend_consec and consecutive_bull:
                     uptrend_subflags.append("CONSEC_BULL")
-                if hh_hl:
+                if use_uptrend_hhhl and hh_hl:
                     uptrend_subflags.append("HHHL")
-                if close_gt_ema20 and ema20_rising:
+                if use_uptrend_ema20 and close_gt_ema20 and ema20_rising:
                     uptrend_subflags.append("ABOVE_EMA20_SLOPEUP")
-                if len(uptrend_subflags) >= 2:
+                if block_uptrend and len(uptrend_subflags) >= uptrend_min_flags:
                     last_block_flags.append(BLOCK_UPTREND_15M)
 
-                # BELOW_EMA120_15M
                 ema120 = float(env["ema120"].iloc[idx_15m])
                 below_ema120 = c < ema120 * cfg.ema120_floor
+                if block_below_ema120 and below_ema120:
+                    last_block_flags.append(BLOCK_BELOW_EMA120_15M)
 
-                # VOLUME_EXPAND_15M
                 vol_ratio = float(env["vol_ratio"].iloc[idx_15m]) if not np.isnan(env["vol_ratio"].iloc[idx_15m]) else 0.0
                 volume_expand = vol_ratio >= cfg.vol_expand_min
+                if block_volume_expand and volume_expand:
+                    last_block_flags.append(BLOCK_VOLUME_EXPAND_15M)
 
-                # HOD_FATIGUE
                 fatigue = touch_count >= cfg.touch_max
+                if block_hod_fatigue and fatigue:
+                    last_block_flags.append(BLOCK_HOD_FATIGUE)
 
                 # MFI_HOT_15M
                 mfi_now = float(env["mfi"].iloc[idx_15m])
@@ -598,11 +631,9 @@ def run_backtest() -> None:
                 elif prev_close <= tp2:
                     exit_reason = "TP2"
                     exit_px = open_now
-                elif remaining > 0.5 and prev_close <= tp1:
-                    realized_r += 0.5 * cfg.tp_r1 * remaining
-                    remaining = remaining * 0.5
-                    open_trade["remaining"] = remaining
-                    open_trade["realized_r"] = realized_r
+                elif prev_close <= tp1:
+                    exit_reason = "TP1"
+                    exit_px = open_now
                 if exit_reason:
                     entry_idx = open_trade["entry_idx"]
                     hold_bars = i - entry_idx + 1
@@ -610,6 +641,8 @@ def run_backtest() -> None:
                     r_val = open_trade["r_val"]
                     if exit_reason == "SL":
                         pnl_r = realized_r - remaining * 1.0
+                    elif exit_reason == "TP1":
+                        pnl_r = realized_r + remaining * cfg.tp_r1
                     else:
                         pnl_r = realized_r + remaining * cfg.tp_r2
                     stats["exits"] += 1
@@ -627,6 +660,7 @@ def run_backtest() -> None:
                             wins_by_mfi_bucket[mfi_bucket] = wins_by_mfi_bucket.get(mfi_bucket, 0) + 1
                         mae_by_mfi_bucket[mfi_bucket] = mae_by_mfi_bucket.get(mfi_bucket, 0.0) + mae
                         net_by_mfi_bucket[mfi_bucket] = net_by_mfi_bucket.get(mfi_bucket, 0.0) + pnl_r
+                        net_sum_by_mfi_bucket[mfi_bucket] = net_sum_by_mfi_bucket.get(mfi_bucket, 0.0) + (pnl_r * open_trade["r_val"])
                     stats["net_sum"] += pnl_r
                     stats["mfe_sum"] += mfe
                     stats["mae_sum"] += mae
@@ -663,11 +697,9 @@ def run_backtest() -> None:
                 elif prev_close <= tp2:
                     exit_reason = "TP2"
                     exit_px = open_now
-                elif remaining > 0.5 and prev_close <= tp1:
-                    realized_r += 0.5 * cfg.tp_r1 * remaining
-                    remaining = remaining * 0.5
-                    shadow_trade["remaining"] = remaining
-                    shadow_trade["realized_r"] = realized_r
+                elif prev_close <= tp1:
+                    exit_reason = "TP1"
+                    exit_px = open_now
                 if exit_reason:
                     entry_idx = shadow_trade["entry_idx"]
                     hold_bars = i - entry_idx + 1
@@ -675,6 +707,8 @@ def run_backtest() -> None:
                     r_val = shadow_trade["r_val"]
                     if exit_reason == "SL":
                         pnl_r = realized_r - remaining * 1.0
+                    elif exit_reason == "TP1":
+                        pnl_r = realized_r + remaining * cfg.tp_r1
                     else:
                         pnl_r = realized_r + remaining * cfg.tp_r2
                     shadow_trades += 1
@@ -947,9 +981,9 @@ def run_backtest() -> None:
             ema_fail = recover_seen_idx is not None and (p - recover_seen_idx) <= pathb_ema_fail_k and close_3m < ema7
             lower_high = False
             if last_pivot_high is not None and prev_pivot_high is not None:
-                if last_pivot_high < prev_pivot_high * (1 - 0.0015):
+                if last_pivot_high < prev_pivot_high * (1 - lower_high_delta):
                     if last_pivot_idx is not None and prev_pivot_idx is not None:
-                        if (p - last_pivot_idx) <= 8 and (p - prev_pivot_idx) <= 8:
+                        if (p - last_pivot_idx) <= lower_high_window and (p - prev_pivot_idx) <= lower_high_window:
                             lower_high = True
             if ctx_ok and (ema_fail or lower_high):
                 entry_ready_b = True
@@ -1145,7 +1179,8 @@ def run_backtest() -> None:
             winrate = (wins / trades * 100.0) if trades > 0 else 0.0
             avg_mae = mae_by_mfi_bucket.get(bucket, 0.0) / trades if trades > 0 else 0.0
             net_r = net_by_mfi_bucket.get(bucket, 0.0)
-            print(f"  {bucket}: trades={trades} winrate={winrate:.2f}% avg_mae={avg_mae:.4f} net_r={net_r:.3f}")
+            net_sum = net_sum_by_mfi_bucket.get(bucket, 0.0)
+            print(f"  {bucket}: trades={trades} winrate={winrate:.2f}% avg_mae={avg_mae:.4f} net_r={net_r:.3f} net_sum={net_sum:.3f}")
 
     if entries_by_path:
         print("[BACKTEST] ENTRY_PATHS")
