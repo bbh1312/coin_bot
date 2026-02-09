@@ -10,10 +10,6 @@ except Exception:
     SwaggyEngine = None
 from engines.atlas.atlas_engine import AtlasEngine
 try:
-    from engines.st_flip_v1.engine import StFlipEngine
-except Exception:
-    StFlipEngine = None
-try:
     from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
 except Exception:
     AtlasRsFailShortEngine = None
@@ -27,8 +23,6 @@ if SwaggyEngine:
     _ENGINE_REGISTRY["swaggy"] = SwaggyEngine
 if AtlasRsFailShortEngine:
     _ENGINE_REGISTRY["atlas_rs_fail_short"] = AtlasRsFailShortEngine
-if StFlipEngine:
-    _ENGINE_REGISTRY["st_flip_v1"] = StFlipEngine
 
 
 def get_engine(name: str) -> BaseEngine:

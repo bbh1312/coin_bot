@@ -34,12 +34,9 @@ from engine_runner import (
     USDT_PER_TRADE,
     BASE_ENTRY_USDT,
     REALTIME_ONLY_ENABLED,
-    NOISE_REVERSE_V1_ENABLED,
     TOP_FAIL_SHORT_V1_ENABLED,
     SWAGGY_ATLAS_LAB_ENABLED,
     SWAGGY_ATLAS_LAB_V2_ENABLED,
-    ST_FLIP_V1_ENABLED,
-    ST_FLIP_ALERT_ONLY,
     SATURDAY_TRADE_ENABLED,
     RSI_ENABLED,
     DCA_ENABLED,
@@ -84,12 +81,10 @@ COMMAND_DEFS = [
     {"cmd": "/auto_exit", "key": "_auto_exit", "label": "Auto Exit", "type": "toggle"},
     {"cmd": "/sat_trade", "key": "_sat_trade", "label": "토요일 진입", "type": "toggle"},
     {"cmd": "/realtime_only", "key": "_realtime_only", "label": "Realtime Only (헤비스캔 OFF)", "type": "toggle"},
-    {"cmd": "/noise_reverse_v1", "key": "_noise_reverse_v1_enabled", "label": "Noise Reverse V1", "type": "toggle"},
     {"cmd": "/top_fail_short_v1", "key": "_top_fail_short_v1_enabled", "label": "Top Fail Short V1", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab_v2", "key": "_swaggy_atlas_lab_v2_enabled", "label": "Swaggy Atlas Lab V2", "type": "toggle"},
     {"cmd": "/wash_short_suite", "key": "_wash_short_suite_enabled", "label": "Wash Short Suite", "type": "toggle"},
-    {"cmd": "/bull_pullback_long_v1", "key": "_bull_pullback_long_v1_enabled", "label": "Bull Pullback Long V1", "type": "toggle"},
     {"cmd": "/rsi", "key": "_rsi_enabled", "label": "RSI", "type": "toggle"},
     {"cmd": "/dca", "key": "_dca_enabled", "label": "DCA", "type": "toggle"},
     {"cmd": "/dca_pct", "key": "_dca_pct", "label": "DCA 진입 금액(%)", "type": "number", "step": 0.1},
@@ -283,7 +278,6 @@ DEFAULTS = {
     "_max_open_positions": MAX_OPEN_POSITIONS,
     "_entry_usdt": USDT_PER_TRADE,
     "_entry_block_hours": "",
-    "_noise_reverse_v1_enabled": NOISE_REVERSE_V1_ENABLED,
     "_rsi_enabled": RSI_ENABLED,
     "_dca_enabled": DCA_ENABLED,
     "_dca_pct": DCA_PCT,
@@ -923,10 +917,9 @@ def _trade_log_entries(state: dict) -> list[dict]:
 
 def _kst_today_start_ts(now_ts: float | None = None) -> float:
     base = float(now_ts if now_ts is not None else time.time())
-    kst = base + 9 * 3600
-    day_start_kst = int(kst // 86400) * 86400
-    # Binance 기준: KST 09:00 ~ 다음날 08:59:59
-    return (day_start_kst - 9 * 3600) + 9 * 3600
+    # Binance 기준: KST 09:00 ~ 다음날 08:59:59 (UTC 00:00 ~ 23:59:59)
+    day_start_utc = int(base // 86400) * 86400
+    return day_start_utc
 
 
 def _fetch_realized_pnl_range(ex, since_ts: float, end_ts: float | None = None) -> tuple[float | None, int, str | None]:

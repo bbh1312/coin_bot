@@ -83,17 +83,6 @@ try:
     except Exception:
         AtlasRsFailShortEngine = None
         AtlasRsFailShortConfig = None
-    _st_flip_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engines", "st_flip_v1", "engine.py")
-    if os.path.exists(_st_flip_path):
-        try:
-            from engines.st_flip_v1.engine import compute_signal as st_flip_compute_signal
-            from engines.st_flip_v1.config import StFlipConfig
-        except Exception:
-            st_flip_compute_signal = None
-            StFlipConfig = None
-    else:
-        st_flip_compute_signal = None
-        StFlipConfig = None
     from engines.wash_short_suite.engine import (
         WashShortSuiteConfig,
         wash_btc_guard,
@@ -104,7 +93,7 @@ try:
         TopFailShortV1Config,
         top_fail_short_entry_signal,
     )
-    from engines.bull_pullback_long_v1.engine import BullPullbackLongConfig
+    BullPullbackLongConfig = None
 except Exception as _import_err:
     SwaggyEngine = None
     SwaggyConfig = None
@@ -11168,6 +11157,27 @@ def _detect_position_events(state: dict, send_telegram) -> None:
             qty = None
         if prev_qty is None and qty is not None:
             if not managed:
+                manual_info = _manual_alert_info(state, symbol, side)
+                if isinstance(manual_info, dict):
+                    ts_val = manual_info.get("ts")
+                    try:
+                        ts_val = float(ts_val) if ts_val is not None else None
+                    except Exception:
+                        ts_val = None
+                    if ts_val is not None and (now - float(ts_val)) <= 1800.0:
+                        entry_price = avg_entry if isinstance(avg_entry, (int, float)) else manual_info.get("entry")
+                        _log_trade_entry(
+                            state,
+                            side=side,
+                            symbol=symbol,
+                            entry_ts=float(ts_val),
+                            entry_price=entry_price if isinstance(entry_price, (int, float)) else None,
+                            qty=qty if isinstance(qty, (int, float)) else None,
+                            usdt=None,
+                            entry_order_id=None,
+                            meta={"reason": "manual_entry", "engine": "MANUAL"},
+                        )
+                        return
                 recent = _recent_entry_event(symbol, side, now)
                 if isinstance(recent, dict):
                     engine_label = str(recent.get("engine") or "").upper()
@@ -14378,12 +14388,10 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/s_exit_tp: {_fmt_pct_safe(AUTO_EXIT_SHORT_TP_PCT)} | /s_exit_sl: {_fmt_pct_safe(AUTO_EXIT_SHORT_SL_PCT)}\n"
                             f"/engine_exit: {_format_engine_exit_overrides()}\n"
                             "--------------\n"
-                            f"엔진요약: noise_reverse={'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'} "
-                            f"st_flip={'ON' if ST_FLIP_V1_ENABLED else 'OFF'}(alert_only={'ON' if ST_FLIP_ALERT_ONLY else 'OFF'}) "
+                            f"엔진요약: "
                             f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
                             f"wash_suite={'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'} "
                             f"top_fail={'ON' if TOP_FAIL_SHORT_V1_ENABLED else 'OFF'} "
-                            f"bull_pullback={'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'} "
                             f"swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
                             f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -14394,10 +14402,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"days={COMMON_WARMUP_DAYS} tfs={','.join(COMMON_WARMUP_TFS)} "
                             f"max_fetch={COMMON_WARMUP_MAX_FETCH}\n"
                             "--------------\n"
-                            f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
                             f"/wash_short_suite(추가진입): {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
                             f"/top_fail_short_v1(추가진입): {'ON' if TOP_FAIL_SHORT_V1_ENABLED else 'OFF'}\n"
-                            f"/bull_pullback_long_v1(롱): {'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -14458,10 +14464,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
                         ""
                         "--------------\n"
-                        f"/noise_reverse_v1(추가진입): {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
                         f"/wash_short_suite(추가진입): {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
                         f"/top_fail_short_v1(추가진입): {'ON' if TOP_FAIL_SHORT_V1_ENABLED else 'OFF'}\n"
-                        f"/bull_pullback_long_v1(롱): {'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'}\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
                         f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                         ""
@@ -14952,29 +14956,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ok = _reply(resp)
                         print(f"[telegram] anti_alpha_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
-                if (cmd in ("/noise_reverse_v1", "noise_reverse_v1")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        NOISE_REVERSE_V1_ENABLED = True
-                        state["_noise_reverse_v1_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ noise_reverse_v1 ON"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        NOISE_REVERSE_V1_ENABLED = False
-                        state["_noise_reverse_v1_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ noise_reverse_v1 OFF"
-                    else:
-                        resp = (
-                            f"ℹ️ noise_reverse_v1 상태: {'ON' if NOISE_REVERSE_V1_ENABLED else 'OFF'}\n"
-                            "사용법: /noise_reverse_v1 on|off|status"
-                        )
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] noise_reverse_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
                 if (cmd in ("/wash_short_suite", "wash_short_suite", "wash_suite")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
@@ -15020,29 +15001,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] top_fail_short_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
-                if (cmd in ("/bull_pullback_long_v1", "bull_pullback_long_v1", "bull_pullback_long")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        BULL_PULLBACK_LONG_V1_ENABLED = True
-                        state["_bull_pullback_long_v1_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ bull_pullback_long_v1 ON"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        BULL_PULLBACK_LONG_V1_ENABLED = False
-                        state["_bull_pullback_long_v1_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ bull_pullback_long_v1 OFF"
-                    else:
-                        resp = (
-                            f"ℹ️ bull_pullback_long_v1 상태: {'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'}\n"
-                            "사용법: /bull_pullback_long_v1 on|off|status"
-                        )
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] bull_pullback_long_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/loss_hedge_engine", "loss_hedge_engine")) and not responded:
                     parts = lower.split()
@@ -16466,7 +16424,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /noise_reverse_v1 on|off|status, /wash_short_suite on|off|status, /top_fail_short_v1 on|off|status, /bull_pullback_long_v1 on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /wash_short_suite on|off|status, /top_fail_short_v1 on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):

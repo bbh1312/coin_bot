@@ -52,12 +52,17 @@ def load_common_universe(
                 tickers, min_quote_volume_usdt=min_quote_volume_usdt, top_n=top_n
             )
     elif universe_arg.startswith("top"):
-        if exchange is None:
-            return []
-        tickers = exchange.fetch_tickers()
-        universe = build_universe_from_tickers(
-            tickers, min_quote_volume_usdt=min_quote_volume_usdt, top_n=top_n
-        )
+        latest_path = os.path.join("logs", "common_universe", "latest.txt")
+        if cache_only and os.path.exists(latest_path):
+            with open(latest_path, "r", encoding="utf-8") as f:
+                universe = [line.strip() for line in f.read().splitlines() if line.strip()]
+        if not universe:
+            if exchange is None:
+                return []
+            tickers = exchange.fetch_tickers()
+            universe = build_universe_from_tickers(
+                tickers, min_quote_volume_usdt=min_quote_volume_usdt, top_n=top_n
+            )
         try:
             n = int(universe_arg.replace("top", ""))
             universe = universe[:n]
@@ -70,6 +75,8 @@ def load_common_universe(
         universe = build_universe_from_tickers(
             tickers, min_quote_volume_usdt=min_quote_volume_usdt, top_n=top_n
         )
+    # Restrict to USDT-margined symbols to avoid BadSymbol for non-USDT markets.
+    universe = [sym for sym in universe if sym.endswith("/USDT") or "/USDT:" in sym]
     return universe
 
 

@@ -321,6 +321,7 @@ def parse_args():
     p.add_argument("--time-stop-min", type=int, default=None)
     p.add_argument("--cooldown-bars", type=int, default=None)
     p.add_argument("--log-path", type=str, default="")
+    p.add_argument("--summary-only", action="store_true")
     p.add_argument("--no-btc-guard", action="store_true")
     p.add_argument("--btc-ema-len", type=int, default=20)
     p.add_argument("--btc-ema-guard-len", type=int, default=10)
@@ -705,23 +706,11 @@ def run_backtest():
 
         stats_by_symbol[sym] = sym_stats
 
-    for sym, s in stats_by_symbol.items():
-        trades = int(s["trades"])
-        wins = int(s["wins"])
-        losses = int(s["losses"])
-        winrate = (wins / trades * 100.0) if trades > 0 else 0.0
-        avg_mfe = s["mfe_sum"] / trades if trades > 0 else 0.0
-        avg_mae = s["mae_sum"] / trades if trades > 0 else 0.0
-        avg_hold = s["hold_sum"] / trades if trades > 0 else 0.0
-        net_sum = s["net_sum"]
-        tp_sum = s.get("tp_sum", 0.0)
-        sl_sum = s.get("sl_sum", 0.0)
-        net_sum_usdt = s.get("net_sum_usdt", 0.0)
-        tp_sum_usdt = s.get("tp_sum_usdt", 0.0)
-        sl_sum_usdt = s.get("sl_sum_usdt", 0.0)
-        line = format_backtest_summary(sym, s)
-        print(line)
-        _log(line)
+    if not args.summary_only:
+        for sym, s in stats_by_symbol.items():
+            line = format_backtest_summary(sym, s)
+            print(line)
+            _log(line)
 
     total_trades = int(stats["trades"])
     total_wins = int(stats["wins"])
@@ -736,8 +725,9 @@ def run_backtest():
     total_net_sum_usdt = stats.get("net_sum_usdt", 0.0)
     total_tp_sum_usdt = stats.get("tp_sum_usdt", 0.0)
     total_sl_sum_usdt = stats.get("sl_sum_usdt", 0.0)
-    print_trades_by_symbol(trades_out, _log)
-    print_time_summaries(trades_out, _log)
+    if not args.summary_only:
+        print_trades_by_symbol(trades_out, _log)
+        print_time_summaries(trades_out, _log)
     total_line = format_backtest_summary(None, stats)
     print(total_line)
     _log(total_line)
