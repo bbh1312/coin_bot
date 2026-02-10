@@ -2168,21 +2168,26 @@ def _hydrate_open_trade_meta(state: Dict[str, dict], now_ts: Optional[float] = N
                 cfg = None
             if cfg:
                 track = str(meta.get("track") or "").strip().lower()
-                tp_mult = cfg.tp_mult_weak if track == "weak" else cfg.tp_mult
-                if side == "SHORT":
-                    desired_tp = entry_px * float(tp_mult)
-                    cur_tp = meta.get("tp_price")
-                    invalid_tp = isinstance(cur_tp, (int, float)) and float(cur_tp) >= float(entry_px)
-                    if meta.get("tp_pct") is None or invalid_tp:
-                        meta["tp_price"] = desired_tp
-                        meta["tp_pct"] = (entry_px - desired_tp) / entry_px * 100.0
+                tp_atr = cfg.tp_atr_mult_weak if track == "weak" else cfg.tp_atr_mult
+                if tp_atr and tp_atr > 0:
+                    # ATR-based TP is resolved at signal time; avoid overriding here.
+                    pass
                 else:
-                    desired_tp = entry_px * (2.0 - float(tp_mult))
-                    cur_tp = meta.get("tp_price")
-                    invalid_tp = isinstance(cur_tp, (int, float)) and float(cur_tp) <= float(entry_px)
-                    if meta.get("tp_pct") is None or invalid_tp:
-                        meta["tp_price"] = desired_tp
-                        meta["tp_pct"] = (desired_tp - entry_px) / entry_px * 100.0
+                    tp_mult = cfg.tp_mult_weak if track == "weak" else cfg.tp_mult
+                    if side == "SHORT":
+                        desired_tp = entry_px * float(tp_mult)
+                        cur_tp = meta.get("tp_price")
+                        invalid_tp = isinstance(cur_tp, (int, float)) and float(cur_tp) >= float(entry_px)
+                        if meta.get("tp_pct") is None or invalid_tp:
+                            meta["tp_price"] = desired_tp
+                            meta["tp_pct"] = (entry_px - desired_tp) / entry_px * 100.0
+                    else:
+                        desired_tp = entry_px * (2.0 - float(tp_mult))
+                        cur_tp = meta.get("tp_price")
+                        invalid_tp = isinstance(cur_tp, (int, float)) and float(cur_tp) <= float(entry_px)
+                        if meta.get("tp_pct") is None or invalid_tp:
+                            meta["tp_price"] = desired_tp
+                            meta["tp_pct"] = (desired_tp - entry_px) / entry_px * 100.0
         tr["meta"] = meta
         changed = True
     return changed
@@ -6723,6 +6728,17 @@ def _close_trade(
                 pass
             if not tr.get("engine_label"):
                 tr["engine_label"] = _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
+            if (
+                side == "SHORT"
+                and reason == "auto_exit_sl"
+                and tr.get("engine_label") == "SR_PRO_SHORT_V1"
+            ):
+                try:
+                    sr_state = state.setdefault("_sr_pro_short_v1_state", {})
+                    sym_state = sr_state.setdefault(symbol, {})
+                    sym_state["cooldown_until"] = int(float(exit_ts) * 1000) + (60 * 60 * 1000)
+                except Exception:
+                    pass
             _update_report_csv(tr)
             return
     log.append(
@@ -8018,6 +8034,7 @@ def _run_sr_pro_short_v1_cycle(
         "no_data_mtf": 0,
         "no_data_htf": 0,
         "skip_stale_ts": 0,
+        "cooldown": 0,
     }
     _append_sr_pro_short_v1_log(
         f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}"
@@ -8040,6 +8057,16 @@ def _run_sr_pro_short_v1_cycle(
 
     sr_state = state.setdefault("_sr_pro_short_v1_state", {})
     symbols = list(sr_universe or [])
+    def _has_gap(df: pd.DataFrame, tf_ms: int, mult: float = 2.5) -> bool:
+        try:
+            if df is None or df.empty or len(df) < 3:
+                return False
+            diffs = df["ts"].diff().dropna()
+            if diffs.empty:
+                return False
+            return float(diffs.max()) > (tf_ms * mult)
+        except Exception:
+            return False
     for symbol in symbols:
         checked += 1
         df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch)
@@ -8057,6 +8084,35 @@ def _run_sr_pro_short_v1_cycle(
 
         df_3m_sig = df_3m.iloc[:-1]
         df_15m_sig = df_15m.iloc[:-1]
+        # refresh stale caches if last bar is too old
+        try:
+            now_ms = int(time.time() * 1000)
+            last_3m_ts = int(df_3m.iloc[-1]["ts"]) if not df_3m.empty else 0
+            last_15m_ts = int(df_15m.iloc[-1]["ts"]) if not df_15m.empty else 0
+            last_1h_ts = int(df_1h.iloc[-1]["ts"]) if not df_1h.empty else 0
+            if last_3m_ts and (now_ms - last_3m_ts) > (7 * 60 * 1000):
+                df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
+            if last_15m_ts and (now_ms - last_15m_ts) > (25 * 60 * 1000):
+                df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+            if last_1h_ts and (now_ms - last_1h_ts) > (70 * 60 * 1000):
+                df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+        except Exception:
+            pass
+
+        # refresh gaps inside series (missing bars)
+        try:
+            if _has_gap(df_3m, 3 * 60 * 1000):
+                df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
+                _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=3m")
+            if _has_gap(df_15m, 15 * 60 * 1000):
+                df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=15m")
+            if _has_gap(df_1h, 60 * 60 * 1000):
+                df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+                _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=1h")
+        except Exception:
+            pass
+
         df_1h_hist = df_1h.iloc[:-1]
         if len(df_3m_sig) < min_ltf or len(df_15m_sig) < min_mtf or len(df_1h_hist) < min_htf:
             no_data += 1
@@ -8074,6 +8130,10 @@ def _run_sr_pro_short_v1_cycle(
             gate_stats["skip_stale_ts"] += 1
             continue
         sym_state["last_eval_ts"] = latest_ts_ms
+        cd_until = sym_state.get("cooldown_until")
+        if isinstance(cd_until, (int, float)) and latest_ts_ms < int(cd_until):
+            gate_stats["cooldown"] += 1
+            continue
 
         # refresh zones if new 1h bar
         last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
@@ -8085,6 +8145,7 @@ def _run_sr_pro_short_v1_cycle(
 
         # current 1h bar (running)
         h1 = df_1h.iloc[-1]
+        h1_ts = int(h1["ts"]) if "ts" in h1 else 0
         h1_high = float(h1["high"])
         h1_low = float(h1["low"])
         h1_close = float(h1["close"])
@@ -8192,9 +8253,12 @@ def _run_sr_pro_short_v1_cycle(
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
                 sl_raw = nearest["top"] + (atr_now * float(cfg.sl_atr_mult))
-                sl_min = entry_px * (1.002 if break_type == "strong" else cfg.sl_min_weak)
-                sl_price = max(sl_raw, sl_min)
-                tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
+                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                tp_atr = cfg.tp_atr_mult_weak if break_type == "weak" else cfg.tp_atr_mult
+                if tp_atr and tp_atr > 0:
+                    tp_price = entry_px - (atr_now * float(tp_atr))
+                else:
+                    tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
 
                 if c3 < retest_level:
                     gate_stats["entry_by_pass_close"] += 1
@@ -8222,6 +8286,7 @@ def _run_sr_pro_short_v1_cycle(
                     _append_sr_pro_short_v1_log(
                         "SR_PRO_SIGNAL_CTX "
                         f"sym={symbol} "
+                        f"h1_ts={_iso_kst(h1_ts/1000) if h1_ts else 'NA'} "
                         f"h1_close={h1_close:.6f} h1_high={h1_high:.6f} h1_low={h1_low:.6f} "
                         f"dvf_norm={dvf_norm:.4f} "
                         f"zone_mid={nearest['mid']:.6f} zone_bot={nearest['bot']:.6f} zone_top={nearest['top']:.6f} "
@@ -15409,6 +15474,10 @@ def run():
 
                     # periodic gap repair for common warmup cache (non-blocking)
                     try:
+                        if not state.get("_common_gap_repair_once"):
+                            state["_common_gap_repair_ts"] = 0.0
+                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                            state["_common_gap_repair_once"] = True
                         _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
                     except Exception:
                         pass

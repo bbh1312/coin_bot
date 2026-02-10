@@ -39,9 +39,10 @@ class SrProShortV1Config:
     shallow_dvf_max: float = 0.0
     sl_buffer: float = 0.01
     sl_atr_mult: float = 0.5
+    tp_atr_mult: float = 0.0
+    tp_atr_mult_weak: float = 0.0
     tp_mult: float = 0.98
     tp_mult_weak: float = 0.98
-    sl_min_weak: float = 1.0015
 
 
 class SrProShortV1Engine(BaseEngine):

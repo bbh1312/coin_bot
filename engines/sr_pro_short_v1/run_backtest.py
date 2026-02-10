@@ -174,9 +174,10 @@ def run_backtest() -> None:
     parser.add_argument("--shallow-dvf-max", type=float, default=0.0)
     parser.add_argument("--sl-buffer", type=float, default=0.01)
     parser.add_argument("--sl-atr-mult", type=float, default=0.5)
+    parser.add_argument("--tp-atr-mult", type=float, default=0.0)
+    parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
     parser.add_argument("--tp-mult", type=float, default=0.98)
     parser.add_argument("--tp-mult-weak", type=float, default=0.98)
-    parser.add_argument("--sl-min-weak", type=float, default=1.0015)
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
@@ -197,6 +198,8 @@ def run_backtest() -> None:
         cluster_atr=args.cluster_atr,
         max_zones_per_side=args.max_zones_per_side,
         sl_buffer=args.sl_buffer,
+        tp_atr_mult=args.tp_atr_mult,
+        tp_atr_mult_weak=args.tp_atr_mult_weak,
         tp_mult=args.tp_mult,
     )
 
@@ -343,6 +346,7 @@ def run_backtest() -> None:
     }
 
     entries_by_day: Dict[str, int] = {}
+    cooldown_until: Dict[str, int] = {}
 
     for sym, frames in data.items():
         df_3m = frames["3m"]
@@ -526,6 +530,9 @@ def run_backtest() -> None:
             ts = int(ts_3m[i3])
             if ts < eval_start_ms:
                 continue
+            cd_until = cooldown_until.get(sym)
+            if isinstance(cd_until, int) and ts < cd_until:
+                continue
 
             # resolve current 1h bar index
             idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
@@ -587,6 +594,7 @@ def run_backtest() -> None:
                             "exit_ts": ts,
                         }
                     )
+                    cooldown_until[sym] = ts + (60 * 60 * 1000)
                     trade = None
                 elif low_i <= trade["tp_price"]:
                     exit_px = trade["tp_price"]
@@ -763,8 +771,12 @@ def run_backtest() -> None:
                         if high_now > nearest.top:
                             continue
                         sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
-                        sl_price = max(sl_raw, entry_px * 1.002)
-                        tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
+                        sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                        tp_atr = float(args.tp_atr_mult_weak) if (not strong_break and float(args.tp_atr_mult_weak) > 0) else float(args.tp_atr_mult)
+                        if tp_atr > 0:
+                            tp_price = entry_px - (atr_now * tp_atr)
+                        else:
+                            tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
                         trade = {
                             "entry_px": entry_px,
                             "sl_price": sl_price,
@@ -802,10 +814,13 @@ def run_backtest() -> None:
                                 gate_counts["retest_pass_low"] += 1
                             entry_px = float(df_3m.at[i3 + 1, "open"])
                             nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
-                            sl_raw = nearest.top * (1.0 + cfg.sl_buffer)
-                            sl_min = entry_px * (1.002 if strong_break else float(args.sl_min_weak))
-                            sl_price = max(sl_raw, sl_min)
-                            tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
+                            sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
+                            sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                            tp_atr = float(args.tp_atr_mult_weak) if (not strong_break and float(args.tp_atr_mult_weak) > 0) else float(args.tp_atr_mult)
+                            if tp_atr > 0:
+                                tp_price = entry_px - (atr_now * tp_atr)
+                            else:
+                                tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
                             trade = {
                                 "entry_px": entry_px,
                                 "sl_price": sl_price,
@@ -844,10 +859,13 @@ def run_backtest() -> None:
                                 if wick_ratio <= float(args.shallow_wick_max):
                                     entry_px = float(df_3m.at[i3 + 1, "open"])
                                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
-                                    sl_raw = nearest.top * (1.0 + cfg.sl_buffer)
-                                    sl_min = entry_px * float(args.sl_min_weak)
-                                    sl_price = max(sl_raw, sl_min)
-                                    tp_price = entry_px * float(args.tp_mult_weak)
+                                    sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
+                                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                                    tp_atr = float(args.tp_atr_mult_weak) if float(args.tp_atr_mult_weak) > 0 else float(args.tp_atr_mult)
+                                    if tp_atr > 0:
+                                        tp_price = entry_px - (atr_now * tp_atr)
+                                    else:
+                                        tp_price = entry_px * float(args.tp_mult_weak)
                                     trade = {
                                         "entry_px": entry_px,
                                         "sl_price": sl_price,
