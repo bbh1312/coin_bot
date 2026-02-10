@@ -340,24 +340,44 @@ def run_backtest() -> None:
 
         zones: List[Zone] = []
 
-        # build zones from full 1h history first (pivot-based)
+        def _pivot_confirmed(series: pd.Series, i: int, lb: int, mode: str) -> Optional[float]:
+            pivot_idx = i - lb
+            if pivot_idx < lb or pivot_idx + lb >= len(series):
+                return None
+            window = series.iloc[pivot_idx - lb : pivot_idx + lb + 1]
+            val = series.iloc[pivot_idx]
+            if mode == "high":
+                return float(val) if float(val) == float(window.max()) else None
+            return float(val) if float(val) == float(window.min()) else None
+
+        # build zones from full 1h history first (TradingView pivot confirmed style)
         zone_end_idx = len(df_1h)
         if args.freeze_zones:
             zone_end_idx = int(np.searchsorted(df_1h["ts"].values, eval_start_ms, side="right"))
         for i1 in range(zone_end_idx):
             lb = cfg.lookback
-            ph = _pivot_high(high_1h, lb, lb, i1)
-            pl = _pivot_low(low_1h, lb, lb, i1)
+            ph = _pivot_confirmed(high_1h, i1, lb, "high")
+            pl = _pivot_confirmed(low_1h, i1, lb, "low")
             lb_used = lb
             if cfg.auto_relax and ph is None and pl is None:
                 lb2 = cfg.relaxed_lookback
-                ph = _pivot_high(high_1h, lb2, lb2, i1)
-                pl = _pivot_low(low_1h, lb2, lb2, i1)
+                ph = _pivot_confirmed(high_1h, i1, lb2, "high")
+                pl = _pivot_confirmed(low_1h, i1, lb2, "low")
                 lb_used = lb2
             if ph is None and pl is None:
+                if i1 % 20 == 0:
+                    for side in (1, -1):
+                        side_z = [z for z in zones if z.side == side]
+                        if len(side_z) > cfg.max_zones_per_side:
+                            oldest = min(side_z, key=lambda z: z.born)
+                            zones.remove(oldest)
+                continue
+            pivot_bar = i1 - lb_used
+            if pivot_bar < 0:
                 continue
             half_w = float(atr_1h.iloc[i1]) * cfg.atr_mult * 0.5
             cluster_dist = float(atr_1h.iloc[i1]) * cfg.cluster_atr
+            vol_val = float(dvf.iloc[pivot_bar]) if pivot_bar < len(dvf) else float(dvf.iloc[i1])
 
             def merge_or_create(side: int, level: float, vol_val: float) -> None:
                 merged = False
@@ -379,21 +399,22 @@ def run_backtest() -> None:
                             side=side,
                             live=True,
                             born=i1,
-                            start=i1,
+                            start=pivot_bar,
                             vol=vol_val,
                         )
                     )
 
             if ph is not None:
-                merge_or_create(1, ph, float(dvf.iloc[i1]))
+                merge_or_create(1, float(ph), vol_val)
             if pl is not None:
-                merge_or_create(-1, pl, float(dvf.iloc[i1]))
+                merge_or_create(-1, float(pl), vol_val)
 
-            for side in (1, -1):
-                side_z = [z for z in zones if z.side == side]
-                if len(side_z) > cfg.max_zones_per_side:
-                    oldest = min(side_z, key=lambda z: z.born)
-                    zones.remove(oldest)
+            if i1 % 20 == 0:
+                for side in (1, -1):
+                    side_z = [z for z in zones if z.side == side]
+                    if len(side_z) > cfg.max_zones_per_side:
+                        oldest = min(side_z, key=lambda z: z.born)
+                        zones.remove(oldest)
 
         # map 1h index by ts for fast lookup
         ts_1h = df_1h["ts"].values

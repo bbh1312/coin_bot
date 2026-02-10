@@ -2983,6 +2983,7 @@ def _sr_pro_pivot(series: pd.Series, idx: int, left: int, right: int, mode: str)
     return float(val) if float(val) == float(window.min()) else None
 
 def _sr_pro_build_zones(df_1h_hist: pd.DataFrame, cfg: SrProShortV1Config) -> list:
+    """TradingView S/R Pro 존 생성 로직(존 무효화는 아직 미적용)."""
     if df_1h_hist is None or df_1h_hist.empty:
         return []
     close = df_1h_hist["close"].astype(float)
@@ -2997,21 +2998,46 @@ def _sr_pro_build_zones(df_1h_hist: pd.DataFrame, cfg: SrProShortV1Config) -> li
     dv = pd.Series(dv, index=df_1h_hist.index)
     dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
 
+    def _pivot_confirmed(series: pd.Series, i: int, lb: int, mode: str) -> Optional[float]:
+        pivot_idx = i - lb
+        if pivot_idx < lb or pivot_idx + lb >= len(series):
+            return None
+        window = series.iloc[pivot_idx - lb : pivot_idx + lb + 1]
+        val = series.iloc[pivot_idx]
+        if mode == "high":
+            return float(val) if float(val) == float(window.max()) else None
+        return float(val) if float(val) == float(window.min()) else None
+
     zones = []
     for i in range(len(df_1h_hist)):
         lb = cfg.lookback
-        ph = _sr_pro_pivot(high, i, lb, lb, "high")
-        pl = _sr_pro_pivot(low, i, lb, lb, "low")
+        ph1 = _pivot_confirmed(high, i, lb, "high")
+        pl1 = _pivot_confirmed(low, i, lb, "low")
+        ph = ph1
+        pl = pl1
+        lb_used = lb
         if cfg.auto_relax and ph is None and pl is None:
             lb2 = cfg.relaxed_lookback
-            ph = _sr_pro_pivot(high, i, lb2, lb2, "high")
-            pl = _sr_pro_pivot(low, i, lb2, lb2, "low")
+            ph = _pivot_confirmed(high, i, lb2, "high")
+            pl = _pivot_confirmed(low, i, lb2, "low")
+            lb_used = lb2
         if ph is None and pl is None:
+            if i % 20 == 0:
+                for side in (1, -1):
+                    side_z = [z for z in zones if z["side"] == side]
+                    if len(side_z) > cfg.max_zones_per_side:
+                        oldest = min(side_z, key=lambda z: z["born"])
+                        zones.remove(oldest)
+            continue
+
+        pivot_bar = i - lb_used
+        if pivot_bar < 0:
             continue
         half_w = float(atr.iloc[i]) * cfg.atr_mult * 0.5
         cluster_dist = float(atr.iloc[i]) * cfg.cluster_atr
+        vol_val = float(dvf.iloc[pivot_bar]) if pivot_bar < len(dvf) else float(dvf.iloc[i])
 
-        def merge_or_create(side: int, level: float, vol_val: float) -> None:
+        def merge_or_create(side: int, level: float) -> None:
             for z in zones:
                 if z["side"] == side and abs(z["mid"] - level) <= cluster_dist:
                     new_mid = (z["mid"] + level) * 0.5
@@ -3028,19 +3054,21 @@ def _sr_pro_build_zones(df_1h_hist: pd.DataFrame, cfg: SrProShortV1Config) -> li
                     "side": side,
                     "vol": vol_val,
                     "born": i,
+                    "start": pivot_bar,
                 }
             )
 
         if ph is not None:
-            merge_or_create(1, ph, float(dvf.iloc[i]))
+            merge_or_create(1, float(ph))
         if pl is not None:
-            merge_or_create(-1, pl, float(dvf.iloc[i]))
+            merge_or_create(-1, float(pl))
 
-        for side in (1, -1):
-            side_z = [z for z in zones if z["side"] == side]
-            if len(side_z) > cfg.max_zones_per_side:
-                oldest = min(side_z, key=lambda z: z["born"])
-                zones.remove(oldest)
+        if i % 20 == 0:
+            for side in (1, -1):
+                side_z = [z for z in zones if z["side"] == side]
+                if len(side_z) > cfg.max_zones_per_side:
+                    oldest = min(side_z, key=lambda z: z["born"])
+                    zones.remove(oldest)
     return zones
 
 def _iso_kst(ts: Optional[float] = None) -> str:
