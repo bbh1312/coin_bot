@@ -8950,6 +8950,9 @@ def _run_sr_pro_short_v1_cycle(
         if not (h15_0 < h15_1 or h15_1 < h15_2):
             gate_stats["lh_15m"] += 1
             continue
+        if not (float(df_15m_sig.iloc[-1]["close"]) < float(df_15m_sig.iloc[-1]["open"])):
+            gate_stats["lh_15m"] += 1
+            continue
 
         # 3m break
         if len(df_3m_sig) < 4:

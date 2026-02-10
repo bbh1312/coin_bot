@@ -712,6 +712,10 @@ def run_backtest() -> None:
                 if args.log_gates:
                     gate_counts["lh_15m"] += 1
                 continue
+            if not (float(df_15m.at[idx_15m, "close"]) < float(df_15m.at[idx_15m, "open"])):
+                if args.log_gates:
+                    gate_counts["lh_15m"] += 1
+                continue
 
             # 3m structure break: close < min(low[-3:])
             close_now = float(df_3m.at[i3, "close"])
