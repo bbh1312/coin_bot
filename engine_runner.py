@@ -1956,7 +1956,7 @@ def _warmup_common_cache(state: dict, exchange, universe: list) -> bool:
                 pass
     return done_all
 
-def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list) -> None:
+def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list, force_full: bool = False) -> None:
     if not COMMON_GAP_REPAIR_ENABLED:
         return
     if not universe:
@@ -1969,12 +1969,23 @@ def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list) -> N
     except Exception:
         now = time.time()
         last_ts = 0.0
-    if COMMON_GAP_REPAIR_INTERVAL_SEC > 0 and (now - last_ts) < COMMON_GAP_REPAIR_INTERVAL_SEC:
+    if not force_full and COMMON_GAP_REPAIR_INTERVAL_SEC > 0 and (now - last_ts) < COMMON_GAP_REPAIR_INTERVAL_SEC:
         return
     state["_common_gap_repair_ts"] = now
     checked = 0
     candidates = 0
     repaired = 0
+    max_fetch = 0 if force_full else COMMON_GAP_REPAIR_MAX_FETCH
+    tf_stale_ms = {
+        "1m": 3 * 60 * 1000,
+        "3m": 6 * 60 * 1000,
+        "5m": 12 * 60 * 1000,
+        "15m": 20 * 60 * 1000,
+        "1h": 70 * 60 * 1000,
+        "4h": 5 * 60 * 60 * 1000,
+        "1d": 36 * 60 * 60 * 1000,
+    }
+    now_ms = int(time.time() * 1000)
     for sym in universe:
         for tf in COMMON_WARMUP_TFS:
             checked += 1
@@ -1987,7 +1998,10 @@ def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list) -> N
             file_ts = _read_warmup_ts(sym, tf)
             file_has = isinstance(file_ts, list) and len(file_ts) >= limit
             file_gap = _has_time_gaps_ts(file_ts, tf, tail=limit) if file_has else True
-            if not file_has or file_gap:
+            last_ts = int(file_ts[-1]) if file_has else 0
+            stale_ms = tf_stale_ms.get(tf, 0)
+            file_stale = bool(stale_ms and last_ts and (now_ms - last_ts) > stale_ms)
+            if (not file_has) or file_gap or file_stale:
                 candidates += 1
                 try:
                     data = _fetch_ohlcv_range(exchange, sym, tf, limit)
@@ -1998,23 +2012,23 @@ def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list) -> N
                         if COMMON_WARMUP_LOG_PATH:
                             _append_log_lines(
                                 COMMON_WARMUP_LOG_PATH,
-                                [f"GAP_REPAIR_OK sym={sym} tf={tf} bars={len(data)} need={limit}"],
+                                [f"GAP_REPAIR_OK sym={sym} tf={tf} bars={len(data)} need={limit} stale={int(file_stale)}"],
                             )
                     else:
                         if COMMON_WARMUP_LOG_PATH:
                             _append_log_lines(
                                 COMMON_WARMUP_LOG_PATH,
-                                [f"GAP_REPAIR_EMPTY sym={sym} tf={tf} need={limit}"],
+                                [f"GAP_REPAIR_EMPTY sym={sym} tf={tf} need={limit} stale={int(file_stale)}"],
                             )
                 except Exception as e:
                     if COMMON_WARMUP_LOG_PATH:
                         _append_log_lines(
                             COMMON_WARMUP_LOG_PATH,
-                            [f"GAP_REPAIR_FAIL sym={sym} tf={tf} err={e}"],
+                            [f"GAP_REPAIR_FAIL sym={sym} tf={tf} err={e} stale={int(file_stale)}"],
                         )
-                if COMMON_GAP_REPAIR_MAX_FETCH > 0 and repaired >= COMMON_GAP_REPAIR_MAX_FETCH:
+                if max_fetch > 0 and repaired >= max_fetch:
                     break
-        if COMMON_GAP_REPAIR_MAX_FETCH > 0 and repaired >= COMMON_GAP_REPAIR_MAX_FETCH:
+        if max_fetch > 0 and repaired >= max_fetch:
             break
     if repaired:
         print(f"[common-gap] repaired {repaired}/{candidates} checked={checked}")
@@ -14720,6 +14734,7 @@ def run():
         state.pop("_common_warmup_idx", None)
         state.pop("_common_warmup_ts_logged", None)
         state.pop("_common_warmup_progress_ts", None)
+        state["_common_gap_repair_force"] = True
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     global COMMON_UNIVERSE_LOG_PATH, COMMON_WARMUP_LOG_PATH, LIVE_OHLCV_SNAPSHOT_DIR
     try:
@@ -15420,6 +15435,21 @@ def run():
                             swaggy_cfg = SwaggyNoAtlasConfig()
 
                     # common OHLCV warmup (block engine run until ready)
+                    try:
+                        now_kst = _kst_now()
+                        today_kst = now_kst.strftime("%Y-%m-%d")
+                        if now_kst.hour == 9 and now_kst.minute < 5:
+                            last_daily = state.get("_common_warmup_daily_day")
+                            if last_daily != today_kst:
+                                _reset_common_warmup_state(state)
+                                COMMON_WARMUP_DONE = False
+                                state["_common_warmup_done"] = False
+                                state["_common_warmup_env_logged"] = False
+                                state["_common_warmup_daily_day"] = today_kst
+                                state["_common_gap_repair_force"] = True
+                                print("[common-warmup] daily refresh triggered (KST 09:00)")
+                    except Exception:
+                        pass
                     if not COMMON_WARMUP_DONE:
                         if not state.get("_common_warmup_env_logged"):
                             try:
@@ -15456,7 +15486,9 @@ def run():
                         already_today = False
                         if isinstance(meta, dict):
                             already_today = bool(meta.get("common_warmup_notified")) and meta.get("common_warmup_notified_day") == today_kst
-                        if (not already_today) and not recently_notified:
+                        gap_inflight = bool(state.get("_common_gap_repair_inflight"))
+                        gap_forced = bool(state.get("_common_gap_repair_force"))
+                        if (not already_today) and not recently_notified and not gap_inflight and not gap_forced:
                             try:
                                 start_ts = float(state.get("_common_warmup_start_ts") or state.get("_startup_ts") or time.time())
                                 elapsed = max(0, time.time() - start_ts)
@@ -15474,12 +15506,21 @@ def run():
 
                     # periodic gap repair for common warmup cache (non-blocking)
                     try:
-                        if not state.get("_common_gap_repair_once"):
+                        if state.get("_common_gap_repair_force"):
                             state["_common_gap_repair_ts"] = 0.0
-                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                            state["_common_gap_repair_inflight"] = True
+                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe, force_full=True)
+                            state["_common_gap_repair_force"] = False
                             state["_common_gap_repair_once"] = True
-                        _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                            state["_common_gap_repair_inflight"] = False
+                        else:
+                            if not state.get("_common_gap_repair_once"):
+                                state["_common_gap_repair_ts"] = 0.0
+                                _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                                state["_common_gap_repair_once"] = True
+                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
                     except Exception:
+                        state["_common_gap_repair_inflight"] = False
                         pass
 
                     if heavy_scan:

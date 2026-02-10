@@ -19,13 +19,13 @@ class SrProShortV1Config:
     max_zones_per_side: int = 8
     touch_mode: str = "bot"
     touch_use_close: bool = False
-    dvf_norm_max: float = 0.0
+    dvf_norm_max: float = -0.2
     require_reject_close: bool = False
     reject_mode: str = "bot"
     reject_source: str = "1h"
     ema200_filter: bool = True
     ema_filter_len: int = 200
-    total_window_days: int = 10
+    total_window_days: int = 14
     rolling_zones: bool = True
     retest_bars: int = 6
     retest_atr_mult: float = 0.25
