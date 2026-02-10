@@ -17,8 +17,27 @@ class SrProShortV1Config:
     delta_len: int = 2
     cluster_atr: float = 1.5
     max_zones_per_side: int = 8
-    sl_buffer: float = 0.006
-    tp_mult: float = 0.976
+    touch_mode: str = "bot"
+    touch_use_close: bool = False
+    dvf_norm_max: float = 0.0
+    require_reject_close: bool = False
+    reject_mode: str = "bot"
+    reject_source: str = "1h"
+    ema200_filter: bool = False
+    retest_bars: int = 6
+    retest_atr_mult: float = 0.25
+    retest_near_atr_mult: float = 0.15
+    retest_wick_max: float = 0.4
+    retest_dyn: bool = False
+    retest_dyn_th: float = 0.6
+    retest_dyn_bars: int = 10
+    shallow_atr_mult: float = 0.35
+    shallow_wick_max: float = 0.35
+    shallow_dvf_max: float = 0.0
+    sl_buffer: float = 0.01
+    tp_mult: float = 0.985
+    tp_mult_weak: float = 0.985
+    sl_min_weak: float = 1.0015
 
 
 class SrProShortV1Engine(BaseEngine):

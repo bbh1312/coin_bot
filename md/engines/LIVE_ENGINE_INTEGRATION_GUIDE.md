@@ -36,6 +36,10 @@
 - 웹 UI 토글 추가 (`web_app/app.py`, `index.html`)
 - `/status`에 엔진 상태 표시
 
+## 6-1) 관리모드(관리 큐) 연결
+- `engine_runner.py`의 `_process_manage_queue()` 내 `allowed_engines`에 엔진 라벨 추가
+- 관리모드에서 `engine_removed`로 스킵되면 이 목록 누락이 원인
+
 ## 7) 엔진 라벨 매핑
 - `_engine_label_from_reason`
 - `_reason_from_engine_label`
@@ -51,6 +55,10 @@
 - 심볼별 요약 + TOTAL 요약
 - 필요 시 시간대/요일 요약 추가
 
+## 9-1) 실매매 로그 경로
+- 엔진별 로그는 `logs/<engine_name>/<engine_name>-YYYY-MM-DD.log`
+- 실매매 사이클 로그는 `*_CYCLE_START/END`, 신호 로그는 `*_SIGNAL` 형식으로 기록
+
 ## 10) 실매매 연결 체크리스트
 - 엔진 기본 설정값이 실매매 기준으로 고정되어 있는지 확인
 - 확정봉 기준이 백테스트와 동일한지 확인 (이전봉 사용)
@@ -64,6 +72,7 @@
 - `/status`에 엔진 상태/공통 워밍업 상태가 표시되는지 확인
 - 엔진 라벨 매핑이 등록되어 있는지 확인
 - 팔로워 계정 동기화(엔트리/청산) 동작 확인
+- 관리모드에서 엔진 요청이 `engine_removed`로 스킵되지 않는지 확인
 
 ## 참고 문서
 - `md/engines/BACKTEST_GUIDE_COMMON.md`

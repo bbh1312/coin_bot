@@ -97,6 +97,7 @@ try:
         HodFailShortV1Config,
         hod_fail_short_entry_signal,
     )
+    from engines.sr_pro_short_v1.engine import SrProShortV1Config
     BullPullbackLongConfig = None
 except Exception as _import_err:
     SwaggyEngine = None
@@ -112,6 +113,7 @@ except Exception as _import_err:
     top_fail_short_entry_signal = None
     HodFailShortV1Config = None
     hod_fail_short_entry_signal = None
+    SrProShortV1Config = None
     BullPullbackLongConfig = None
     AtlasRsFailShortEngine = None
     AtlasRsFailShortConfig = None
@@ -633,6 +635,8 @@ def _realtime_only_required() -> bool:
         return True
     if WASH_SHORT_SUITE_ENABLED:
         return True
+    if SR_PRO_SHORT_V1_ENABLED:
+        return True
     if BULL_PULLBACK_LONG_V1_ENABLED:
         return True
     if ST_FLIP_V1_ENABLED or ST_FLIP_ALERT_ONLY:
@@ -1098,6 +1102,7 @@ TOP_FAIL_SHORT_V1_ENABLED = os.getenv("TOP_FAIL_SHORT_V1_ENABLED", "0") == "1"
 TOP_FAIL_SHORT_USE_CONFIRMED = True
 HOD_FAIL_SHORT_V1_ENABLED = os.getenv("HOD_FAIL_SHORT_V1_ENABLED", "0") == "1"
 HOD_FAIL_SHORT_V1_USE_CONFIRMED = True
+SR_PRO_SHORT_V1_ENABLED = os.getenv("SR_PRO_SHORT_V1_ENABLED", "0") == "1"
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = os.getenv("SRP_ST_REGIME_PULLBACK_V1_ENABLED", "0") == "1"
 WASH_SHORT_SUITE_ENABLED = os.getenv("WASH_SHORT_SUITE_ENABLED", "0") == "1"
 WASH_SHORT_SUITE_BTC_EMA_LEN = int(os.getenv("WASH_SHORT_SUITE_BTC_EMA_LEN", "20"))
@@ -1351,7 +1356,7 @@ COMMON_UNIVERSE: list = []
 COMMON_UNIVERSE_READY = False
 COMMON_WARMUP_DONE = False
 COMMON_WARMUP_DAYS = int(os.getenv("COMMON_WARMUP_DAYS", "1"))
-COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m,3m").split(",") if tf.strip())
+COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m,3m,15m,1h").split(",") if tf.strip())
 COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "30"))
 COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "false", "off", "no")
 COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
@@ -2205,6 +2210,28 @@ def _hydrate_open_trade_meta(state: Dict[str, dict], now_ts: Optional[float] = N
                             meta["sl_pct"] = (meta.get("sl_price") - entry_px) / entry_px * 100.0
             except Exception:
                 pass
+        if engine_label == "SR_PRO_SHORT_V1" and entry_px:
+            try:
+                cfg = SrProShortV1Config()
+            except Exception:
+                cfg = None
+            if cfg:
+                track = str(meta.get("track") or "").strip().lower()
+                tp_mult = cfg.tp_mult_weak if track == "weak" else cfg.tp_mult
+                if side == "SHORT":
+                    desired_tp = entry_px * float(tp_mult)
+                    cur_tp = meta.get("tp_price")
+                    invalid_tp = isinstance(cur_tp, (int, float)) and float(cur_tp) >= float(entry_px)
+                    if meta.get("tp_pct") is None or invalid_tp:
+                        meta["tp_price"] = desired_tp
+                        meta["tp_pct"] = (entry_px - desired_tp) / entry_px * 100.0
+                else:
+                    desired_tp = entry_px * (2.0 - float(tp_mult))
+                    cur_tp = meta.get("tp_price")
+                    invalid_tp = isinstance(cur_tp, (int, float)) and float(cur_tp) <= float(entry_px)
+                    if meta.get("tp_pct") is None or invalid_tp:
+                        meta["tp_price"] = desired_tp
+                        meta["tp_pct"] = (desired_tp - entry_px) / entry_px * 100.0
         tr["meta"] = meta
         changed = True
     return changed
@@ -2939,6 +2966,82 @@ def _append_hod_fail_short_v1_log(line: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("hod_fail_short_v1", f"hod_fail_short_v1-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
+
+def _append_sr_pro_short_v1_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("sr_pro_short_v1", f"sr_pro_short_v1-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
+def _sr_pro_pivot(series: pd.Series, idx: int, left: int, right: int, mode: str) -> Optional[float]:
+    if idx - left < 0 or idx + right >= len(series):
+        return None
+    window = series.iloc[idx - left : idx + right + 1]
+    val = series.iloc[idx]
+    if mode == "high":
+        return float(val) if float(val) == float(window.max()) else None
+    return float(val) if float(val) == float(window.min()) else None
+
+def _sr_pro_build_zones(df_1h_hist: pd.DataFrame, cfg: SrProShortV1Config) -> list:
+    if df_1h_hist is None or df_1h_hist.empty:
+        return []
+    close = df_1h_hist["close"].astype(float)
+    open_ = df_1h_hist["open"].astype(float)
+    high = df_1h_hist["high"].astype(float)
+    low = df_1h_hist["low"].astype(float)
+    vol = df_1h_hist["volume"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    dv = np.where(close > open_, vol, np.where(close < open_, -vol, 0.0))
+    dv = pd.Series(dv, index=df_1h_hist.index)
+    dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
+
+    zones = []
+    for i in range(len(df_1h_hist)):
+        lb = cfg.lookback
+        ph = _sr_pro_pivot(high, i, lb, lb, "high")
+        pl = _sr_pro_pivot(low, i, lb, lb, "low")
+        if cfg.auto_relax and ph is None and pl is None:
+            lb2 = cfg.relaxed_lookback
+            ph = _sr_pro_pivot(high, i, lb2, lb2, "high")
+            pl = _sr_pro_pivot(low, i, lb2, lb2, "low")
+        if ph is None and pl is None:
+            continue
+        half_w = float(atr.iloc[i]) * cfg.atr_mult * 0.5
+        cluster_dist = float(atr.iloc[i]) * cfg.cluster_atr
+
+        def merge_or_create(side: int, level: float, vol_val: float) -> None:
+            for z in zones:
+                if z["side"] == side and abs(z["mid"] - level) <= cluster_dist:
+                    new_mid = (z["mid"] + level) * 0.5
+                    z["mid"] = new_mid
+                    z["top"] = new_mid + half_w
+                    z["bot"] = new_mid - half_w
+                    z["vol"] = (z["vol"] + vol_val) * 0.5
+                    return
+            zones.append(
+                {
+                    "mid": level,
+                    "top": level + half_w,
+                    "bot": level - half_w,
+                    "side": side,
+                    "vol": vol_val,
+                    "born": i,
+                }
+            )
+
+        if ph is not None:
+            merge_or_create(1, ph, float(dvf.iloc[i]))
+        if pl is not None:
+            merge_or_create(-1, pl, float(dvf.iloc[i]))
+
+        for side in (1, -1):
+            side_z = [z for z in zones if z["side"] == side]
+            if len(side_z) > cfg.max_zones_per_side:
+                oldest = min(side_z, key=lambda z: z["born"])
+                zones.remove(oldest)
+    return zones
 
 def _iso_kst(ts: Optional[float] = None) -> str:
     tz = timezone(timedelta(hours=9))
@@ -7190,6 +7293,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "TOP_FAIL_SHORT_V1"
     if key in ("hod_fail_short_v1", "hod_fail_short"):
         return "HOD_FAIL_SHORT_V1"
+    if key in ("sr_pro_short_v1", "sr_pro_short"):
+        return "SR_PRO_SHORT_V1"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -7216,6 +7321,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "top_fail_short_v1"
     if label == "HOD_FAIL_SHORT_V1":
         return "hod_fail_short_v1"
+    if label == "SR_PRO_SHORT_V1":
+        return "sr_pro_short_v1"
     if label == "SCALP":
         return "long_entry"
     if label == "MANUAL":
@@ -7242,6 +7349,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "WASH_SHORT_SUITE": "워시숏슈트",
         "TOP_FAIL_SHORT_V1": "탑페일숏v1",
         "HOD_FAIL_SHORT_V1": "고점실패숏v1",
+        "SR_PRO_SHORT_V1": "SR프로숏v1",
     }
     return overrides.get(name, name)
 
@@ -7277,6 +7385,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return TOP_FAIL_SHORT_V1_ENABLED
     if key == "HOD_FAIL_SHORT_V1":
         return HOD_FAIL_SHORT_V1_ENABLED
+    if key == "SR_PRO_SHORT_V1":
+        return SR_PRO_SHORT_V1_ENABLED
     if key == "BULL_PULLBACK_LONG_V1":
         return BULL_PULLBACK_LONG_V1_ENABLED
     if key in ("RSI", "SCALP"):
@@ -8669,6 +8779,267 @@ def _run_dtfx_cycle(
         time.sleep(PER_SYMBOL_SLEEP)
     _set_thread_log_buffer(None)
     result["log"] = buf
+    return result
+
+def _run_sr_pro_short_v1_cycle(
+    sr_universe,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"entries": 0}
+    if not SR_PRO_SHORT_V1_ENABLED or not sr_universe or SrProShortV1Config is None:
+        return result
+    cfg = SrProShortV1Config()
+    start_ts = time.time()
+    checked = 0
+    no_data = 0
+    gate_stats = {
+        "zone_touch": 0,
+        "lh_15m": 0,
+        "break_3m": 0,
+        "retest_seen": 0,
+        "entry_by_pass_close": 0,
+        "entry_by_pass_low": 0,
+        "no_data_ltf": 0,
+        "no_data_mtf": 0,
+        "no_data_htf": 0,
+        "skip_stale_ts": 0,
+    }
+    _append_sr_pro_short_v1_log(
+        f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}"
+    )
+    try:
+        print(f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}")
+    except Exception:
+        pass
+
+    tf_ltf = cfg.tf_ltf
+    tf_mtf = cfg.tf_mtf
+    tf_htf = cfg.tf_htf
+    min_ltf = 120
+    min_mtf = 120
+    min_htf = max(cfg.lookback * 2 + 50, 220)
+    min_ltf_fetch = min_ltf + 1
+    min_mtf_fetch = min_mtf + 1
+    min_htf_fetch = min_htf + 1
+
+    sr_state = state.setdefault("_sr_pro_short_v1_state", {})
+    symbols = list(sr_universe or [])
+    for symbol in symbols:
+        checked += 1
+        df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch)
+        df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch)
+        df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch)
+        if df_3m.empty or df_15m.empty or df_1h.empty:
+            no_data += 1
+            if df_3m.empty:
+                gate_stats["no_data_ltf"] += 1
+            if df_15m.empty:
+                gate_stats["no_data_mtf"] += 1
+            if df_1h.empty:
+                gate_stats["no_data_htf"] += 1
+            continue
+
+        df_3m_sig = df_3m.iloc[:-1]
+        df_15m_sig = df_15m.iloc[:-1]
+        df_1h_hist = df_1h.iloc[:-1]
+        if len(df_3m_sig) < min_ltf or len(df_15m_sig) < min_mtf or len(df_1h_hist) < min_htf:
+            no_data += 1
+            if len(df_3m_sig) < min_ltf:
+                gate_stats["no_data_ltf"] += 1
+            if len(df_15m_sig) < min_mtf:
+                gate_stats["no_data_mtf"] += 1
+            if len(df_1h_hist) < min_htf:
+                gate_stats["no_data_htf"] += 1
+            continue
+
+        sym_state = sr_state.setdefault(symbol, {})
+        latest_ts_ms = int(df_3m.iloc[-1]["ts"])
+        if sym_state.get("last_eval_ts") == latest_ts_ms:
+            gate_stats["skip_stale_ts"] += 1
+            continue
+        sym_state["last_eval_ts"] = latest_ts_ms
+
+        # refresh zones if new 1h bar
+        last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
+        if sym_state.get("zones_ts") != last_1h_hist_ts:
+            zones = _sr_pro_build_zones(df_1h_hist, cfg)
+            sym_state["zones"] = zones
+            sym_state["zones_ts"] = last_1h_hist_ts
+        zones = sym_state.get("zones") or []
+
+        # current 1h bar (running)
+        h1 = df_1h.iloc[-1]
+        h1_high = float(h1["high"])
+        h1_low = float(h1["low"])
+        h1_close = float(h1["close"])
+
+        # dvf_norm from 1h (running)
+        close_1h = df_1h["close"].astype(float)
+        open_1h = df_1h["open"].astype(float)
+        vol_1h = df_1h["volume"].astype(float)
+        dv = np.where(close_1h > open_1h, vol_1h, np.where(close_1h < open_1h, -vol_1h, 0.0))
+        dv = pd.Series(dv, index=df_1h.index)
+        dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
+        vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
+        dvf_norm = float(dvf.iloc[-1]) / float(vol_ema.iloc[-1]) if float(vol_ema.iloc[-1]) > 0 else 0.0
+
+        touch_level = "mid" if cfg.touch_mode == "mid" else "bot"
+        h1_touch_px = h1_close if cfg.touch_use_close else h1_high
+        # filter zones by break (avoid already broken)
+        resist_candidates = [
+            z for z in zones
+            if z["side"] == 1
+            and h1_close <= z["top"]
+            and dvf_norm <= float(cfg.dvf_norm_max)
+            and h1_touch_px >= (z["mid"] if touch_level == "mid" else z["bot"])
+            and h1_low <= z["top"]
+        ]
+        if not resist_candidates:
+            gate_stats["zone_touch"] += 1
+            continue
+
+        # 15m lower high (2-bar LH)
+        if len(df_15m_sig) < 3:
+            gate_stats["lh_15m"] += 1
+            continue
+        h15_0 = float(df_15m_sig.iloc[-1]["high"])
+        h15_1 = float(df_15m_sig.iloc[-2]["high"])
+        h15_2 = float(df_15m_sig.iloc[-3]["high"])
+        if not (h15_0 < h15_1 or h15_1 < h15_2):
+            gate_stats["lh_15m"] += 1
+            continue
+
+        # 3m break
+        if len(df_3m_sig) < 4:
+            gate_stats["break_3m"] += 1
+            continue
+        c3 = float(df_3m_sig.iloc[-1]["close"])
+        o3 = float(df_3m_sig.iloc[-1]["open"])
+        low_prev = [
+            float(df_3m_sig.iloc[-2]["low"]),
+            float(df_3m_sig.iloc[-3]["low"]),
+            float(df_3m_sig.iloc[-4]["low"]),
+        ]
+        low_min = min(low_prev)
+        strong_break = c3 < low_min
+        weak_break = (float(df_3m_sig.iloc[-1]["low"]) < low_min) and (c3 >= low_min) and (c3 < o3)
+        if not strong_break and not weak_break:
+            gate_stats["break_3m"] += 1
+            continue
+
+        # retest state
+        retest_active = bool(sym_state.get("retest_active"))
+        retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
+        retest_until = int(sym_state.get("retest_until", 0) or 0)
+        break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
+        now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
+        if not retest_active:
+            retest_active = True
+            retest_level = low_min
+            retest_bars = max(1, int(cfg.retest_bars))
+            retest_until = now_ts_ms + retest_bars * 3 * 60 * 1000
+            break_type = "strong" if strong_break else "weak"
+            sym_state["retest_active"] = True
+            sym_state["retest_level"] = retest_level
+            sym_state["retest_until"] = retest_until
+            sym_state["break_type"] = break_type
+            gate_stats["retest_seen"] += 1
+
+        if retest_active and now_ts_ms <= retest_until:
+            # retest checks on current confirmed 3m bar
+            h3 = float(df_3m_sig.iloc[-1]["high"])
+            l3 = float(df_3m_sig.iloc[-1]["low"])
+            # compute atr_3m quickly
+            high3 = df_3m_sig["high"].astype(float)
+            low3 = df_3m_sig["low"].astype(float)
+            close3 = df_3m_sig["close"].astype(float)
+            prev_close3 = close3.shift(1)
+            tr3 = pd.concat([(high3 - low3), (high3 - prev_close3).abs(), (low3 - prev_close3).abs()], axis=1).max(axis=1)
+            atr_3m = tr3.ewm(alpha=1 / 14, adjust=False).mean()
+            atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
+            if h3 >= retest_level - (atr_now * float(cfg.retest_atr_mult)):
+                entry_px = float(df_3m.iloc[-1]["open"])
+                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                sl_raw = nearest["top"] * (1.0 + cfg.sl_buffer)
+                sl_min = entry_px * (1.002 if break_type == "strong" else cfg.sl_min_weak)
+                sl_price = max(sl_raw, sl_min)
+                tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
+
+                if c3 < retest_level:
+                    gate_stats["entry_by_pass_close"] += 1
+                elif l3 < retest_level and c3 < o3:
+                    gate_stats["entry_by_pass_low"] += 1
+                elif break_type == "weak" and h3 < retest_level + (atr_now * cfg.shallow_atr_mult) and c3 < o3 and dvf_norm <= cfg.shallow_dvf_max:
+                    rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
+                    upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
+                    wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+                    if wick_ratio <= cfg.shallow_wick_max:
+                        gate_stats["entry_by_pass_low"] += 1
+                    else:
+                        sym_state["retest_active"] = True
+                        continue
+                else:
+                    continue
+
+                usdt = _resolve_entry_usdt()
+                if usdt <= 0 or not _admin_is_active():
+                    continue
+                _append_sr_pro_short_v1_log(
+                    f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={break_type}"
+                )
+                try:
+                    _append_sr_pro_short_v1_log(
+                        "SR_PRO_SIGNAL_CTX "
+                        f"sym={symbol} "
+                        f"h1_close={h1_close:.6f} h1_high={h1_high:.6f} h1_low={h1_low:.6f} "
+                        f"dvf_norm={dvf_norm:.4f} "
+                        f"zone_mid={nearest['mid']:.6f} zone_bot={nearest['bot']:.6f} zone_top={nearest['top']:.6f} "
+                        f"h15_0={h15_0:.6f} h15_1={h15_1:.6f} h15_2={h15_2:.6f} "
+                        f"c3={c3:.6f} o3={o3:.6f} h3={h3:.6f} l3={l3:.6f} "
+                        f"low_min={low_min:.6f} strong={int(strong_break)} weak={int(weak_break)} "
+                        f"retest_level={retest_level:.6f} retest_until={retest_until}"
+                    )
+                except Exception:
+                    pass
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side="SHORT",
+                    engine="SR_PRO_SHORT_V1",
+                    reason="sr_pro_short_v1",
+                    usdt=usdt,
+                    live=LIVE_TRADING,
+                    entry_price_hint=entry_px,
+                    meta={
+                        "sl_price": float(sl_price),
+                        "tp_price": float(tp_price),
+                        "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                        "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                        "track": break_type,
+                    },
+                )
+                if req_id:
+                    result["entries"] += 1
+                sym_state["retest_active"] = False
+                continue
+        if retest_active and now_ts_ms > retest_until:
+            sym_state["retest_active"] = False
+
+    elapsed = time.time() - start_ts
+    _append_sr_pro_short_v1_log(
+        f"SR_PRO_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} no_data={no_data} "
+        f"zone_fail={gate_stats['zone_touch']} lh_fail={gate_stats['lh_15m']} break_fail={gate_stats['break_3m']} "
+        f"retest_seen={gate_stats['retest_seen']} pass_close={gate_stats['entry_by_pass_close']} pass_low={gate_stats['entry_by_pass_low']}"
+    )
+    try:
+        print(
+            f"SR_PRO_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} no_data={no_data} "
+            f"zone_fail={gate_stats['zone_touch']} lh_fail={gate_stats['lh_15m']} break_fail={gate_stats['break_3m']}"
+        )
+    except Exception:
+        pass
     return result
 
 def _run_atlas_rs_fail_short_cycle(
@@ -10144,6 +10515,7 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             "ANTI_ALPHA_V1",
             "NOISE_REVERSE_V1",
             "TOP_FAIL_SHORT_V1",
+            "SR_PRO_SHORT_V1",
             "ST_FLIP_V1",
             "WASH_SHORT_SUITE",
             "BULL_PULLBACK_LONG_V1",
@@ -11997,7 +12369,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
-    global ANTI_ALPHA_V1_ENABLED, TOP_FAIL_SHORT_V1_ENABLED, HOD_FAIL_SHORT_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, WASH_SHORT_SUITE_ENABLED
+    global ANTI_ALPHA_V1_ENABLED, TOP_FAIL_SHORT_V1_ENABLED, HOD_FAIL_SHORT_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, WASH_SHORT_SUITE_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -12065,12 +12437,14 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_anti_alpha_v1_enabled",
         "_top_fail_short_v1_enabled",
         "_hod_fail_short_v1_enabled",
+        "_sr_pro_short_v1_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_wash_short_suite_enabled",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
         "_top_fail_short_v1_enabled",
         "_hod_fail_short_v1_enabled",
+        "_sr_pro_short_v1_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_wash_short_suite_enabled",
         "_rsi_enabled",
@@ -12179,6 +12553,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         TOP_FAIL_SHORT_V1_ENABLED = bool(state.get("_top_fail_short_v1_enabled"))
     if (not skip_keys or "_hod_fail_short_v1_enabled" not in skip_keys) and isinstance(state.get("_hod_fail_short_v1_enabled"), bool):
         HOD_FAIL_SHORT_V1_ENABLED = bool(state.get("_hod_fail_short_v1_enabled"))
+    if (not skip_keys or "_sr_pro_short_v1_enabled" not in skip_keys) and isinstance(state.get("_sr_pro_short_v1_enabled"), bool):
+        SR_PRO_SHORT_V1_ENABLED = bool(state.get("_sr_pro_short_v1_enabled"))
     if (not skip_keys or "_srp_st_regime_pullback_v1_enabled" not in skip_keys) and isinstance(state.get("_srp_st_regime_pullback_v1_enabled"), bool):
         SRP_ST_REGIME_PULLBACK_V1_ENABLED = False
         state["_srp_st_regime_pullback_v1_enabled"] = False
@@ -12935,7 +13311,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, TOP_FAIL_SHORT_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, WASH_SHORT_SUITE_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_ATLAS_LAB_V2_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, TOP_FAIL_SHORT_V1_ENABLED, HOD_FAIL_SHORT_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, WASH_SHORT_SUITE_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_ATLAS_LAB_V2_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     global ENTRY_BLOCK_HOURS
@@ -13179,6 +13555,38 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                                 sym_col = max(sym_col, len(base))
                                 eng_col = max(eng_col, len(str(engine)))
                                 tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
+                                open_tr = _get_open_trade(state, side, sym)
+                                if isinstance(open_tr, dict):
+                                    meta = open_tr.get("meta") or {}
+                                    entry_px = open_tr.get("entry_price")
+                                    try:
+                                        tp_meta = meta.get("tp_pct")
+                                        if isinstance(tp_meta, (int, float)) and float(tp_meta) > 0:
+                                            tp_pct = float(tp_meta)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        tp_price_meta = meta.get("tp_price")
+                                        if isinstance(tp_price_meta, (int, float)) and isinstance(entry_px, (int, float)) and entry_px > 0:
+                                            tp_calc = (float(entry_px) - float(tp_price_meta)) / float(entry_px) * 100.0
+                                            if tp_calc > 0:
+                                                tp_pct = tp_calc
+                                    except Exception:
+                                        pass
+                                    try:
+                                        sl_meta = meta.get("sl_pct")
+                                        if isinstance(sl_meta, (int, float)):
+                                            sl_pct = float(sl_meta)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        sl_price_meta = meta.get("sl_price")
+                                        if isinstance(sl_price_meta, (int, float)) and isinstance(entry_px, (int, float)) and entry_px > 0:
+                                            sl_calc = (float(sl_price_meta) - float(entry_px)) / float(entry_px) * 100.0
+                                            if sl_calc > 0:
+                                                sl_pct = sl_calc
+                                    except Exception:
+                                        pass
                                 rows.append((base, side, engine, tp_pct, sl_pct))
                     else:
                         for sym, side in fallback_positions:
@@ -13578,6 +13986,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         over_limit = "YES" if open_pos > MAX_OPEN_POSITIONS else "NO"
                         status_msg = (
                             "🤖 상태\n"
+                            f"/user_active(유저활성): {'ON' if _admin_is_active() else 'OFF'}\n"
                             f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
                             f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
                             f"/realtime_only(헤비스캔OFF): {'ON' if REALTIME_ONLY_ENABLED else 'OFF'}\n"
@@ -13598,6 +14007,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
                             f"wash_suite={'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'} "
                             f"top_fail={'ON' if TOP_FAIL_SHORT_V1_ENABLED else 'OFF'} "
+                            f"hod_fail={'ON' if HOD_FAIL_SHORT_V1_ENABLED else 'OFF'} "
+                            f"sr_pro={'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'} "
                             f"swaggy_lab={'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'} "
                             f"swaggy_lab_v2={'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'} "
                             f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
@@ -13610,6 +14021,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             "--------------\n"
                             f"/wash_short_suite(추가진입): {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
                             f"/top_fail_short_v1(추가진입): {'ON' if TOP_FAIL_SHORT_V1_ENABLED else 'OFF'}\n"
+                            f"/hod_fail_short_v1(추가진입): {'ON' if HOD_FAIL_SHORT_V1_ENABLED else 'OFF'}\n"
+                            f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab(추가진입): {'ON' if SWAGGY_ATLAS_LAB_ENABLED else 'OFF'}\n"
                             f"/swaggy_atlas_lab_v2(추가진입): {'ON' if SWAGGY_ATLAS_LAB_V2_ENABLED else 'OFF'}\n"
                             f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
@@ -13644,6 +14057,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     over_limit = "YES" if open_pos > MAX_OPEN_POSITIONS else "NO"
                     status_msg = (
                         "🤖 상태\n"
+                        f"/user_active(유저활성): {'ON' if _admin_is_active() else 'OFF'}\n"
                         f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
                         f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
                         f"/realtime_only(헤비스캔OFF): {'ON' if REALTIME_ONLY_ENABLED else 'OFF'}\n"
@@ -13665,6 +14079,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"srp_st={'ON' if SRP_ST_REGIME_PULLBACK_V1_ENABLED else 'OFF'} "
                         f"wash_suite={'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'} "
                         f"top_fail={'ON' if TOP_FAIL_SHORT_V1_ENABLED else 'OFF'} "
+                        f"hod_fail={'ON' if HOD_FAIL_SHORT_V1_ENABLED else 'OFF'} "
+                        f"sr_pro={'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'} "
                         f"bull_pullback={'ON' if BULL_PULLBACK_LONG_V1_ENABLED else 'OFF'} "
                         f"arsf={'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'} "
                         f"rsi={'ON' if RSI_ENABLED else 'OFF'} "
@@ -13672,6 +14088,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         "--------------\n"
                         f"/wash_short_suite(추가진입): {'ON' if WASH_SHORT_SUITE_ENABLED else 'OFF'}\n"
                         f"/top_fail_short_v1(추가진입): {'ON' if TOP_FAIL_SHORT_V1_ENABLED else 'OFF'}\n"
+                        f"/hod_fail_short_v1(추가진입): {'ON' if HOD_FAIL_SHORT_V1_ENABLED else 'OFF'}\n"
+                        f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
                         f"/atlas_rs_fail_short(추가진입): {'ON' if ATLAS_RS_FAIL_SHORT_ENABLED else 'OFF'}\n"
                         f"/rsi(추가진입): {'ON' if RSI_ENABLED else 'OFF'}\n\n"
                         ""
@@ -14207,6 +14625,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] top_fail_short_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/sr_pro_short_v1", "sr_pro_short_v1", "sr_pro_short")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SR_PRO_SHORT_V1_ENABLED = True
+                        state["_sr_pro_short_v1_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ sr_pro_short_v1 ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SR_PRO_SHORT_V1_ENABLED = False
+                        state["_sr_pro_short_v1_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ sr_pro_short_v1 OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ sr_pro_short_v1 상태: {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
+                            "사용법: /sr_pro_short_v1 on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] sr_pro_short_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/hod_fail_short_v1", "hod_fail_short_v1", "hod_fail_short")) and not responded:
                     parts = lower.split()
@@ -15220,7 +15661,7 @@ def run():
     global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, RATE_LIMIT_LOG_TS, _LAST_ACCOUNT_REFRESH_TS
     global TOTAL_CYCLES, TOTAL_ELAPSED, TOTAL_REST_CALLS, TOTAL_429_COUNT
     global MANAGE_LOOP_ENABLED, MANAGE_WS_MODE
-    global TOP_FAIL_SHORT_V1_ENABLED
+    global TOP_FAIL_SHORT_V1_ENABLED, HOD_FAIL_SHORT_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED
     global COMMON_WARMUP_DONE, COMMON_UNIVERSE_READY, COMMON_UNIVERSE, _COMMON_WARMUP_NOTIFY_TS_MEM
     _install_error_hooks()
     print("[시작] RSI 스캐너 초기화 중...")
@@ -15649,7 +16090,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /wash_short_suite on|off|status, /top_fail_short_v1 on|off|status, /hod_fail_short_v1 on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /wash_short_suite on|off|status, /top_fail_short_v1 on|off|status, /sr_pro_short_v1 on|off|status, /hod_fail_short_v1 on|off|status, /rsi on|off|status, /atlas_rs_fail_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -15973,6 +16414,8 @@ def run():
                     wash_short_suite_universe_len = len(wash_short_suite_universe)
                     top_fail_short_universe = list(shared_universe)
                     top_fail_short_universe_len = len(top_fail_short_universe)
+                    sr_pro_short_universe = list(shared_universe)
+                    sr_pro_short_universe_len = len(sr_pro_short_universe)
                     wash_universe_path = os.getenv("WASH_SHORT_SUITE_UNIVERSE_FILE", "").strip()
                     if wash_universe_path:
                         try:
@@ -16132,6 +16575,7 @@ def run():
                     adv_trend_ran = bool(heavy_scan and ADV_TREND_ENABLED and adv_trend_universe)
                     wash_short_suite_ran = bool(WASH_SHORT_SUITE_ENABLED and wash_short_suite_universe and (not heavy_scan) and new_1m_bar)
                     top_fail_short_ran = bool(TOP_FAIL_SHORT_V1_ENABLED and top_fail_short_universe and (not heavy_scan) and new_3m_bar)
+                    sr_pro_short_ran = bool(SR_PRO_SHORT_V1_ENABLED and sr_pro_short_universe and (not heavy_scan) and new_3m_bar)
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
                     atlas_rs_fail_short_ran = bool(
                         ATLAS_RS_FAIL_SHORT_ENABLED
@@ -16463,6 +16907,8 @@ def run():
                     noise_reverse_thread = None
                     top_fail_result = {}
                     top_fail_thread = None
+                    sr_pro_result = {}
+                    sr_pro_thread = None
                     hod_fail_result = {}
                     hod_fail_thread = None
                     st_flip_result = {}
@@ -16608,6 +17054,18 @@ def run():
                             daemon=True,
                         )
                         top_fail_thread.start()
+                    if SR_PRO_SHORT_V1_ENABLED and new_3m_bar:
+                        sr_pro_thread = threading.Thread(
+                            target=lambda: sr_pro_result.update(
+                                _run_sr_pro_short_v1_cycle(
+                                    sr_pro_short_universe,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        sr_pro_thread.start()
                     if HOD_FAIL_SHORT_V1_ENABLED and new_3m_bar:
                         hod_fail_thread = threading.Thread(
                             target=lambda: hod_fail_result.update(
@@ -17322,7 +17780,7 @@ def run():
                         f"union={universe_union_len}"
                     )
                     print(
-                        "[engines] rsi=%s(%d) wash_suite=%s(%d) top_fail=%s(%d) "
+                        "[engines] rsi=%s(%d) wash_suite=%s(%d) top_fail=%s(%d) sr_pro=%s(%d) "
                         "swaggy_atlas_lab=%s(%d) swaggy_atlas_lab_v2=%s(%d)"
                         % (
                             "ON" if rsi_ran else "OFF",
@@ -17331,6 +17789,8 @@ def run():
                             wash_short_suite_universe_len,
                             "ON" if top_fail_short_ran else "OFF",
                             top_fail_short_universe_len,
+                            "ON" if sr_pro_short_ran else "OFF",
+                            sr_pro_short_universe_len,
                             "ON" if swaggy_atlas_lab_ran else "OFF",
                             swaggy_atlas_lab_universe_len,
                             "ON" if swaggy_atlas_lab_v2_ran else "OFF",

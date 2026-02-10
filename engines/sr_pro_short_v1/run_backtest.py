@@ -170,10 +170,12 @@ def run_backtest() -> None:
     parser.add_argument("--shallow-atr-mult", type=float, default=0.35)
     parser.add_argument("--shallow-wick-max", type=float, default=0.35)
     parser.add_argument("--shallow-dvf-max", type=float, default=0.0)
-    parser.add_argument("--sl-buffer", type=float, default=0.006)
-    parser.add_argument("--tp-mult", type=float, default=0.976)
-    parser.add_argument("--tp-mult-weak", type=float, default=0.982)
+    parser.add_argument("--sl-buffer", type=float, default=0.01)
+    parser.add_argument("--tp-mult", type=float, default=0.985)
+    parser.add_argument("--tp-mult-weak", type=float, default=0.985)
     parser.add_argument("--sl-min-weak", type=float, default=1.0015)
+    parser.add_argument("--base-usdt", type=float, default=1000.0)
+    parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
     parser.add_argument("--log-gates", action="store_true")
     parser.add_argument("--debug-zone", action="store_true")
@@ -271,6 +273,9 @@ def run_backtest() -> None:
         "net_sum": 0.0,
         "tp_sum": 0.0,
         "sl_sum": 0.0,
+        "net_sum_usdt": 0.0,
+        "tp_sum_usdt": 0.0,
+        "sl_sum_usdt": 0.0,
     }
     trades_out: List[dict] = []
     gate_counts = {
@@ -304,6 +309,8 @@ def run_backtest() -> None:
         "hold_strong_sum": 0.0,
         "hold_weak_sum": 0.0,
     }
+
+    entries_by_day: Dict[str, int] = {}
 
     for sym, frames in data.items():
         df_3m = frames["3m"]
@@ -397,8 +404,6 @@ def run_backtest() -> None:
         retest_active = False
         retest_level = 0.0
         retest_until = -1
-        entries_by_day: Dict[str, int] = {}
-
         if args.log_gates:
             print(
                 f"[BACKTEST_START_STATE] {sym} in_position=False cooldown=0 "
@@ -441,6 +446,8 @@ def run_backtest() -> None:
                     stats["hold_sum"] += trade["hold_bars"]
                     stats["net_sum"] += pnl_pct
                     stats["sl_sum"] += pnl_pct
+                    stats["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
+                    stats["sl_sum_usdt"] += pnl_pct * float(args.entry_usdt)
                     stats["losses"] += 1
                     if trade.get("track") == "strong":
                         gate_counts["losses_strong"] += 1
@@ -474,6 +481,8 @@ def run_backtest() -> None:
                     stats["hold_sum"] += trade["hold_bars"]
                     stats["net_sum"] += pnl_pct
                     stats["tp_sum"] += pnl_pct
+                    stats["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
+                    stats["tp_sum_usdt"] += pnl_pct * float(args.entry_usdt)
                     stats["wins"] += 1
                     if trade.get("track") == "strong":
                         gate_counts["wins_strong"] += 1
