@@ -25,7 +25,7 @@ class SrProShortV1Config:
     reject_source: str = "1h"
     ema200_filter: bool = True
     ema_filter_len: int = 200
-    total_window_days: int = 14
+    total_window_days: int = 10
     rolling_zones: bool = True
     retest_bars: int = 6
     retest_atr_mult: float = 0.25

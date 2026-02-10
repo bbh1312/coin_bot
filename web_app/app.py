@@ -36,6 +36,7 @@ from engine_runner import (
     REALTIME_ONLY_ENABLED,
     TOP_FAIL_SHORT_V1_ENABLED,
     SR_PRO_SHORT_V1_ENABLED,
+    SR_PRO_LONG_V1_ENABLED,
     SWAGGY_ATLAS_LAB_ENABLED,
     SATURDAY_TRADE_ENABLED,
     RSI_ENABLED,
@@ -85,6 +86,7 @@ COMMAND_DEFS = [
     {"cmd": "/realtime_only", "key": "_realtime_only", "label": "Realtime Only (헤비스캔 OFF)", "type": "toggle"},
     {"cmd": "/top_fail_short_v1", "key": "_top_fail_short_v1_enabled", "label": "Top Fail Short V1", "type": "toggle"},
     {"cmd": "/sr_pro_short_v1", "key": "_sr_pro_short_v1_enabled", "label": "SR Pro Short V1", "type": "toggle"},
+    {"cmd": "/sr_pro_long_v1", "key": "_sr_pro_long_v1_enabled", "label": "SR Pro Long V1", "type": "toggle"},
     {"cmd": "/swaggy_atlas_lab", "key": "_swaggy_atlas_lab_enabled", "label": "Swaggy Atlas Lab", "type": "toggle"},
     {"cmd": "/rsi", "key": "_rsi_enabled", "label": "RSI", "type": "toggle"},
     {"cmd": "/dca", "key": "_dca_enabled", "label": "DCA", "type": "toggle"},
@@ -287,6 +289,8 @@ DEFAULTS = {
     "_dca_third_pct": DCA_THIRD_PCT,
     "_exit_cooldown_hours": EXIT_COOLDOWN_HOURS,
     "_swaggy_atlas_lab_enabled": SWAGGY_ATLAS_LAB_ENABLED,
+    "_sr_pro_short_v1_enabled": SR_PRO_SHORT_V1_ENABLED,
+    "_sr_pro_long_v1_enabled": SR_PRO_LONG_V1_ENABLED,
     "_auto_exit_long_tp_pct": AUTO_EXIT_LONG_TP_PCT,
     "_auto_exit_long_sl_pct": AUTO_EXIT_LONG_SL_PCT,
     "_auto_exit_short_tp_pct": AUTO_EXIT_SHORT_TP_PCT,
@@ -335,7 +339,7 @@ def follower_positions():
 def manual_entry():
     notice = request.args.get("notice")
     try:
-        accounts = _list_accounts()
+        accounts = _list_accounts_all()
     except Exception:
         accounts = []
     return render_template("manual_entry.html", notice=notice, accounts=accounts)

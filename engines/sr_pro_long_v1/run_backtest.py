@@ -208,6 +208,7 @@ def run_backtest() -> None:
     parser.add_argument("--zones-snapshot-out", type=str, default="")
     parser.add_argument("--log-gates", action="store_true")
     parser.add_argument("--debug-zone", action="store_true")
+    parser.add_argument("--block-hours", type=str, default="")
     args = parser.parse_args()
 
     cfg = SrProLongV1Config(
@@ -322,7 +323,36 @@ def run_backtest() -> None:
         "reject_pass_1h": 0,
         "reject_pass_15m": 0,
         "ema200_pass": 0,
+        "time_block": 0,
     }
+
+    def _load_entry_block_hours() -> set[int]:
+        # prefer explicit args, else read from state.json or ENV ENTRY_BLOCK_HOURS
+        if args.block_hours:
+            try:
+                return {int(h.strip()) for h in args.block_hours.split(",") if h.strip() != ""}
+            except Exception:
+                return set()
+        try:
+            if os.path.exists("state.json"):
+                with open("state.json", "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                raw = ""
+                if isinstance(st, dict):
+                    raw = str(st.get("_entry_block_hours") or st.get("entry_block_hours") or "")
+                if raw:
+                    return {int(h.strip()) for h in raw.split(",") if h.strip() != ""}
+        except Exception:
+            pass
+        raw_env = os.getenv("ENTRY_BLOCK_HOURS", "").strip()
+        if raw_env:
+            try:
+                return {int(h.strip()) for h in raw_env.split(",") if h.strip() != ""}
+            except Exception:
+                return set()
+        return set()
+
+    block_hours = _load_entry_block_hours()
 
     entries_by_day: Dict[str, int] = {}
     cooldown_until: Dict[tuple, int] = {}
@@ -604,6 +634,12 @@ def run_backtest() -> None:
             if not strong_break and not weak_break:
                 if args.log_gates:
                     gate_counts["break_3m"] += 1
+                continue
+            # time block (KST hours)
+            hour_kst = int(_ts_kst(ts).split(" ")[1].split(":")[0])
+            if block_hours and hour_kst in block_hours:
+                if args.log_gates:
+                    gate_counts["time_block"] += 1
                 continue
             if args.log_gates:
                 if strong_break:
