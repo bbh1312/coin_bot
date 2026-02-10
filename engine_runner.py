@@ -954,7 +954,7 @@ def close_short_market_qty(symbol: str, qty: float) -> dict:
     return res
 
 def place_long_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None) -> dict:
-    res = _EXEC_PLACE_LONG_SL_PX(symbol, stop_price, qty=qty)
+    res = _EXEC_PLACE_LONG_SL_PX(symbol, stop_price, qty=qty, working_type="CONTRACT_PRICE")
     followers = FOLLOWER_CONTEXTS
     if not followers:
         return res
@@ -975,7 +975,7 @@ def place_long_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None
                 continue
         except Exception:
             pass
-        follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.place_long_sl_px(symbol, stop_price, qty=qty)})
+        follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.place_long_sl_px(symbol, stop_price, qty=qty, working_type="CONTRACT_PRICE")})
     _broadcast_followers("place_long_sl_px", follower_calls, {"symbol": symbol})
     return res
 
@@ -8092,6 +8092,18 @@ def _run_sr_pro_short_v1_cycle(
             gate_stats["cooldown"] += 1
             continue
 
+        # TP1 partial close handling (short only)
+        try:
+            tp1_px = sym_state.get("tp1_price")
+            tp1_done = sym_state.get("tp1_done")
+            if isinstance(tp1_px, (int, float)) and not tp1_done:
+                last_close = float(df_3m_sig.iloc[-1]["close"])
+                if last_close <= float(tp1_px):
+                    _adv_partial_close(symbol, "SHORT", 0.5)
+                    sym_state["tp1_done"] = True
+        except Exception:
+            pass
+
         # refresh zones if new 1h bar
         last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
         if sym_state.get("zones_ts") != last_1h_hist_ts:
@@ -8237,34 +8249,30 @@ def _run_sr_pro_short_v1_cycle(
                 sl_raw = nearest["top"] + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
                 tp_atr = cfg.tp_atr_mult_weak if break_type == "weak" else cfg.tp_atr_mult
-                if tp_atr and tp_atr > 0:
-                    tp_price = entry_px - (atr_now * float(tp_atr))
-                else:
-                    tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
-
+                rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
+                upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
+                wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
                 if c3 < retest_level:
                     gate_stats["entry_by_pass_close"] += 1
-                else:
-                    rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
-                    upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
-                    wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
-                    if l3 < retest_level and c3 < o3 and wick_ratio <= float(cfg.retest_wick_max):
-                        gate_stats["entry_by_pass_low"] += 1
-                    elif (
-                        h3 < retest_level + (atr_now * cfg.shallow_atr_mult)
-                        and c3 < o3
-                        and dvf_norm <= cfg.shallow_dvf_max
-                        and wick_ratio <= cfg.shallow_wick_max
-                    ):
-                        gate_stats["entry_by_pass_low"] += 1
-                    else:
+                elif l3 < retest_level and c3 < o3 and wick_ratio <= float(cfg.retest_wick_max):
+                    if break_type == "weak" and not (dvf_norm <= -0.3 and wick_ratio <= 0.25 and retest_bars <= 3):
                         continue
+                    gate_stats["entry_by_pass_low"] += 1
+                else:
+                    continue
+
+                sl_price = max(h3 + (atr_now * 0.3), entry_px + (atr_now * 0.6))
+                tp1_price = entry_px - (atr_now * 1.0)
+                swing_low = float(df_15m_sig["low"].astype(float).iloc[-1])
+                if len(df_15m_sig) >= 20:
+                    swing_low = float(df_15m_sig["low"].astype(float).iloc[-20:].min())
+                tp2_price = swing_low
 
                 usdt = _resolve_entry_usdt()
                 if usdt <= 0 or not _admin_is_active():
                     continue
                 _append_sr_pro_short_v1_log(
-                    f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={break_type}"
+                    f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp1={tp1_price:.6f} tp2={tp2_price:.6f} track={break_type}"
                 )
                 try:
                     _append_sr_pro_short_v1_log(
@@ -8292,15 +8300,19 @@ def _run_sr_pro_short_v1_cycle(
                     entry_price_hint=entry_px,
                     meta={
                         "sl_price": float(sl_price),
-                        "tp_price": float(tp_price),
+                        "tp_price": float(tp2_price),
                         "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
-                        "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                        "tp_pct": ((entry_px - float(tp2_price)) / entry_px * 100.0) if entry_px > 0 else None,
                         "track": break_type,
+                        "tp1_price": float(tp1_price),
+                        "tp2_price": float(tp2_price),
                     },
                 )
                 if req_id:
                     result["entries"] += 1
                 sym_state["retest_active"] = False
+                sym_state["tp1_price"] = float(tp1_price)
+                sym_state["tp1_done"] = False
                 continue
         if retest_active and now_ts_ms > retest_until:
             sym_state["retest_active"] = False
@@ -8588,7 +8600,17 @@ def _run_sr_pro_long_v1_cycle(
                 if not entry_ok:
                     continue
 
-                entry_px = float(df_3m.iloc[-1]["open"])
+                ema_entry = None
+                try:
+                    ema_entry = float(ema(df_3m_sig["close"], int(cfg.entry_ema_len)).iloc[-1])
+                except Exception:
+                    ema_entry = None
+                entry_target = None
+                if isinstance(ema_entry, (int, float)) and atr_now > 0:
+                    entry_target = float(ema_entry) - (atr_now * float(cfg.entry_atr_offset))
+                if entry_target is None or l3 > entry_target:
+                    continue
+                entry_px = float(entry_target)
                 nearest = min(support_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 if not (c3 >= nearest["mid"] or entry_px >= nearest["top"] - (atr_now * 0.2)):
                     sym_state["retest_active"] = True
@@ -9565,6 +9587,7 @@ def _place_long_sl_order(
     entry_price: float,
     sl_pct: float,
     qty: Optional[float] = None,
+    working_type: str = "MARK_PRICE",
 ) -> Optional[dict]:
     if not LIVE_TRADING:
         return {"status": "skip", "reason": "live_off"}
@@ -9589,7 +9612,10 @@ def _place_long_sl_order(
         if amt <= 0:
             print(f"[long-sl] {symbol} skipped: qty precision=0 entry={entry_price} raw_qty={qty}")
             return {"status": "skip", "reason": "qty_precision_zero"}
-        params = {"stopPrice": float(exchange.price_to_precision(symbol, sl_price)), "workingType": "MARK_PRICE"}
+        params = {
+            "stopPrice": float(exchange.price_to_precision(symbol, sl_price)),
+            "workingType": working_type,
+        }
         try:
             if is_hedge_mode():
                 params["positionSide"] = "LONG"
@@ -10741,6 +10767,25 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
         _sync_trade_log_from_db(state, symbol, side)
     except Exception:
         pass
+    if side == "LONG" and str(req.get("engine") or "").upper() == "SR_PRO_LONG_V1":
+        sl_price_meta = meta.get("sl_price") if isinstance(meta, dict) else None
+        if not isinstance(sl_price_meta, (int, float)) or sl_price_meta <= 0:
+            _append_entry_gate_log(
+                "sr_pro_long_v1",
+                symbol,
+                f"sl_meta_missing entry={entry_base} meta={meta}",
+                side="LONG",
+            )
+        else:
+            try:
+                place_long_sl_px(symbol, float(sl_price_meta))
+            except Exception:
+                _append_entry_gate_log(
+                    "sr_pro_long_v1",
+                    symbol,
+                    f"sl_place_failed sl_price={sl_price_meta}",
+                    side="LONG",
+                )
     try:
         _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
     except Exception:
@@ -11692,6 +11737,34 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 sl_price_meta = float(meta.get("sl_price"))
             except Exception:
                 sl_price_meta = None
+        if engine_label == "SR_PRO_LONG_V1":
+            tp_price_meta = None
+            try:
+                tp_price_meta = float(meta.get("tp_price")) if isinstance(meta, dict) else None
+            except Exception:
+                tp_price_meta = None
+            if not isinstance(sl_price_meta, (int, float)) or not isinstance(tp_price_meta, (int, float)):
+                _append_entry_gate_log(
+                    "auto_exit_long",
+                    sym,
+                    f"srp_guard=missing_price_meta sl={sl_price_meta} tp={tp_price_meta}",
+                    side="LONG",
+                )
+            # SR_PRO_LONG_V1는 가격 기반 SL만 허용 (pct SL 비활성)
+            sl_pct = None
+            # SR_PRO_LONG_V1는 가격 기준으로만 청산
+            if not (
+                isinstance(tp_price_meta, (int, float)) and mark_px >= float(tp_price_meta)
+            ) and not (
+                isinstance(sl_price_meta, (int, float)) and mark_px <= float(sl_price_meta)
+            ):
+                _append_entry_gate_log(
+                    "auto_exit_long",
+                    sym,
+                    f"srp_guard_skip mark={mark_px} tp={tp_price_meta} sl={sl_price_meta} profit={profit_unlev:.4f}%",
+                    side="LONG",
+                )
+                continue
         if AUTO_EXIT_ENABLED and profit_unlev >= tp_pct:
             _append_entry_gate_log(
                 "auto_exit_long",

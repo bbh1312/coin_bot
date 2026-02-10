@@ -192,12 +192,14 @@ def run_backtest() -> None:
     parser.add_argument("--shallow-atr-mult", type=float, default=0.35)
     parser.add_argument("--shallow-wick-max", type=float, default=0.35)
     parser.add_argument("--shallow-dvf-min", type=float, default=0.0)
+    parser.add_argument("--entry-ema-len", type=int, default=7)
+    parser.add_argument("--entry-atr-offset", type=float, default=0.15)
     parser.add_argument("--sl-buffer", type=float, default=0.01)
     parser.add_argument("--sl-atr-mult", type=float, default=0.4)
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
     parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
-    parser.add_argument("--tp-mult", type=float, default=1.01)
-    parser.add_argument("--tp-mult-weak", type=float, default=1.01)
+    parser.add_argument("--tp-mult", type=float, default=1.022)
+    parser.add_argument("--tp-mult-weak", type=float, default=1.022)
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
@@ -223,6 +225,8 @@ def run_backtest() -> None:
         tp_atr_mult=args.tp_atr_mult,
         tp_atr_mult_weak=args.tp_atr_mult_weak,
         tp_mult=args.tp_mult,
+        entry_ema_len=args.entry_ema_len,
+        entry_atr_offset=args.entry_atr_offset,
     )
 
     exchange = None if args.cache_only else ccxt.binance({"enableRateLimit": True})
@@ -397,6 +401,7 @@ def run_backtest() -> None:
         dvf = _ema(dv, cfg.delta_len)
         vol_ema = _ema(volume_1h, cfg.delta_len)
         atr_3m = _atr(df_3m, 14)
+        ema_3m_entry = _ema(df_3m["close"].astype(float), int(cfg.entry_ema_len))
         atr_15m = _atr(df_15m, 14)
 
         zones: List[Zone] = []
@@ -699,7 +704,14 @@ def run_backtest() -> None:
                     else:
                         continue
 
-                    entry_px = float(df_3m.at[i3 + 1, "open"])
+                    ema_entry = float(ema_3m_entry.iloc[i3]) if len(ema_3m_entry) > i3 and not np.isnan(ema_3m_entry.iloc[i3]) else None
+                    entry_offset = float(cfg.entry_atr_offset)
+                    entry_target = None
+                    if isinstance(ema_entry, (int, float)) and atr_now > 0:
+                        entry_target = float(ema_entry) - (atr_now * entry_offset)
+                    if entry_target is None or low_now > entry_target:
+                        continue
+                    entry_px = float(entry_target)
                     nearest = min(support_candidates, key=lambda z: abs(z.mid - entry_px))
                     if not (close_now >= nearest.mid or entry_px >= nearest.top - (atr_now * 0.2)):
                         if args.log_gates:
