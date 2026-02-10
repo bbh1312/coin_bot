@@ -73,6 +73,7 @@
 - 엔진 라벨 매핑이 등록되어 있는지 확인
 - 팔로워 계정 동기화(엔트리/청산) 동작 확인
 - 관리모드에서 엔진 요청이 `engine_removed`로 스킵되지 않는지 확인
+- 텔레그램 청산 로그에 TP/SL 퍼센트가 함께 출력되는지 확인
 - **런타임 설정 동기화 키 목록에 엔진 토글 키가 포함되는지 확인**
   - `_reload_runtime_settings_from_disk()`의 `keys`
   - `save_state()` / `save_state_to()`의 `runtime_keys`

@@ -2436,6 +2436,41 @@ def _fmt_tp_price_safe(entry_price: Any, tp_pct: Any, side: str = "LONG") -> str
     except Exception:
         return "N/A"
 
+def _resolve_tp_sl_pct(
+    entry_price: Optional[float],
+    meta: Optional[dict],
+    engine_label: Optional[str],
+    side: str,
+) -> tuple[Optional[float], Optional[float]]:
+    tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, side)
+    tp_val = tp_pct
+    sl_val = sl_pct
+    if isinstance(meta, dict):
+        tp_meta = meta.get("tp_pct")
+        sl_meta = meta.get("sl_pct")
+        if isinstance(tp_meta, (int, float)) and tp_meta > 0:
+            tp_val = float(tp_meta)
+        if isinstance(sl_meta, (int, float)) and sl_meta > 0:
+            sl_val = float(sl_meta)
+        if isinstance(entry_price, (int, float)) and entry_price > 0:
+            tp_price = meta.get("tp_price")
+            sl_price = meta.get("sl_price")
+            if isinstance(tp_price, (int, float)) and tp_price > 0:
+                if side.upper() == "SHORT":
+                    tp_val = (float(entry_price) - float(tp_price)) / float(entry_price) * 100.0
+                else:
+                    tp_val = (float(tp_price) - float(entry_price)) / float(entry_price) * 100.0
+            if isinstance(sl_price, (int, float)) and sl_price > 0:
+                if side.upper() == "SHORT":
+                    sl_val = (float(sl_price) - float(entry_price)) / float(entry_price) * 100.0
+                else:
+                    sl_val = (float(entry_price) - float(sl_price)) / float(entry_price) * 100.0
+    return tp_val, sl_val
+
+def _fmt_tp_sl_pct(entry_price: Optional[float], meta: Optional[dict], engine_label: Optional[str], side: str) -> str:
+    tp_val, sl_val = _resolve_tp_sl_pct(entry_price, meta, engine_label, side)
+    return f"tp={_fmt_pct_safe(tp_val)} sl={_fmt_pct_safe(sl_val)}"
+
 def _fmt_entry_price(val: Any) -> str:
     try:
         return f"{float(val):.6g}"
@@ -7951,6 +7986,9 @@ def _run_sr_pro_short_v1_cycle(
         "retest_seen": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
+        "reentry_strong_seen": 0,
+        "entry_by_reentry_strong": 0,
+        "reentry_eval": 0,
         "no_data_ltf": 0,
         "no_data_mtf": 0,
         "no_data_htf": 0,
@@ -8096,8 +8134,8 @@ def _run_sr_pro_short_v1_cycle(
         except Exception:
             pass
 
-        touch_level = "mid" if cfg.touch_mode == "mid" else "bot"
         h1_touch_px = h1_close if cfg.touch_use_close else h1_high
+        touch_age_ms = max(1, int(getattr(cfg, "touch_age_h1", 2))) * 60 * 60 * 1000
         if cfg.ema200_filter:
             ema_len = max(1, int(getattr(cfg, "ema_filter_len", 200)))
             ema_line = ema(close_1h, ema_len)
@@ -8106,13 +8144,21 @@ def _run_sr_pro_short_v1_cycle(
                 gate_stats["zone_touch"] += 1
                 continue
         # filter zones by break (avoid already broken)
+        # update touch timestamp for zones touched near mid
+        for z in zones:
+            if not z.get("live", True) or z.get("side") != 1:
+                continue
+            if h1_touch_px >= float(z.get("mid", 0.0)) and h1_low <= float(z.get("top", 0.0)):
+                z["last_touch_ts"] = h1_ts
         resist_candidates = [
             z for z in zones
             if z.get("live", True)
             and z["side"] == 1
             and dvf_norm <= float(cfg.dvf_norm_max)
-            and h1_touch_px >= (z["mid"] if touch_level == "mid" else z["bot"])
-            and h1_low <= z["top"]
+            and h1_touch_px >= float(z.get("mid", 0.0))
+            and h1_low <= float(z.get("top", 0.0))
+            and isinstance(z.get("last_touch_ts"), (int, float))
+            and (h1_ts - int(z["last_touch_ts"])) <= touch_age_ms
         ]
         if not resist_candidates:
             gate_stats["zone_touch"] += 1
@@ -8128,7 +8174,10 @@ def _run_sr_pro_short_v1_cycle(
         if not (h15_0 < h15_1 or h15_1 < h15_2):
             gate_stats["lh_15m"] += 1
             continue
-        if not (float(df_15m_sig.iloc[-1]["close"]) < float(df_15m_sig.iloc[-1]["open"])):
+        if not (
+            float(df_15m_sig.iloc[-1]["close"]) < float(df_15m_sig.iloc[-1]["open"])
+            or float(df_15m_sig.iloc[-1]["close"]) < float(df_15m_sig.iloc[-2]["close"])
+        ):
             gate_stats["lh_15m"] += 1
             continue
 
@@ -8149,11 +8198,28 @@ def _run_sr_pro_short_v1_cycle(
         if not strong_break:
             gate_stats["break_3m"] += 1
             continue
+        # strong-break reentry window setup (independent of retest)
+        if strong_break and getattr(cfg, "enable_strong_reentry", False):
+            reentry_active = True
+            reentry_bars = max(1, int(getattr(cfg, "reentry_window_bars", 2)))
+            reentry_until = now_ts_ms + reentry_bars * 3 * 60 * 1000
+            sym_state["reentry_active"] = True
+            sym_state["reentry_until"] = reentry_until
+            gate_stats["reentry_strong_seen"] += 1
+        reentry_active = bool(
+            getattr(cfg, "enable_strong_reentry", False)
+            and sym_state.get("reentry_active")
+            and now_ts_ms <= int(sym_state.get("reentry_until", 0) or 0)
+        )
+        if reentry_active:
+            gate_stats["reentry_eval"] += 1
         # retest state
         retest_active = bool(sym_state.get("retest_active"))
         retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
         retest_until = int(sym_state.get("retest_until", 0) or 0)
         break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
+        reentry_active = bool(sym_state.get("reentry_active"))
+        reentry_until = int(sym_state.get("reentry_until", 0) or 0)
         now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
         if not retest_active:
             retest_active = True
@@ -8166,6 +8232,8 @@ def _run_sr_pro_short_v1_cycle(
             sym_state["retest_until"] = retest_until
             sym_state["break_type"] = break_type
             gate_stats["retest_seen"] += 1
+            if strong_break and getattr(cfg, "enable_strong_reentry", False):
+                pass
 
         if retest_active and now_ts_ms <= retest_until:
             # retest checks on current confirmed 3m bar
@@ -8196,9 +8264,14 @@ def _run_sr_pro_short_v1_cycle(
                 else:
                     tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
 
-                if c3 < retest_level:
+                if c3 <= retest_level + (atr_now * float(cfg.retest_close_atr_tol)):
                     gate_stats["entry_by_pass_close"] += 1
                 elif l3 < retest_level and c3 < o3:
+                    rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
+                    upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
+                    wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+                    if wick_ratio > float(cfg.retest_wick_max):
+                        continue
                     gate_stats["entry_by_pass_low"] += 1
                 elif break_type == "weak" and h3 < retest_level + (atr_now * cfg.shallow_atr_mult) and c3 < o3 and dvf_norm <= cfg.shallow_dvf_max:
                     rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
@@ -8253,9 +8326,75 @@ def _run_sr_pro_short_v1_cycle(
                 if req_id:
                     result["entries"] += 1
                 sym_state["retest_active"] = False
+                sym_state["reentry_active"] = False
                 continue
         if retest_active and now_ts_ms > retest_until:
             sym_state["retest_active"] = False
+        # strong-break reentry addon (short window)
+        if (
+            getattr(cfg, "enable_strong_reentry", False)
+            and reentry_active
+            and now_ts_ms <= reentry_until
+            and not retest_active
+        ):
+            ema20_3m = ema(df_3m_sig["close"].astype(float), 20)
+            ema20_now = float(ema20_3m.iloc[-1])
+            rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
+            upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
+            wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+            if (
+                c3 < ema20_now
+                and c3 < o3
+                and wick_ratio <= float(getattr(cfg, "reentry_wick_max", 0.4))
+            ):
+                entry_px = float(df_3m.iloc[-1]["open"])
+                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                high3 = df_3m_sig["high"].astype(float)
+                low3 = df_3m_sig["low"].astype(float)
+                close3 = df_3m_sig["close"].astype(float)
+                prev_close3 = close3.shift(1)
+                tr3 = pd.concat([(high3 - low3), (high3 - prev_close3).abs(), (low3 - prev_close3).abs()], axis=1).max(axis=1)
+                atr_3m = tr3.ewm(alpha=1 / 14, adjust=False).mean()
+                atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
+                sl_raw = nearest["top"] + (atr_now * float(cfg.sl_atr_mult))
+                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                tp_atr = cfg.tp_atr_mult
+                if tp_atr and tp_atr > 0:
+                    tp_price = entry_px - (atr_now * float(tp_atr))
+                else:
+                    tp_price = entry_px * cfg.tp_mult
+                usdt = _resolve_entry_usdt()
+                if usdt <= 0 or not _admin_is_active():
+                    sym_state["reentry_active"] = False
+                    continue
+                _append_sr_pro_short_v1_log(
+                    f"SR_PRO_REENTRY_STRONG sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f}"
+                )
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side="SHORT",
+                    engine="SR_PRO_SHORT_V1",
+                    reason="sr_pro_short_v1",
+                    usdt=usdt,
+                    live=LIVE_TRADING,
+                    entry_price_hint=entry_px,
+                    meta={
+                        "sl_price": float(sl_price),
+                        "tp_price": float(tp_price),
+                        "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                        "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                        "track": "strong_reentry",
+                    },
+                )
+                if req_id:
+                    result["entries"] += 1
+                    gate_stats["entry_by_reentry_strong"] += 1
+                sym_state["reentry_active"] = False
+                sym_state["retest_active"] = False
+                continue
+        if reentry_active and now_ts_ms > reentry_until:
+            sym_state["reentry_active"] = False
 
     elapsed = time.time() - start_ts
     _append_sr_pro_short_v1_log(
@@ -8265,11 +8404,15 @@ def _run_sr_pro_short_v1_cycle(
         f"cooldown={gate_stats.get('cooldown', 0)} skip_stale_ts={gate_stats.get('skip_stale_ts', 0)} "
         f"no_data_ltf={gate_stats.get('no_data_ltf', 0)} no_data_mtf={gate_stats.get('no_data_mtf', 0)} no_data_htf={gate_stats.get('no_data_htf', 0)}"
     )
+    _append_sr_pro_short_v1_log(
+        "SR_PRO_GATE_SUMMARY " + " ".join([f"{k}={v}" for k, v in gate_stats.items()])
+    )
     try:
         print(
             f"SR_PRO_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} no_data={no_data} "
             f"zone_fail={gate_stats['zone_touch']} lh_fail={gate_stats['lh_15m']} break_fail={gate_stats['break_3m']}"
         )
+        print("SR_PRO_GATE_SUMMARY " + " ".join([f"{k}={v}" for k, v in gate_stats.items()]))
     except Exception:
         pass
     return result
@@ -11252,6 +11395,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 and _trade_has_entry(open_tr)
                 and not _recent_auto_exit(state, sym, now)
             ):
+                meta = open_tr.get("meta") or {}
+                tp_sl_text = _fmt_tp_sl_pct(open_tr.get("entry_price"), meta, engine_label, "SHORT")
                 entry_time = _fmt_entry_time(open_tr)
                 entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                 icon = EXIT_SL_ICON if exit_tag == "SL" else EXIT_ICON
@@ -11260,6 +11405,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     f"<b>{sym}</b>\n"
                     f"엔진: {_display_engine_label(engine_label)}\n"
                     f"사유: {exit_tag}\n"
+                    f"TP/SL={tp_sl_text}\n"
                     f"{entry_line}".rstrip()
                 )
             time.sleep(0.1)
@@ -11393,11 +11539,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     entry_time = _fmt_entry_time(open_tr)
                     entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                     icon = EXIT_ICON if exit_tag == "TP" else EXIT_SL_ICON
+                    meta = open_tr.get("meta") or {} if isinstance(open_tr, dict) else {}
+                    tp_sl_text = _fmt_tp_sl_pct(entry_px if isinstance(entry_px, (int, float)) else None, meta, engine_label, "SHORT")
                     send_telegram(
                         f"{icon} <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
+                        f"TP/SL={tp_sl_text}\n"
                         f"{entry_line}"
                         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
@@ -11458,11 +11607,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     entry_time = _fmt_entry_time(open_tr)
                     entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                     icon = EXIT_ICON if exit_tag == "TP" else EXIT_SL_ICON
+                    meta = open_tr.get("meta") or {} if isinstance(open_tr, dict) else {}
+                    tp_sl_text = _fmt_tp_sl_pct(entry_px if isinstance(entry_px, (int, float)) else None, meta, engine_label, "SHORT")
                     send_telegram(
                         f"{icon} <b>숏 청산</b>\n"
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
+                        f"TP/SL={tp_sl_text}\n"
                         f"{entry_line}"
                         f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                         f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
@@ -11586,6 +11738,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 st["dca_adds_short"] = 0
                 state[sym] = st
                 if engine_label != "UNKNOWN" and _trade_has_entry(open_tr) and not _recent_auto_exit(state, sym, now):
+                    meta = open_tr.get("meta") or {}
+                    tp_sl_text = _fmt_tp_sl_pct(open_tr.get("entry_price"), meta, engine_label, "LONG")
                     entry_time = _fmt_entry_time(open_tr)
                     entry_line = f"진입시간={entry_time}\n" if entry_time else ""
                     exit_tag = "SL" if exit_reason == "auto_exit_sl" else "TP" if exit_reason == "auto_exit_tp" else "MANUAL"
@@ -11595,6 +11749,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         f"<b>{sym}</b>\n"
                         f"엔진: {_display_engine_label(engine_label)}\n"
                         f"사유: {exit_tag}\n"
+                        f"TP/SL={tp_sl_text}\n"
                         f"{entry_line}".rstrip()
                     )
                 time.sleep(0.1)
@@ -11618,12 +11773,23 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             continue
         closed = False
         tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "LONG")
+        sl_price_meta = None
         if isinstance(open_tr, dict):
             meta = open_tr.get("meta") or {}
             tp_pct_meta = meta.get("tp_pct")
             if isinstance(tp_pct_meta, (int, float)):
                 tp_pct = float(tp_pct_meta)
+            try:
+                sl_price_meta = float(meta.get("sl_price"))
+            except Exception:
+                sl_price_meta = None
         if AUTO_EXIT_ENABLED and profit_unlev >= tp_pct:
+            _append_entry_gate_log(
+                "auto_exit_long",
+                sym,
+                f"tp_hit profit={profit_unlev:.4f}% tp_pct={tp_pct:.4f} entry={entry_px} mark={mark_px}",
+                side="LONG",
+            )
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
@@ -11662,11 +11828,13 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
             entry_time = _fmt_entry_time(open_tr)
             entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+            tp_sl_text = _fmt_tp_sl_pct(entry_px if isinstance(entry_px, (int, float)) else None, meta if isinstance(meta, dict) else None, engine_label, "LONG")
             send_telegram(
                 f"{EXIT_ICON} <b>롱 청산</b>\n"
                 f"<b>{sym}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
+                f"TP/SL={tp_sl_text}\n"
                 f"{entry_line}"
                 f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                 f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
@@ -11674,13 +11842,13 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             )
             time.sleep(0.15)
             closed = True
-        elif (
-            AUTO_EXIT_ENABLED
-            and isinstance(sl_pct, (int, float))
-            and float(sl_pct) > 0
-            and profit_unlev < 0
-            and profit_unlev <= -float(sl_pct)
-        ):
+        elif AUTO_EXIT_ENABLED and isinstance(sl_price_meta, (int, float)) and mark_px <= float(sl_price_meta):
+            _append_entry_gate_log(
+                "auto_exit_long",
+                sym,
+                f"sl_price_hit mark={mark_px} sl_price={sl_price_meta} profit={profit_unlev:.4f}% entry={entry_px}",
+                side="LONG",
+            )
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
@@ -11719,11 +11887,79 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
             entry_time = _fmt_entry_time(open_tr)
             entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+            tp_sl_text = _fmt_tp_sl_pct(entry_px if isinstance(entry_px, (int, float)) else None, meta if isinstance(meta, dict) else None, engine_label, "LONG")
             send_telegram(
                 f"{EXIT_SL_ICON} <b>롱 청산</b>\n"
                 f"<b>{sym}</b>\n"
                 f"엔진: {_display_engine_label(engine_label)}\n"
                 f"사유: {exit_tag}\n"
+                f"TP/SL={tp_sl_text}\n"
+                f"{entry_line}"
+                f"체결가={avg_price} 수량={filled} 비용={cost}\n"
+                f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"
+                f"{'' if pnl_long is None else f' 손익={pnl_long:+.3f} USDT'}"
+            )
+            time.sleep(0.15)
+            closed = True
+        elif (
+            AUTO_EXIT_ENABLED
+            and (sl_price_meta is None or not isinstance(sl_price_meta, (int, float)))
+            and isinstance(sl_pct, (int, float))
+            and float(sl_pct) > 0
+            and profit_unlev < 0
+            and profit_unlev <= -float(sl_pct)
+        ):
+            _append_entry_gate_log(
+                "auto_exit_long",
+                sym,
+                f"sl_pct_hit profit={profit_unlev:.4f}% sl_pct={sl_pct:.4f} entry={entry_px} mark={mark_px}",
+                side="LONG",
+            )
+            engine_label = _engine_label_from_reason(
+                (open_tr.get("meta") or {}).get("reason") if open_tr else None
+            )
+            try:
+                set_dry_run(False if LONG_LIVE_TRADING else True)
+            except Exception:
+                pass
+            res = close_long_market(sym)
+            exit_order_id = _order_id_from_res(res)
+            cancel_conditional_by_side(sym, "LONG")
+            cancel_stop_orders(sym)
+            cancel_open_orders(sym)
+            avg_price = (
+                res.get("order", {}).get("average")
+                or res.get("order", {}).get("price")
+                or res.get("order", {}).get("info", {}).get("avgPrice")
+            )
+            filled = res.get("order", {}).get("filled") or res.get("order", {}).get("amount")
+            cost = res.get("order", {}).get("cost") or res.get("order", {}).get("info", {}).get("cumQuote")
+            exit_tag = "SL"
+            pnl_long = detail.get("pnl")
+            _close_trade(
+                state,
+                side="LONG",
+                symbol=sym,
+                exit_ts=now,
+                exit_price=avg_price if isinstance(avg_price, (int, float)) else mark_px,
+                pnl_usdt=pnl_long,
+                reason="auto_exit_sl",
+                exit_order_id=exit_order_id,
+            )
+            st = state.get(sym, {})
+            if isinstance(st, dict):
+                _set_last_exit_state(st, "LONG", now, "auto_exit_sl")
+                state[sym] = st
+            _append_report_line(sym, "LONG", profit_unlev, pnl_long, engine_label)
+            entry_time = _fmt_entry_time(open_tr)
+            entry_line = f"진입시간={entry_time}\n" if entry_time else ""
+            tp_sl_text = _fmt_tp_sl_pct(entry_px if isinstance(entry_px, (int, float)) else None, meta if isinstance(meta, dict) else None, engine_label, "LONG")
+            send_telegram(
+                f"{EXIT_SL_ICON} <b>롱 청산</b>\n"
+                f"<b>{sym}</b>\n"
+                f"엔진: {_display_engine_label(engine_label)}\n"
+                f"사유: {exit_tag}\n"
+                f"TP/SL={tp_sl_text}\n"
                 f"{entry_line}"
                 f"체결가={avg_price} 수량={filled} 비용={cost}\n"
                 f"진입가={entry_px} 현재가={mark_px} 수익률={profit_unlev:.2f}%"

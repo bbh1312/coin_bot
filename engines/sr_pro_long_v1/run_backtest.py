@@ -233,9 +233,9 @@ def run_backtest() -> None:
             print("[BACKTEST] total_window_days must be >= days")
             return
         total_window_days = args.total_window_days
-        warmup_days = max(0, total_window_days - args.days)
+        warmup_days = max(0, total_window_days)
         warmup_minutes = warmup_days * 1440
-        start_ms = end_ms - int(total_window_days * 24 * 60 * 60 * 1000)
+        start_ms = end_ms - int((warmup_days + args.days) * 24 * 60 * 60 * 1000)
         eval_start_ms = end_ms - int(args.days * 24 * 60 * 60 * 1000)
     else:
         start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(args.days, end_ms, min_bars)
@@ -305,6 +305,14 @@ def run_backtest() -> None:
             "tp_sum_usdt": 0.0,
             "sl_sum_usdt": 0.0,
         }
+
+    def _tp_sl_pct_from_trade(trade: dict) -> tuple[float, float]:
+        entry = float(trade.get("entry_px") or 0.0)
+        tp = float(trade.get("tp_price") or 0.0)
+        sl = float(trade.get("sl_price") or 0.0)
+        tp_pct = (tp - entry) / entry * 100.0 if entry > 0 and tp > 0 else 0.0
+        sl_pct = (entry - sl) / entry * 100.0 if entry > 0 and sl > 0 else 0.0
+        return tp_pct, sl_pct
 
     stats = _new_stats()
     per_symbol_stats: Dict[str, Dict[str, float]] = {}
@@ -524,6 +532,8 @@ def run_backtest() -> None:
                             "entry_px": trade["entry_px"],
                             "exit_px": exit_px,
                             "reason": "SL",
+                            "tp_pct": _tp_sl_pct_from_trade(trade)[0],
+                            "sl_pct": _tp_sl_pct_from_trade(trade)[1],
                         }
                     )
                     cooldown_until[(sym, "LONG")] = ts + (60 * 60 * 1000)
@@ -553,6 +563,8 @@ def run_backtest() -> None:
                             "entry_px": trade["entry_px"],
                             "exit_px": exit_px,
                             "reason": "TP",
+                            "tp_pct": _tp_sl_pct_from_trade(trade)[0],
+                            "sl_pct": _tp_sl_pct_from_trade(trade)[1],
                         }
                     )
                     trade = None
@@ -791,11 +803,17 @@ def run_backtest() -> None:
         sym_items.sort(key=lambda x: x["entry_ts"], reverse=True)
         for item in sym_items:
             if "exit_ts" in item:
+                tp_pct = item.get("tp_pct")
+                sl_pct = item.get("sl_pct")
+                tp_sl_text = ""
+                if isinstance(tp_pct, (int, float)) and isinstance(sl_pct, (int, float)):
+                    tp_sl_text = f" tp_pct={tp_pct:.2f} sl_pct={sl_pct:.2f}"
+                result = "WIN" if item.get("reason") == "TP" else "LOSS" if item.get("reason") == "SL" else "OTHER"
                 print(
                     "[BACKTEST][EXIT] "
                     f"sym={item['sym']} mode={item['mode']} side={item['side']} "
                     f"entry_dt={_minute_str(item['entry_ts'])} exit_dt={_minute_str(item['exit_ts'])} "
-                    f"entry_px={item['entry_px']:.6f} exit_px={item['exit_px']:.6f} reason={item['reason']}"
+                    f"entry_px={item['entry_px']:.6f} exit_px={item['exit_px']:.6f} reason={item['reason']} result={result}{tp_sl_text}"
                 )
             else:
                 print(
@@ -815,6 +833,8 @@ def run_backtest() -> None:
         len(entry_symbols),
     )
     print(summary)
+    if args.log_gates:
+        print(f"[BACKTEST] GATES {gate_counts}")
 
     print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
     for hour in range(24):

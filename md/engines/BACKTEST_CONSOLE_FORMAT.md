@@ -36,7 +36,7 @@ ENTRY는 중복 방지를 위해 콘솔에 출력하지 않는다.
 
 ```
 [BACKTEST][OPEN] sym=<SYMBOL> mode=<MODE> side=<SIDE> entry_dt=<YYYY-MM-DD HH:MM> exit_dt= entry_px=<PX> last_px=<PX|N/A> last_dt=<YYYY-MM-DD HH:MM|N/A> unrealized_pct=<PCT|N/A>
-[BACKTEST][EXIT] sym=<SYMBOL> mode=<MODE> side=<SIDE> entry_dt=<YYYY-MM-DD HH:MM> exit_dt=<YYYY-MM-DD HH:MM> entry_px=<PX> exit_px=<PX> reason=<TP|SL|TIMEOUT|MANUAL>
+[BACKTEST][EXIT] sym=<SYMBOL> mode=<MODE> side=<SIDE> entry_dt=<YYYY-MM-DD HH:MM> exit_dt=<YYYY-MM-DD HH:MM> entry_px=<PX> exit_px=<PX> reason=<TP|SL|TIMEOUT|MANUAL> result=<WIN|LOSS|OTHER> tp_pct=<PCT> sl_pct=<PCT>
 ```
 
 참고:
@@ -49,8 +49,8 @@ ENTRY는 중복 방지를 위해 콘솔에 출력하지 않는다.
 ```
 [BACKTEST] ARPA/USDT:USDT entries=5 exits=4 trades=4 wins=4 losses=0 winrate=100.00% tp=4 sl=0 avg_mfe=0.0389 avg_mae=0.0584 avg_hold=115.0 last_day_exits=2 base_usdt=10.00 tp_sum=0.800 sl_sum=0.000 net_sum=0.800 entry_syms=3
 [BACKTEST][OPEN] sym=ARPA/USDT:USDT mode=swaggy_no_atlas side=LONG entry_dt=2026-01-20 02:15 exit_dt= entry_px=0.01966 last_px=0.01767 last_dt=2026-01-20 06:45 unrealized_pct=-10.12%
-[BACKTEST][EXIT] sym=ARPA/USDT:USDT mode=swaggy_no_atlas side=LONG entry_dt=2026-01-20 00:10 exit_dt=2026-01-20 01:45 entry_px=0.01918 exit_px=0.0195636 reason=TP
-[BACKTEST][EXIT] sym=ARPA/USDT:USDT mode=swaggy_no_atlas side=LONG entry_dt=2026-01-19 22:15 exit_dt=2026-01-19 23:45 entry_px=0.01967 exit_px=0.0200634 reason=TP
+[BACKTEST][EXIT] sym=ARPA/USDT:USDT mode=swaggy_no_atlas side=LONG entry_dt=2026-01-20 00:10 exit_dt=2026-01-20 01:45 entry_px=0.01918 exit_px=0.0195636 reason=TP result=WIN tp_pct=2.00 sl_pct=5.00
+[BACKTEST][EXIT] sym=ARPA/USDT:USDT mode=swaggy_no_atlas side=LONG entry_dt=2026-01-19 22:15 exit_dt=2026-01-19 23:45 entry_px=0.01967 exit_px=0.0200634 reason=TP result=WIN tp_pct=2.00 sl_pct=5.00
 ```
 
 ## TOTAL 출력 포맷
