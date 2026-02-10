@@ -77,6 +77,7 @@ try:
     from engines.atlas.atlas_engine import AtlasEngine, AtlasSwaggyConfig
     from engines.rsi.engine import RsiEngine
     from engines.universe import build_universe_from_tickers
+    from engines.sr_pro_common import build_sr_zones
     try:
         from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
         from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
@@ -98,6 +99,7 @@ except Exception as _import_err:
     TopFailShortV1Config = None
     top_fail_short_entry_signal = None
     SrProShortV1Config = None
+    build_sr_zones = None
     BullPullbackLongConfig = None
     AtlasRsFailShortEngine = None
     AtlasRsFailShortConfig = None
@@ -115,12 +117,6 @@ if "SwaggyAtlasLabConfig" not in globals():
     SwaggyAtlasLabConfig = None
 if "SwaggyAtlasLabAtlasConfig" not in globals():
     SwaggyAtlasLabAtlasConfig = None
-if "SwaggyAtlasLabV2Engine" not in globals():
-    SwaggyAtlasLabV2Engine = None
-if "SwaggyAtlasLabV2Config" not in globals():
-    SwaggyAtlasLabV2Config = None
-if "SwaggyAtlasLabV2AtlasConfig" not in globals():
-    SwaggyAtlasLabV2AtlasConfig = None
 if "SwaggyNoAtlasEngine" not in globals():
     SwaggyNoAtlasEngine = None
 if "SwaggyNoAtlasConfig" not in globals():
@@ -133,26 +129,6 @@ if "lab_apply_policy" not in globals():
     lab_apply_policy = None
 if "SwaggyAtlasLabMode" not in globals():
     SwaggyAtlasLabMode = None
-if "lab_v2_evaluate_global_gate" not in globals():
-    lab_v2_evaluate_global_gate = None
-if "lab_v2_evaluate_local" not in globals():
-    lab_v2_evaluate_local = None
-if "lab_v2_apply_policy" not in globals():
-    lab_v2_apply_policy = None
-if "WashShortSuiteConfig" not in globals():
-    WashShortSuiteConfig = None
-if "wash_btc_guard" not in globals():
-    wash_btc_guard = None
-if "wash_map_idx_by_ts" not in globals():
-    wash_map_idx_by_ts = None
-if "wash_short_entry_signal" not in globals():
-    wash_short_entry_signal = None
-if "HodFailShortV1Config" not in globals():
-    HodFailShortV1Config = None
-if "hod_fail_short_entry_signal" not in globals():
-    hod_fail_short_entry_signal = None
-if "SwaggyAtlasLabV2Mode" not in globals():
-    SwaggyAtlasLabV2Mode = None
 if "DTFXEngine" not in globals():
     DTFXEngine = None
 if "DTFXConfig" not in globals():
@@ -2915,109 +2891,6 @@ def _append_sr_pro_short_v1_log(line: str) -> None:
     path = os.path.join("sr_pro_short_v1", f"sr_pro_short_v1-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
-def _sr_pro_pivot(series: pd.Series, idx: int, left: int, right: int, mode: str) -> Optional[float]:
-    if idx - left < 0 or idx + right >= len(series):
-        return None
-    window = series.iloc[idx - left : idx + right + 1]
-    val = series.iloc[idx]
-    if mode == "high":
-        return float(val) if float(val) == float(window.max()) else None
-    return float(val) if float(val) == float(window.min()) else None
-
-def _sr_pro_build_zones(
-    df_1h_hist: pd.DataFrame,
-    cfg: SrProShortV1Config,
-    window_bars: Optional[int] = None,
-) -> list:
-    """TradingView S/R Pro 존 생성 로직(존 무효화는 아직 미적용)."""
-    if df_1h_hist is None or df_1h_hist.empty:
-        return []
-    if window_bars and window_bars > 0 and len(df_1h_hist) > window_bars:
-        df_1h_hist = df_1h_hist.iloc[-window_bars:].copy()
-    close = df_1h_hist["close"].astype(float)
-    open_ = df_1h_hist["open"].astype(float)
-    high = df_1h_hist["high"].astype(float)
-    low = df_1h_hist["low"].astype(float)
-    vol = df_1h_hist["volume"].astype(float)
-    prev_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
-    dv = np.where(close > open_, vol, np.where(close < open_, -vol, 0.0))
-    dv = pd.Series(dv, index=df_1h_hist.index)
-    dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
-
-    def _pivot_confirmed(series: pd.Series, i: int, lb: int, mode: str) -> Optional[float]:
-        pivot_idx = i - lb
-        if pivot_idx < lb or pivot_idx + lb >= len(series):
-            return None
-        window = series.iloc[pivot_idx - lb : pivot_idx + lb + 1]
-        val = series.iloc[pivot_idx]
-        if mode == "high":
-            return float(val) if float(val) == float(window.max()) else None
-        return float(val) if float(val) == float(window.min()) else None
-
-    zones = []
-    for i in range(len(df_1h_hist)):
-        lb = cfg.lookback
-        ph1 = _pivot_confirmed(high, i, lb, "high")
-        pl1 = _pivot_confirmed(low, i, lb, "low")
-        ph = ph1
-        pl = pl1
-        lb_used = lb
-        if cfg.auto_relax and ph is None and pl is None:
-            lb2 = cfg.relaxed_lookback
-            ph = _pivot_confirmed(high, i, lb2, "high")
-            pl = _pivot_confirmed(low, i, lb2, "low")
-            lb_used = lb2
-        if ph is None and pl is None:
-            if i % 20 == 0:
-                for side in (1, -1):
-                    side_z = [z for z in zones if z["side"] == side]
-                    if len(side_z) > cfg.max_zones_per_side:
-                        oldest = min(side_z, key=lambda z: z["born"])
-                        zones.remove(oldest)
-            continue
-
-        pivot_bar = i - lb_used
-        if pivot_bar < 0:
-            continue
-        half_w = float(atr.iloc[i]) * cfg.atr_mult * 0.5
-        cluster_dist = float(atr.iloc[i]) * cfg.cluster_atr
-        vol_val = float(dvf.iloc[pivot_bar]) if pivot_bar < len(dvf) else float(dvf.iloc[i])
-
-        def merge_or_create(side: int, level: float) -> None:
-            for z in zones:
-                if z["side"] == side and abs(z["mid"] - level) <= cluster_dist:
-                    new_mid = (z["mid"] + level) * 0.5
-                    z["mid"] = new_mid
-                    z["top"] = new_mid + half_w
-                    z["bot"] = new_mid - half_w
-                    z["vol"] = (z["vol"] + vol_val) * 0.5
-                    return
-            zones.append(
-                {
-                    "mid": level,
-                    "top": level + half_w,
-                    "bot": level - half_w,
-                    "side": side,
-                    "vol": vol_val,
-                    "born": i,
-                    "start": pivot_bar,
-                }
-            )
-
-        if ph is not None:
-            merge_or_create(1, float(ph))
-        if pl is not None:
-            merge_or_create(-1, float(pl))
-
-        if i % 20 == 0:
-            for side in (1, -1):
-                side_z = [z for z in zones if z["side"] == side]
-                if len(side_z) > cfg.max_zones_per_side:
-                    oldest = min(side_z, key=lambda z: z["born"])
-                    zones.remove(oldest)
-    return zones
 
 def _iso_kst(ts: Optional[float] = None) -> str:
     tz = timezone(timedelta(hours=9))
@@ -6750,7 +6623,7 @@ def _close_trade(
                 try:
                     sr_state = state.setdefault("_sr_pro_short_v1_state", {})
                     sym_state = sr_state.setdefault(symbol, {})
-                    sym_state["cooldown_until"] = int(float(exit_ts) * 1000) + (60 * 60 * 1000)
+                    sym_state["cooldown_until_short"] = int(float(exit_ts) * 1000) + (60 * 60 * 1000)
                 except Exception:
                     pass
             _update_report_csv(tr)
@@ -8144,7 +8017,7 @@ def _run_sr_pro_short_v1_cycle(
             gate_stats["skip_stale_ts"] += 1
             continue
         sym_state["last_eval_ts"] = latest_ts_ms
-        cd_until = sym_state.get("cooldown_until")
+        cd_until = sym_state.get("cooldown_until_short")
         if isinstance(cd_until, (int, float)) and latest_ts_ms < int(cd_until):
             gate_stats["cooldown"] += 1
             continue
@@ -8152,7 +8025,7 @@ def _run_sr_pro_short_v1_cycle(
         # refresh zones if new 1h bar
         last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
         if sym_state.get("zones_ts") != last_1h_hist_ts:
-            zones = _sr_pro_build_zones(df_1h_hist, cfg, window_bars=window_bars_1h)
+            zones = build_sr_zones(df_1h_hist, cfg, window_bars=window_bars_1h)
             sym_state["zones"] = zones
             sym_state["zones_ts"] = last_1h_hist_ts
         zones = sym_state.get("zones") or []
@@ -8339,7 +8212,9 @@ def _run_sr_pro_short_v1_cycle(
     _append_sr_pro_short_v1_log(
         f"SR_PRO_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} no_data={no_data} "
         f"zone_fail={gate_stats['zone_touch']} lh_fail={gate_stats['lh_15m']} break_fail={gate_stats['break_3m']} "
-        f"retest_seen={gate_stats['retest_seen']} pass_close={gate_stats['entry_by_pass_close']} pass_low={gate_stats['entry_by_pass_low']}"
+        f"retest_seen={gate_stats['retest_seen']} pass_close={gate_stats['entry_by_pass_close']} pass_low={gate_stats['entry_by_pass_low']} "
+        f"cooldown={gate_stats.get('cooldown', 0)} skip_stale_ts={gate_stats.get('skip_stale_ts', 0)} "
+        f"no_data_ltf={gate_stats.get('no_data_ltf', 0)} no_data_mtf={gate_stats.get('no_data_mtf', 0)} no_data_htf={gate_stats.get('no_data_htf', 0)}"
     )
     try:
         print(

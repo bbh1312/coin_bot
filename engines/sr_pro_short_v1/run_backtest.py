@@ -24,6 +24,7 @@ from engines.backtest_common import (
     log_warmup_info,
 )
 from engines.sr_pro_short_v1.engine import SrProShortV1Config
+from engines.sr_pro_common import build_sr_zones
 
 
 def _read_cached_csv(path: str) -> List[List[float]]:
@@ -390,109 +391,27 @@ def run_backtest() -> None:
                 for z in zones_snapshot_in.get(sym, [])
             ]
 
-        def _pivot_confirmed(
-            series: pd.Series,
-            i: int,
-            lb: int,
-            mode: str,
-            start_idx: int,
-            end_idx: int,
-        ) -> Optional[float]:
-            pivot_idx = i - lb
-            if pivot_idx - lb < start_idx or pivot_idx + lb > end_idx:
-                return None
-            window = series.iloc[pivot_idx - lb : pivot_idx + lb + 1]
-            val = series.iloc[pivot_idx]
-            if mode == "high":
-                return float(val) if float(val) == float(window.max()) else None
-            return float(val) if float(val) == float(window.min()) else None
-
         window_bars_1h = int(args.total_window_days * 24) if args.total_window_days else 0
-
-        def build_zones(end_idx: int) -> List[Zone]:
-            zones_local: List[Zone] = []
-            if end_idx < 0:
-                return zones_local
-            start_idx = 0
-            if window_bars_1h:
-                start_idx = max(0, end_idx - window_bars_1h + 1)
-
-            def merge_or_create(
-                zones_ref: List[Zone],
-                side: int,
-                level: float,
-                vol_val: float,
-                half_w: float,
-                cluster_dist: float,
-                born_idx: int,
-                start_bar: int,
-            ) -> None:
-                merged = False
-                for z in zones_ref:
-                    if z.live and z.side == side and abs(z.mid - level) <= cluster_dist:
-                        new_mid = (z.mid + level) * 0.5
-                        z.mid = new_mid
-                        z.top = new_mid + half_w
-                        z.bot = new_mid - half_w
-                        z.vol = (z.vol + vol_val) * 0.5
-                        merged = True
-                        break
-                if not merged:
-                    zones_ref.append(
-                        Zone(
-                            mid=level,
-                            top=level + half_w,
-                            bot=level - half_w,
-                            side=side,
-                            live=True,
-                            born=born_idx,
-                            start=start_bar,
-                            vol=vol_val,
-                        )
-                    )
-
-            for i1 in range(start_idx, end_idx + 1):
-                lb = cfg.lookback
-                ph = _pivot_confirmed(high_1h, i1, lb, "high", start_idx, end_idx)
-                pl = _pivot_confirmed(low_1h, i1, lb, "low", start_idx, end_idx)
-                lb_used = lb
-                if cfg.auto_relax and ph is None and pl is None:
-                    lb2 = cfg.relaxed_lookback
-                    ph = _pivot_confirmed(high_1h, i1, lb2, "high", start_idx, end_idx)
-                    pl = _pivot_confirmed(low_1h, i1, lb2, "low", start_idx, end_idx)
-                    lb_used = lb2
-                if ph is None and pl is None:
-                    if i1 % 20 == 0:
-                        for side in (1, -1):
-                            side_z = [z for z in zones_local if z.side == side]
-                            if len(side_z) > cfg.max_zones_per_side:
-                                oldest = min(side_z, key=lambda z: z.born)
-                                zones_local.remove(oldest)
-                    continue
-                pivot_bar = i1 - lb_used
-                if pivot_bar < start_idx:
-                    continue
-                half_w = float(atr_1h.iloc[i1]) * cfg.atr_mult * 0.5
-                cluster_dist = float(atr_1h.iloc[i1]) * cfg.cluster_atr
-                vol_val = float(dvf.iloc[pivot_bar]) if pivot_bar < len(dvf) else float(dvf.iloc[i1])
-                if ph is not None:
-                    merge_or_create(zones_local, 1, float(ph), vol_val, half_w, cluster_dist, i1, pivot_bar)
-                if pl is not None:
-                    merge_or_create(zones_local, -1, float(pl), vol_val, half_w, cluster_dist, i1, pivot_bar)
-                if i1 % 20 == 0:
-                    for side in (1, -1):
-                        side_z = [z for z in zones_local if z.side == side]
-                        if len(side_z) > cfg.max_zones_per_side:
-                            oldest = min(side_z, key=lambda z: z.born)
-                            zones_local.remove(oldest)
-            return zones_local
 
         # build zones from 1h history first (TradingView pivot confirmed style)
         if not zones and not args.rolling_zones:
             zone_end_idx = len(df_1h)
             if args.freeze_zones:
                 zone_end_idx = int(np.searchsorted(df_1h["ts"].values, eval_start_ms, side="right"))
-            zones = build_zones(zone_end_idx - 1)
+            zones_raw = build_sr_zones(df_1h.iloc[:zone_end_idx], cfg, window_bars=window_bars_1h)
+            zones = [
+                Zone(
+                    mid=float(z["mid"]),
+                    top=float(z["top"]),
+                    bot=float(z["bot"]),
+                    side=int(z["side"]),
+                    live=True,
+                    born=int(z["born"]),
+                    start=int(z["start"]),
+                    vol=float(z["vol"]),
+                )
+                for z in zones_raw
+            ]
 
         if args.zones_snapshot_out:
             zones_snapshot_out[sym] = [
@@ -542,7 +461,20 @@ def run_backtest() -> None:
 
             if args.rolling_zones and not zones_snapshot_in:
                 if last_zone_end_idx != idx_1h:
-                    zones = build_zones(idx_1h)
+                    zones_raw = build_sr_zones(df_1h.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
+                    zones = [
+                        Zone(
+                            mid=float(z["mid"]),
+                            top=float(z["top"]),
+                            bot=float(z["bot"]),
+                            side=int(z["side"]),
+                            live=True,
+                            born=int(z["born"]),
+                            start=int(z["start"]),
+                            vol=float(z["vol"]),
+                        )
+                        for z in zones_raw
+                    ]
                     last_zone_end_idx = idx_1h
 
             # invalidate zones
