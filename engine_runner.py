@@ -7986,9 +7986,6 @@ def _run_sr_pro_short_v1_cycle(
         "retest_seen": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
-        "reentry_strong_seen": 0,
-        "entry_by_reentry_strong": 0,
-        "reentry_eval": 0,
         "no_data_ltf": 0,
         "no_data_mtf": 0,
         "no_data_htf": 0,
@@ -8198,28 +8195,11 @@ def _run_sr_pro_short_v1_cycle(
         if not strong_break:
             gate_stats["break_3m"] += 1
             continue
-        # strong-break reentry window setup (independent of retest)
-        if strong_break and getattr(cfg, "enable_strong_reentry", False):
-            reentry_active = True
-            reentry_bars = max(1, int(getattr(cfg, "reentry_window_bars", 2)))
-            reentry_until = now_ts_ms + reentry_bars * 3 * 60 * 1000
-            sym_state["reentry_active"] = True
-            sym_state["reentry_until"] = reentry_until
-            gate_stats["reentry_strong_seen"] += 1
-        reentry_active = bool(
-            getattr(cfg, "enable_strong_reentry", False)
-            and sym_state.get("reentry_active")
-            and now_ts_ms <= int(sym_state.get("reentry_until", 0) or 0)
-        )
-        if reentry_active:
-            gate_stats["reentry_eval"] += 1
         # retest state
         retest_active = bool(sym_state.get("retest_active"))
         retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
         retest_until = int(sym_state.get("retest_until", 0) or 0)
         break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
-        reentry_active = bool(sym_state.get("reentry_active"))
-        reentry_until = int(sym_state.get("reentry_until", 0) or 0)
         now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
         if not retest_active:
             retest_active = True
@@ -8232,8 +8212,6 @@ def _run_sr_pro_short_v1_cycle(
             sym_state["retest_until"] = retest_until
             sym_state["break_type"] = break_type
             gate_stats["retest_seen"] += 1
-            if strong_break and getattr(cfg, "enable_strong_reentry", False):
-                pass
 
         if retest_active and now_ts_ms <= retest_until:
             # retest checks on current confirmed 3m bar
@@ -8264,26 +8242,23 @@ def _run_sr_pro_short_v1_cycle(
                 else:
                     tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
 
-                if c3 <= retest_level + (atr_now * float(cfg.retest_close_atr_tol)):
+                if c3 < retest_level:
                     gate_stats["entry_by_pass_close"] += 1
-                elif l3 < retest_level and c3 < o3:
+                else:
                     rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
                     upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
                     wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
-                    if wick_ratio > float(cfg.retest_wick_max):
-                        continue
-                    gate_stats["entry_by_pass_low"] += 1
-                elif break_type == "weak" and h3 < retest_level + (atr_now * cfg.shallow_atr_mult) and c3 < o3 and dvf_norm <= cfg.shallow_dvf_max:
-                    rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
-                    upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
-                    wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
-                    if wick_ratio <= cfg.shallow_wick_max:
+                    if l3 < retest_level and c3 < o3 and wick_ratio <= float(cfg.retest_wick_max):
+                        gate_stats["entry_by_pass_low"] += 1
+                    elif (
+                        h3 < retest_level + (atr_now * cfg.shallow_atr_mult)
+                        and c3 < o3
+                        and dvf_norm <= cfg.shallow_dvf_max
+                        and wick_ratio <= cfg.shallow_wick_max
+                    ):
                         gate_stats["entry_by_pass_low"] += 1
                     else:
-                        sym_state["retest_active"] = True
                         continue
-                else:
-                    continue
 
                 usdt = _resolve_entry_usdt()
                 if usdt <= 0 or not _admin_is_active():
@@ -8326,75 +8301,9 @@ def _run_sr_pro_short_v1_cycle(
                 if req_id:
                     result["entries"] += 1
                 sym_state["retest_active"] = False
-                sym_state["reentry_active"] = False
                 continue
         if retest_active and now_ts_ms > retest_until:
             sym_state["retest_active"] = False
-        # strong-break reentry addon (short window)
-        if (
-            getattr(cfg, "enable_strong_reentry", False)
-            and reentry_active
-            and now_ts_ms <= reentry_until
-            and not retest_active
-        ):
-            ema20_3m = ema(df_3m_sig["close"].astype(float), 20)
-            ema20_now = float(ema20_3m.iloc[-1])
-            rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
-            upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
-            wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
-            if (
-                c3 < ema20_now
-                and c3 < o3
-                and wick_ratio <= float(getattr(cfg, "reentry_wick_max", 0.4))
-            ):
-                entry_px = float(df_3m.iloc[-1]["open"])
-                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
-                high3 = df_3m_sig["high"].astype(float)
-                low3 = df_3m_sig["low"].astype(float)
-                close3 = df_3m_sig["close"].astype(float)
-                prev_close3 = close3.shift(1)
-                tr3 = pd.concat([(high3 - low3), (high3 - prev_close3).abs(), (low3 - prev_close3).abs()], axis=1).max(axis=1)
-                atr_3m = tr3.ewm(alpha=1 / 14, adjust=False).mean()
-                atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
-                sl_raw = nearest["top"] + (atr_now * float(cfg.sl_atr_mult))
-                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                tp_atr = cfg.tp_atr_mult
-                if tp_atr and tp_atr > 0:
-                    tp_price = entry_px - (atr_now * float(tp_atr))
-                else:
-                    tp_price = entry_px * cfg.tp_mult
-                usdt = _resolve_entry_usdt()
-                if usdt <= 0 or not _admin_is_active():
-                    sym_state["reentry_active"] = False
-                    continue
-                _append_sr_pro_short_v1_log(
-                    f"SR_PRO_REENTRY_STRONG sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f}"
-                )
-                req_id = _enqueue_entry_request(
-                    state,
-                    symbol=symbol,
-                    side="SHORT",
-                    engine="SR_PRO_SHORT_V1",
-                    reason="sr_pro_short_v1",
-                    usdt=usdt,
-                    live=LIVE_TRADING,
-                    entry_price_hint=entry_px,
-                    meta={
-                        "sl_price": float(sl_price),
-                        "tp_price": float(tp_price),
-                        "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
-                        "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
-                        "track": "strong_reentry",
-                    },
-                )
-                if req_id:
-                    result["entries"] += 1
-                    gate_stats["entry_by_reentry_strong"] += 1
-                sym_state["reentry_active"] = False
-                sym_state["retest_active"] = False
-                continue
-        if reentry_active and now_ts_ms > reentry_until:
-            sym_state["reentry_active"] = False
 
     elapsed = time.time() - start_ts
     _append_sr_pro_short_v1_log(

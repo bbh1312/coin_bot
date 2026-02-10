@@ -38,11 +38,11 @@ class SrProLongV1Config:
     shallow_wick_max: float = 0.35
     shallow_dvf_min: float = 0.0
     sl_buffer: float = 0.01
-    sl_atr_mult: float = 0.5
+    sl_atr_mult: float = 0.4
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 1.02
-    tp_mult_weak: float = 1.02
+    tp_mult: float = 1.01
+    tp_mult_weak: float = 1.01
 
 
 class SrProLongV1Engine(BaseEngine):

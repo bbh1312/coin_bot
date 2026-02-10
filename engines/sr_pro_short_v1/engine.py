@@ -25,12 +25,12 @@ class SrProShortV1Config:
     reject_source: str = "1h"
     ema200_filter: bool = True
     ema_filter_len: int = 200
-    total_window_days: int = 10
+    total_window_days: int = 14
     rolling_zones: bool = True
     retest_bars: int = 6
     retest_atr_mult: float = 0.25
     retest_near_atr_mult: float = 0.15
-    retest_wick_max: float = 0.4
+    retest_wick_max: float = 0.40
     retest_dyn: bool = False
     retest_dyn_th: float = 0.6
     retest_dyn_bars: int = 10

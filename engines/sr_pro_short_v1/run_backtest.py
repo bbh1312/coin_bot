@@ -217,7 +217,7 @@ def run_backtest() -> None:
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
-    parser.add_argument("--total-window-days", type=int, default=10)
+    parser.add_argument("--total-window-days", type=int, default=14)
     parser.add_argument("--rolling-zones", action="store_true")
     parser.add_argument("--zones-snapshot-in", type=str, default="")
     parser.add_argument("--zones-snapshot-out", type=str, default="")
@@ -252,13 +252,13 @@ def run_backtest() -> None:
         cfg.tf_htf: 120,
     }
     if args.total_window_days:
-        if args.total_window_days < args.days:
-            print("[BACKTEST] total_window_days must be >= days")
+        if args.total_window_days <= 0:
+            print("[BACKTEST] total_window_days must be > 0")
             return
         total_window_days = args.total_window_days
-        warmup_days = max(0, total_window_days - args.days)
+        warmup_days = total_window_days
         warmup_minutes = warmup_days * 1440
-        start_ms = end_ms - int(total_window_days * 24 * 60 * 60 * 1000)
+        start_ms = end_ms - int((total_window_days + args.days) * 24 * 60 * 60 * 1000)
         eval_start_ms = end_ms - int(args.days * 24 * 60 * 60 * 1000)
     else:
         start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(
@@ -643,6 +643,9 @@ def run_backtest() -> None:
                             "entry_px": trade["entry_px"],
                             "exit_px": exit_px,
                             "reason": "SL",
+                            "result": "LOSS",
+                            "tp_pct": ((trade["entry_px"] - trade["tp_price"]) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
+                            "sl_pct": ((trade["sl_price"] - trade["entry_px"]) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
                         }
                     )
                     cooldown_until[sym] = ts + (60 * 60 * 1000)
@@ -684,6 +687,9 @@ def run_backtest() -> None:
                             "entry_px": trade["entry_px"],
                             "exit_px": exit_px,
                             "reason": "TP",
+                            "result": "WIN",
+                            "tp_pct": ((trade["entry_px"] - trade["tp_price"]) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
+                            "sl_pct": ((trade["sl_price"] - trade["entry_px"]) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
                         }
                     )
                     trade = None
@@ -924,14 +930,9 @@ def run_backtest() -> None:
                             entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
                             retest_active = False
                         else:
-                            near_limit = retest_level + (atr_now * float(args.retest_near_atr_mult))
-                            if high_now < near_limit and close_now < float(df_3m.at[i3, "open"]):
-                                if args.log_gates:
-                                    gate_counts["retest_fail_shallow"] += 1
                             shallow_limit = retest_level + (atr_now * float(args.shallow_atr_mult))
                             if (
-                                weak_break
-                                and high_now < shallow_limit
+                                high_now < shallow_limit
                                 and close_now < float(df_3m.at[i3, "open"])
                                 and dvf_norm <= float(args.shallow_dvf_max)
                             ):
@@ -939,11 +940,13 @@ def run_backtest() -> None:
                                 upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
                                 wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
                                 if wick_ratio <= float(args.shallow_wick_max):
+                                    if args.log_gates:
+                                        gate_counts["retest_pass_low"] += 1
                                     entry_px = float(df_3m.at[i3 + 1, "open"])
                                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                                    tp_atr = float(args.tp_atr_mult_weak) if float(args.tp_atr_mult_weak) > 0 else float(args.tp_atr_mult)
+                                    tp_atr = float(args.tp_atr_mult_weak) if (not strong_break and float(args.tp_atr_mult_weak) > 0) else float(args.tp_atr_mult)
                                     if tp_atr > 0:
                                         tp_price = entry_px - (atr_now * tp_atr)
                                     else:
@@ -956,7 +959,7 @@ def run_backtest() -> None:
                                         "mae": 0.0,
                                         "hold_bars": 0,
                                         "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
-                                        "track": "weak",
+                                        "track": "strong" if strong_break else "weak",
                                     }
                                     stats["entries"] += 1
                                     sym_stats["entries"] += 1
@@ -970,10 +973,16 @@ def run_backtest() -> None:
                                     dow_stats[dow_bucket]["entries"] += 1
                                     if args.log_gates:
                                         gate_counts["entry_by_pass_low"] += 1
-                                        gate_counts["entries_weak"] += 1
+                                        if strong_break:
+                                            gate_counts["entries_strong"] += 1
+                                        else:
+                                            gate_counts["entries_weak"] += 1
                                     day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
                                     entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
                                     retest_active = False
+                            else:
+                                if args.log_gates:
+                                    gate_counts["retest_fail_shallow"] += 1
                 if i3 >= retest_until:
                     if args.log_gates:
                         gate_counts["retest_fail_far"] += 1
@@ -1039,7 +1048,9 @@ def run_backtest() -> None:
                     "[BACKTEST][EXIT] "
                     f"sym={item['sym']} mode={item['mode']} side={item['side']} "
                     f"entry_dt={_minute_str(item['entry_ts'])} exit_dt={_minute_str(item['exit_ts'])} "
-                    f"entry_px={item['entry_px']:.6f} exit_px={item['exit_px']:.6f} reason={item['reason']}"
+                    f"entry_px={item['entry_px']:.6f} exit_px={item['exit_px']:.6f} "
+                    f"reason={item['reason']} result={item.get('result','')} "
+                    f"tp_pct={item.get('tp_pct',0.0):.2f} sl_pct={item.get('sl_pct',0.0):.2f}"
                 )
             else:
                 print(
@@ -1060,29 +1071,6 @@ def run_backtest() -> None:
             len(entry_symbols),
         )
     )
-
-    print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
-    for hour in range(24):
-        bucket = hour_stats.get(hour, {"entries": 0, "tp": 0, "sl": 0})
-        entries = bucket["entries"]
-        sl = bucket["sl"]
-        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
-        print(
-            f"[BACKTEST] HOUR {hour:02d} entries={entries} tp={bucket['tp']} "
-            f"sl={sl} sl_rate={sl_rate:.2f}%"
-        )
-
-    print("[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate")
-    for dow in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
-        bucket = dow_stats.get(dow, {"entries": 0, "tp": 0, "sl": 0})
-        entries = bucket["entries"]
-        sl = bucket["sl"]
-        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
-        print(
-            f"[BACKTEST] DOW {dow} entries={entries} tp={bucket['tp']} "
-            f"sl={sl} sl_rate={sl_rate:.2f}%"
-        )
-
     if args.verbose:
         print(
             "[BACKTEST] GATE_COUNTS "
@@ -1116,10 +1104,33 @@ def run_backtest() -> None:
             f"hold_strong={gate_counts['hold_strong_sum']:.1f} "
             f"hold_weak={gate_counts['hold_weak_sum']:.1f}"
         )
-        if entries_by_day:
-            print("[BACKTEST] ENTRIES_BY_DAY")
-            for day in sorted(entries_by_day.keys()):
-                print(f"[BACKTEST] {day} entries={entries_by_day[day]}")
+
+    print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
+    for hour in range(24):
+        bucket = hour_stats.get(hour, {"entries": 0, "tp": 0, "sl": 0})
+        entries = bucket["entries"]
+        sl = bucket["sl"]
+        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
+        print(
+            f"[BACKTEST] HOUR {hour:02d} entries={entries} tp={bucket['tp']} "
+            f"sl={sl} sl_rate={sl_rate:.2f}%"
+        )
+
+    print("[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate")
+    for dow in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
+        bucket = dow_stats.get(dow, {"entries": 0, "tp": 0, "sl": 0})
+        entries = bucket["entries"]
+        sl = bucket["sl"]
+        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
+        print(
+            f"[BACKTEST] DOW {dow} entries={entries} tp={bucket['tp']} "
+            f"sl={sl} sl_rate={sl_rate:.2f}%"
+        )
+
+    if args.verbose and entries_by_day:
+        print("[BACKTEST] ENTRIES_BY_DAY")
+        for day in sorted(entries_by_day.keys()):
+            print(f"[BACKTEST] {day} entries={entries_by_day[day]}")
 
     if args.zones_snapshot_out:
         try:
