@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import csv
 import os
 import sys
@@ -177,6 +178,10 @@ def run_backtest() -> None:
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
+    parser.add_argument("--total-window-days", type=int, default=0)
+    parser.add_argument("--rolling-zones", action="store_true")
+    parser.add_argument("--zones-snapshot-in", type=str, default="")
+    parser.add_argument("--zones-snapshot-out", type=str, default="")
     parser.add_argument("--log-gates", action="store_true")
     parser.add_argument("--debug-zone", action="store_true")
     args = parser.parse_args()
@@ -200,9 +205,23 @@ def run_backtest() -> None:
         cfg.tf_mtf: 120,
         cfg.tf_htf: 120,
     }
-    start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(
-        args.days, end_ms, min_bars
-    )
+    if args.total_window_days:
+        if args.total_window_days < args.days:
+            print("[BACKTEST] total_window_days must be >= days")
+            return
+        total_window_days = args.total_window_days
+        warmup_days = max(0, total_window_days - args.days)
+        warmup_minutes = warmup_days * 1440
+        start_ms = end_ms - int(total_window_days * 24 * 60 * 60 * 1000)
+        eval_start_ms = end_ms - int(args.days * 24 * 60 * 60 * 1000)
+    else:
+        start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(
+            args.days, end_ms, min_bars
+        )
+
+    if args.rolling_zones and not args.total_window_days:
+        print("[BACKTEST] rolling_zones requires total_window_days")
+        return
 
     use_common = bool(args.common_warmup_dir)
     common_dir = args.common_warmup_dir or os.path.join("logs", "common_warmup", "ohlcv")
@@ -260,6 +279,17 @@ def run_backtest() -> None:
     if not data:
         print("[BACKTEST] no_data")
         return
+
+    zones_snapshot_in: Dict[str, List[dict]] = {}
+    if args.zones_snapshot_in:
+        try:
+            with open(args.zones_snapshot_in, "r", encoding="utf-8") as f:
+                zones_snapshot_in = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[BACKTEST] zones_snapshot_in_error={exc}")
+            zones_snapshot_in = {}
+
+    zones_snapshot_out: Dict[str, List[dict]] = {}
 
     stats = {
         "entries": 0,
@@ -339,10 +369,31 @@ def run_backtest() -> None:
         atr_15m = _atr(df_15m, 14)
 
         zones: List[Zone] = []
+        if args.zones_snapshot_in and sym in zones_snapshot_in:
+            zones = [
+                Zone(
+                    mid=float(z["mid"]),
+                    top=float(z["top"]),
+                    bot=float(z["bot"]),
+                    side=int(z["side"]),
+                    live=bool(z["live"]),
+                    born=int(z["born"]),
+                    start=int(z["start"]),
+                    vol=float(z["vol"]),
+                )
+                for z in zones_snapshot_in.get(sym, [])
+            ]
 
-        def _pivot_confirmed(series: pd.Series, i: int, lb: int, mode: str) -> Optional[float]:
+        def _pivot_confirmed(
+            series: pd.Series,
+            i: int,
+            lb: int,
+            mode: str,
+            start_idx: int,
+            end_idx: int,
+        ) -> Optional[float]:
             pivot_idx = i - lb
-            if pivot_idx < lb or pivot_idx + lb >= len(series):
+            if pivot_idx - lb < start_idx or pivot_idx + lb > end_idx:
                 return None
             window = series.iloc[pivot_idx - lb : pivot_idx + lb + 1]
             val = series.iloc[pivot_idx]
@@ -350,38 +401,28 @@ def run_backtest() -> None:
                 return float(val) if float(val) == float(window.max()) else None
             return float(val) if float(val) == float(window.min()) else None
 
-        # build zones from full 1h history first (TradingView pivot confirmed style)
-        zone_end_idx = len(df_1h)
-        if args.freeze_zones:
-            zone_end_idx = int(np.searchsorted(df_1h["ts"].values, eval_start_ms, side="right"))
-        for i1 in range(zone_end_idx):
-            lb = cfg.lookback
-            ph = _pivot_confirmed(high_1h, i1, lb, "high")
-            pl = _pivot_confirmed(low_1h, i1, lb, "low")
-            lb_used = lb
-            if cfg.auto_relax and ph is None and pl is None:
-                lb2 = cfg.relaxed_lookback
-                ph = _pivot_confirmed(high_1h, i1, lb2, "high")
-                pl = _pivot_confirmed(low_1h, i1, lb2, "low")
-                lb_used = lb2
-            if ph is None and pl is None:
-                if i1 % 20 == 0:
-                    for side in (1, -1):
-                        side_z = [z for z in zones if z.side == side]
-                        if len(side_z) > cfg.max_zones_per_side:
-                            oldest = min(side_z, key=lambda z: z.born)
-                            zones.remove(oldest)
-                continue
-            pivot_bar = i1 - lb_used
-            if pivot_bar < 0:
-                continue
-            half_w = float(atr_1h.iloc[i1]) * cfg.atr_mult * 0.5
-            cluster_dist = float(atr_1h.iloc[i1]) * cfg.cluster_atr
-            vol_val = float(dvf.iloc[pivot_bar]) if pivot_bar < len(dvf) else float(dvf.iloc[i1])
+        window_bars_1h = int(args.total_window_days * 24) if args.total_window_days else 0
 
-            def merge_or_create(side: int, level: float, vol_val: float) -> None:
+        def build_zones(end_idx: int) -> List[Zone]:
+            zones_local: List[Zone] = []
+            if end_idx < 0:
+                return zones_local
+            start_idx = 0
+            if window_bars_1h:
+                start_idx = max(0, end_idx - window_bars_1h + 1)
+
+            def merge_or_create(
+                zones_ref: List[Zone],
+                side: int,
+                level: float,
+                vol_val: float,
+                half_w: float,
+                cluster_dist: float,
+                born_idx: int,
+                start_bar: int,
+            ) -> None:
                 merged = False
-                for z in zones:
+                for z in zones_ref:
                     if z.live and z.side == side and abs(z.mid - level) <= cluster_dist:
                         new_mid = (z.mid + level) * 0.5
                         z.mid = new_mid
@@ -391,30 +432,76 @@ def run_backtest() -> None:
                         merged = True
                         break
                 if not merged:
-                    zones.append(
+                    zones_ref.append(
                         Zone(
                             mid=level,
                             top=level + half_w,
                             bot=level - half_w,
                             side=side,
                             live=True,
-                            born=i1,
-                            start=pivot_bar,
+                            born=born_idx,
+                            start=start_bar,
                             vol=vol_val,
                         )
                     )
 
-            if ph is not None:
-                merge_or_create(1, float(ph), vol_val)
-            if pl is not None:
-                merge_or_create(-1, float(pl), vol_val)
+            for i1 in range(start_idx, end_idx + 1):
+                lb = cfg.lookback
+                ph = _pivot_confirmed(high_1h, i1, lb, "high", start_idx, end_idx)
+                pl = _pivot_confirmed(low_1h, i1, lb, "low", start_idx, end_idx)
+                lb_used = lb
+                if cfg.auto_relax and ph is None and pl is None:
+                    lb2 = cfg.relaxed_lookback
+                    ph = _pivot_confirmed(high_1h, i1, lb2, "high", start_idx, end_idx)
+                    pl = _pivot_confirmed(low_1h, i1, lb2, "low", start_idx, end_idx)
+                    lb_used = lb2
+                if ph is None and pl is None:
+                    if i1 % 20 == 0:
+                        for side in (1, -1):
+                            side_z = [z for z in zones_local if z.side == side]
+                            if len(side_z) > cfg.max_zones_per_side:
+                                oldest = min(side_z, key=lambda z: z.born)
+                                zones_local.remove(oldest)
+                    continue
+                pivot_bar = i1 - lb_used
+                if pivot_bar < start_idx:
+                    continue
+                half_w = float(atr_1h.iloc[i1]) * cfg.atr_mult * 0.5
+                cluster_dist = float(atr_1h.iloc[i1]) * cfg.cluster_atr
+                vol_val = float(dvf.iloc[pivot_bar]) if pivot_bar < len(dvf) else float(dvf.iloc[i1])
+                if ph is not None:
+                    merge_or_create(zones_local, 1, float(ph), vol_val, half_w, cluster_dist, i1, pivot_bar)
+                if pl is not None:
+                    merge_or_create(zones_local, -1, float(pl), vol_val, half_w, cluster_dist, i1, pivot_bar)
+                if i1 % 20 == 0:
+                    for side in (1, -1):
+                        side_z = [z for z in zones_local if z.side == side]
+                        if len(side_z) > cfg.max_zones_per_side:
+                            oldest = min(side_z, key=lambda z: z.born)
+                            zones_local.remove(oldest)
+            return zones_local
 
-            if i1 % 20 == 0:
-                for side in (1, -1):
-                    side_z = [z for z in zones if z.side == side]
-                    if len(side_z) > cfg.max_zones_per_side:
-                        oldest = min(side_z, key=lambda z: z.born)
-                        zones.remove(oldest)
+        # build zones from 1h history first (TradingView pivot confirmed style)
+        if not zones and not args.rolling_zones:
+            zone_end_idx = len(df_1h)
+            if args.freeze_zones:
+                zone_end_idx = int(np.searchsorted(df_1h["ts"].values, eval_start_ms, side="right"))
+            zones = build_zones(zone_end_idx - 1)
+
+        if args.zones_snapshot_out:
+            zones_snapshot_out[sym] = [
+                {
+                    "mid": z.mid,
+                    "top": z.top,
+                    "bot": z.bot,
+                    "side": z.side,
+                    "live": z.live,
+                    "born": z.born,
+                    "start": z.start,
+                    "vol": z.vol,
+                }
+                for z in zones
+            ]
 
         # map 1h index by ts for fast lookup
         ts_1h = df_1h["ts"].values
@@ -425,6 +512,7 @@ def run_backtest() -> None:
         retest_active = False
         retest_level = 0.0
         retest_until = -1
+        last_zone_end_idx = None
         if args.log_gates:
             print(
                 f"[BACKTEST_START_STATE] {sym} in_position=False cooldown=0 "
@@ -441,6 +529,11 @@ def run_backtest() -> None:
             idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
             if idx_1h < 0:
                 continue
+
+            if args.rolling_zones and not zones_snapshot_in:
+                if last_zone_end_idx != idx_1h:
+                    zones = build_zones(idx_1h)
+                    last_zone_end_idx = idx_1h
 
             # invalidate zones
             close_1h_now = float(close_1h.iloc[idx_1h])
@@ -810,6 +903,20 @@ def run_backtest() -> None:
             print("[BACKTEST] ENTRIES_BY_DAY")
             for day in sorted(entries_by_day.keys()):
                 print(f"[BACKTEST] {day} entries={entries_by_day[day]}")
+
+    if args.zones_snapshot_out:
+        try:
+            out_dir = os.path.dirname(args.zones_snapshot_out)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(args.zones_snapshot_out, "w", encoding="utf-8") as f:
+                json.dump(zones_snapshot_out, f, ensure_ascii=False)
+            print(
+                f"[BACKTEST] zones_snapshot_out saved={args.zones_snapshot_out} "
+                f"symbols={len(zones_snapshot_out)}"
+            )
+        except OSError as exc:
+            print(f"[BACKTEST] zones_snapshot_out_error={exc}")
 
 
 def _ts_kst(ts_ms: int) -> str:
