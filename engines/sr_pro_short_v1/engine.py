@@ -24,6 +24,7 @@ class SrProShortV1Config:
     reject_mode: str = "bot"
     reject_source: str = "1h"
     ema200_filter: bool = True
+    ema_filter_len: int = 200
     total_window_days: int = 10
     rolling_zones: bool = True
     retest_bars: int = 6
@@ -37,9 +38,9 @@ class SrProShortV1Config:
     shallow_wick_max: float = 0.35
     shallow_dvf_max: float = 0.0
     sl_buffer: float = 0.01
-    sl_atr_mult: float = 0.7
-    tp_mult: float = 0.985
-    tp_mult_weak: float = 0.985
+    sl_atr_mult: float = 0.5
+    tp_mult: float = 0.98
+    tp_mult_weak: float = 0.98
     sl_min_weak: float = 1.0015
 
 

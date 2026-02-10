@@ -8102,9 +8102,10 @@ def _run_sr_pro_short_v1_cycle(
         touch_level = "mid" if cfg.touch_mode == "mid" else "bot"
         h1_touch_px = h1_close if cfg.touch_use_close else h1_high
         if cfg.ema200_filter:
-            ema200_1h = ema(close_1h, 200)
-            ema200_now = float(ema200_1h.iloc[-1])
-            if h1_close >= ema200_now:
+            ema_len = max(1, int(getattr(cfg, "ema_filter_len", 200)))
+            ema_line = ema(close_1h, ema_len)
+            ema_now = float(ema_line.iloc[-1])
+            if h1_close >= ema_now:
                 gate_stats["zone_touch"] += 1
                 continue
         # filter zones by break (avoid already broken)
