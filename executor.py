@@ -230,6 +230,10 @@ class AccountExecutor:
         with self.activate():
             return get_available_usdt(ttl_sec=ttl_sec)
 
+    def get_futures_usdt_balance(self, ttl_sec: float = _BAL_TTL_SEC) -> Optional[float]:
+        with self.activate():
+            return get_futures_usdt_balance(ttl_sec=ttl_sec)
+
     def get_short_position_amount(self, symbol: str) -> float:
         with self.activate():
             return get_short_position_amount(symbol)
@@ -369,6 +373,52 @@ def _extract_usdt_available(balance: dict) -> Optional[float]:
                     return float(val)
     return None
 
+def _extract_usdt_total(balance: dict) -> Optional[float]:
+    if not isinstance(balance, dict):
+        return None
+    try:
+        usdt = balance.get("USDT") or {}
+        if isinstance(usdt, dict):
+            for key in ("total", "balance", "walletBalance", "marginBalance", "equity"):
+                val = usdt.get(key)
+                if isinstance(val, (int, float)) and val > 0:
+                    return float(val)
+    except Exception:
+        pass
+    try:
+        total_map = balance.get("total") or {}
+        val = total_map.get("USDT")
+        if isinstance(val, (int, float)) and val > 0:
+            return float(val)
+    except Exception:
+        pass
+    info = balance.get("info")
+    if isinstance(info, dict):
+        for key in ("totalWalletBalance", "walletBalance", "balance", "marginBalance", "equity"):
+            val = info.get(key)
+            try:
+                val = float(val)
+            except Exception:
+                val = None
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+    if isinstance(info, list):
+        for row in info:
+            if not isinstance(row, dict):
+                continue
+            asset = str(row.get("asset") or row.get("currency") or "").upper()
+            if asset != "USDT":
+                continue
+            for key in ("walletBalance", "balance", "total", "marginBalance", "equity"):
+                val = row.get(key)
+                try:
+                    val = float(val)
+                except Exception:
+                    val = None
+                if isinstance(val, (int, float)) and val > 0:
+                    return float(val)
+    return None
+
 def get_available_usdt(ttl_sec: float = _BAL_TTL_SEC) -> Optional[float]:
     ctx = _get_ctx()
     now = time.time()
@@ -393,6 +443,31 @@ def get_available_usdt(ttl_sec: float = _BAL_TTL_SEC) -> Optional[float]:
             ctx.bal_cache["ts"] = now
             ctx.bal_cache["available"] = float(available)
     return available
+
+def get_futures_usdt_balance(ttl_sec: float = _BAL_TTL_SEC) -> Optional[float]:
+    ctx = _get_ctx()
+    now = time.time()
+    with ctx.bal_lock:
+        ts = float(ctx.bal_cache.get("ts", 0.0) or 0.0)
+        cached = ctx.bal_cache.get("total")
+        if cached is not None and (now - ts) <= ttl_sec:
+            return float(cached)
+    try:
+        balance = ctx.exchange.fetch_balance({"type": "swap"})
+    except Exception:
+        try:
+            balance = ctx.exchange.fetch_balance({"type": "future"})
+        except Exception:
+            try:
+                balance = ctx.exchange.fetch_balance()
+            except Exception:
+                return None
+    total = _extract_usdt_total(balance)
+    if isinstance(total, (int, float)) and total > 0:
+        with ctx.bal_lock:
+            ctx.bal_cache["ts"] = now
+            ctx.bal_cache["total"] = float(total)
+    return total
 
 
 def _calc_dca_usdt() -> Optional[float]:

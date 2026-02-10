@@ -59,6 +59,8 @@ from account_context import AccountContext, AccountSettings
 
 _FOLLOWER_POS_CACHE = {"ts": 0.0, "items": [], "groups": {}}
 _FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "0"))
+_PNL_CACHE = {"ts": 0.0, "payload": None}
+_PNL_TTL_SEC = float(os.getenv("WEB_PNL_TTL_SEC", "20"))
 _WEB_MAX_WORKERS = int(os.getenv("WEB_MAX_WORKERS", "8"))
 
 def _run_parallel_tasks(tasks: list) -> list:
@@ -984,6 +986,105 @@ def _fetch_realized_pnl_since(ex, since_ts: float) -> tuple[float | None, int, s
     return _fetch_realized_pnl_range(ex, since_ts, None)
 
 
+def _build_pnl_payload(force: bool = False) -> dict:
+    now = time.time()
+    cached = _PNL_CACHE
+    if not force and _PNL_TTL_SEC > 0 and (now - float(cached.get("ts") or 0.0)) <= _PNL_TTL_SEC:
+        payload = cached.get("payload") or {}
+        payload["cached"] = True
+        return payload
+
+    pnl_today_payload: list[dict] = []
+    pnl_yesterday_payload: list[dict] = []
+    pnl_unreal_payload: list[dict] = []
+    pnl_balance_payload: list[dict] = []
+    pnl_start_ts = _kst_today_start_ts()
+    pnl_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_start_ts + 9 * 3600))
+    pnl_yesterday_start_ts = pnl_start_ts - 86400
+    pnl_yesterday_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_yesterday_start_ts + 9 * 3600))
+
+    for acct in _list_accounts_all():
+        account_id = int(acct["id"])
+        settings = _load_account_settings(account_id)
+        state_path = _state_path_for_account(acct)
+        acct_state = load_state_from(state_path)
+        executor = _build_executor(acct, settings, force_hedge=True)
+        futures_usdt = None
+        pnl_val = None
+        pnl_trades = 0
+        pnl_err = None
+        pnl_y_val = None
+        pnl_y_trades = 0
+        pnl_y_err = None
+        pnl_unreal = None
+        try:
+            with executor.activate():
+                futures_usdt = executor.get_futures_usdt_balance()
+                pnl_val, pnl_trades, pnl_err = _fetch_realized_pnl_since(executor.ctx.exchange, pnl_start_ts)
+                pnl_y_val, pnl_y_trades, pnl_y_err = _fetch_realized_pnl_range(
+                    executor.ctx.exchange, pnl_yesterday_start_ts, pnl_start_ts
+                )
+                pnl_unreal = _sum_unrealized_pnl(executor, acct_state)
+        except Exception:
+            pnl_err = pnl_err or "error"
+        pnl_today_payload.append(
+            {
+                "account_id": account_id,
+                "name": str(acct.get("name") or account_id),
+                "pnl": pnl_val,
+                "trades": pnl_trades,
+                "error": pnl_err,
+                "date": pnl_date_kst,
+                "is_active": bool(acct.get("is_active", 1)),
+            }
+        )
+        pnl_yesterday_payload.append(
+            {
+                "account_id": account_id,
+                "name": str(acct.get("name") or account_id),
+                "pnl": pnl_y_val,
+                "trades": pnl_y_trades,
+                "error": pnl_y_err,
+                "date": pnl_yesterday_date_kst,
+                "is_active": bool(acct.get("is_active", 1)),
+            }
+        )
+        pnl_unreal_payload.append(
+            {
+                "account_id": account_id,
+                "name": str(acct.get("name") or account_id),
+                "pnl": pnl_unreal,
+                "balance": futures_usdt,
+                "trades": 0,
+                "error": None,
+                "date": pnl_date_kst,
+                "is_active": bool(acct.get("is_active", 1)),
+            }
+        )
+        pnl_balance_payload.append(
+            {
+                "account_id": account_id,
+                "name": str(acct.get("name") or account_id),
+                "balance": futures_usdt,
+                "trades": 0,
+                "error": None,
+                "date": pnl_date_kst,
+                "is_active": bool(acct.get("is_active", 1)),
+            }
+        )
+    payload = {
+        "timestamp": datetime.now().isoformat(),
+        "pnl_today": pnl_today_payload,
+        "pnl_yesterday": pnl_yesterday_payload,
+        "pnl_unrealized": pnl_unreal_payload,
+        "pnl_balance": pnl_balance_payload,
+        "cached": False,
+    }
+    _PNL_CACHE["ts"] = now
+    _PNL_CACHE["payload"] = payload
+    return payload
+
+
 @app.route("/")
 def index():
     state = load_state()
@@ -1116,6 +1217,13 @@ def status():
     else:
         payload["accounts"] = []
         payload["pnl_today"] = []
+    return jsonify(payload)
+
+
+@app.route("/pnl_summary")
+def pnl_summary():
+    force = str(request.args.get("force", "")).lower() in ("1", "true", "yes")
+    payload = _build_pnl_payload(force=force)
     return jsonify(payload)
 
 
