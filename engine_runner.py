@@ -8932,7 +8932,6 @@ def _run_sr_pro_short_v1_cycle(
         resist_candidates = [
             z for z in zones
             if z["side"] == 1
-            and h1_close <= z["top"]
             and dvf_norm <= float(cfg.dvf_norm_max)
             and h1_touch_px >= (z["mid"] if touch_level == "mid" else z["bot"])
             and h1_low <= z["top"]
@@ -8992,6 +8991,11 @@ def _run_sr_pro_short_v1_cycle(
             # retest checks on current confirmed 3m bar
             h3 = float(df_3m_sig.iloc[-1]["high"])
             l3 = float(df_3m_sig.iloc[-1]["low"])
+            if resist_candidates:
+                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - float(df_3m.iloc[-1]["open"])))
+                if h3 > nearest["top"]:
+                    sym_state["retest_active"] = False
+                    continue
             # compute atr_3m quickly
             high3 = df_3m_sig["high"].astype(float)
             low3 = df_3m_sig["low"].astype(float)

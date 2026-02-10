@@ -755,6 +755,8 @@ def run_backtest() -> None:
                             gate_counts["retest_pass_close"] += 1
                         entry_px = float(df_3m.at[i3 + 1, "open"])
                         nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
+                        if high_now > nearest.top:
+                            continue
                         sl_raw = nearest.top * (1.0 + cfg.sl_buffer)
                         sl_price = max(sl_raw, entry_px * 1.002)
                         tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
