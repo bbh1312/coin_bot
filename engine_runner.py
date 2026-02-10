@@ -2982,10 +2982,16 @@ def _sr_pro_pivot(series: pd.Series, idx: int, left: int, right: int, mode: str)
         return float(val) if float(val) == float(window.max()) else None
     return float(val) if float(val) == float(window.min()) else None
 
-def _sr_pro_build_zones(df_1h_hist: pd.DataFrame, cfg: SrProShortV1Config) -> list:
+def _sr_pro_build_zones(
+    df_1h_hist: pd.DataFrame,
+    cfg: SrProShortV1Config,
+    window_bars: Optional[int] = None,
+) -> list:
     """TradingView S/R Pro 존 생성 로직(존 무효화는 아직 미적용)."""
     if df_1h_hist is None or df_1h_hist.empty:
         return []
+    if window_bars and window_bars > 0 and len(df_1h_hist) > window_bars:
+        df_1h_hist = df_1h_hist.iloc[-window_bars:].copy()
     close = df_1h_hist["close"].astype(float)
     open_ = df_1h_hist["open"].astype(float)
     high = df_1h_hist["high"].astype(float)
@@ -8847,7 +8853,8 @@ def _run_sr_pro_short_v1_cycle(
     tf_htf = cfg.tf_htf
     min_ltf = 120
     min_mtf = 120
-    min_htf = max(cfg.lookback * 2 + 50, 220)
+    window_bars_1h = max(0, int(cfg.total_window_days) * 24) if cfg.rolling_zones else 0
+    min_htf = max(cfg.lookback * 2 + 50, 220, window_bars_1h + 5 if window_bars_1h else 0)
     min_ltf_fetch = min_ltf + 1
     min_mtf_fetch = min_mtf + 1
     min_htf_fetch = min_htf + 1
@@ -8892,7 +8899,7 @@ def _run_sr_pro_short_v1_cycle(
         # refresh zones if new 1h bar
         last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
         if sym_state.get("zones_ts") != last_1h_hist_ts:
-            zones = _sr_pro_build_zones(df_1h_hist, cfg)
+            zones = _sr_pro_build_zones(df_1h_hist, cfg, window_bars=window_bars_1h)
             sym_state["zones"] = zones
             sym_state["zones_ts"] = last_1h_hist_ts
         zones = sym_state.get("zones") or []
@@ -8915,6 +8922,12 @@ def _run_sr_pro_short_v1_cycle(
 
         touch_level = "mid" if cfg.touch_mode == "mid" else "bot"
         h1_touch_px = h1_close if cfg.touch_use_close else h1_high
+        if cfg.ema200_filter:
+            ema200_1h = ema(close_1h, 200)
+            ema200_now = float(ema200_1h.iloc[-1])
+            if h1_close >= ema200_now:
+                gate_stats["zone_touch"] += 1
+                continue
         # filter zones by break (avoid already broken)
         resist_candidates = [
             z for z in zones

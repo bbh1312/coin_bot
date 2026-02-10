@@ -161,6 +161,7 @@ def run_backtest() -> None:
     parser.add_argument("--reject-mode", type=str, default="bot", choices=["bot", "mid"])
     parser.add_argument("--reject-source", type=str, default="1h", choices=["1h", "15m"])
     parser.add_argument("--ema200-filter", action="store_true")
+    parser.add_argument("--ema-filter-len", type=int, default=200)
     parser.add_argument("--retest-bars", type=int, default=6)
     parser.add_argument("--retest-atr-mult", type=float, default=0.25)
     parser.add_argument("--retest-near-atr-mult", type=float, default=0.15)
@@ -530,6 +531,7 @@ def run_backtest() -> None:
             if idx_1h < 0:
                 continue
 
+
             if args.rolling_zones and not zones_snapshot_in:
                 if last_zone_end_idx != idx_1h:
                     zones = build_zones(idx_1h)
@@ -638,8 +640,10 @@ def run_backtest() -> None:
             )
             h1_touch_px = h1_close if args.touch_use_close else h1_high
             if args.ema200_filter:
-                ema200_now = float(ema200_1h.iloc[idx_1h])
-                if h1_close >= ema200_now:
+                ema_len = max(1, int(args.ema_filter_len))
+                ema_line = _ema(close_1h, ema_len)
+                ema_now = float(ema_line.iloc[idx_1h])
+                if h1_close >= ema_now:
                     if args.log_gates:
                         gate_counts["zone_touch"] += 1
                     continue

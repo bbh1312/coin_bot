@@ -23,7 +23,9 @@ class SrProShortV1Config:
     require_reject_close: bool = False
     reject_mode: str = "bot"
     reject_source: str = "1h"
-    ema200_filter: bool = False
+    ema200_filter: bool = True
+    total_window_days: int = 10
+    rolling_zones: bool = True
     retest_bars: int = 6
     retest_atr_mult: float = 0.25
     retest_near_atr_mult: float = 0.15
