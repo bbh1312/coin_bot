@@ -17,12 +17,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from engines.backtest_common import (
-    calc_warmup_window,
-    format_backtest_summary,
-    load_common_universe,
-    log_warmup_info,
-)
+from engines.backtest_common import calc_warmup_window, load_common_universe, log_warmup_info
 from engines.sr_pro_long_v1.engine import SrProLongV1Config
 from engines.sr_pro_common import build_sr_zones
 
@@ -96,9 +91,57 @@ def _atr(df: pd.DataFrame, length: int) -> pd.Series:
     return tr.ewm(alpha=1 / length, adjust=False).mean()
 
 
+def _tf_to_minutes(tf: str) -> int:
+    if tf.endswith("m"):
+        return int(tf[:-1])
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 60
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 1440
+    return 1
+
+
 def _ts_kst(ts_ms: int) -> str:
     dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
     return (dt + pd.Timedelta(hours=9)).strftime("%Y-%m-%d %H:%M")
+
+
+def _minute_str(ts_ms: int) -> str:
+    return _ts_kst(ts_ms)
+
+
+def _fmt_summary_line(
+    symbol: Optional[str],
+    stats: Dict[str, float],
+    base_usdt: float,
+    last_day_exits: int,
+    entry_syms: int,
+) -> str:
+    trades = int(stats.get("trades", 0))
+    wins = int(stats.get("wins", 0))
+    losses = int(stats.get("losses", 0))
+    entries = int(stats.get("entries", 0))
+    exits = int(stats.get("exits", 0))
+    tp = int(stats.get("tp", wins))
+    sl = int(stats.get("sl", losses))
+    winrate = (wins / trades * 100.0) if trades > 0 else 0.0
+    avg_mfe = stats.get("mfe_sum", 0.0) / trades if trades > 0 else 0.0
+    avg_mae = stats.get("mae_sum", 0.0) / trades if trades > 0 else 0.0
+    avg_hold = stats.get("hold_sum", 0.0) / trades if trades > 0 else 0.0
+    tag = "TOTAL" if symbol is None else symbol
+    return (
+        f"[BACKTEST] {tag} entries={entries} exits={exits} trades={trades} "
+        f"wins={wins} losses={losses} winrate={winrate:.2f}% "
+        f"tp={tp} sl={sl} avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} "
+        f"avg_hold={avg_hold:.1f} last_day_exits={last_day_exits} "
+        f"base_usdt={base_usdt:.2f} tp_sum={stats.get('tp_sum', 0.0):.3f} "
+        f"sl_sum={stats.get('sl_sum', 0.0):.3f} net_sum={stats.get('net_sum', 0.0):.3f} "
+        f"net_sum_usdt={stats.get('net_sum_usdt', 0.0):.3f} entry_syms={entry_syms}"
+    )
+
+
+def _dow_label(dt: datetime) -> str:
+    return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][dt.weekday()]
 
 
 @dataclass
@@ -118,6 +161,7 @@ def run_backtest() -> None:
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--universe", type=str, default="common")
     parser.add_argument("--use-confirmed", action="store_true")
+    parser.add_argument("--use-live-cache", action="store_true")
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
     parser.add_argument("--common-warmup-dir", type=str, default="")
@@ -199,8 +243,14 @@ def run_backtest() -> None:
         print("[BACKTEST] rolling_zones requires total_window_days")
         return
 
-    use_common = bool(args.common_warmup_dir)
-    common_dir = args.common_warmup_dir or os.path.join("logs", "common_warmup", "ohlcv")
+    if args.use_live_cache:
+        args.cache_only = True
+    if args.common_only:
+        args.cache_only = True
+    use_common = bool(args.use_live_cache or args.common_only or args.common_warmup_dir)
+    common_dir = args.common_warmup_dir or os.getenv("COMMON_WARMUP_CACHE_DIR", "")
+    if not common_dir:
+        common_dir = os.path.join("logs", "common_warmup", "ohlcv")
     universe = load_common_universe(args.universe, exchange, args.cache_only, top_n=args.top_n)
     if not universe:
         print("[BACKTEST] no_universe")
@@ -235,23 +285,28 @@ def run_backtest() -> None:
 
     zones_snapshot_out: Dict[str, List[dict]] = {}
 
-    stats = {
-        "entries": 0,
-        "exits": 0,
-        "trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "mfe_sum": 0.0,
-        "mae_sum": 0.0,
-        "hold_sum": 0.0,
-        "net_sum": 0.0,
-        "tp_sum": 0.0,
-        "sl_sum": 0.0,
-        "net_sum_usdt": 0.0,
-        "tp_sum_usdt": 0.0,
-        "sl_sum_usdt": 0.0,
-    }
-    trades_out: List[dict] = []
+    def _new_stats() -> Dict[str, float]:
+        return {
+            "entries": 0,
+            "exits": 0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "tp": 0,
+            "sl": 0,
+            "mfe_sum": 0.0,
+            "mae_sum": 0.0,
+            "hold_sum": 0.0,
+            "net_sum": 0.0,
+            "tp_sum": 0.0,
+            "sl_sum": 0.0,
+            "net_sum_usdt": 0.0,
+            "tp_sum_usdt": 0.0,
+            "sl_sum_usdt": 0.0,
+        }
+
+    stats = _new_stats()
+    per_symbol_stats: Dict[str, Dict[str, float]] = {}
     gate_counts = {
         "zone_touch": 0,
         "hl_15m": 0,
@@ -271,14 +326,24 @@ def run_backtest() -> None:
 
     entries_by_day: Dict[str, int] = {}
     cooldown_until: Dict[tuple, int] = {}
+    exit_logs: List[dict] = []
+    open_logs: List[dict] = []
+    entry_symbols: set[str] = set()
+    ltf_minutes = _tf_to_minutes(cfg.tf_ltf)
+    hour_stats: Dict[int, Dict[str, int]] = {}
+    dow_stats: Dict[str, Dict[str, int]] = {}
+    end_ms_last = end_ms
 
     for sym, frames in data.items():
+        sym_stats = _new_stats()
+        per_symbol_stats[sym] = sym_stats
         df_3m = frames["3m"]
         df_15m = frames["15m"]
         df_1h = frames["1h"]
         if args.use_confirmed:
             df_3m = df_3m.iloc[:-1]
             df_15m = df_15m.iloc[:-1]
+            df_1h = df_1h.iloc[:-1]
 
         if len(df_3m) < 10 or len(df_15m) < 5 or len(df_1h) < (cfg.lookback * 2 + 5):
             continue
@@ -368,6 +433,8 @@ def run_backtest() -> None:
                 continue
 
             idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
+            if args.use_confirmed:
+                idx_1h -= 1
             if idx_1h < 0:
                 continue
 
@@ -405,23 +472,28 @@ def run_backtest() -> None:
                 if low_i <= trade["sl_price"]:
                     exit_px = trade["sl_price"]
                     pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
-                    stats["exits"] += 1
-                    stats["trades"] += 1
-                    stats["mfe_sum"] += trade["mfe"]
-                    stats["mae_sum"] += trade["mae"]
-                    stats["hold_sum"] += trade["hold_bars"]
-                    stats["net_sum"] += pnl_pct
-                    stats["sl_sum"] += pnl_pct
-                    stats["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
-                    stats["sl_sum_usdt"] += pnl_pct * float(args.entry_usdt)
-                    stats["losses"] += 1
-                    trades_out.append(
+                    for bucket in (stats, sym_stats):
+                        bucket["exits"] += 1
+                        bucket["trades"] += 1
+                        bucket["mfe_sum"] += trade["mfe"]
+                        bucket["mae_sum"] += trade["mae"]
+                        bucket["hold_sum"] += trade["hold_bars"] * ltf_minutes
+                        bucket["net_sum"] += pnl_pct
+                        bucket["sl_sum"] += pnl_pct
+                        bucket["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
+                        bucket["sl_sum_usdt"] += pnl_pct * float(args.entry_usdt)
+                        bucket["losses"] += 1
+                        bucket["sl"] = bucket.get("sl", 0) + 1
+                    exit_logs.append(
                         {
-                            "symbol": sym,
-                            "result": "LOSS",
-                            "pnl_pct": pnl_pct * 100.0,
+                            "sym": sym,
+                            "mode": "sr_pro_long_v1",
+                            "side": "LONG",
                             "entry_ts": trade["entry_ts"],
                             "exit_ts": ts,
+                            "entry_px": trade["entry_px"],
+                            "exit_px": exit_px,
+                            "reason": "SL",
                         }
                     )
                     cooldown_until[(sym, "LONG")] = ts + (60 * 60 * 1000)
@@ -429,23 +501,28 @@ def run_backtest() -> None:
                 elif high_i >= trade["tp_price"]:
                     exit_px = trade["tp_price"]
                     pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
-                    stats["exits"] += 1
-                    stats["trades"] += 1
-                    stats["mfe_sum"] += trade["mfe"]
-                    stats["mae_sum"] += trade["mae"]
-                    stats["hold_sum"] += trade["hold_bars"]
-                    stats["net_sum"] += pnl_pct
-                    stats["tp_sum"] += pnl_pct
-                    stats["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
-                    stats["tp_sum_usdt"] += pnl_pct * float(args.entry_usdt)
-                    stats["wins"] += 1
-                    trades_out.append(
+                    for bucket in (stats, sym_stats):
+                        bucket["exits"] += 1
+                        bucket["trades"] += 1
+                        bucket["mfe_sum"] += trade["mfe"]
+                        bucket["mae_sum"] += trade["mae"]
+                        bucket["hold_sum"] += trade["hold_bars"] * ltf_minutes
+                        bucket["net_sum"] += pnl_pct
+                        bucket["tp_sum"] += pnl_pct
+                        bucket["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
+                        bucket["tp_sum_usdt"] += pnl_pct * float(args.entry_usdt)
+                        bucket["wins"] += 1
+                        bucket["tp"] = bucket.get("tp", 0) + 1
+                    exit_logs.append(
                         {
-                            "symbol": sym,
-                            "result": "WIN",
-                            "pnl_pct": pnl_pct * 100.0,
+                            "sym": sym,
+                            "mode": "sr_pro_long_v1",
+                            "side": "LONG",
                             "entry_ts": trade["entry_ts"],
                             "exit_ts": ts,
+                            "entry_px": trade["entry_px"],
+                            "exit_px": exit_px,
+                            "reason": "TP",
                         }
                     )
                     trade = None
@@ -600,6 +677,7 @@ def run_backtest() -> None:
                         "reason": entry_reason,
                     }
                     stats["entries"] += 1
+                    sym_stats["entries"] += 1
                     if args.log_gates:
                         if entry_reason == "close_reclaim":
                             gate_counts["entry_by_pass_close"] += 1
@@ -607,21 +685,122 @@ def run_backtest() -> None:
                             gate_counts["entry_by_pass_high"] += 1
                     day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
                     entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                    entry_symbols.add(sym)
+                    dt_kst = datetime.fromtimestamp(trade["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
+                    hour_bucket = dt_kst.hour
+                    dow_bucket = _dow_label(dt_kst)
+                    hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
+                    dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
+                    hour_stats[hour_bucket]["entries"] += 1
+                    dow_stats[dow_bucket]["entries"] += 1
                     retest_active = False
             if retest_active and i3 > retest_until:
                 retest_active = False
 
-    summary = format_backtest_summary(None, stats)
-    print("[BACKTEST] ENTRY DAYS", entries_by_day)
-    if trades_out:
-        print("[BACKTEST] TRADES(KST) symbol result pnl_pct entry_ts exit_ts")
-        for t in trades_out[:50]:
-            print(
-                f"{t['symbol']} {t['result']} pnl={t['pnl_pct']:.2f}% "
-                f"entry_ts={_ts_kst(t['entry_ts'])} exit_ts={_ts_kst(t['exit_ts'])}"
+        if trade:
+            last_idx = len(df_3m) - 2 if args.use_confirmed else len(df_3m) - 1
+            last_idx = max(0, last_idx)
+            last_px = float(df_3m.at[last_idx, "close"])
+            last_ts = int(df_3m.at[last_idx, "ts"])
+            unrealized_pct = (last_px - trade["entry_px"]) / trade["entry_px"] * 100.0
+            open_logs.append(
+                {
+                    "sym": sym,
+                    "mode": "sr_pro_long_v1",
+                    "side": "LONG",
+                    "entry_ts": trade["entry_ts"],
+                    "entry_px": trade["entry_px"],
+                    "last_px": last_px,
+                    "last_ts": last_ts,
+                    "unrealized_pct": unrealized_pct,
+                }
             )
+
+    # enrich exit stats by hour/dow using entry times
+    for ex in exit_logs:
+        dt_kst = datetime.fromtimestamp(ex["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
+        hour_bucket = dt_kst.hour
+        dow_bucket = _dow_label(dt_kst)
+        hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
+        dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
+        if ex["reason"] == "TP":
+            hour_stats[hour_bucket]["tp"] += 1
+            dow_stats[dow_bucket]["tp"] += 1
+        elif ex["reason"] == "SL":
+            hour_stats[hour_bucket]["sl"] += 1
+            dow_stats[dow_bucket]["sl"] += 1
+
+    last_day_threshold = end_ms_last - (24 * 60 * 60 * 1000)
+
+    for sym, sym_stats in per_symbol_stats.items():
+        if not (sym_stats.get("entries", 0) or sym_stats.get("trades", 0)):
+            continue
+        last_day_exits = 0
+        for ex in exit_logs:
+            if ex["sym"] == sym and ex["exit_ts"] >= last_day_threshold:
+                last_day_exits += 1
+        print(
+            _fmt_summary_line(
+                sym,
+                sym_stats,
+                float(args.entry_usdt),
+                last_day_exits,
+                1 if sym_stats.get("entries", 0) > 0 else 0,
+            )
+        )
+        # OPEN/EXIT logs (entry_dt desc)
+        sym_items: List[dict] = []
+        sym_items.extend([ex for ex in exit_logs if ex["sym"] == sym])
+        sym_items.extend([op for op in open_logs if op["sym"] == sym])
+        sym_items.sort(key=lambda x: x["entry_ts"], reverse=True)
+        for item in sym_items:
+            if "exit_ts" in item:
+                print(
+                    "[BACKTEST][EXIT] "
+                    f"sym={item['sym']} mode={item['mode']} side={item['side']} "
+                    f"entry_dt={_minute_str(item['entry_ts'])} exit_dt={_minute_str(item['exit_ts'])} "
+                    f"entry_px={item['entry_px']:.6f} exit_px={item['exit_px']:.6f} reason={item['reason']}"
+                )
+            else:
+                print(
+                    "[BACKTEST][OPEN] "
+                    f"sym={item['sym']} mode={item['mode']} side={item['side']} "
+                    f"entry_dt={_minute_str(item['entry_ts'])} exit_dt= "
+                    f"entry_px={item['entry_px']:.6f} last_px={item['last_px']:.6f} "
+                    f"last_dt={_minute_str(item['last_ts'])} unrealized_pct={item['unrealized_pct']:.2f}%"
+                )
+
+    total_last_day_exits = sum(1 for ex in exit_logs if ex["exit_ts"] >= last_day_threshold)
+    summary = _fmt_summary_line(
+        None,
+        stats,
+        float(args.entry_usdt),
+        total_last_day_exits,
+        len(entry_symbols),
+    )
     print(summary)
-    print("[BACKTEST] GATES", gate_counts)
+
+    print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
+    for hour in range(24):
+        bucket = hour_stats.get(hour, {"entries": 0, "tp": 0, "sl": 0})
+        entries = bucket["entries"]
+        sl = bucket["sl"]
+        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
+        print(
+            f"[BACKTEST] HOUR {hour:02d} entries={entries} tp={bucket['tp']} "
+            f"sl={sl} sl_rate={sl_rate:.2f}%"
+        )
+
+    print("[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate")
+    for dow in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
+        bucket = dow_stats.get(dow, {"entries": 0, "tp": 0, "sl": 0})
+        entries = bucket["entries"]
+        sl = bucket["sl"]
+        sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
+        print(
+            f"[BACKTEST] DOW {dow} entries={entries} tp={bucket['tp']} "
+            f"sl={sl} sl_rate={sl_rate:.2f}%"
+        )
 
     if args.zones_snapshot_out:
         try:

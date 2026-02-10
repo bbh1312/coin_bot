@@ -8030,17 +8030,17 @@ def _run_sr_pro_short_v1_cycle(
             sym_state["zones_ts"] = last_1h_hist_ts
         zones = sym_state.get("zones") or []
 
-        # current 1h bar (running)
-        h1 = df_1h.iloc[-1]
+        # current 1h bar (confirmed)
+        h1 = df_1h_hist.iloc[-1]
         h1_ts = int(h1["ts"]) if "ts" in h1 else 0
         h1_high = float(h1["high"])
         h1_low = float(h1["low"])
         h1_close = float(h1["close"])
 
-        # dvf_norm from 1h (running)
-        close_1h = df_1h["close"].astype(float)
-        open_1h = df_1h["open"].astype(float)
-        vol_1h = df_1h["volume"].astype(float)
+        # dvf_norm from 1h (confirmed)
+        close_1h = df_1h_hist["close"].astype(float)
+        open_1h = df_1h_hist["open"].astype(float)
+        vol_1h = df_1h_hist["volume"].astype(float)
         dv = np.where(close_1h > open_1h, vol_1h, np.where(close_1h < open_1h, -vol_1h, 0.0))
         dv = pd.Series(dv, index=df_1h.index)
         dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
