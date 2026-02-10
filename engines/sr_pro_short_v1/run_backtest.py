@@ -173,6 +173,7 @@ def run_backtest() -> None:
     parser.add_argument("--shallow-wick-max", type=float, default=0.35)
     parser.add_argument("--shallow-dvf-max", type=float, default=0.0)
     parser.add_argument("--sl-buffer", type=float, default=0.01)
+    parser.add_argument("--sl-atr-mult", type=float, default=0.7)
     parser.add_argument("--tp-mult", type=float, default=0.985)
     parser.add_argument("--tp-mult-weak", type=float, default=0.985)
     parser.add_argument("--sl-min-weak", type=float, default=1.0015)
@@ -761,7 +762,7 @@ def run_backtest() -> None:
                         nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                         if high_now > nearest.top:
                             continue
-                        sl_raw = nearest.top * (1.0 + cfg.sl_buffer)
+                        sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                         sl_price = max(sl_raw, entry_px * 1.002)
                         tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
                         trade = {

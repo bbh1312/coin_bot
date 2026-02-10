@@ -9010,7 +9010,8 @@ def _run_sr_pro_short_v1_cycle(
             if h3 >= retest_level - (atr_now * float(cfg.retest_atr_mult)):
                 entry_px = float(df_3m.iloc[-1]["open"])
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
-                sl_raw = nearest["top"] * (1.0 + cfg.sl_buffer)
+                atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
+                sl_raw = nearest["top"] + (atr_now * float(cfg.sl_atr_mult))
                 sl_min = entry_px * (1.002 if break_type == "strong" else cfg.sl_min_weak)
                 sl_price = max(sl_raw, sl_min)
                 tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)

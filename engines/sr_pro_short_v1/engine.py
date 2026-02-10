@@ -37,6 +37,7 @@ class SrProShortV1Config:
     shallow_wick_max: float = 0.35
     shallow_dvf_max: float = 0.0
     sl_buffer: float = 0.01
+    sl_atr_mult: float = 0.7
     tp_mult: float = 0.985
     tp_mult_weak: float = 0.985
     sl_min_weak: float = 1.0015
