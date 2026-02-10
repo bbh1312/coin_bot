@@ -1,6 +1,6 @@
 # 실매매 엔진 연결 지침서
 
-이 문서는 최근 엔진들(wash_short_suite, st_flip_v1, noise_reverse_v1) 실매매 연결 과정에서 적용했던 기준을 정리한 지침서입니다. 신규 엔진 추가 시 동일한 흐름으로 적용하세요.
+이 문서는 최근 엔진들의 실매매 연결 과정에서 적용했던 기준을 정리한 지침서입니다. 신규 엔진 추가 시 동일한 흐름으로 적용하세요.
 
 ## 1) 엔진 기본 구조
 - `engines/<engine_name>/engine.py`에 config dataclass 생성
@@ -26,7 +26,7 @@
 
 ## 5) 메인 루프 연결
 - 유니버스 연결 (보통 shared_universe)
-- 사이클별 실행 플래그 추가 (예: `wash_short_suite_ran`)
+- 사이클별 실행 플래그 추가 (예: `<engine>_ran`)
 - `_run_<engine>_cycle`을 스레드로 실행
 - 콘솔 로그에 cycle start/end 출력
 
