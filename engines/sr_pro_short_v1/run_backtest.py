@@ -944,6 +944,39 @@ def run_backtest() -> None:
                     continue
             except Exception:
                 pass
+            def _log_signal_ctx(track: str, nearest_zone, entry_px: float, atr_now: float | None = None, extra: str = "") -> None:
+                try:
+                    parts = [
+                        "[BACKTEST][SIGNAL_CTX]",
+                        f"sym={sym}",
+                        f"track={track}",
+                        f"h1_close={h1_close:.6f}",
+                        f"h1_high={h1_high:.6f}",
+                        f"h1_low={h1_low:.6f}",
+                        f"dvf_norm={dvf_norm:.4f}",
+                        f"zone_mid={nearest_zone.mid:.6f}",
+                        f"zone_bot={nearest_zone.bot:.6f}",
+                        f"zone_top={nearest_zone.top:.6f}",
+                        f"h15_0={h15_0:.6f}",
+                        f"h15_1={h15_1:.6f}",
+                        f"h15_2={h15_2:.6f}",
+                        f"c3={close_now:.6f}",
+                        f"o3={float(df_3m.at[i3, 'open']):.6f}",
+                        f"h3={high_now:.6f}",
+                        f"l3={low_now:.6f}",
+                        f"low_min={low_min:.6f}",
+                        f"strong={int(strong_break)}",
+                        f"weak={int(weak_break)}",
+                        f"retest_level={retest_level:.6f}",
+                        f"retest_until={retest_until}",
+                    ]
+                    if isinstance(atr_now, (int, float)):
+                        parts.append(f"atr3={atr_now:.6f}")
+                    if extra:
+                        parts.append(extra)
+                    print(" ".join(parts))
+                except Exception:
+                    pass
             # Big bear break candle -> immediate entry (skip retest)
             try:
                 body = abs(close_now - float(df_3m.at[i3, "open"]))
@@ -971,6 +1004,13 @@ def run_backtest() -> None:
                     if args.log_gates:
                         gate_counts["entry_by_big_bear"] += 1
                     _record_entry_ts(trade["entry_ts"])
+                    _log_signal_ctx(
+                        "big_bear",
+                        nearest,
+                        entry_px,
+                        atr_now,
+                        extra=f"body={body:.6f} avg_body={avg_body:.6f} body_mult={body/avg_body if avg_body>0 else 0:.3f}",
+                    )
                     retest_active = False
                     continue
             except Exception:
@@ -999,6 +1039,7 @@ def run_backtest() -> None:
                     if args.log_gates:
                         gate_counts["entry_by_dvf_accel"] += 1
                     _record_entry_ts(trade["entry_ts"])
+                    _log_signal_ctx("dvf_accel", nearest, entry_px, atr_now)
                     retest_active = False
                     continue
             except Exception:
@@ -1034,6 +1075,7 @@ def run_backtest() -> None:
                         gate_counts["entry_by_dvf_accel"] += 1
                     day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
                     entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                    _log_signal_ctx("dvf_accel", nearest, entry_px, atr_now)
                     retest_active = False
                     continue
             except Exception:
@@ -1063,6 +1105,7 @@ def run_backtest() -> None:
                     if args.log_gates:
                         gate_counts["entry_by_dvf_slope"] += 1
                     _record_entry_ts(trade["entry_ts"])
+                    _log_signal_ctx("dvf_slope", nearest, entry_px, atr_now)
                     retest_active = False
                     continue
             except Exception:
@@ -1120,6 +1163,7 @@ def run_backtest() -> None:
                     if args.log_gates:
                         gate_counts["entry_by_timeout"] += 1
                     _record_entry_ts(trade["entry_ts"])
+                    _log_signal_ctx("timeout", nearest, entry_px, atr_now)
                     retest_active = False
                     continue
 
@@ -1143,7 +1187,7 @@ def run_backtest() -> None:
                             gate_counts["retest_pass_low"] += 1
                     else:
                         continue
-                    trade = {
+                trade = {
                         "entry_px": entry_px,
                         "sl_price": sl_price,
                         "tp_price": tp_price,
@@ -1156,8 +1200,9 @@ def run_backtest() -> None:
                     stats["entries"] += 1
                     sym_stats["entries"] += 1
                     entry_symbols.add(sym)
-                    _record_entry_ts(trade["entry_ts"])
-                    if args.log_gates:
+                _record_entry_ts(trade["entry_ts"])
+                _log_signal_ctx("strong" if strong_break else "weak", nearest, entry_px, atr_now)
+                if args.log_gates:
                         if close_now < retest_level:
                             gate_counts["entry_by_pass_close"] += 1
                         else:

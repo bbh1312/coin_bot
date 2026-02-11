@@ -8244,6 +8244,7 @@ def _run_sr_pro_short_v1_cycle(
             pass
 
         h1_touch_px = h1_close if cfg.touch_use_close else h1_high
+        ema_now = None
         if cfg.ema200_filter:
             ema_len = max(1, int(getattr(cfg, "ema_filter_len", 200)))
             ema_line = ema(close_1h, ema_len)
@@ -8283,6 +8284,53 @@ def _run_sr_pro_short_v1_cycle(
             sym_state["break_type"] = None
             gate_stats["zone_touch"] += 1
             continue
+
+        def _log_signal_ctx(track: str, nearest_zone: dict, entry_px: float, atr_now: float | None = None, extra: str = "") -> None:
+            try:
+                parts = [
+                    "SR_PRO_SIGNAL_CTX",
+                    f"sym={symbol}",
+                    f"track={track}",
+                    f"h1_ts={_iso_kst(h1_ts/1000) if h1_ts else 'NA'}",
+                    f"h1_close={h1_close:.6f}",
+                    f"h1_high={h1_high:.6f}",
+                    f"h1_low={h1_low:.6f}",
+                    f"dvf_norm={dvf_norm:.4f}",
+                    f"dvf_diff={dvf_norm_diff:.4f}",
+                ]
+                if isinstance(ema_now, (int, float)):
+                    parts.append(f"ema200={ema_now:.6f}")
+                parts2 = [
+                    "SR_PRO_SIGNAL_CTX",
+                    f"sym={symbol}",
+                    f"track={track}",
+                    f"touch_px={h1_touch_px:.6f}",
+                    f"touch_mode={cfg.touch_mode}",
+                    "touch_latest=1",
+                    f"zone_mid={nearest_zone['mid']:.6f}",
+                    f"zone_bot={nearest_zone['bot']:.6f}",
+                    f"zone_top={nearest_zone['top']:.6f}",
+                    f"h15_0={h15_0:.6f}",
+                    f"h15_1={h15_1:.6f}",
+                    f"h15_2={h15_2:.6f}",
+                    f"c3={c3:.6f}",
+                    f"o3={o3:.6f}",
+                    f"h3={h3:.6f}",
+                    f"l3={l3:.6f}",
+                    f"low_min={low_min:.6f}",
+                    f"strong={int(strong_break)}",
+                    f"weak={int(weak_break)}",
+                    f"retest_level={retest_level:.6f}",
+                    f"retest_until={retest_until}",
+                ]
+                if isinstance(atr_now, (int, float)):
+                    parts2.append(f"atr3={atr_now:.6f}")
+                _append_sr_pro_short_v1_log(" ".join(parts))
+                _append_sr_pro_short_v1_log(" ".join(parts2))
+                if extra:
+                    _append_sr_pro_short_v1_log(f"SR_PRO_SIGNAL_CTX {extra}")
+            except Exception:
+                pass
 
         # 15m bearish + close below EMA20 (trend filter)
         if len(df_15m_sig) < 3:
@@ -8356,12 +8404,12 @@ def _run_sr_pro_short_v1_cycle(
             body = abs(c3 - o3)
             bodies = (df_3m_sig["close"] - df_3m_sig["open"]).abs()
             avg_body = float(bodies.iloc[-6:-1].mean()) if len(bodies) >= 6 else float(bodies.iloc[:-1].mean())
-            if avg_body > 0 and c3 < o3 and body >= (avg_body * float(cfg.big_bear_body_mult)):
-                entry_px = float(df_3m.iloc[-1]["open"])
-                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
-                sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
-                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                tp_price = entry_px * float(cfg.tp_mult)
+                if avg_body > 0 and c3 < o3 and body >= (avg_body * float(cfg.big_bear_body_mult)):
+                    entry_px = float(df_3m.iloc[-1]["open"])
+                    nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                    sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
+                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
                 if usdt > 0 and _admin_is_active():
                     _append_sr_pro_short_v1_log(
@@ -8387,6 +8435,13 @@ def _run_sr_pro_short_v1_cycle(
                     if req_id:
                         result["entries"] += 1
                         gate_stats["entry_by_big_bear"] += 1
+                    _log_signal_ctx(
+                        "big_bear",
+                        nearest,
+                        entry_px,
+                        atr_now,
+                        extra=f"body={body:.6f} avg_body={avg_body:.6f} body_mult={body/avg_body if avg_body>0 else 0:.3f}",
+                    )
                 sym_state["retest_active"] = False
                 continue
         except Exception:
@@ -8421,11 +8476,12 @@ def _run_sr_pro_short_v1_cycle(
                             "track": "dvf_accel",
                         },
                     )
-                    if req_id:
-                        result["entries"] += 1
-                        gate_stats["entry_by_dvf_accel"] += 1
-                sym_state["retest_active"] = False
-                continue
+                if req_id:
+                    result["entries"] += 1
+                    gate_stats["entry_by_dvf_accel"] += 1
+                _log_signal_ctx("dvf_accel", nearest, entry_px, atr_now)
+            sym_state["retest_active"] = False
+            continue
         except Exception:
             pass
         # DVF slope acceleration -> immediate entry (skip retest)
@@ -8458,11 +8514,12 @@ def _run_sr_pro_short_v1_cycle(
                             "track": "dvf_slope",
                         },
                     )
-                    if req_id:
-                        result["entries"] += 1
-                        gate_stats["entry_by_dvf_slope"] += 1
-                sym_state["retest_active"] = False
-                continue
+                if req_id:
+                    result["entries"] += 1
+                    gate_stats["entry_by_dvf_slope"] += 1
+                _log_signal_ctx("dvf_slope", nearest, entry_px, atr_now)
+            sym_state["retest_active"] = False
+            continue
         except Exception:
             pass
         # retest state

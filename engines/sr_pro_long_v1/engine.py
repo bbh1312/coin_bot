@@ -43,8 +43,8 @@ class SrProLongV1Config:
     sl_atr_mult: float = 0.4
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 1.015
-    tp_mult_weak: float = 1.015
+    tp_mult: float = 1.02
+    tp_mult_weak: float = 1.02
 
 
 class SrProLongV1Engine(BaseEngine):

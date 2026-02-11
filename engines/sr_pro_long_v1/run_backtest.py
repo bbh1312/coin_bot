@@ -291,8 +291,8 @@ def run_backtest() -> None:
     parser.add_argument("--sl-atr-mult", type=float, default=0.4)
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
     parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
-    parser.add_argument("--tp-mult", type=float, default=1.015)
-    parser.add_argument("--tp-mult-weak", type=float, default=1.015)
+    parser.add_argument("--tp-mult", type=float, default=1.02)
+    parser.add_argument("--tp-mult-weak", type=float, default=1.02)
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
@@ -708,6 +708,18 @@ def run_backtest() -> None:
                 if args.log_gates:
                     gate_counts["ema200_pass"] += 1
 
+            # Only accept zones touched by the latest confirmed 1h bar
+            h1_ts = int(df_1h.at[idx_1h, "ts"]) if "ts" in df_1h.columns else 0
+            for z in zones:
+                if not z.live:
+                    setattr(z, "last_touch_ts", 0)
+                    continue
+                touched_now = (
+                    z.side == -1
+                    and h1_touch_px <= (z.mid if h1_touch_level == "mid" else z.top)
+                    and h1_high >= z.bot
+                )
+                setattr(z, "last_touch_ts", h1_ts if touched_now else 0)
             support_candidates = [
                 z
                 for z in zones
@@ -716,6 +728,7 @@ def run_backtest() -> None:
                 and dvf_norm >= float(args.dvf_norm_min)
                 and h1_touch_px <= (z.mid if h1_touch_level == "mid" else z.top)
                 and h1_high >= z.bot
+                and getattr(z, "last_touch_ts", 0) == h1_ts
             ]
             if support_candidates and args.require_reject_close:
                 reject_level = "mid" if args.reject_mode == "mid" else "top"
