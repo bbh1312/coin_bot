@@ -19,7 +19,7 @@ class SrProShortV1Config:
     max_zones_per_side: int = 8
     touch_mode: str = "bot"
     touch_use_close: bool = False
-    dvf_norm_max: float = -0.2
+    dvf_norm_max: float = -0.10
     require_reject_close: bool = False
     reject_mode: str = "bot"
     reject_source: str = "1h"
@@ -37,6 +37,12 @@ class SrProShortV1Config:
     shallow_atr_mult: float = 0.35
     shallow_wick_max: float = 0.35
     shallow_dvf_max: float = 0.0
+    big_bear_body_mult: float = 1.5
+    atr_filter_len: int = 20
+    atr_filter_mult: float = 0.8
+    ema60_15m_len: int = 60
+    ema120_15m_len: int = 120
+    ema_slope_min: float = 0.001
     sl_buffer: float = 0.01
     sl_atr_mult: float = 0.5
     tp_atr_mult: float = 0.0

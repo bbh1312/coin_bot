@@ -6695,6 +6695,17 @@ def _close_trade(
                     sym_state["cooldown_until_short"] = int(float(exit_ts) * 1000) + (60 * 60 * 1000)
                 except Exception:
                     pass
+            if (
+                side == "LONG"
+                and reason == "auto_exit_sl"
+                and tr.get("engine_label") == "SR_PRO_LONG_V1"
+            ):
+                try:
+                    sr_state = state.setdefault("_sr_pro_long_v1_state", {})
+                    sym_state = sr_state.setdefault(symbol, {})
+                    sym_state["cooldown_until_long"] = int(float(exit_ts) * 1000) + (60 * 60 * 1000)
+                except Exception:
+                    pass
             _update_report_csv(tr)
             return
     log.append(
@@ -7986,6 +7997,9 @@ def _run_sr_pro_short_v1_cycle(
         "retest_seen": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
+        "entry_by_big_bear": 0,
+        "atr_filter": 0,
+        "ema_slope_block": 0,
         "no_data_ltf": 0,
         "no_data_mtf": 0,
         "no_data_htf": 0,
@@ -8092,18 +8106,6 @@ def _run_sr_pro_short_v1_cycle(
             gate_stats["cooldown"] += 1
             continue
 
-        # TP1 partial close handling (short only)
-        try:
-            tp1_px = sym_state.get("tp1_price")
-            tp1_done = sym_state.get("tp1_done")
-            if isinstance(tp1_px, (int, float)) and not tp1_done:
-                last_close = float(df_3m_sig.iloc[-1]["close"])
-                if last_close <= float(tp1_px):
-                    _adv_partial_close(symbol, "SHORT", 0.5)
-                    sym_state["tp1_done"] = True
-        except Exception:
-            pass
-
         # refresh zones if new 1h bar
         last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
         if sym_state.get("zones_ts") != last_1h_hist_ts:
@@ -8112,39 +8114,38 @@ def _run_sr_pro_short_v1_cycle(
             sym_state["zones_ts"] = last_1h_hist_ts
         zones = sym_state.get("zones") or []
 
-        # current 1h bar (confirmed)
-        h1 = df_1h_hist.iloc[-1]
+        # current 1h bar (in-progress for touch)
+        h1 = df_1h.iloc[-1]
         h1_ts = int(h1["ts"]) if "ts" in h1 else 0
         h1_high = float(h1["high"])
         h1_low = float(h1["low"])
         h1_close = float(h1["close"])
 
         # dvf_norm from 1h (confirmed)
-        close_1h = df_1h_hist["close"].astype(float)
-        open_1h = df_1h_hist["open"].astype(float)
-        vol_1h = df_1h_hist["volume"].astype(float)
+        close_1h = df_1h["close"].astype(float)
+        open_1h = df_1h["open"].astype(float)
+        vol_1h = df_1h["volume"].astype(float)
         dv = np.where(close_1h > open_1h, vol_1h, np.where(close_1h < open_1h, -vol_1h, 0.0))
         dv = pd.Series(dv, index=df_1h.index)
         dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
         vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
         dvf_norm = float(dvf.iloc[-1]) / float(vol_ema.iloc[-1]) if float(vol_ema.iloc[-1]) > 0 else 0.0
 
-        # invalidate zones on confirmed 1h close (match backtest behavior)
+        # invalidate zones on confirmed 1h close (live)
         try:
             for z in zones:
                 if "live" not in z:
                     z["live"] = True
                 if not z.get("live"):
                     continue
-                if z.get("side") == 1 and h1_close > float(z.get("top", 0)):
+                if z.get("side") == 1 and float(df_1h_hist.iloc[-1]["close"]) > float(z.get("top", 0)):
                     z["live"] = False
-                elif z.get("side") == -1 and h1_close < float(z.get("bot", 0)):
+                elif z.get("side") == -1 and float(df_1h_hist.iloc[-1]["close"]) < float(z.get("bot", 0)):
                     z["live"] = False
         except Exception:
             pass
 
         h1_touch_px = h1_close if cfg.touch_use_close else h1_high
-        touch_age_ms = max(1, int(getattr(cfg, "touch_age_h1", 2))) * 60 * 60 * 1000
         if cfg.ema200_filter:
             ema_len = max(1, int(getattr(cfg, "ema_filter_len", 200)))
             ema_line = ema(close_1h, ema_len)
@@ -8152,43 +8153,53 @@ def _run_sr_pro_short_v1_cycle(
             if h1_close >= ema_now:
                 gate_stats["zone_touch"] += 1
                 continue
-        # filter zones by break (avoid already broken)
-        # update touch timestamp for zones touched near mid
-        for z in zones:
-            if not z.get("live", True) or z.get("side") != 1:
-                continue
-            if h1_touch_px >= float(z.get("mid", 0.0)) and h1_low <= float(z.get("top", 0.0)):
-                z["last_touch_ts"] = h1_ts
         resist_candidates = [
             z for z in zones
             if z.get("live", True)
             and z["side"] == 1
             and dvf_norm <= float(cfg.dvf_norm_max)
-            and h1_touch_px >= float(z.get("mid", 0.0))
+            and h1_high >= float(z.get("bot", 0.0))
             and h1_low <= float(z.get("top", 0.0))
-            and isinstance(z.get("last_touch_ts"), (int, float))
-            and (h1_ts - int(z["last_touch_ts"])) <= touch_age_ms
         ]
         if not resist_candidates:
             gate_stats["zone_touch"] += 1
             continue
 
-        # 15m lower high (2-bar LH)
+        # 15m lower high (2-bar) or close below EMA20 (softer trend filter)
         if len(df_15m_sig) < 3:
             gate_stats["lh_15m"] += 1
             continue
         h15_0 = float(df_15m_sig.iloc[-1]["high"])
         h15_1 = float(df_15m_sig.iloc[-2]["high"])
         h15_2 = float(df_15m_sig.iloc[-3]["high"])
-        if not (h15_0 < h15_1 or h15_1 < h15_2):
+        close15 = float(df_15m_sig.iloc[-1]["close"])
+        open15 = float(df_15m_sig.iloc[-1]["open"])
+        lh_ok = (h15_0 < h15_1) or (h15_1 < h15_2)
+        ema20_15m_ok = False
+        try:
+            if len(df_15m_sig) >= 20:
+                ema20_15m = ema(df_15m_sig["close"], 20)
+                ema20_15m_ok = close15 < float(ema20_15m.iloc[-1])
+        except Exception:
+            ema20_15m_ok = False
+        if not (lh_ok or ema20_15m_ok):
             gate_stats["lh_15m"] += 1
             continue
-        if not (
-            float(df_15m_sig.iloc[-1]["close"]) < float(df_15m_sig.iloc[-1]["open"])
-            or float(df_15m_sig.iloc[-1]["close"]) < float(df_15m_sig.iloc[-2]["close"])
-        ):
+        if not (close15 < open15):
             gate_stats["lh_15m"] += 1
             continue
+        # 15m EMA60/EMA120 slope filter (skip if steeply rising)
+        try:
+            ema60 = ema(df_15m_sig["close"], int(cfg.ema60_15m_len))
+            ema120 = ema(df_15m_sig["close"], int(cfg.ema120_15m_len))
+            if len(ema60) >= 2 and len(ema120) >= 2:
+                ema60_slope = (float(ema60.iloc[-1]) - float(ema60.iloc[-2])) / float(ema60.iloc[-2])
+                ema120_slope = (float(ema120.iloc[-1]) - float(ema120.iloc[-2])) / float(ema120.iloc[-2])
+                if ema60_slope > float(cfg.ema_slope_min) or ema120_slope > float(cfg.ema_slope_min):
+                    gate_stats["ema_slope_block"] += 1
+                    continue
+        except Exception:
+            pass
 
         # 3m break
         if len(df_3m_sig) < 4:
@@ -8204,9 +8215,64 @@ def _run_sr_pro_short_v1_cycle(
         low_min = min(low_prev)
         strong_break = c3 < low_min
         weak_break = (float(df_3m_sig.iloc[-1]["low"]) < low_min) and (c3 >= low_min) and (c3 < o3)
-        if not strong_break:
+        if not strong_break and not weak_break:
             gate_stats["break_3m"] += 1
             continue
+        # ATR filter (skip low-volatility regime)
+        try:
+            high3 = df_3m_sig["high"].astype(float)
+            low3 = df_3m_sig["low"].astype(float)
+            close3 = df_3m_sig["close"].astype(float)
+            prev_close3 = close3.shift(1)
+            tr3 = pd.concat([(high3 - low3), (high3 - prev_close3).abs(), (low3 - prev_close3).abs()], axis=1).max(axis=1)
+            atr_3m = tr3.ewm(alpha=1 / 14, adjust=False).mean()
+            atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
+            atr_ma = float(atr_3m.rolling(int(cfg.atr_filter_len)).mean().iloc[-1]) if len(atr_3m) >= int(cfg.atr_filter_len) else 0.0
+            if atr_ma > 0 and atr_now <= (atr_ma * float(cfg.atr_filter_mult)):
+                gate_stats["atr_filter"] += 1
+                continue
+        except Exception:
+            pass
+        # Big bear break candle -> immediate entry (skip retest)
+        try:
+            body = abs(c3 - o3)
+            bodies = (df_3m_sig["close"] - df_3m_sig["open"]).abs()
+            avg_body = float(bodies.iloc[-6:-1].mean()) if len(bodies) >= 6 else float(bodies.iloc[:-1].mean())
+            if avg_body > 0 and c3 < o3 and body >= (avg_body * float(cfg.big_bear_body_mult)):
+                entry_px = float(df_3m.iloc[-1]["open"])
+                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
+                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                tp_price = entry_px * float(cfg.tp_mult)
+                usdt = _resolve_entry_usdt()
+                if usdt > 0 and _admin_is_active():
+                    _append_sr_pro_short_v1_log(
+                        f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track=big_bear"
+                    )
+                    req_id = _enqueue_entry_request(
+                        state,
+                        symbol=symbol,
+                        side="SHORT",
+                        engine="SR_PRO_SHORT_V1",
+                        reason="sr_pro_short_v1",
+                        usdt=usdt,
+                        live=LIVE_TRADING,
+                        entry_price_hint=entry_px,
+                        meta={
+                            "sl_price": float(sl_price),
+                            "tp_price": float(tp_price),
+                            "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                            "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                            "track": "big_bear",
+                        },
+                    )
+                    if req_id:
+                        result["entries"] += 1
+                        gate_stats["entry_by_big_bear"] += 1
+                sym_state["retest_active"] = False
+                continue
+        except Exception:
+            pass
         # retest state
         retest_active = bool(sym_state.get("retest_active"))
         retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
@@ -8231,9 +8297,6 @@ def _run_sr_pro_short_v1_cycle(
             l3 = float(df_3m_sig.iloc[-1]["low"])
             if resist_candidates:
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - float(df_3m.iloc[-1]["open"])))
-                if h3 > nearest["top"]:
-                    sym_state["retest_active"] = False
-                    continue
             # compute atr_3m quickly
             high3 = df_3m_sig["high"].astype(float)
             low3 = df_3m_sig["low"].astype(float)
@@ -8242,37 +8305,32 @@ def _run_sr_pro_short_v1_cycle(
             tr3 = pd.concat([(high3 - low3), (high3 - prev_close3).abs(), (low3 - prev_close3).abs()], axis=1).max(axis=1)
             atr_3m = tr3.ewm(alpha=1 / 14, adjust=False).mean()
             atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
-            if h3 >= retest_level - (atr_now * float(cfg.retest_atr_mult)):
+            retest_touch_mult = float(cfg.retest_atr_mult) if strong_break else 0.5
+            if h3 >= retest_level - (atr_now * retest_touch_mult):
                 entry_px = float(df_3m.iloc[-1]["open"])
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
                 sl_raw = nearest["top"] + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                tp_atr = cfg.tp_atr_mult_weak if break_type == "weak" else cfg.tp_atr_mult
                 rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
                 upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
                 wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
                 if c3 < retest_level:
                     gate_stats["entry_by_pass_close"] += 1
                 elif l3 < retest_level and c3 < o3 and wick_ratio <= float(cfg.retest_wick_max):
-                    if break_type == "weak" and not (dvf_norm <= -0.3 and wick_ratio <= 0.25 and retest_bars <= 3):
-                        continue
+                    gate_stats["entry_by_pass_low"] += 1
+                elif h3 < retest_level + (atr_now * float(cfg.shallow_atr_mult)) and c3 < o3 and dvf_norm <= float(cfg.shallow_dvf_max) and wick_ratio <= float(cfg.shallow_wick_max):
                     gate_stats["entry_by_pass_low"] += 1
                 else:
                     continue
 
-                sl_price = max(h3 + (atr_now * 0.3), entry_px + (atr_now * 0.6))
-                tp1_price = entry_px - (atr_now * 1.0)
-                swing_low = float(df_15m_sig["low"].astype(float).iloc[-1])
-                if len(df_15m_sig) >= 20:
-                    swing_low = float(df_15m_sig["low"].astype(float).iloc[-20:].min())
-                tp2_price = swing_low
+                tp_price = entry_px * float(cfg.tp_mult)
 
                 usdt = _resolve_entry_usdt()
                 if usdt <= 0 or not _admin_is_active():
                     continue
                 _append_sr_pro_short_v1_log(
-                    f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp1={tp1_price:.6f} tp2={tp2_price:.6f} track={break_type}"
+                    f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={break_type}"
                 )
                 try:
                     _append_sr_pro_short_v1_log(
@@ -8300,19 +8358,17 @@ def _run_sr_pro_short_v1_cycle(
                     entry_price_hint=entry_px,
                     meta={
                         "sl_price": float(sl_price),
-                        "tp_price": float(tp2_price),
+                        "tp_price": float(tp_price),
                         "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
-                        "tp_pct": ((entry_px - float(tp2_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                        "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
                         "track": break_type,
-                        "tp1_price": float(tp1_price),
-                        "tp2_price": float(tp2_price),
                     },
                 )
                 if req_id:
                     result["entries"] += 1
                 sym_state["retest_active"] = False
-                sym_state["tp1_price"] = float(tp1_price)
-                sym_state["tp1_done"] = False
+                sym_state.pop("tp1_price", None)
+                sym_state.pop("tp1_done", None)
                 continue
         if retest_active and now_ts_ms > retest_until:
             sym_state["retest_active"] = False
@@ -11649,6 +11705,25 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 engine_label = _engine_label_from_reason(
                     (open_tr.get("meta") or {}).get("reason") if open_tr else None
                 )
+                # SR_PRO_LONG_V1: entry 직후 포지션 캐시 지연으로 잘못 청산되는 케이스 방지
+                if engine_label == "SR_PRO_LONG_V1":
+                    entry_ts_ms = open_tr.get("entry_ts_ms") or open_tr.get("entry_ts")
+                    now_ms = int(time.time() * 1000)
+                    try:
+                        if isinstance(entry_ts_ms, (int, float)) and entry_ts_ms > 0:
+                            entry_ts_ms = float(entry_ts_ms)
+                            if entry_ts_ms < 10_000_000_000:  # sec -> ms
+                                entry_ts_ms *= 1000.0
+                            if (now_ms - entry_ts_ms) < 120_000:
+                                _append_entry_gate_log(
+                                    "auto_exit_long",
+                                    sym,
+                                    f"srp_guard_skip_missing_detail age_ms={int(now_ms - entry_ts_ms)}",
+                                    side="LONG",
+                                )
+                                continue
+                    except Exception:
+                        pass
                 exit_reason = "manual_close"
                 entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
                 tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "LONG")
@@ -11664,8 +11739,9 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     except Exception:
                         sl_price_meta = None
                 mark_px = _fetch_last_price(sym)
-                if mark_px is None and isinstance(sl_price_meta, (int, float)):
-                    mark_px = float(sl_price_meta)
+                if engine_label != "SR_PRO_LONG_V1":
+                    if mark_px is None and isinstance(sl_price_meta, (int, float)):
+                        mark_px = float(sl_price_meta)
                 if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
                     profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
                     if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
@@ -16347,7 +16423,11 @@ def run():
                         refresh_positions_cache(force=True)
                     except Exception as e:
                         print("[positions] cache refresh failed:", e)
-                    active_positions_total = count_open_positions(force=True)
+                    try:
+                        active_positions_total = count_open_positions(force=True)
+                    except Exception as e:
+                        print("[positions] count_open_positions failed:", e)
+                        active_positions_total = None
                     if not isinstance(active_positions_total, int):
                         active_positions_total = sum(
                             1 for st in state.values() if isinstance(st, dict) and st.get("in_pos")

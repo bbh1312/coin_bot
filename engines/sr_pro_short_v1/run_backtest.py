@@ -190,7 +190,7 @@ def run_backtest() -> None:
     parser.add_argument("--max-zones-per-side", type=int, default=8)
     parser.add_argument("--touch-mode", type=str, default="bot", choices=["bot", "mid"])
     parser.add_argument("--touch-use-close", action="store_true")
-    parser.add_argument("--dvf-norm-max", type=float, default=-0.2)
+    parser.add_argument("--dvf-norm-max", type=float, default=-0.10)
     parser.add_argument("--require-reject-close", action="store_true")
     parser.add_argument("--reject-mode", type=str, default="bot", choices=["bot", "mid"])
     parser.add_argument("--reject-source", type=str, default="1h", choices=["1h", "15m"])
@@ -208,6 +208,12 @@ def run_backtest() -> None:
     parser.add_argument("--shallow-atr-mult", type=float, default=0.35)
     parser.add_argument("--shallow-wick-max", type=float, default=0.35)
     parser.add_argument("--shallow-dvf-max", type=float, default=0.0)
+    parser.add_argument("--big-bear-body-mult", type=float, default=1.5)
+    parser.add_argument("--atr-filter-len", type=int, default=20)
+    parser.add_argument("--atr-filter-mult", type=float, default=0.8)
+    parser.add_argument("--ema60-15m-len", type=int, default=60)
+    parser.add_argument("--ema120-15m-len", type=int, default=120)
+    parser.add_argument("--ema-slope-min", type=float, default=0.001)
     parser.add_argument("--sl-buffer", type=float, default=0.01)
     parser.add_argument("--sl-atr-mult", type=float, default=0.5)
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
@@ -374,6 +380,9 @@ def run_backtest() -> None:
         "retest_fail_shallow": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
+        "entry_by_big_bear": 0,
+        "atr_filter": 0,
+        "ema_slope_block": 0,
         "reject_pass_1h": 0,
         "reject_pass_15m": 0,
         "ema200_pass": 0,
@@ -609,7 +618,7 @@ def run_backtest() -> None:
                 if high_i >= trade["sl_price"]:
                     exit_px = trade["sl_price"]
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
-                    pnl_total = trade.get("pnl_partial", 0.0) + (pnl_pct * 0.5)
+                    pnl_total = pnl_pct
                     for bucket in (stats, sym_stats):
                         bucket["exits"] += 1
                         bucket["trades"] += 1
@@ -645,22 +654,17 @@ def run_backtest() -> None:
                                 "exit_px": exit_px,
                                 "reason": "SL",
                                 "result": "LOSS",
-                                "tp_pct": ((trade["entry_px"] - trade.get("tp2_price", trade["entry_px"])) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
+                                "tp_pct": ((trade["entry_px"] - trade.get("tp_price", trade["entry_px"])) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
                                 "sl_pct": ((trade["sl_price"] - trade["entry_px"]) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
                             }
                         )
                     cooldown_until[sym] = ts + (60 * 60 * 1000)
                     trade = None
                     continue
-                elif (not trade.get("tp1_done")) and low_i <= trade.get("tp1_price", -1):
-                    tp1_px = trade["tp1_price"]
-                    pnl_pct = (trade["entry_px"] - tp1_px) / trade["entry_px"]
-                    trade["pnl_partial"] = trade.get("pnl_partial", 0.0) + (pnl_pct * 0.5)
-                    trade["tp1_done"] = True
-                elif low_i <= trade.get("tp2_price", -1):
-                    exit_px = trade["tp2_price"]
+                elif low_i <= trade.get("tp_price", -1):
+                    exit_px = trade["tp_price"]
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
-                    pnl_total = trade.get("pnl_partial", 0.0) + (pnl_pct * 0.5)
+                    pnl_total = pnl_pct
                     for bucket in (stats, sym_stats):
                         bucket["exits"] += 1
                         bucket["trades"] += 1
@@ -696,32 +700,29 @@ def run_backtest() -> None:
                                 "exit_px": exit_px,
                                 "reason": "TP",
                                 "result": "WIN",
-                                "tp_pct": ((trade["entry_px"] - trade.get("tp2_price", trade["entry_px"])) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
+                                "tp_pct": ((trade["entry_px"] - trade.get("tp_price", trade["entry_px"])) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
                                 "sl_pct": ((trade["sl_price"] - trade["entry_px"]) / trade["entry_px"] * 100.0) if trade["entry_px"] > 0 else 0.0,
                             }
                         )
                     trade = None
                     continue
+                continue
 
-            # 1h confirmed bar touching resistance zone with negative delta
-            h1_high = float(high_1h.iloc[idx_1h])
-            h1_low = float(low_1h.iloc[idx_1h])
-            h1_close = float(close_1h.iloc[idx_1h])
-            h1_touch_level = None
-            if args.touch_mode == "mid":
-                h1_touch_level = "mid"
-            else:
-                h1_touch_level = "bot"
+            # 1h in-progress bar touching resistance zone with negative delta
+            idx_1h_touch = idx_1h + 1 if args.use_confirmed and (idx_1h + 1) < len(df_1h) else idx_1h
+            h1_high = float(high_1h.iloc[idx_1h_touch])
+            h1_low = float(low_1h.iloc[idx_1h_touch])
+            h1_close = float(close_1h.iloc[idx_1h_touch])
             dvf_norm = (
-                float(dvf.iloc[idx_1h]) / float(vol_ema.iloc[idx_1h])
-                if float(vol_ema.iloc[idx_1h]) > 0
+                float(dvf.iloc[idx_1h_touch]) / float(vol_ema.iloc[idx_1h_touch])
+                if float(vol_ema.iloc[idx_1h_touch]) > 0
                 else 0.0
             )
             h1_touch_px = h1_close if args.touch_use_close else h1_high
             if args.ema200_filter:
                 ema_len = max(1, int(args.ema_filter_len))
                 ema_line = _ema(close_1h, ema_len)
-                ema_now = float(ema_line.iloc[idx_1h])
+                ema_now = float(ema_line.iloc[idx_1h_touch])
                 if h1_close >= ema_now:
                     if args.log_gates:
                         gate_counts["zone_touch"] += 1
@@ -734,7 +735,7 @@ def run_backtest() -> None:
                 if z.live
                 and z.side == 1
                 and dvf_norm <= float(args.dvf_norm_max)
-                and h1_touch_px >= (z.mid if h1_touch_level == "mid" else z.bot)
+                and h1_high >= z.bot
                 and h1_low <= z.top
             ]
             if resist_candidates and args.require_reject_close:
@@ -780,21 +781,44 @@ def run_backtest() -> None:
                     gate_counts["zone_touch"] += 1
                 continue
 
-            # 15m lower high
+            # 15m lower high (2-bar) or close below EMA20 + bearish candle
             idx_15m = int(np.searchsorted(ts_15m, ts, side="right") - 1)
             if idx_15m < 2:
                 continue
-            if (
-                float(df_15m.at[idx_15m, "high"]) >= float(df_15m.at[idx_15m - 1, "high"])
-                and float(df_15m.at[idx_15m - 1, "high"]) >= float(df_15m.at[idx_15m - 2, "high"])
-            ):
+            h15_0 = float(df_15m.at[idx_15m, "high"])
+            h15_1 = float(df_15m.at[idx_15m - 1, "high"])
+            h15_2 = float(df_15m.at[idx_15m - 2, "high"])
+            close15 = float(df_15m.at[idx_15m, "close"])
+            open15 = float(df_15m.at[idx_15m, "open"])
+            lh_ok = (h15_0 < h15_1) or (h15_1 < h15_2)
+            ema20_15m_ok = False
+            try:
+                if len(df_15m) >= 20:
+                    ema20_15m = _ema(df_15m["close"], 20)
+                    ema20_15m_ok = close15 < float(ema20_15m.iloc[idx_15m])
+            except Exception:
+                ema20_15m_ok = False
+            if not (lh_ok or ema20_15m_ok):
                 if args.log_gates:
                     gate_counts["lh_15m"] += 1
                 continue
-            if not (float(df_15m.at[idx_15m, "close"]) < float(df_15m.at[idx_15m, "open"])):
+            if not (close15 < open15):
                 if args.log_gates:
                     gate_counts["lh_15m"] += 1
                 continue
+            # 15m EMA60/EMA120 slope filter (skip if steeply rising)
+            try:
+                ema60 = _ema(df_15m["close"], int(args.ema60_15m_len))
+                ema120 = _ema(df_15m["close"], int(args.ema120_15m_len))
+                if len(ema60) >= 2 and len(ema120) >= 2:
+                    ema60_slope = (float(ema60.iloc[idx_15m]) - float(ema60.iloc[idx_15m - 1])) / float(ema60.iloc[idx_15m - 1])
+                    ema120_slope = (float(ema120.iloc[idx_15m]) - float(ema120.iloc[idx_15m - 1])) / float(ema120.iloc[idx_15m - 1])
+                    if ema60_slope > float(args.ema_slope_min) or ema120_slope > float(args.ema_slope_min):
+                        if args.log_gates:
+                            gate_counts["ema_slope_block"] += 1
+                        continue
+            except Exception:
+                pass
 
             # 3m structure break: close < min(low[-3:])
             close_now = float(df_3m.at[i3, "close"])
@@ -812,6 +836,48 @@ def run_backtest() -> None:
                 if args.log_gates:
                     gate_counts["break_3m"] += 1
                 continue
+            # ATR filter (skip low-volatility regime)
+            try:
+                atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
+                atr_ma = float(atr_3m.rolling(int(args.atr_filter_len)).mean().iloc[i3]) if len(atr_3m) >= int(args.atr_filter_len) else 0.0
+                if atr_ma > 0 and atr_now <= (atr_ma * float(args.atr_filter_mult)):
+                    if args.log_gates:
+                        gate_counts["atr_filter"] += 1
+                    continue
+            except Exception:
+                pass
+            # Big bear break candle -> immediate entry (skip retest)
+            try:
+                body = abs(close_now - float(df_3m.at[i3, "open"]))
+                bodies = (df_3m["close"] - df_3m["open"]).abs()
+                avg_body = float(bodies.iloc[i3-6:i3].mean()) if i3 >= 6 else float(bodies.iloc[:i3].mean())
+                if avg_body > 0 and close_now < float(df_3m.at[i3, "open"]) and body >= (avg_body * float(args.big_bear_body_mult)):
+                    entry_px = float(df_3m.at[i3 + 1, "open"])
+                    nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
+                    sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
+                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    tp_price = entry_px * float(args.tp_mult)
+                    trade = {
+                        "entry_px": entry_px,
+                        "sl_price": sl_price,
+                        "tp_price": tp_price,
+                        "mfe": 0.0,
+                        "mae": 0.0,
+                        "hold_bars": 0,
+                        "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                        "track": "big_bear",
+                    }
+                    stats["entries"] += 1
+                    sym_stats["entries"] += 1
+                    entry_symbols.add(sym)
+                    if args.log_gates:
+                        gate_counts["entry_by_big_bear"] += 1
+                    day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
+                    entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                    retest_active = False
+                    continue
+            except Exception:
+                pass
             # time block (KST hours)
             hour_kst = int(_ts_kst(ts).split(" ")[1].split(":")[0])
             if block_hours and hour_kst in block_hours:
@@ -828,8 +894,6 @@ def run_backtest() -> None:
             retest_level = low_min
             retest_active = True
             retest_bars = max(1, int(args.retest_bars))
-            if weak_break:
-                retest_bars = min(retest_bars, 3)
             if args.retest_dyn:
                 atr3 = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
                 atr15 = float(atr_15m.iloc[idx_15m]) if not np.isnan(atr_15m.iloc[idx_15m]) else 0.0
@@ -841,115 +905,61 @@ def run_backtest() -> None:
 
             if retest_active and i3 <= retest_until:
                 high_now = float(df_3m.at[i3, "high"])
+                low_now = float(df_3m.at[i3, "low"])
                 atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
-                if high_now >= retest_level - (atr_now * float(args.retest_atr_mult)):
+                retest_touch_mult = float(args.retest_atr_mult) if strong_break else 0.5
+                if high_now >= retest_level - (atr_now * retest_touch_mult):
+                    rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
+                    upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
+                    wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+                    entry_px = float(df_3m.at[i3 + 1, "open"])
+                    nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
+                    sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
+                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    tp_price = entry_px * float(args.tp_mult)
                     if close_now < retest_level:
                         if args.log_gates:
                             gate_counts["retest_pass_close"] += 1
-                        if weak_break and not (dvf_norm <= -0.3 and retest_bars <= 3):
-                            continue
-                        entry_px = float(df_3m.at[i3 + 1, "open"])
-                        nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
-                        if high_now > nearest.top:
-                            continue
-                        sl_price = max(high_now + (atr_now * 0.3), entry_px + (atr_now * 0.6))
-                        tp1_price = entry_px - (atr_now * 1.0)
-                        swing_low = float(df_15m.at[idx_15m - 1, "low"])
-                        if idx_15m >= 20:
-                            swing_low = float(df_15m["low"].astype(float).iloc[idx_15m-20:idx_15m].min())
-                        tp2_price = swing_low
-                        trade = {
-                            "entry_px": entry_px,
-                            "sl_price": sl_price,
-                            "tp1_price": tp1_price,
-                            "tp2_price": tp2_price,
-                            "tp1_done": False,
-                            "pnl_partial": 0.0,
-                            "mfe": 0.0,
-                            "mae": 0.0,
-                            "hold_bars": 0,
-                            "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
-                            "track": "strong" if strong_break else "weak",
-                        }
-                        stats["entries"] += 1
-                        sym_stats["entries"] += 1
-                        entry_symbols.add(sym)
-                        dt_kst = datetime.fromtimestamp(trade["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
-                        hour_bucket = dt_kst.hour
-                        dow_bucket = _dow_label(dt_kst)
-                        hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
-                        dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
-                        hour_stats[hour_bucket]["entries"] += 1
-                        dow_stats[dow_bucket]["entries"] += 1
+                    elif low_now < retest_level and close_now < float(df_3m.at[i3, "open"]) and wick_ratio <= float(args.retest_wick_max):
                         if args.log_gates:
-                            gate_counts["entry_by_pass_close"] += 1
-                            if strong_break:
-                                gate_counts["entries_strong"] += 1
-                            else:
-                                gate_counts["entries_weak"] += 1
-                        day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
-                        entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
-                        retest_active = False
+                            gate_counts["retest_pass_low"] += 1
+                    elif high_now < retest_level + (atr_now * float(args.shallow_atr_mult)) and close_now < float(df_3m.at[i3, "open"]) and dvf_norm <= float(args.shallow_dvf_max) and wick_ratio <= float(args.shallow_wick_max):
+                        if args.log_gates:
+                            gate_counts["retest_pass_low"] += 1
                     else:
-                        low_now = float(df_3m.at[i3, "low"])
-                        if low_now < retest_level and close_now < float(df_3m.at[i3, "open"]):
-                            rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
-                            upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
-                            wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
-                            if wick_ratio > float(args.retest_wick_max):
-                                if args.log_gates:
-                                    gate_counts["retest_fail_shallow"] += 1
-                                retest_active = True
-                                if i3 >= retest_until:
-                                    retest_active = False
-                                continue
-                            if weak_break and not (dvf_norm <= -0.3 and wick_ratio <= 0.25 and retest_bars <= 3):
-                                continue
-                            if args.log_gates:
-                                gate_counts["retest_pass_low"] += 1
-                            entry_px = float(df_3m.at[i3 + 1, "open"])
-                            nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
-                            sl_price = max(high_now + (atr_now * 0.3), entry_px + (atr_now * 0.6))
-                            tp1_price = entry_px - (atr_now * 1.0)
-                            swing_low = float(df_15m.at[idx_15m - 1, "low"])
-                            if idx_15m >= 20:
-                                swing_low = float(df_15m["low"].astype(float).iloc[idx_15m-20:idx_15m].min())
-                            tp2_price = swing_low
-                            trade = {
-                                "entry_px": entry_px,
-                                "sl_price": sl_price,
-                                "tp1_price": tp1_price,
-                                "tp2_price": tp2_price,
-                                "tp1_done": False,
-                                "pnl_partial": 0.0,
-                                "mfe": 0.0,
-                                "mae": 0.0,
-                                "hold_bars": 0,
-                                "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
-                                "track": "strong" if strong_break else "weak",
-                            }
-                            stats["entries"] += 1
-                            sym_stats["entries"] += 1
-                            entry_symbols.add(sym)
-                            dt_kst = datetime.fromtimestamp(trade["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
-                            hour_bucket = dt_kst.hour
-                            dow_bucket = _dow_label(dt_kst)
-                            hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
-                            dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
-                            hour_stats[hour_bucket]["entries"] += 1
-                            dow_stats[dow_bucket]["entries"] += 1
-                            if args.log_gates:
-                                gate_counts["entry_by_pass_low"] += 1
-                                if strong_break:
-                                    gate_counts["entries_strong"] += 1
-                                else:
-                                    gate_counts["entries_weak"] += 1
-                            day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
-                            entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
-                            retest_active = False
+                        continue
+                    trade = {
+                        "entry_px": entry_px,
+                        "sl_price": sl_price,
+                        "tp_price": tp_price,
+                        "mfe": 0.0,
+                        "mae": 0.0,
+                        "hold_bars": 0,
+                        "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                        "track": "strong" if strong_break else "weak",
+                    }
+                    stats["entries"] += 1
+                    sym_stats["entries"] += 1
+                    entry_symbols.add(sym)
+                    dt_kst = datetime.fromtimestamp(trade["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
+                    hour_bucket = dt_kst.hour
+                    dow_bucket = _dow_label(dt_kst)
+                    hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
+                    dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
+                    hour_stats[hour_bucket]["entries"] += 1
+                    dow_stats[dow_bucket]["entries"] += 1
+                    if args.log_gates:
+                        if close_now < retest_level:
+                            gate_counts["entry_by_pass_close"] += 1
                         else:
-                            if args.log_gates:
-                                gate_counts["retest_fail_shallow"] += 1
+                            gate_counts["entry_by_pass_low"] += 1
+                        if strong_break:
+                            gate_counts["entries_strong"] += 1
+                        else:
+                            gate_counts["entries_weak"] += 1
+                    day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
+                    entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                    retest_active = False
                 if i3 >= retest_until:
                     if args.log_gates:
                         gate_counts["retest_fail_far"] += 1
