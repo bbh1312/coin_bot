@@ -1810,7 +1810,7 @@ def _warmup_common_cache(state: dict, exchange, universe: list) -> bool:
     if not universe:
         return False
     now = time.time()
-    backoff_until = float(state.get("_common_warmup_backoff_until", 0.0) or 0.0)
+    backoff_until = _coerce_state_float(state.get("_common_warmup_backoff_until", 0.0))
     if backoff_until and now < backoff_until:
         return False
     plan = state.get("_common_warmup_plan")
@@ -8108,6 +8108,8 @@ def _run_sr_pro_short_v1_cycle(
         "entry_by_pass_low": 0,
         "entry_by_big_bear": 0,
         "entry_by_dvf_accel": 0,
+        "entry_by_dvf_slope": 0,
+        "entry_by_timeout": 0,
         "atr_filter": 0,
         "ema_slope_block": 0,
         "no_data_ltf": 0,
@@ -8149,6 +8151,8 @@ def _run_sr_pro_short_v1_cycle(
         except Exception:
             return False
     for symbol in symbols:
+        if symbol in {"BTC/USDT:USDT", "BTC/USDT"}:
+            continue
         checked += 1
         if _entry_blocked_now(ENTRY_BLOCK_HOURS):
             gate_stats["time_block"] += 1
@@ -8404,6 +8408,9 @@ def _run_sr_pro_short_v1_cycle(
             continue
         c3 = float(df_3m_sig.iloc[-1]["close"])
         o3 = float(df_3m_sig.iloc[-1]["open"])
+        h3 = float(df_3m_sig.iloc[-1]["high"])
+        l3 = float(df_3m_sig.iloc[-1]["low"])
+        now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
         low_prev = [
             float(df_3m_sig.iloc[-2]["low"]),
             float(df_3m_sig.iloc[-3]["low"]),
@@ -8430,6 +8437,59 @@ def _run_sr_pro_short_v1_cycle(
                 continue
         except Exception:
             pass
+
+        # DVF pending confirmation (next-bar confirm)
+        dvf_pending_until = sym_state.get("dvf_pending_until")
+        dvf_pending_level = float(sym_state.get("dvf_pending_level", 0.0) or 0.0)
+        dvf_pending_type = sym_state.get("dvf_pending_type")
+        if isinstance(dvf_pending_until, (int, float)) and dvf_pending_until > 0:
+            if now_ts_ms > int(dvf_pending_until):
+                sym_state["dvf_pending_until"] = 0
+                sym_state["dvf_pending_level"] = 0.0
+                sym_state["dvf_pending_type"] = None
+            else:
+                if l3 < dvf_pending_level or c3 < dvf_pending_level:
+                    entry_px = float(df_3m.iloc[-1]["open"])
+                    nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                    sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
+                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    cap_pct = max(float(cfg.sl_cap_pct), (atr_now * float(cfg.sl_cap_atr_mult)) / entry_px) if entry_px > 0 else float(cfg.sl_cap_pct)
+                    sl_price = min(sl_price, entry_px * (1.0 + cap_pct))
+                    tp_price = entry_px * float(cfg.tp_mult)
+                    usdt = _resolve_entry_usdt()
+                    if usdt > 0 and _admin_is_active():
+                        _append_sr_pro_short_v1_log(
+                            f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={dvf_pending_type}_confirm"
+                        )
+                        req_id = _enqueue_entry_request(
+                            state,
+                            symbol=symbol,
+                            side="SHORT",
+                            engine="SR_PRO_SHORT_V1",
+                            reason="sr_pro_short_v1",
+                            usdt=usdt,
+                            live=LIVE_TRADING,
+                            entry_price_hint=entry_px,
+                            meta={
+                                "sl_price": float(sl_price),
+                                "tp_price": float(tp_price),
+                                "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                                "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                                "track": f"{dvf_pending_type}_confirm",
+                            },
+                        )
+                        if req_id:
+                            result["entries"] += 1
+                            if dvf_pending_type == "dvf_accel":
+                                gate_stats["entry_by_dvf_accel"] += 1
+                            elif dvf_pending_type == "dvf_slope":
+                                gate_stats["entry_by_dvf_slope"] += 1
+                        _log_signal_ctx(f"{dvf_pending_type}_confirm", nearest, entry_px, atr_now)
+                    sym_state["dvf_pending_until"] = 0
+                    sym_state["dvf_pending_level"] = 0.0
+                    sym_state["dvf_pending_type"] = None
+                    sym_state["retest_active"] = False
+                    continue
         # Big bear break candle -> immediate entry (skip retest)
         try:
             body = abs(c3 - o3)
@@ -8440,7 +8500,8 @@ def _run_sr_pro_short_v1_cycle(
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
+                cap_pct = max(float(cfg.sl_cap_pct), (atr_now * float(cfg.sl_cap_atr_mult)) / entry_px) if entry_px > 0 else float(cfg.sl_cap_pct)
+                sl_price = min(sl_price, entry_px * (1.0 + cap_pct))
                 tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
                 if usdt > 0 and _admin_is_active():
@@ -8481,11 +8542,18 @@ def _run_sr_pro_short_v1_cycle(
         # DVF acceleration -> immediate entry (skip retest)
         try:
             if dvf_norm <= float(cfg.dvf_norm_immediate):
+                if int(getattr(cfg, "dvf_confirm_bars", 0)) > 0:
+                    sym_state["dvf_pending_until"] = now_ts_ms + int(cfg.dvf_confirm_bars) * 3 * 60 * 1000
+                    sym_state["dvf_pending_level"] = low_min
+                    sym_state["dvf_pending_type"] = "dvf_accel"
+                    sym_state["retest_active"] = False
+                    continue
                 entry_px = float(df_3m.iloc[-1]["open"])
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
+                cap_pct = max(float(cfg.sl_cap_pct), (atr_now * float(cfg.sl_cap_atr_mult)) / entry_px) if entry_px > 0 else float(cfg.sl_cap_pct)
+                sl_price = min(sl_price, entry_px * (1.0 + cap_pct))
                 tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
                 if usdt > 0 and _admin_is_active():
@@ -8520,11 +8588,18 @@ def _run_sr_pro_short_v1_cycle(
         # DVF slope acceleration -> immediate entry (skip retest)
         try:
             if dvf_norm_diff <= float(cfg.dvf_norm_diff_th):
+                if int(getattr(cfg, "dvf_confirm_bars", 0)) > 0:
+                    sym_state["dvf_pending_until"] = now_ts_ms + int(cfg.dvf_confirm_bars) * 3 * 60 * 1000
+                    sym_state["dvf_pending_level"] = low_min
+                    sym_state["dvf_pending_type"] = "dvf_slope"
+                    sym_state["retest_active"] = False
+                    continue
                 entry_px = float(df_3m.iloc[-1]["open"])
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
+                cap_pct = max(float(cfg.sl_cap_pct), (atr_now * float(cfg.sl_cap_atr_mult)) / entry_px) if entry_px > 0 else float(cfg.sl_cap_pct)
+                sl_price = min(sl_price, entry_px * (1.0 + cap_pct))
                 tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
                 if usdt > 0 and _admin_is_active():
@@ -8614,7 +8689,8 @@ def _run_sr_pro_short_v1_cycle(
                     nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                     sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                    sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
+                    cap_pct = max(float(cfg.sl_cap_pct), (atr_now * float(cfg.sl_cap_atr_mult)) / entry_px) if entry_px > 0 else float(cfg.sl_cap_pct)
+                    sl_price = min(sl_price, entry_px * (1.0 + cap_pct))
                     tp_price = entry_px * float(cfg.tp_mult)
                     usdt = _resolve_entry_usdt()
                     if usdt > 0 and _admin_is_active():
@@ -8652,7 +8728,8 @@ def _run_sr_pro_short_v1_cycle(
                 atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
                 sl_raw = nearest["top"] + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
+                cap_pct = max(float(cfg.sl_cap_pct), (atr_now * float(cfg.sl_cap_atr_mult)) / entry_px) if entry_px > 0 else float(cfg.sl_cap_pct)
+                sl_price = min(sl_price, entry_px * (1.0 + cap_pct))
                 rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
                 upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
                 wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
@@ -16648,7 +16725,7 @@ def run():
                         if not COMMON_WARMUP_DONE:
                             plan = state.get("_common_warmup_plan") or []
                             idx = int(state.get("_common_warmup_idx", 0) or 0)
-                            backoff_until = float(state.get("_common_warmup_backoff_until", 0.0) or 0.0)
+                            backoff_until = _coerce_state_float(state.get("_common_warmup_backoff_until", 0.0))
                             if backoff_until and time.time() < backoff_until:
                                 remain = max(0.0, backoff_until - time.time())
                                 print(f"[common-warmup] backoff {remain:.1f}s")
@@ -16686,7 +16763,7 @@ def run():
                         if not COMMON_WARMUP_DONE:
                             plan = state.get("_common_warmup_plan") or []
                             idx = int(state.get("_common_warmup_idx", 0) or 0)
-                            backoff_until = float(state.get("_common_warmup_backoff_until", 0.0) or 0.0)
+                            backoff_until = _coerce_state_float(state.get("_common_warmup_backoff_until", 0.0))
                             if backoff_until and time.time() < backoff_until:
                                 remain = max(0.0, backoff_until - time.time())
                                 print(f"[common-warmup] backoff {remain:.1f}s")
@@ -16726,30 +16803,28 @@ def run():
                             save_state(state)
 
                     # periodic gap repair for common warmup cache (non-blocking)
-                    if not COMMON_WARMUP_WS:
-                        try:
-                            if state.get("_common_gap_repair_force"):
-                                state["_common_gap_repair_ts"] = 0.0
-                                state["_common_gap_repair_inflight"] = True
-                                _maybe_repair_common_warmup_gaps(state, exchange, shared_universe, force_full=True)
-                                state["_common_gap_repair_force"] = False
-                                state["_common_gap_repair_once"] = True
-                                state["_common_gap_repair_inflight"] = False
-                            else:
-                                if not state.get("_common_gap_repair_once"):
-                                    state["_common_gap_repair_ts"] = 0.0
-                                    _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
-                                    state["_common_gap_repair_once"] = True
-                                _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
-                        except Exception:
+                    try:
+                        if state.get("_common_gap_repair_force"):
+                            state["_common_gap_repair_ts"] = 0.0
+                            state["_common_gap_repair_inflight"] = True
+                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe, force_full=True)
+                            state["_common_gap_repair_force"] = False
+                            state["_common_gap_repair_once"] = True
                             state["_common_gap_repair_inflight"] = False
-                            pass
+                        else:
+                            if not state.get("_common_gap_repair_once"):
+                                state["_common_gap_repair_ts"] = 0.0
+                                _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                                state["_common_gap_repair_once"] = True
+                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                    except Exception:
+                        state["_common_gap_repair_inflight"] = False
+                        pass
                     # periodic cycle cache refresh for stale/gapped TFS (non-blocking)
-                    if not COMMON_WARMUP_WS:
-                        try:
-                            _maybe_refresh_common_cycle_cache(state, exchange, shared_universe)
-                        except Exception:
-                            pass
+                    try:
+                        _maybe_refresh_common_cycle_cache(state, exchange, shared_universe)
+                    except Exception:
+                        pass
 
                     if heavy_scan:
                         universe_union = list(

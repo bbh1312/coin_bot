@@ -29,10 +29,10 @@ class SrProShortV1Config:
     ema_filter_len: int = 200
     total_window_days: int = 14
     rolling_zones: bool = True
-    retest_bars: int = 4
-    retest_atr_mult: float = 0.2
-    retest_above_atr_mult: float = 0.1
-    retest_timeout_bars: int = 2
+    retest_bars: int = 6
+    retest_atr_mult: float = 0.6
+    retest_above_atr_mult: float = 0.25
+    retest_timeout_bars: int = 6
     retest_near_atr_mult: float = 0.15
     retest_wick_max: float = 0.35
     retest_dyn: bool = False
@@ -50,10 +50,12 @@ class SrProShortV1Config:
     sl_buffer: float = 0.01
     sl_atr_mult: float = 0.5
     sl_cap_pct: float = 0.02
+    sl_cap_atr_mult: float = 0.6
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
     tp_mult: float = 0.98
     tp_mult_weak: float = 0.98
+    dvf_confirm_bars: int = 1
 
 
 class SrProShortV1Engine(BaseEngine):
