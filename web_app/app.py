@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,6 +62,7 @@ _FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "0"))
 _PNL_CACHE = {"ts": 0.0, "payload": None}
 _PNL_TTL_SEC = float(os.getenv("WEB_PNL_TTL_SEC", "20"))
 _WEB_MAX_WORKERS = int(os.getenv("WEB_MAX_WORKERS", "8"))
+KST = timezone(timedelta(hours=9))
 
 def _run_parallel_tasks(tasks: list) -> list:
     if not tasks:
@@ -921,9 +922,26 @@ def _trade_log_entries(state: dict) -> list[dict]:
 
 def _kst_today_start_ts(now_ts: float | None = None) -> float:
     base = float(now_ts if now_ts is not None else time.time())
-    # Binance 기준: KST 09:00 ~ 다음날 08:59:59 (UTC 00:00 ~ 23:59:59)
-    day_start_utc = int(base // 86400) * 86400
-    return day_start_utc
+    now_kst = datetime.fromtimestamp(base, timezone.utc).astimezone(KST)
+    day_start_kst = now_kst.replace(hour=9, minute=0, second=0, microsecond=0)
+    if now_kst < day_start_kst:
+        day_start_kst = day_start_kst - timedelta(days=1)
+    return float(day_start_kst.astimezone(timezone.utc).timestamp())
+
+
+def _week_start_ts(now_ts: float | None = None) -> float:
+    day_start_ts = _kst_today_start_ts(now_ts)
+    day_start_kst = datetime.fromtimestamp(day_start_ts, timezone.utc).astimezone(KST)
+    weekday = day_start_kst.weekday()  # Monday=0
+    week_start_kst = day_start_kst - timedelta(days=weekday)
+    return float(week_start_kst.astimezone(timezone.utc).timestamp())
+
+
+def _month_start_ts(now_ts: float | None = None) -> float:
+    day_start_ts = _kst_today_start_ts(now_ts)
+    day_start_kst = datetime.fromtimestamp(day_start_ts, timezone.utc).astimezone(KST)
+    month_start_kst = datetime(day_start_kst.year, day_start_kst.month, 1, 9, 0, 0, tzinfo=KST)
+    return float(month_start_kst.astimezone(timezone.utc).timestamp())
 
 
 def _fetch_realized_pnl_range(ex, since_ts: float, end_ts: float | None = None) -> tuple[float | None, int, str | None]:
@@ -994,11 +1012,18 @@ def _build_pnl_payload(force: bool = False) -> dict:
         return payload
 
     pnl_today_payload: list[dict] = []
+    pnl_month_payload: list[dict] = []
+    pnl_week_payload: list[dict] = []
     pnl_yesterday_payload: list[dict] = []
     pnl_unreal_payload: list[dict] = []
     pnl_balance_payload: list[dict] = []
+    pnl_entry_available_payload: list[dict] = []
     pnl_start_ts = _kst_today_start_ts()
+    pnl_month_start_ts = _month_start_ts()
+    pnl_week_start_ts = _week_start_ts()
     pnl_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_start_ts + 9 * 3600))
+    pnl_month_start_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_month_start_ts + 9 * 3600))
+    pnl_week_start_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_week_start_ts + 9 * 3600))
     pnl_yesterday_start_ts = pnl_start_ts - 86400
     pnl_yesterday_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_yesterday_start_ts + 9 * 3600))
 
@@ -1016,10 +1041,20 @@ def _build_pnl_payload(force: bool = False) -> dict:
         pnl_y_trades = 0
         pnl_y_err = None
         pnl_unreal = None
+        entry_usdt_available = None
+        pnl_w_val = None
+        pnl_w_trades = 0
+        pnl_w_err = None
+        pnl_m_val = None
+        pnl_m_trades = 0
+        pnl_m_err = None
         try:
             with executor.activate():
                 futures_usdt = executor.get_futures_usdt_balance()
+                entry_usdt_available = executor.get_available_usdt()
                 pnl_val, pnl_trades, pnl_err = _fetch_realized_pnl_since(executor.ctx.exchange, pnl_start_ts)
+                pnl_m_val, pnl_m_trades, pnl_m_err = _fetch_realized_pnl_since(executor.ctx.exchange, pnl_month_start_ts)
+                pnl_w_val, pnl_w_trades, pnl_w_err = _fetch_realized_pnl_since(executor.ctx.exchange, pnl_week_start_ts)
                 pnl_y_val, pnl_y_trades, pnl_y_err = _fetch_realized_pnl_range(
                     executor.ctx.exchange, pnl_yesterday_start_ts, pnl_start_ts
                 )
@@ -1034,6 +1069,28 @@ def _build_pnl_payload(force: bool = False) -> dict:
                 "trades": pnl_trades,
                 "error": pnl_err,
                 "date": pnl_date_kst,
+                "is_active": bool(acct.get("is_active", 1)),
+            }
+        )
+        pnl_week_payload.append(
+            {
+                "account_id": account_id,
+                "name": str(acct.get("name") or account_id),
+                "pnl": pnl_w_val,
+                "trades": pnl_w_trades,
+                "error": pnl_w_err,
+                "date": pnl_week_start_date_kst,
+                "is_active": bool(acct.get("is_active", 1)),
+            }
+        )
+        pnl_month_payload.append(
+            {
+                "account_id": account_id,
+                "name": str(acct.get("name") or account_id),
+                "pnl": pnl_m_val,
+                "trades": pnl_m_trades,
+                "error": pnl_m_err,
+                "date": pnl_month_start_date_kst,
                 "is_active": bool(acct.get("is_active", 1)),
             }
         )
@@ -1071,12 +1128,26 @@ def _build_pnl_payload(force: bool = False) -> dict:
                 "is_active": bool(acct.get("is_active", 1)),
             }
         )
+        pnl_entry_available_payload.append(
+            {
+                "account_id": account_id,
+                "name": str(acct.get("name") or account_id),
+                "entry_usdt_available": entry_usdt_available,
+                "trades": 0,
+                "error": None,
+                "date": pnl_date_kst,
+                "is_active": bool(acct.get("is_active", 1)),
+            }
+        )
     payload = {
         "timestamp": datetime.now().isoformat(),
         "pnl_today": pnl_today_payload,
+        "pnl_monthly": pnl_month_payload,
+        "pnl_weekly": pnl_week_payload,
         "pnl_yesterday": pnl_yesterday_payload,
         "pnl_unrealized": pnl_unreal_payload,
         "pnl_balance": pnl_balance_payload,
+        "pnl_entry_available": pnl_entry_available_payload,
         "cached": False,
     }
     _PNL_CACHE["ts"] = now

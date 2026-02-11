@@ -954,7 +954,7 @@ def close_short_market_qty(symbol: str, qty: float) -> dict:
     return res
 
 def place_long_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None) -> dict:
-    res = _EXEC_PLACE_LONG_SL_PX(symbol, stop_price, qty=qty, working_type="CONTRACT_PRICE")
+    res = _EXEC_PLACE_LONG_SL_PX(symbol, stop_price, qty=qty)
     followers = FOLLOWER_CONTEXTS
     if not followers:
         return res
@@ -975,7 +975,7 @@ def place_long_sl_px(symbol: str, stop_price: float, qty: Optional[float] = None
                 continue
         except Exception:
             pass
-        follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.place_long_sl_px(symbol, stop_price, qty=qty, working_type="CONTRACT_PRICE")})
+        follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.place_long_sl_px(symbol, stop_price, qty=qty)})
     _broadcast_followers("place_long_sl_px", follower_calls, {"symbol": symbol})
     return res
 
@@ -1337,6 +1337,14 @@ COMMON_WARMUP_CACHE_DIR = os.getenv("COMMON_WARMUP_CACHE_DIR", "").strip()
 COMMON_GAP_REPAIR_ENABLED = os.getenv("COMMON_GAP_REPAIR_ENABLED", "1") not in ("0", "false", "off", "no")
 COMMON_GAP_REPAIR_INTERVAL_SEC = int(os.getenv("COMMON_GAP_REPAIR_INTERVAL_SEC", "60"))
 COMMON_GAP_REPAIR_MAX_FETCH = int(os.getenv("COMMON_GAP_REPAIR_MAX_FETCH", "50"))
+COMMON_CYCLE_REFRESH_ENABLED = os.getenv("COMMON_CYCLE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
+COMMON_CYCLE_REFRESH_INTERVAL_SEC = int(os.getenv("COMMON_CYCLE_REFRESH_INTERVAL_SEC", "300"))
+COMMON_CYCLE_REFRESH_MAX_FETCH = int(os.getenv("COMMON_CYCLE_REFRESH_MAX_FETCH", "10"))
+COMMON_CYCLE_REFRESH_TFS = tuple(
+    tf.strip()
+    for tf in os.getenv("COMMON_CYCLE_REFRESH_TFS", "3m,15m,1h").split(",")
+    if tf.strip()
+)
 LIVE_OHLCV_SNAPSHOT_ENABLED = os.getenv("LIVE_OHLCV_SNAPSHOT_ENABLED", "1") not in ("0", "false", "off", "no")
 LIVE_OHLCV_SNAPSHOT_DIR = os.getenv("LIVE_OHLCV_SNAPSHOT_DIR", "").strip()
 NOISE_REVERSE_USE_COMMON_CACHE = os.getenv("NOISE_REVERSE_USE_COMMON_CACHE", "0") == "1"
@@ -2026,6 +2034,78 @@ def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list, forc
             break
     if repaired:
         print(f"[common-gap] repaired {repaired}/{candidates} checked={checked}")
+
+def _maybe_refresh_common_cycle_cache(state: dict, exchange, universe: list) -> None:
+    if not COMMON_CYCLE_REFRESH_ENABLED:
+        return
+    if not universe:
+        return
+    if not COMMON_CYCLE_REFRESH_TFS:
+        return
+    try:
+        now = time.time()
+        last_ts = _coerce_state_float(state.get("_common_cycle_refresh_ts", 0.0))
+    except Exception:
+        now = time.time()
+        last_ts = 0.0
+    if COMMON_CYCLE_REFRESH_INTERVAL_SEC > 0 and (now - last_ts) < COMMON_CYCLE_REFRESH_INTERVAL_SEC:
+        return
+    state["_common_cycle_refresh_ts"] = now
+    tf_ms_map = {
+        "1m": 60 * 1000,
+        "3m": 3 * 60 * 1000,
+        "5m": 5 * 60 * 1000,
+        "15m": 15 * 60 * 1000,
+        "1h": 60 * 60 * 1000,
+        "4h": 4 * 60 * 60 * 1000,
+    }
+    refreshed = 0
+    checked = 0
+    now_ms = int(time.time() * 1000)
+    for sym in universe:
+        for tf in COMMON_CYCLE_REFRESH_TFS:
+            checked += 1
+            if refreshed >= COMMON_CYCLE_REFRESH_MAX_FETCH:
+                break
+            try:
+                df = cycle_cache.get_df(sym, tf, limit=120)
+                if df is None or df.empty:
+                    need_refresh = True
+                else:
+                    last_ts = int(df.iloc[-1]["ts"])
+                    tf_ms = tf_ms_map.get(tf, 0)
+                    expected_last_open = (now_ms // tf_ms) * tf_ms if tf_ms else 0
+                    stale = bool(tf_ms and last_ts and last_ts < (expected_last_open - tf_ms))
+                    gap = False
+                    try:
+                        diffs = df["ts"].diff().dropna()
+                        if not diffs.empty and float(diffs.max()) > (tf_ms * 2.5):
+                            gap = True
+                    except Exception:
+                        gap = False
+                    need_refresh = stale or gap
+                if not need_refresh:
+                    continue
+                limit = _tf_bars_for_days(tf, COMMON_WARMUP_DAYS)
+                data = exchange.fetch_ohlcv(sym, tf, limit=limit)
+                if data:
+                    cycle_cache.set_raw(sym, tf, data)
+                    refreshed += 1
+                    if COMMON_WARMUP_LOG_PATH:
+                        _append_log_lines(
+                            COMMON_WARMUP_LOG_PATH,
+                            [f"CYCLE_REFRESH_OK sym={sym} tf={tf} bars={len(data)}"],
+                        )
+            except Exception as e:
+                if COMMON_WARMUP_LOG_PATH:
+                    _append_log_lines(
+                        COMMON_WARMUP_LOG_PATH,
+                        [f"CYCLE_REFRESH_FAIL sym={sym} tf={tf} err={e}"],
+                    )
+        if refreshed >= COMMON_CYCLE_REFRESH_MAX_FETCH:
+            break
+    if refreshed:
+        print(f"[common-cycle] refreshed {refreshed} checked={checked}")
 
 def _kst_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=9)
@@ -8041,6 +8121,9 @@ def _run_sr_pro_short_v1_cycle(
             return False
     for symbol in symbols:
         checked += 1
+        if _entry_blocked_now(ENTRY_BLOCK_HOURS):
+            gate_stats["time_block"] += 1
+            continue
         df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch)
         df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch)
         df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch)
@@ -8086,6 +8169,7 @@ def _run_sr_pro_short_v1_cycle(
             pass
 
         df_1h_hist = df_1h.iloc[:-1]
+        df_1h_sig = df_1h_hist
         if len(df_3m_sig) < min_ltf or len(df_15m_sig) < min_mtf or len(df_1h_hist) < min_htf:
             no_data += 1
             if len(df_3m_sig) < min_ltf:
@@ -8115,19 +8199,19 @@ def _run_sr_pro_short_v1_cycle(
             sym_state["zones_ts"] = last_1h_hist_ts
         zones = sym_state.get("zones") or []
 
-        # current 1h bar (in-progress for touch)
-        h1 = df_1h.iloc[-1]
+        # current 1h bar (confirmed, match backtest)
+        h1 = df_1h_sig.iloc[-1]
         h1_ts = int(h1["ts"]) if "ts" in h1 else 0
         h1_high = float(h1["high"])
         h1_low = float(h1["low"])
         h1_close = float(h1["close"])
 
-        # dvf_norm from 1h (confirmed)
-        close_1h = df_1h["close"].astype(float)
-        open_1h = df_1h["open"].astype(float)
-        vol_1h = df_1h["volume"].astype(float)
+        # dvf_norm from confirmed 1h (match backtest)
+        close_1h = df_1h_sig["close"].astype(float)
+        open_1h = df_1h_sig["open"].astype(float)
+        vol_1h = df_1h_sig["volume"].astype(float)
         dv = np.where(close_1h > open_1h, vol_1h, np.where(close_1h < open_1h, -vol_1h, 0.0))
-        dv = pd.Series(dv, index=df_1h.index)
+        dv = pd.Series(dv, index=df_1h_sig.index)
         dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
         vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
         dvf_norm = float(dvf.iloc[-1]) / float(vol_ema.iloc[-1]) if float(vol_ema.iloc[-1]) > 0 else 0.0
@@ -8361,6 +8445,9 @@ def _run_sr_pro_short_v1_cycle(
         break_low_min = float(sym_state.get("break_low_min", 0.0) or 0.0)
         break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
         now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
+        if retest_active and now_ts_ms > retest_until:
+            retest_active = False
+            sym_state["retest_active"] = False
         if not retest_active:
             retest_active = True
             retest_level = low_min
@@ -16469,6 +16556,11 @@ def run():
                             _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
                     except Exception:
                         state["_common_gap_repair_inflight"] = False
+                        pass
+                    # periodic cycle cache refresh for stale/gapped TFS (non-blocking)
+                    try:
+                        _maybe_refresh_common_cycle_cache(state, exchange, shared_universe)
+                    except Exception:
                         pass
 
                     if heavy_scan:
