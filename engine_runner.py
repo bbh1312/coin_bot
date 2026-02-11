@@ -8589,11 +8589,58 @@ def _run_sr_pro_long_v1_cycle(
         except Exception:
             return False
 
+    def _tf_ms(tf: str) -> int:
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1]) * 60 * 1000
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 60 * 60 * 1000
+            if tf.endswith("d"):
+                return int(tf[:-1]) * 24 * 60 * 60 * 1000
+        except Exception:
+            pass
+        return 60 * 1000
+
+    def _confirmed_df(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        tf_ms = _tf_ms(tf)
+        now_ms = int(time.time() * 1000)
+        last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns else 0
+        # if last bar is still forming, drop it; else keep
+        if last_ts and (now_ms - last_ts) < tf_ms:
+            return df.iloc[:-1]
+        return df
+
+    def _get_confirmed_df(symbol: str, tf: str, limit: int, retry_sec: float = 3.0) -> pd.DataFrame:
+        df = cycle_cache.get_df(symbol, tf, limit=limit)
+        if df is None or df.empty:
+            return df
+        tf_ms = _tf_ms(tf)
+        now_ms = int(time.time() * 1000)
+        last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns else 0
+        if last_ts and (now_ms - last_ts) < tf_ms:
+            time.sleep(retry_sec)
+            df = cycle_cache.get_df(symbol, tf, limit=limit, force=True)
+        return df
+
     for symbol in symbols:
         checked += 1
-        df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch)
-        df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch)
-        df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch)
+        df_3m = _get_confirmed_df(symbol, tf_ltf, min_ltf_fetch)
+        df_15m = _get_confirmed_df(symbol, tf_mtf, min_mtf_fetch)
+        df_1h = _get_confirmed_df(symbol, tf_htf, min_htf_fetch)
+        # If still not confirmed, skip this cycle for strict parity with backtest
+        def _is_confirmed(df: pd.DataFrame, tf: str) -> bool:
+            if df is None or df.empty:
+                return False
+            tf_ms = _tf_ms(tf)
+            now_ms = int(time.time() * 1000)
+            last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns else 0
+            return bool(last_ts and (now_ms - last_ts) >= tf_ms)
+
+        if not (_is_confirmed(df_3m, tf_ltf) and _is_confirmed(df_15m, tf_mtf) and _is_confirmed(df_1h, tf_htf)):
+            gate_stats["skip_stale_ts"] += 1
+            continue
         if df_3m.empty or df_15m.empty or df_1h.empty:
             no_data += 1
             if df_3m.empty:
@@ -8604,9 +8651,9 @@ def _run_sr_pro_long_v1_cycle(
                 gate_stats["no_data_htf"] += 1
             continue
 
-        df_3m_sig = df_3m.iloc[:-1]
-        df_15m_sig = df_15m.iloc[:-1]
-        df_1h_hist = df_1h.iloc[:-1]
+        df_3m_sig = _confirmed_df(df_3m, tf_ltf)
+        df_15m_sig = _confirmed_df(df_15m, tf_mtf)
+        df_1h_hist = _confirmed_df(df_1h, tf_htf)
         try:
             now_ms = int(time.time() * 1000)
             last_3m_ts = int(df_3m.iloc[-1]["ts"]) if not df_3m.empty else 0
@@ -10993,13 +11040,19 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
                         f"sl_place_ok sl_price={sl_price_meta}",
                         side="LONG",
                     )
-            except Exception:
+            except Exception as e:
                 _append_entry_gate_log(
                     "sr_pro_long_v1",
                     symbol,
-                    f"sl_place_failed sl_price={sl_price_meta}",
+                    f"sl_place_failed err={e} sl_price={sl_price_meta}",
                     side="LONG",
                 )
+                st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+                if not isinstance(st, dict):
+                    st = {}
+                st["_srp_long_sl_pending"] = time.time()
+                st["_srp_long_sl_price"] = float(sl_price_meta)
+                state[symbol] = st
     try:
         _entry_seen_mark(state, symbol, side, str(req.get("engine") or "unknown"))
     except Exception:
@@ -11840,6 +11893,35 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
     except Exception:
         pass
     for sym in long_syms:
+        # SR_PRO_LONG_V1: entry 직후 SL 주문 지연 재시도
+        st = state.get(sym) if isinstance(state.get(sym), dict) else {}
+        pending_ts = st.get("_srp_long_sl_pending") if isinstance(st, dict) else None
+        pending_sl = st.get("_srp_long_sl_price") if isinstance(st, dict) else None
+        if isinstance(pending_ts, (int, float)) and isinstance(pending_sl, (int, float)):
+            if (now - float(pending_ts)) >= 3.0:
+                try:
+                    amt = get_long_position_amount(sym)
+                except Exception:
+                    amt = None
+                if isinstance(amt, (int, float)) and amt > 0:
+                    try:
+                        res_sl = place_long_sl_px(sym, float(pending_sl), qty=amt)
+                        if isinstance(res_sl, dict) and res_sl.get("status") == "ok":
+                            st.pop("_srp_long_sl_pending", None)
+                            st.pop("_srp_long_sl_price", None)
+                            state[sym] = st
+                            _append_entry_gate_log(
+                                "sr_pro_long_v1",
+                                sym,
+                                f"sl_delay_ok sl_price={pending_sl}",
+                                side="LONG",
+                            )
+                        else:
+                            st["_srp_long_sl_pending"] = now
+                            state[sym] = st
+                    except Exception:
+                        st["_srp_long_sl_pending"] = now
+                        state[sym] = st
         detail = get_long_position_detail(sym)
         if not detail:
             try:
@@ -11849,6 +11931,16 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             detail = get_long_position_detail(sym)
         open_tr = _get_open_trade(state, "LONG", sym)
         entry_ts = float(open_tr.get("entry_ts", 0.0) or 0.0) if open_tr else 0.0
+        meta = open_tr.get("meta") if isinstance(open_tr, dict) else None
+        if isinstance(meta, dict) and str(meta.get("reason") or "").lower() == "sr_pro_long_v1":
+            if entry_ts and (now - entry_ts) < 120.0:
+                _append_entry_gate_log(
+                    "auto_exit_long",
+                    sym,
+                    f"srp_guard_skip_early_loop age_s={now - entry_ts:.1f}",
+                    side="LONG",
+                )
+                continue
         if entry_ts and (now - entry_ts) < AUTO_EXIT_GRACE_SEC:
             continue
         if not detail:
@@ -11865,6 +11957,19 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 )
                 # SR_PRO_LONG_V1: entry 직후 포지션 캐시 지연으로 잘못 청산되는 케이스 방지
                 if engine_label == "SR_PRO_LONG_V1":
+                    st = state.get(sym) if isinstance(state.get(sym), dict) else {}
+                    pending_ts = st.get("_srp_long_sl_pending") if isinstance(st, dict) else None
+                    pending_sl = st.get("_srp_long_sl_price") if isinstance(st, dict) else None
+                    if isinstance(pending_ts, (int, float)) and isinstance(pending_sl, (int, float)):
+                        mark_px = _fetch_last_price(sym)
+                        if isinstance(mark_px, (int, float)) and mark_px > float(pending_sl):
+                            _append_entry_gate_log(
+                                "auto_exit_long",
+                                sym,
+                                f"srp_guard_skip_pending_sl_nohit_detail mark={mark_px} sl={pending_sl}",
+                                side="LONG",
+                            )
+                            continue
                     entry_ts_ms = open_tr.get("entry_ts_ms") or open_tr.get("entry_ts")
                     now_ms = int(time.time() * 1000)
                     try:
@@ -11957,6 +12062,25 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             (open_tr.get("meta") or {}).get("reason") if open_tr else None
         )
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
+        # SR_PRO_LONG_V1: SL 주문 실패 시, SL 가격 도달 전에는 자동청산 금지
+        if engine_label == "SR_PRO_LONG_V1" and isinstance(open_tr, dict):
+            meta = open_tr.get("meta") or {}
+            sl_price_meta = None
+            try:
+                sl_price_meta = float(meta.get("sl_price"))
+            except Exception:
+                sl_price_meta = None
+            st = state.get(sym) if isinstance(state.get(sym), dict) else {}
+            pending_ts = st.get("_srp_long_sl_pending") if isinstance(st, dict) else None
+            if isinstance(pending_ts, (int, float)) and isinstance(sl_price_meta, (int, float)):
+                if mark_px > float(sl_price_meta):
+                    _append_entry_gate_log(
+                        "auto_exit_long",
+                        sym,
+                        f"srp_guard_skip_pending_sl_nohit mark={mark_px} sl={sl_price_meta}",
+                        side="LONG",
+                    )
+                    continue
         if engine_label == "SR_PRO_LONG_V1" and entry_ts and (now - entry_ts) < 120.0:
             _append_entry_gate_log(
                 "auto_exit_long",
