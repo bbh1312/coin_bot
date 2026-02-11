@@ -4,6 +4,7 @@ import argparse
 import csv
 import os
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List
@@ -17,6 +18,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from engines.backtest_common import calc_warmup_window, load_common_universe
+from engines.sr_pro_common import build_sr_zones
+from types import SimpleNamespace
 
 
 def _read_cached_csv(path: str) -> List[List[float]]:
@@ -51,6 +54,46 @@ def _fetch_ohlcv_all(
     if use_common_warmup and common_warmup_dir:
         fname = symbol.replace("/", "_").replace(":", "_")
         cached_path = os.path.join(common_warmup_dir, f"{fname}_{timeframe}.csv")
+        if not os.path.exists(cached_path):
+            # allow common_ohlcv_cache files with limit suffix; prefer freshest large file
+            try:
+                prefix = f"{fname}_{timeframe}_"
+                candidates = []
+                tf_ms = _tf_to_minutes(timeframe) * 60 * 1000
+                for name in os.listdir(common_warmup_dir):
+                    if not name.startswith(prefix) or not name.endswith(".csv"):
+                        continue
+                    full = os.path.join(common_warmup_dir, name)
+                    try:
+                        mtime = os.path.getmtime(full)
+                        lim = int(name[len(prefix):-4])
+                        last_ts = 0
+                        with open(full, "rb") as fh:
+                            try:
+                                fh.seek(-2, os.SEEK_END)
+                                while fh.read(1) != b"\n":
+                                    fh.seek(-2, os.SEEK_CUR)
+                            except Exception:
+                                fh.seek(0)
+                            last_line = fh.readline().decode("utf-8").strip()
+                        if last_line:
+                            try:
+                                last_ts = int(float(last_line.split(",")[0]))
+                            except Exception:
+                                last_ts = 0
+                    except Exception:
+                        continue
+                    candidates.append((lim, last_ts, mtime, full))
+                if candidates:
+                    fresh = [c for c in candidates if c[1] and c[1] >= (end_ms - max(tf_ms * 2, 1))]
+                    if fresh:
+                        fresh.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                        cached_path = fresh[0][3]
+                    else:
+                        candidates.sort(key=lambda x: x[2], reverse=True)
+                        cached_path = candidates[0][3]
+            except Exception:
+                pass
         if os.path.exists(cached_path):
             rows = _read_cached_csv(cached_path)
             return [r for r in rows if start_ms <= r[0] <= end_ms]
@@ -86,6 +129,17 @@ def _atr(df: pd.DataFrame, length: int) -> pd.Series:
         axis=1,
     ).max(axis=1)
     return tr.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def _tf_to_minutes(tf: str) -> int:
+    tf = (tf or "").strip().lower()
+    if tf.endswith("m"):
+        return int(tf[:-1])
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 60
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 1440
+    return 0
 
 
 def _pivot_high(series: pd.Series, left: int, right: int, idx: int):
@@ -124,6 +178,19 @@ def _parse_floats(csv_list: str) -> List[float]:
     return [float(x.strip()) for x in csv_list.split(",") if x.strip()]
 
 
+def _z_get(z, key: str, default=None):
+    if isinstance(z, dict):
+        return z.get(key, default)
+    return getattr(z, key, default)
+
+
+def _z_set(z, key: str, val) -> None:
+    if isinstance(z, dict):
+        z[key] = val
+    else:
+        setattr(z, key, val)
+
+
 def run_sweep() -> None:
     parser = argparse.ArgumentParser("sr_pro_short_v1 sweep")
     parser.add_argument("--days", type=int, default=3)
@@ -132,6 +199,8 @@ def run_sweep() -> None:
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
     parser.add_argument("--common-warmup-dir", type=str, default="")
+    parser.add_argument("--rolling-zones", action="store_true")
+    parser.add_argument("--total-window-days", type=int, default=0)
     parser.add_argument("--top-n", type=int, default=50)
     parser.add_argument("--lookback", type=int, default=20)
     parser.add_argument("--relaxed-lookback", type=int, default=10)
@@ -162,10 +231,24 @@ def run_sweep() -> None:
     exchange = None if args.cache_only else ccxt.binance({"enableRateLimit": True})
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     min_bars = {"3m": 120, "15m": 120, "1h": 120}
-    start_ms, eval_start_ms, _, _ = calc_warmup_window(args.days, end_ms, min_bars)
+    if args.total_window_days:
+        total_window_days = args.total_window_days
+        start_ms = end_ms - int((total_window_days + args.days) * 24 * 60 * 60 * 1000)
+        eval_start_ms = end_ms - int(args.days * 24 * 60 * 60 * 1000)
+    else:
+        start_ms, eval_start_ms, _, _ = calc_warmup_window(args.days, end_ms, min_bars)
+    if args.rolling_zones and not args.total_window_days:
+        print("[SWEEP] rolling_zones requires total_window_days")
+        return
 
-    use_common = bool(args.common_warmup_dir)
-    common_dir = args.common_warmup_dir or os.path.join("logs", "common_warmup", "ohlcv")
+    use_common = bool(args.common_warmup_dir) or args.common_only or args.cache_only
+    common_dir = args.common_warmup_dir
+    if not common_dir:
+        live_cache_dir = os.path.join("logs", "common_ohlcv_cache")
+        if os.path.isdir(live_cache_dir) and os.listdir(live_cache_dir):
+            common_dir = live_cache_dir
+        else:
+            common_dir = os.path.join("logs", "common_warmup", "ohlcv")
     universe = load_common_universe(args.universe, exchange, args.cache_only, top_n=args.top_n)
     if not universe:
         print("[SWEEP] no_universe")
@@ -200,6 +283,7 @@ def run_sweep() -> None:
         return
 
     results = []
+    zones_cache: Dict[str, Dict[int, List[Zone]]] = {}
 
     for touch_mode in touch_modes:
         for dvf_norm_max in dvf_norm_vals:
@@ -219,6 +303,8 @@ def run_sweep() -> None:
                         "sl_sum": 0.0,
                     }
                     for sym, frames in data.items():
+                        if args.rolling_zones:
+                            zones_cache.setdefault(sym, {})
                         df_3m = frames["3m"].iloc[:-1] if args.use_confirmed else frames["3m"]
                         df_15m = frames["15m"].iloc[:-1] if args.use_confirmed else frames["15m"]
                         df_1h = frames["1h"]
@@ -239,6 +325,17 @@ def run_sweep() -> None:
                         atr_3m = _atr(df_3m, 14)
 
                         zones: List[Zone] = []
+                        zones_ts = -1
+                        window_bars_1h = int(args.total_window_days * 24) if args.rolling_zones else 0
+                        zone_cfg = SimpleNamespace(
+                            lookback=args.lookback,
+                            relaxed_lookback=args.relaxed_lookback,
+                            auto_relax=args.auto_relax,
+                            atr_mult=args.atr_mult,
+                            delta_len=args.delta_len,
+                            cluster_atr=args.cluster_atr,
+                            max_zones_per_side=args.max_zones_per_side,
+                        )
                         ts_1h = df_1h["ts"].values
                         ts_15m = df_15m["ts"].values
                         ts_3m = df_3m["ts"].values
@@ -256,52 +353,61 @@ def run_sweep() -> None:
                             if idx_1h < 0:
                                 continue
 
-                            for i1 in range(max(0, idx_1h - 1), idx_1h + 1):
-                                lb = args.lookback
-                                ph = _pivot_high(high_1h, lb, lb, i1 - lb) if i1 - lb >= 0 else None
-                                pl = _pivot_low(low_1h, lb, lb, i1 - lb) if i1 - lb >= 0 else None
-                                lb_used = lb
-                                if args.auto_relax and ph is None and pl is None:
-                                    lb2 = args.relaxed_lookback
-                                    ph = _pivot_high(high_1h, lb2, lb2, i1 - lb2) if i1 - lb2 >= 0 else None
-                                    pl = _pivot_low(low_1h, lb2, lb2, i1 - lb2) if i1 - lb2 >= 0 else None
-                                    lb_used = lb2
-                                pivot_bar = i1 - lb_used
-                                if pivot_bar < 0:
-                                    continue
+                            if args.rolling_zones:
+                                if zones_ts != int(ts_1h[idx_1h]):
+                                    cached = zones_cache[sym].get(idx_1h)
+                                    if cached is None:
+                                        cached = build_sr_zones(df_1h.iloc[:idx_1h + 1], zone_cfg, window_bars=window_bars_1h)
+                                        zones_cache[sym][idx_1h] = cached
+                                    zones = deepcopy(cached)
+                                    zones_ts = int(ts_1h[idx_1h])
+                            else:
+                                for i1 in range(max(0, idx_1h - 1), idx_1h + 1):
+                                    lb = args.lookback
+                                    ph = _pivot_high(high_1h, lb, lb, i1 - lb) if i1 - lb >= 0 else None
+                                    pl = _pivot_low(low_1h, lb, lb, i1 - lb) if i1 - lb >= 0 else None
+                                    lb_used = lb
+                                    if args.auto_relax and ph is None and pl is None:
+                                        lb2 = args.relaxed_lookback
+                                        ph = _pivot_high(high_1h, lb2, lb2, i1 - lb2) if i1 - lb2 >= 0 else None
+                                        pl = _pivot_low(low_1h, lb2, lb2, i1 - lb2) if i1 - lb2 >= 0 else None
+                                        lb_used = lb2
+                                    pivot_bar = i1 - lb_used
+                                    if pivot_bar < 0:
+                                        continue
 
-                                half_w = float(atr_1h.iloc[i1]) * args.atr_mult * 0.5
-                                cluster_dist = float(atr_1h.iloc[i1]) * args.cluster_atr
+                                    half_w = float(atr_1h.iloc[i1]) * args.atr_mult * 0.5
+                                    cluster_dist = float(atr_1h.iloc[i1]) * args.cluster_atr
 
-                                def merge_or_create(side: int, level: float, vol_val: float) -> None:
-                                    merged = False
-                                    for z in zones:
-                                        if z.live and z.side == side and abs(z.mid - level) <= cluster_dist:
-                                            new_mid = (z.mid + level) * 0.5
-                                            z.mid = new_mid
-                                            z.top = new_mid + half_w
-                                            z.bot = new_mid - half_w
-                                            z.vol = (z.vol + vol_val) * 0.5
-                                            merged = True
-                                            break
-                                    if not merged:
-                                        zones.append(
-                                            Zone(
-                                                mid=level,
-                                                top=level + half_w,
-                                                bot=level - half_w,
-                                                side=side,
-                                                live=True,
-                                                born=i1,
-                                                start=pivot_bar,
-                                                vol=vol_val,
+                                    def merge_or_create(side: int, level: float, vol_val: float) -> None:
+                                        merged = False
+                                        for z in zones:
+                                            if z.live and z.side == side and abs(z.mid - level) <= cluster_dist:
+                                                new_mid = (z.mid + level) * 0.5
+                                                z.mid = new_mid
+                                                z.top = new_mid + half_w
+                                                z.bot = new_mid - half_w
+                                                z.vol = (z.vol + vol_val) * 0.5
+                                                merged = True
+                                                break
+                                        if not merged:
+                                            zones.append(
+                                                Zone(
+                                                    mid=level,
+                                                    top=level + half_w,
+                                                    bot=level - half_w,
+                                                    side=side,
+                                                    live=True,
+                                                    born=i1,
+                                                    start=pivot_bar,
+                                                    vol=vol_val,
+                                                )
                                             )
-                                        )
 
-                                if ph is not None:
-                                    merge_or_create(1, ph, float(dvf.iloc[pivot_bar]))
-                                if pl is not None:
-                                    merge_or_create(-1, pl, float(dvf.iloc[pivot_bar]))
+                                    if ph is not None:
+                                        merge_or_create(1, ph, float(dvf.iloc[pivot_bar]))
+                                    if pl is not None:
+                                        merge_or_create(-1, pl, float(dvf.iloc[pivot_bar]))
 
                                 for side in (1, -1):
                                     side_z = [z for z in zones if z.side == side]
@@ -311,10 +417,10 @@ def run_sweep() -> None:
 
                             close_1h_now = float(close_1h.iloc[idx_1h])
                             for z in zones:
-                                if z.live and z.side == 1 and close_1h_now > z.top:
-                                    z.live = False
-                                if z.live and z.side == -1 and close_1h_now < z.bot:
-                                    z.live = False
+                                if _z_get(z, "live", True) and _z_get(z, "side") == 1 and close_1h_now > float(_z_get(z, "top", 0)):
+                                    _z_set(z, "live", False)
+                                if _z_get(z, "live", True) and _z_get(z, "side") == -1 and close_1h_now < float(_z_get(z, "bot", 0)):
+                                    _z_set(z, "live", False)
 
                             if trade:
                                 high_i = float(df_3m.at[i3, "high"])
@@ -362,18 +468,18 @@ def run_sweep() -> None:
                             resist_candidates = [
                                 z
                                 for z in zones
-                                if z.live
-                                and z.side == 1
+                                if _z_get(z, "live", True)
+                                and _z_get(z, "side") == 1
                                 and dvf_norm <= dvf_norm_max
-                                and h1_touch_px >= (z.mid if touch_mode == "mid" else z.bot)
-                                and h1_low <= z.top
+                                and h1_touch_px >= (_z_get(z, "mid") if touch_mode == "mid" else _z_get(z, "bot"))
+                                and h1_low <= float(_z_get(z, "top", 0))
                             ]
                             if resist_candidates and args.require_reject_close:
                                 reject_level = "mid" if args.reject_mode == "mid" else "bot"
                                 resist_candidates = [
                                     z
                                     for z in resist_candidates
-                                    if h1_close < (z.mid if reject_level == "mid" else z.bot)
+                                    if h1_close < (_z_get(z, "mid") if reject_level == "mid" else _z_get(z, "bot"))
                                 ]
                             if not resist_candidates:
                                 continue
@@ -402,8 +508,8 @@ def run_sweep() -> None:
                                 atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
                                 if high_now >= retest_level - (atr_now * float(args.retest_atr_mult)) and close_now < retest_level:
                                     entry_px = float(df_3m.at[i3 + 1, "open"])
-                                    nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
-                                    sl_raw = nearest.top * (1.0 + sl_buffer)
+                                    nearest = min(resist_candidates, key=lambda z: abs(_z_get(z, "mid") - entry_px))
+                                    sl_raw = float(_z_get(nearest, "top")) * (1.0 + sl_buffer)
                                     sl_price = max(sl_raw, entry_px * 1.002)
                                     tp_price = entry_px * tp_mult
                                     trade = {

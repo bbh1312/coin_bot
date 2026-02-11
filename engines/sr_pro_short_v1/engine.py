@@ -49,6 +49,7 @@ class SrProShortV1Config:
     ema_slope_min: float = 0.001
     sl_buffer: float = 0.01
     sl_atr_mult: float = 0.5
+    sl_cap_pct: float = 0.008
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
     tp_mult: float = 0.99

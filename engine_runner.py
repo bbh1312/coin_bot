@@ -8126,9 +8126,12 @@ def _run_sr_pro_short_v1_cycle(
             gate_stats["time_block"] += 1
             continue
         if SR_PRO_USE_COMMON_CACHE:
-            df_3m = _load_common_warmup_ohlcv(symbol, tf_ltf, limit=min_ltf_fetch) or pd.DataFrame()
-            df_15m = _load_common_warmup_ohlcv(symbol, tf_mtf, limit=min_mtf_fetch) or pd.DataFrame()
-            df_1h = _load_common_warmup_ohlcv(symbol, tf_htf, limit=min_htf_fetch) or pd.DataFrame()
+            _df = _load_common_warmup_ohlcv(symbol, tf_ltf, limit=min_ltf_fetch)
+            df_3m = _df if _df is not None else pd.DataFrame()
+            _df = _load_common_warmup_ohlcv(symbol, tf_mtf, limit=min_mtf_fetch)
+            df_15m = _df if _df is not None else pd.DataFrame()
+            _df = _load_common_warmup_ohlcv(symbol, tf_htf, limit=min_htf_fetch)
+            df_1h = _df if _df is not None else pd.DataFrame()
         else:
             df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch)
             df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch)
@@ -8409,6 +8412,7 @@ def _run_sr_pro_short_v1_cycle(
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
                 tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
                 if usdt > 0 and _admin_is_active():
@@ -8453,6 +8457,7 @@ def _run_sr_pro_short_v1_cycle(
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
                 tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
                 if usdt > 0 and _admin_is_active():
@@ -8491,6 +8496,7 @@ def _run_sr_pro_short_v1_cycle(
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
                 tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
                 if usdt > 0 and _admin_is_active():
@@ -8580,6 +8586,7 @@ def _run_sr_pro_short_v1_cycle(
                     nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                     sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
                     tp_price = entry_px * float(cfg.tp_mult)
                     usdt = _resolve_entry_usdt()
                     if usdt > 0 and _admin_is_active():
@@ -8617,6 +8624,7 @@ def _run_sr_pro_short_v1_cycle(
                 atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
                 sl_raw = nearest["top"] + (atr_now * float(cfg.sl_atr_mult))
                 sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                sl_price = min(sl_price, entry_px * (1.0 + float(cfg.sl_cap_pct)))
                 rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
                 upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
                 wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
@@ -8799,9 +8807,12 @@ def _run_sr_pro_long_v1_cycle(
     for symbol in symbols:
         checked += 1
         if SR_PRO_USE_COMMON_CACHE:
-            df_3m = _load_common_warmup_ohlcv(symbol, tf_ltf, min_ltf_fetch) or pd.DataFrame()
-            df_15m = _load_common_warmup_ohlcv(symbol, tf_mtf, min_mtf_fetch) or pd.DataFrame()
-            df_1h = _load_common_warmup_ohlcv(symbol, tf_htf, min_htf_fetch) or pd.DataFrame()
+            _df = _load_common_warmup_ohlcv(symbol, tf_ltf, min_ltf_fetch)
+            df_3m = _df if _df is not None else pd.DataFrame()
+            _df = _load_common_warmup_ohlcv(symbol, tf_mtf, min_mtf_fetch)
+            df_15m = _df if _df is not None else pd.DataFrame()
+            _df = _load_common_warmup_ohlcv(symbol, tf_htf, min_htf_fetch)
+            df_1h = _df if _df is not None else pd.DataFrame()
         else:
             df_3m = _get_confirmed_df(symbol, tf_ltf, min_ltf_fetch)
             df_15m = _get_confirmed_df(symbol, tf_mtf, min_mtf_fetch)

@@ -264,6 +264,7 @@ def run_backtest() -> None:
     parser.add_argument("--ema-slope-min", type=float, default=0.001)
     parser.add_argument("--sl-buffer", type=float, default=0.01)
     parser.add_argument("--sl-atr-mult", type=float, default=0.5)
+    parser.add_argument("--sl-cap-pct", type=float, default=0.008)
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
     parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
     parser.add_argument("--tp-mult", type=float, default=0.99)
@@ -987,6 +988,7 @@ def run_backtest() -> None:
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    sl_price = min(sl_price, entry_px * (1.0 + float(args.sl_cap_pct)))
                     tp_price = entry_px * float(args.tp_mult)
                     trade = {
                         "entry_px": entry_px,
@@ -1022,6 +1024,7 @@ def run_backtest() -> None:
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    sl_price = min(sl_price, entry_px * (1.0 + float(args.sl_cap_pct)))
                     tp_price = entry_px * float(args.tp_mult)
                     trade = {
                         "entry_px": entry_px,
@@ -1057,6 +1060,7 @@ def run_backtest() -> None:
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    sl_price = min(sl_price, entry_px * (1.0 + float(args.sl_cap_pct)))
                     tp_price = entry_px * float(args.tp_mult)
                     trade = {
                         "entry_px": entry_px,
@@ -1088,6 +1092,7 @@ def run_backtest() -> None:
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    sl_price = min(sl_price, entry_px * (1.0 + float(args.sl_cap_pct)))
                     tp_price = entry_px * float(args.tp_mult)
                     trade = {
                         "entry_px": entry_px,
@@ -1146,6 +1151,7 @@ def run_backtest() -> None:
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    sl_price = min(sl_price, entry_px * (1.0 + float(args.sl_cap_pct)))
                     tp_price = entry_px * float(args.tp_mult)
                     trade = {
                         "entry_px": entry_px,
@@ -1188,32 +1194,32 @@ def run_backtest() -> None:
                     else:
                         continue
                 trade = {
-                        "entry_px": entry_px,
-                        "sl_price": sl_price,
-                        "tp_price": tp_price,
-                        "mfe": 0.0,
-                        "mae": 0.0,
-                        "hold_bars": 0,
-                        "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
-                        "track": "strong" if strong_break else "weak",
-                    }
-                    stats["entries"] += 1
-                    sym_stats["entries"] += 1
-                    entry_symbols.add(sym)
+                    "entry_px": entry_px,
+                    "sl_price": sl_price,
+                    "tp_price": tp_price,
+                    "mfe": 0.0,
+                    "mae": 0.0,
+                    "hold_bars": 0,
+                    "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                    "track": "strong" if strong_break else "weak",
+                }
+                stats["entries"] += 1
+                sym_stats["entries"] += 1
+                entry_symbols.add(sym)
                 _record_entry_ts(trade["entry_ts"])
                 _log_signal_ctx("strong" if strong_break else "weak", nearest, entry_px, atr_now)
                 if args.log_gates:
-                        if close_now < retest_level:
-                            gate_counts["entry_by_pass_close"] += 1
-                        else:
-                            gate_counts["entry_by_pass_low"] += 1
-                        if strong_break:
-                            gate_counts["entries_strong"] += 1
-                        else:
-                            gate_counts["entries_weak"] += 1
-                    day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
-                    entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
-                    retest_active = False
+                    if close_now < retest_level:
+                        gate_counts["entry_by_pass_close"] += 1
+                    else:
+                        gate_counts["entry_by_pass_low"] += 1
+                    if strong_break:
+                        gate_counts["entries_strong"] += 1
+                    else:
+                        gate_counts["entries_weak"] += 1
+                day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
+                entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                retest_active = False
                 if i3 >= retest_until:
                     if args.log_gates:
                         gate_counts["retest_fail_far"] += 1
