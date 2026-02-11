@@ -40,6 +40,20 @@ def _read_cached_csv(path: str) -> List[List[float]]:
     return rows
 
 
+def _write_cached_csv(path: str, rows: List[List[float]]) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ts,open,high,low,close,volume\n")
+        for row in rows:
+            if not row or len(row) < 6:
+                continue
+            f.write(
+                f"{int(row[0])},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n"
+            )
+
+
 def _fetch_ohlcv_all(
     exchange,
     symbol: str,
@@ -99,6 +113,41 @@ def _tf_to_minutes(tf: str) -> int:
     if tf.endswith("d"):
         return int(tf[:-1]) * 1440
     return 1
+
+
+def _ensure_common_cache(
+    exchange,
+    symbols: List[str],
+    timeframes: List[str],
+    start_ms: int,
+    end_ms: int,
+    common_warmup_dir: str,
+) -> None:
+    if exchange is None:
+        return
+    for sym in symbols:
+        fname = sym.replace("/", "_").replace(":", "_")
+        for tf in timeframes:
+            cached_path = os.path.join(common_warmup_dir, f"{fname}_{tf}.csv")
+            rows = _read_cached_csv(cached_path) if os.path.exists(cached_path) else []
+            if rows:
+                ts_min = min(r[0] for r in rows)
+                ts_max = max(r[0] for r in rows)
+                if ts_min <= start_ms and ts_max >= end_ms:
+                    continue
+            fetched = _fetch_ohlcv_all(
+                exchange,
+                sym,
+                tf,
+                start_ms,
+                end_ms,
+                cache_only=False,
+                use_common_warmup=False,
+                common_warmup_dir=None,
+                common_only=False,
+            )
+            if fetched:
+                _write_cached_csv(cached_path, fetched)
 
 
 def _ts_kst(ts_ms: int) -> str:
@@ -164,6 +213,7 @@ def run_backtest() -> None:
     parser.add_argument("--use-live-cache", action="store_true")
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
+    parser.add_argument("--auto-fill-cache", action="store_true", default=False)
     parser.add_argument("--common-warmup-dir", type=str, default="")
     parser.add_argument("--top-n", type=int, default=50)
     parser.add_argument("--lookback", type=int, default=20)
@@ -262,6 +312,19 @@ def run_backtest() -> None:
         return
 
     log_warmup_info(lambda _: None, warmup_days, warmup_minutes, args.days)
+
+    if args.auto_fill_cache and use_common and common_dir:
+        cache_ex = exchange
+        if cache_ex is None:
+            cache_ex = ccxt.binance({"enableRateLimit": True})
+        _ensure_common_cache(
+            cache_ex,
+            universe,
+            [cfg.tf_ltf, cfg.tf_mtf, cfg.tf_htf],
+            start_ms,
+            end_ms,
+            common_dir,
+        )
 
     data: Dict[str, Dict[str, pd.DataFrame]] = {}
     for sym in universe:
@@ -711,7 +774,7 @@ def run_backtest() -> None:
                         entry_target = float(ema_entry) - (atr_now * entry_offset)
                     if entry_target is None or low_now > entry_target:
                         continue
-                    entry_px = float(entry_target)
+                    entry_px = float(close_now)
                     nearest = min(support_candidates, key=lambda z: abs(z.mid - entry_px))
                     if not (close_now >= nearest.mid or entry_px >= nearest.top - (atr_now * 0.2)):
                         if args.log_gates:

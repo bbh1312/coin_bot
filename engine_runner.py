@@ -7998,6 +7998,7 @@ def _run_sr_pro_short_v1_cycle(
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
         "entry_by_big_bear": 0,
+        "entry_by_dvf_accel": 0,
         "atr_filter": 0,
         "ema_slope_block": 0,
         "no_data_ltf": 0,
@@ -8130,6 +8131,12 @@ def _run_sr_pro_short_v1_cycle(
         dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
         vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
         dvf_norm = float(dvf.iloc[-1]) / float(vol_ema.iloc[-1]) if float(vol_ema.iloc[-1]) > 0 else 0.0
+        dvf_prev = (
+            float(dvf.iloc[-2]) / float(vol_ema.iloc[-2])
+            if len(dvf) >= 2 and float(vol_ema.iloc[-2]) > 0
+            else dvf_norm
+        )
+        dvf_norm_diff = dvf_norm - dvf_prev
 
         # invalidate zones on confirmed 1h close (live)
         try:
@@ -8165,7 +8172,7 @@ def _run_sr_pro_short_v1_cycle(
             gate_stats["zone_touch"] += 1
             continue
 
-        # 15m lower high (2-bar) or close below EMA20 (softer trend filter)
+        # 15m bearish + close below EMA20 (trend filter)
         if len(df_15m_sig) < 3:
             gate_stats["lh_15m"] += 1
             continue
@@ -8174,7 +8181,6 @@ def _run_sr_pro_short_v1_cycle(
         h15_2 = float(df_15m_sig.iloc[-3]["high"])
         close15 = float(df_15m_sig.iloc[-1]["close"])
         open15 = float(df_15m_sig.iloc[-1]["open"])
-        lh_ok = (h15_0 < h15_1) or (h15_1 < h15_2)
         ema20_15m_ok = False
         try:
             if len(df_15m_sig) >= 20:
@@ -8182,7 +8188,7 @@ def _run_sr_pro_short_v1_cycle(
                 ema20_15m_ok = close15 < float(ema20_15m.iloc[-1])
         except Exception:
             ema20_15m_ok = False
-        if not (lh_ok or ema20_15m_ok):
+        if not ema20_15m_ok:
             gate_stats["lh_15m"] += 1
             continue
         if not (close15 < open15):
@@ -8214,7 +8220,7 @@ def _run_sr_pro_short_v1_cycle(
         ]
         low_min = min(low_prev)
         strong_break = c3 < low_min
-        weak_break = (float(df_3m_sig.iloc[-1]["low"]) < low_min) and (c3 >= low_min) and (c3 < o3)
+        weak_break = float(df_3m_sig.iloc[-1]["low"]) <= low_min
         if not strong_break and not weak_break:
             gate_stats["break_3m"] += 1
             continue
@@ -8273,10 +8279,86 @@ def _run_sr_pro_short_v1_cycle(
                 continue
         except Exception:
             pass
+        # DVF acceleration -> immediate entry (skip retest)
+        try:
+            if dvf_norm <= float(cfg.dvf_norm_immediate):
+                entry_px = float(df_3m.iloc[-1]["open"])
+                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
+                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                tp_price = entry_px * float(cfg.tp_mult)
+                usdt = _resolve_entry_usdt()
+                if usdt > 0 and _admin_is_active():
+                    _append_sr_pro_short_v1_log(
+                        f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track=dvf_accel"
+                    )
+                    req_id = _enqueue_entry_request(
+                        state,
+                        symbol=symbol,
+                        side="SHORT",
+                        engine="SR_PRO_SHORT_V1",
+                        reason="sr_pro_short_v1",
+                        usdt=usdt,
+                        live=LIVE_TRADING,
+                        entry_price_hint=entry_px,
+                        meta={
+                            "sl_price": float(sl_price),
+                            "tp_price": float(tp_price),
+                            "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                            "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                            "track": "dvf_accel",
+                        },
+                    )
+                    if req_id:
+                        result["entries"] += 1
+                        gate_stats["entry_by_dvf_accel"] += 1
+                sym_state["retest_active"] = False
+                continue
+        except Exception:
+            pass
+        # DVF slope acceleration -> immediate entry (skip retest)
+        try:
+            if dvf_norm_diff <= float(cfg.dvf_norm_diff_th):
+                entry_px = float(df_3m.iloc[-1]["open"])
+                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
+                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                tp_price = entry_px * float(cfg.tp_mult)
+                usdt = _resolve_entry_usdt()
+                if usdt > 0 and _admin_is_active():
+                    _append_sr_pro_short_v1_log(
+                        f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track=dvf_slope"
+                    )
+                    req_id = _enqueue_entry_request(
+                        state,
+                        symbol=symbol,
+                        side="SHORT",
+                        engine="SR_PRO_SHORT_V1",
+                        reason="sr_pro_short_v1",
+                        usdt=usdt,
+                        live=LIVE_TRADING,
+                        entry_price_hint=entry_px,
+                        meta={
+                            "sl_price": float(sl_price),
+                            "tp_price": float(tp_price),
+                            "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                            "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                            "track": "dvf_slope",
+                        },
+                    )
+                    if req_id:
+                        result["entries"] += 1
+                        gate_stats["entry_by_dvf_slope"] += 1
+                sym_state["retest_active"] = False
+                continue
+        except Exception:
+            pass
         # retest state
         retest_active = bool(sym_state.get("retest_active"))
         retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
         retest_until = int(sym_state.get("retest_until", 0) or 0)
+        break_ts_ms = int(sym_state.get("break_ts_ms", 0) or 0)
+        break_low_min = float(sym_state.get("break_low_min", 0.0) or 0.0)
         break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
         now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
         if not retest_active:
@@ -8285,10 +8367,14 @@ def _run_sr_pro_short_v1_cycle(
             retest_bars = max(1, int(cfg.retest_bars))
             retest_until = now_ts_ms + retest_bars * 3 * 60 * 1000
             break_type = "strong" if strong_break else "weak"
+            break_ts_ms = now_ts_ms
+            break_low_min = low_min
             sym_state["retest_active"] = True
             sym_state["retest_level"] = retest_level
             sym_state["retest_until"] = retest_until
             sym_state["break_type"] = break_type
+            sym_state["break_ts_ms"] = break_ts_ms
+            sym_state["break_low_min"] = break_low_min
             gate_stats["retest_seen"] += 1
 
         if retest_active and now_ts_ms <= retest_until:
@@ -8306,7 +8392,54 @@ def _run_sr_pro_short_v1_cycle(
             atr_3m = tr3.ewm(alpha=1 / 14, adjust=False).mean()
             atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
             retest_touch_mult = float(cfg.retest_atr_mult) if strong_break else 0.5
-            if h3 >= retest_level - (atr_now * retest_touch_mult):
+            retest_touch = (
+                h3 >= retest_level - (atr_now * retest_touch_mult)
+                and h3 <= retest_level + (atr_now * float(cfg.retest_above_atr_mult))
+            )
+            # timeout chase: if no retest and new low within N bars, enter
+            try:
+                if (
+                    not retest_touch
+                    and break_ts_ms > 0
+                    and (now_ts_ms - break_ts_ms) <= int(cfg.retest_timeout_bars) * 3 * 60 * 1000
+                    and l3 < break_low_min
+                ):
+                    entry_px = float(df_3m.iloc[-1]["open"])
+                    nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                    sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
+                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                    tp_price = entry_px * float(cfg.tp_mult)
+                    usdt = _resolve_entry_usdt()
+                    if usdt > 0 and _admin_is_active():
+                        _append_sr_pro_short_v1_log(
+                            f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track=timeout"
+                        )
+                        req_id = _enqueue_entry_request(
+                            state,
+                            symbol=symbol,
+                            side="SHORT",
+                            engine="SR_PRO_SHORT_V1",
+                            reason="sr_pro_short_v1",
+                            usdt=usdt,
+                            live=LIVE_TRADING,
+                            entry_price_hint=entry_px,
+                            meta={
+                                "sl_price": float(sl_price),
+                                "tp_price": float(tp_price),
+                                "sl_pct": ((float(sl_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                                "tp_pct": ((entry_px - float(tp_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                                "track": "timeout",
+                            },
+                        )
+                        if req_id:
+                            result["entries"] += 1
+                            gate_stats["entry_by_timeout"] += 1
+                    sym_state["retest_active"] = False
+                    continue
+            except Exception:
+                pass
+
+            if retest_touch:
                 entry_px = float(df_3m.iloc[-1]["open"])
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
