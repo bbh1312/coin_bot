@@ -10967,7 +10967,32 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
             )
         else:
             try:
-                place_long_sl_px(symbol, float(sl_price_meta))
+                cancel_conditional_by_side(symbol, "LONG")
+                cancel_stop_orders(symbol)
+            except Exception:
+                pass
+            try:
+                res_sl = place_long_sl_px(symbol, float(sl_price_meta), qty=qty if isinstance(qty, (int, float)) else None)
+                if isinstance(res_sl, dict) and res_sl.get("status") != "ok":
+                    _append_entry_gate_log(
+                        "sr_pro_long_v1",
+                        symbol,
+                        f"sl_place_failed status={res_sl.get('status')} reason={res_sl.get('reason')}",
+                        side="LONG",
+                    )
+                    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+                    if not isinstance(st, dict):
+                        st = {}
+                    st["_srp_long_sl_pending"] = time.time()
+                    st["_srp_long_sl_price"] = float(sl_price_meta)
+                    state[symbol] = st
+                else:
+                    _append_entry_gate_log(
+                        "sr_pro_long_v1",
+                        symbol,
+                        f"sl_place_ok sl_price={sl_price_meta}",
+                        side="LONG",
+                    )
             except Exception:
                 _append_entry_gate_log(
                     "sr_pro_long_v1",
@@ -11932,6 +11957,14 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             (open_tr.get("meta") or {}).get("reason") if open_tr else None
         )
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
+        if engine_label == "SR_PRO_LONG_V1" and entry_ts and (now - entry_ts) < 120.0:
+            _append_entry_gate_log(
+                "auto_exit_long",
+                sym,
+                f"srp_guard_skip_early age_s={now - entry_ts:.1f} mark={mark_px} entry={entry_px}",
+                side="LONG",
+            )
+            continue
         if engine_label == "ADVANCED_TREND_FOLLOWER":
             continue
         closed = False
@@ -11952,6 +11985,37 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 tp_price_meta = float(meta.get("tp_price")) if isinstance(meta, dict) else None
             except Exception:
                 tp_price_meta = None
+            st = state.get(sym) if isinstance(state.get(sym), dict) else {}
+            pending_ts = st.get("_srp_long_sl_pending") if isinstance(st, dict) else None
+            pending_sl = st.get("_srp_long_sl_price") if isinstance(st, dict) else None
+            if isinstance(pending_ts, (int, float)) and isinstance(pending_sl, (int, float)):
+                if (now - float(pending_ts)) < 120.0:
+                    try:
+                        amt = get_long_position_amount(sym)
+                    except Exception:
+                        amt = None
+                    if isinstance(amt, (int, float)) and amt > 0:
+                        try:
+                            res_sl = place_long_sl_px(sym, float(pending_sl), qty=amt)
+                            if isinstance(res_sl, dict) and res_sl.get("status") == "ok":
+                                st.pop("_srp_long_sl_pending", None)
+                                st.pop("_srp_long_sl_price", None)
+                                state[sym] = st
+                                _append_entry_gate_log(
+                                    "sr_pro_long_v1",
+                                    sym,
+                                    f"sl_retry_ok sl_price={pending_sl}",
+                                    side="LONG",
+                                )
+                        except Exception:
+                            pass
+                    _append_entry_gate_log(
+                        "auto_exit_long",
+                        sym,
+                        f"srp_guard_skip_pending_sl age_s={now - float(pending_ts):.1f}",
+                        side="LONG",
+                    )
+                    continue
             if not isinstance(sl_price_meta, (int, float)) or not isinstance(tp_price_meta, (int, float)):
                 _append_entry_gate_log(
                     "auto_exit_long",
