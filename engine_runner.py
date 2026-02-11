@@ -8814,6 +8814,9 @@ def _run_sr_pro_long_v1_cycle(
             return df
         tf_ms = _tf_ms(tf)
         now_ms = int(time.time() * 1000)
+        # keep UTC epoch as-is; only use KST for display
+        if df is None or df.empty:
+            return df
         last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns else 0
         # if last bar is still forming, drop it; else keep
         if last_ts and (now_ms - last_ts) < tf_ms:

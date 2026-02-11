@@ -19,7 +19,7 @@ class SrProShortV1Config:
     max_zones_per_side: int = 8
     touch_mode: str = "bot"
     touch_use_close: bool = False
-    dvf_norm_max: float = -0.10
+    dvf_norm_max: float = -0.05
     dvf_norm_immediate: float = -0.20
     dvf_norm_diff_th: float = -0.03
     require_reject_close: bool = False
@@ -49,11 +49,11 @@ class SrProShortV1Config:
     ema_slope_min: float = 0.001
     sl_buffer: float = 0.01
     sl_atr_mult: float = 0.5
-    sl_cap_pct: float = 0.008
+    sl_cap_pct: float = 0.02
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 0.99
-    tp_mult_weak: float = 0.99
+    tp_mult: float = 0.98
+    tp_mult_weak: float = 0.98
 
 
 class SrProShortV1Engine(BaseEngine):
