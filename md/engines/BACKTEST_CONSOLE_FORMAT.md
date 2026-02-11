@@ -111,6 +111,24 @@ TOTAL 아래에 **KST 기준 시간대/요일 요약 표**를 추가한다.
 - `sl`: SL 종료 수
 - `sl_rate`: `sl / entries * 100` (소수점 2자리)
 
+날짜별 요약:
+
+```
+[BACKTEST] BY_DATE(KST) date entries tp sl sl_rate winrate net_sum net_sum_usdt
+[BACKTEST] DATE YYYY-MM-DD entries=<N> tp=<N> sl=<N> sl_rate=<PCT>% winrate=<PCT>% net_sum=<F> net_sum_usdt=<F>
+[BACKTEST] DATE TOTAL entries=<N> tp=<N> sl=<N> sl_rate=<PCT>% winrate=<PCT>% net_sum=<F> net_sum_usdt=<F>
+...
+```
+
+정의:
+- `entries`: 해당 날짜 **진입 수**
+- `tp`: TP 종료 수
+- `sl`: SL 종료 수
+- `sl_rate`: `sl / entries * 100` (소수점 2자리)
+- `winrate`: 해당 날짜 승률 (`tp / (tp+sl) * 100`)
+- `net_sum`: 해당 날짜 순손익(비율 합)
+- `net_sum_usdt`: 해당 날짜 순손익(USDT 합)
+
 ## 홀드 시간 규칙
 
 LTF 기준 분 단위로 변환:

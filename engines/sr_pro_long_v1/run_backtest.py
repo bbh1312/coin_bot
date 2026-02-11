@@ -437,6 +437,7 @@ def run_backtest() -> None:
     ltf_minutes = _tf_to_minutes(cfg.tf_ltf)
     hour_stats: Dict[int, Dict[str, int]] = {}
     dow_stats: Dict[str, Dict[str, int]] = {}
+    date_stats: Dict[str, Dict[str, float]] = {}
     end_ms_last = end_ms
 
     for sym, frames in data.items():
@@ -602,6 +603,7 @@ def run_backtest() -> None:
                             "reason": "SL",
                             "tp_pct": _tp_sl_pct_from_trade(trade)[0],
                             "sl_pct": _tp_sl_pct_from_trade(trade)[1],
+                            "pnl_pct": pnl_pct,
                         }
                     )
                     cooldown_until[(sym, "LONG")] = ts + (60 * 60 * 1000)
@@ -633,6 +635,7 @@ def run_backtest() -> None:
                             "reason": "TP",
                             "tp_pct": _tp_sl_pct_from_trade(trade)[0],
                             "sl_pct": _tp_sl_pct_from_trade(trade)[1],
+                            "pnl_pct": pnl_pct,
                         }
                     )
                     trade = None
@@ -808,6 +811,10 @@ def run_backtest() -> None:
                             gate_counts["entry_by_pass_high"] += 1
                     day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
                     entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                    date_stats.setdefault(
+                        day_key, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0}
+                    )
+                    date_stats[day_key]["entries"] += 1
                     entry_symbols.add(sym)
                     dt_kst = datetime.fromtimestamp(trade["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
                     hour_bucket = dt_kst.hour
@@ -844,14 +851,20 @@ def run_backtest() -> None:
         dt_kst = datetime.fromtimestamp(ex["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
         hour_bucket = dt_kst.hour
         dow_bucket = _dow_label(dt_kst)
+        day_bucket = dt_kst.strftime("%Y-%m-%d")
         hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
         dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
+        date_stats.setdefault(day_bucket, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0})
+        date_stats[day_bucket]["net_sum"] += float(ex.get("pnl_pct", 0.0))
+        date_stats[day_bucket]["net_sum_usdt"] += float(ex.get("pnl_pct", 0.0)) * float(args.entry_usdt)
         if ex["reason"] == "TP":
             hour_stats[hour_bucket]["tp"] += 1
             dow_stats[dow_bucket]["tp"] += 1
+            date_stats[day_bucket]["tp"] += 1
         elif ex["reason"] == "SL":
             hour_stats[hour_bucket]["sl"] += 1
             dow_stats[dow_bucket]["sl"] += 1
+            date_stats[day_bucket]["sl"] += 1
 
     last_day_threshold = end_ms_last - (24 * 60 * 60 * 1000)
 
@@ -931,6 +944,42 @@ def run_backtest() -> None:
         print(
             f"[BACKTEST] DOW {dow} entries={entries} tp={bucket['tp']} "
             f"sl={sl} sl_rate={sl_rate:.2f}%"
+        )
+
+    if date_stats:
+        print("[BACKTEST] BY_DATE(KST) date entries tp sl sl_rate winrate net_sum net_sum_usdt")
+        total_entries = 0
+        total_tp = 0
+        total_sl = 0
+        total_net_sum = 0.0
+        total_net_sum_usdt = 0.0
+        for day_key in sorted(date_stats.keys()):
+            bucket = date_stats[day_key]
+            entries = int(bucket.get("entries", 0))
+            sl = int(bucket.get("sl", 0))
+            sl_rate = (sl / entries * 100.0) if entries > 0 else 0.0
+            tp = int(bucket.get("tp", 0))
+            trades = tp + sl
+            winrate = (tp / trades * 100.0) if trades > 0 else 0.0
+            net_sum = float(bucket.get("net_sum", 0.0))
+            net_sum_usdt = float(bucket.get("net_sum_usdt", 0.0))
+            total_entries += entries
+            total_tp += tp
+            total_sl += sl
+            total_net_sum += net_sum
+            total_net_sum_usdt += net_sum_usdt
+            print(
+                f"[BACKTEST] DATE {day_key} entries={entries} tp={tp} "
+                f"sl={sl} sl_rate={sl_rate:.2f}% winrate={winrate:.2f}% "
+                f"net_sum={net_sum:.3f} net_sum_usdt={net_sum_usdt:.3f}"
+            )
+        total_trades = total_tp + total_sl
+        total_sl_rate = (total_sl / total_entries * 100.0) if total_entries > 0 else 0.0
+        total_winrate = (total_tp / total_trades * 100.0) if total_trades > 0 else 0.0
+        print(
+            f"[BACKTEST] DATE TOTAL entries={total_entries} tp={total_tp} sl={total_sl} "
+            f"sl_rate={total_sl_rate:.2f}% winrate={total_winrate:.2f}% "
+            f"net_sum={total_net_sum:.3f} net_sum_usdt={total_net_sum_usdt:.3f}"
         )
 
     if args.zones_snapshot_out:
