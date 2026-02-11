@@ -47,6 +47,10 @@ try:
 except Exception:
     ws_manager = None
 try:
+    import common_ws_manager
+except Exception:
+    common_ws_manager = None
+try:
     import db_recorder as dbrec
 except Exception:
     dbrec = None
@@ -1325,6 +1329,7 @@ COMMON_WARMUP_DAYS = int(os.getenv("COMMON_WARMUP_DAYS", "1"))
 COMMON_WARMUP_TFS = tuple(tf.strip() for tf in os.getenv("COMMON_WARMUP_TFS", "1m,3m,15m,1h").split(",") if tf.strip())
 COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "30"))
 COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "false", "off", "no")
+COMMON_WARMUP_WS = os.getenv("COMMON_WARMUP_WS", "0") in ("1", "true", "on", "yes")
 COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
 COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "9"))
 COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "50"))
@@ -1493,6 +1498,29 @@ def _append_common_warmup_ohlcv(sym: str, tf: str, data: list) -> None:
                     continue
                 f.write(f"{ts},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n")
                 last_ts = ts
+    except Exception:
+        pass
+
+
+def _common_warmup_ws_hook(sym: str, tf: str, ohlcv_row: list) -> None:
+    if not ohlcv_row or len(ohlcv_row) < 6:
+        return
+    # append to warmup file
+    _append_common_warmup_ohlcv(sym, tf, [ohlcv_row])
+    # update cycle_cache raw (keep last N bars)
+    try:
+        limit = _tf_bars_for_days(tf, COMMON_WARMUP_DAYS)
+    except Exception:
+        limit = 0
+    try:
+        cur = cycle_cache.get_raw(sym, tf) or []
+        if cur and cur[-1][0] == ohlcv_row[0]:
+            cur[-1] = ohlcv_row
+        else:
+            cur = cur + [ohlcv_row]
+        if limit and len(cur) > limit:
+            cur = cur[-limit:]
+        cycle_cache.set_raw(sym, tf, cur)
     except Exception:
         pass
 
@@ -16589,16 +16617,58 @@ def run():
                         if now_kst.hour == 9 and now_kst.minute < 5:
                             last_daily = state.get("_common_warmup_daily_day")
                             if last_daily != today_kst:
-                                _reset_common_warmup_state(state)
-                                COMMON_WARMUP_DONE = False
-                                state["_common_warmup_done"] = False
-                                state["_common_warmup_env_logged"] = False
+                                if not COMMON_WARMUP_WS or COMMON_WARMUP_ALWAYS:
+                                    _reset_common_warmup_state(state)
+                                    COMMON_WARMUP_DONE = False
+                                    state["_common_warmup_done"] = False
+                                    state["_common_warmup_env_logged"] = False
+                                    state["_common_gap_repair_force"] = True
+                                    print("[common-warmup] daily refresh triggered (KST 09:00)")
+                                else:
+                                    print("[common-warmup] WS mode daily refresh (KST 09:00)")
                                 state["_common_warmup_daily_day"] = today_kst
-                                state["_common_gap_repair_force"] = True
-                                print("[common-warmup] daily refresh triggered (KST 09:00)")
                     except Exception:
                         pass
-                    if not COMMON_WARMUP_DONE:
+                    # If WS mode is enabled but warmup is required, run REST warmup first.
+                    if COMMON_WARMUP_WS and COMMON_WARMUP_ALWAYS and not COMMON_WARMUP_DONE:
+                        if not state.get("_common_warmup_env_logged"):
+                            try:
+                                print(
+                                    f"[common-warmup] env days={COMMON_WARMUP_DAYS} "
+                                    f"tfs={','.join(COMMON_WARMUP_TFS)} max_fetch={COMMON_WARMUP_MAX_FETCH}"
+                                )
+                            except Exception:
+                                pass
+                            state["_common_warmup_env_logged"] = True
+                        COMMON_WARMUP_DONE = _warmup_common_cache(state, exchange, shared_universe)
+                        state["_common_warmup_done"] = COMMON_WARMUP_DONE
+                        if not COMMON_WARMUP_DONE:
+                            plan = state.get("_common_warmup_plan") or []
+                            idx = int(state.get("_common_warmup_idx", 0) or 0)
+                            backoff_until = float(state.get("_common_warmup_backoff_until", 0.0) or 0.0)
+                            if backoff_until and time.time() < backoff_until:
+                                remain = max(0.0, backoff_until - time.time())
+                                print(f"[common-warmup] backoff {remain:.1f}s")
+                                time.sleep(min(3.0, remain))
+                            else:
+                                print(f"[common-warmup] progress {idx}/{len(plan)}")
+                                time.sleep(1.0)
+                            continue
+                    if COMMON_WARMUP_WS:
+                        if common_ws_manager and common_ws_manager.is_available():
+                            common_ws_manager.set_on_close_hook(_common_warmup_ws_hook)
+                            if not common_ws_manager.is_running():
+                                common_ws_manager.start()
+                            if not state.get("_common_warmup_ws_logged"):
+                                try:
+                                    print(f"[common-warmup] WS mode tfs={','.join(COMMON_WARMUP_TFS)} syms={len(shared_universe)}")
+                                except Exception:
+                                    pass
+                                state["_common_warmup_ws_logged"] = True
+                            common_ws_manager.set_watch(shared_universe, COMMON_WARMUP_TFS)
+                        COMMON_WARMUP_DONE = True
+                        state["_common_warmup_done"] = True
+                    if not COMMON_WARMUP_WS and not COMMON_WARMUP_DONE:
                         if not state.get("_common_warmup_env_logged"):
                             try:
                                 print(
@@ -16653,28 +16723,30 @@ def run():
                             save_state(state)
 
                     # periodic gap repair for common warmup cache (non-blocking)
-                    try:
-                        if state.get("_common_gap_repair_force"):
-                            state["_common_gap_repair_ts"] = 0.0
-                            state["_common_gap_repair_inflight"] = True
-                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe, force_full=True)
-                            state["_common_gap_repair_force"] = False
-                            state["_common_gap_repair_once"] = True
-                            state["_common_gap_repair_inflight"] = False
-                        else:
-                            if not state.get("_common_gap_repair_once"):
+                    if not COMMON_WARMUP_WS:
+                        try:
+                            if state.get("_common_gap_repair_force"):
                                 state["_common_gap_repair_ts"] = 0.0
-                                _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                                state["_common_gap_repair_inflight"] = True
+                                _maybe_repair_common_warmup_gaps(state, exchange, shared_universe, force_full=True)
+                                state["_common_gap_repair_force"] = False
                                 state["_common_gap_repair_once"] = True
-                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
-                    except Exception:
-                        state["_common_gap_repair_inflight"] = False
-                        pass
+                                state["_common_gap_repair_inflight"] = False
+                            else:
+                                if not state.get("_common_gap_repair_once"):
+                                    state["_common_gap_repair_ts"] = 0.0
+                                    _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                                    state["_common_gap_repair_once"] = True
+                                _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                        except Exception:
+                            state["_common_gap_repair_inflight"] = False
+                            pass
                     # periodic cycle cache refresh for stale/gapped TFS (non-blocking)
-                    try:
-                        _maybe_refresh_common_cycle_cache(state, exchange, shared_universe)
-                    except Exception:
-                        pass
+                    if not COMMON_WARMUP_WS:
+                        try:
+                            _maybe_refresh_common_cycle_cache(state, exchange, shared_universe)
+                        except Exception:
+                            pass
 
                     if heavy_scan:
                         universe_union = list(
@@ -16967,7 +17039,8 @@ def run():
                     if ws_manager and ws_manager.is_running():
                         try:
                             manage_syms = [s for s, st in state.items() if isinstance(st, dict) and st.get("in_pos")]
-                            ws_manager.set_watch_symbols(manage_syms)
+                            manage_tfs = os.getenv("MANAGE_WS_TFS", "3m,15m,1h")
+                            ws_manager.set_watch(manage_syms, [tf.strip() for tf in manage_tfs.split(",") if tf.strip()])
                         except Exception as e:
                             print("[WS] set_watch_symbols error:", e)
 

@@ -21,6 +21,7 @@ import db_reconcile as dbrecon
 
 MANAGE_WS_WRITE_STATE = os.getenv("MANAGE_WS_WRITE_STATE", "1") == "1"
 MANAGE_WS_SAVE_RUNTIME = os.getenv("MANAGE_WS_SAVE_RUNTIME", "1") == "1"
+MANAGE_WS_TFS = os.getenv("MANAGE_WS_TFS", "3m,15m,1h")
 
 _ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_BY_SYMBOL_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
@@ -323,7 +324,7 @@ def _get_recent_entry_event(symbol: str, side: str, now_ts: Optional[float] = No
 
 
 def _last_ws_close(symbol: str):
-    df = ws_manager.get_5m_df(symbol, limit=2)
+    df = ws_manager.get_df(symbol, "3m", limit=2)
     if df is None or df.empty:
         return None
     try:
@@ -352,7 +353,7 @@ def _update_watch_symbols() -> list:
         watch = []
     if ws_manager and ws_manager.is_running():
         try:
-            ws_manager.set_watch_symbols(watch)
+            ws_manager.set_watch(watch, [tf.strip() for tf in MANAGE_WS_TFS.split(",") if tf.strip()])
         except Exception:
             pass
     return watch

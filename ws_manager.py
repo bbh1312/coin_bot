@@ -1,15 +1,15 @@
 """ws_manager.py
-Binance Futures WebSocket helper for 5m kline streams (manage-mode only).
+Binance Futures WebSocket helper for manage-mode OHLCV (multi-tf).
 
 특징
-- 관리 대상 심볼만 대상으로 5m kline 스트림을 수집
+- 관리 대상 심볼만 대상으로 kline 스트림을 수집 (다중 TF)
 - 최신 klines 캐시(DataFrame) 제공
 - 웹소켓 미존재/실패 시 사용하지 않음(자동 폴백)
 """
 import json
 import threading
 import time
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -20,16 +20,16 @@ except Exception:
 
 # --- 상태 ---
 _watch_symbols: set = set()
+_watch_tfs: set = set()
 _lock = threading.Lock()
 _stop_event = threading.Event()
 _reconnect_event = threading.Event()
 _thread: Optional[threading.Thread] = None
 _running: bool = False
-_kline_cache: Dict[str, List[dict]] = {}  # stream_symbol -> list of kline dicts
+_kline_cache: Dict[Tuple[str, str], List[dict]] = {}  # (stream_symbol, tf) -> list of kline dicts
 _last_error: Optional[str] = None
 
 BINANCE_FSTREAM_WS = "wss://fstream.binance.com/stream"
-KLINE_INTERVAL = "5m"
 MAX_KLINE_KEEP = 240  # 최대 보존 캔들 수
 
 
@@ -60,6 +60,19 @@ def set_watch_symbols(symbols: Iterable[str]) -> None:
             _watch_symbols = new_set
             _reconnect_event.set()
 
+def set_watch_tfs(tfs: Iterable[str]) -> None:
+    """감시 대상 타임프레임 설정. 변경 시 재연결 트리거."""
+    global _watch_tfs
+    with _lock:
+        new_set = set(tf.strip() for tf in tfs if tf.strip())
+        if new_set != _watch_tfs:
+            _watch_tfs = new_set
+            _reconnect_event.set()
+
+def set_watch(symbols: Iterable[str], tfs: Iterable[str]) -> None:
+    set_watch_symbols(symbols)
+    set_watch_tfs(tfs)
+
 
 def stop():
     global _running
@@ -83,10 +96,10 @@ def start() -> bool:
     return True
 
 
-def get_5m_df(symbol: str, limit: int = 120) -> Optional[pd.DataFrame]:
-    """관리 심볼용 5m kline DF 반환. 데이터 없으면 None."""
+def get_df(symbol: str, tf: str, limit: int = 120) -> Optional[pd.DataFrame]:
+    """관리 심볼용 kline DF 반환. 데이터 없으면 None."""
     stream_sym = _sym_to_stream(symbol)
-    data = _kline_cache.get(stream_sym)
+    data = _kline_cache.get((stream_sym, tf))
     if not data:
         return None
     try:
@@ -94,6 +107,10 @@ def get_5m_df(symbol: str, limit: int = 120) -> Optional[pd.DataFrame]:
         return df
     except Exception:
         return None
+
+def get_5m_df(symbol: str, limit: int = 120) -> Optional[pd.DataFrame]:
+    """호환용. 기본 5m DF 반환 (5m 수집 안 하면 None)."""
+    return get_df(symbol, "5m", limit=limit)
 
 
 def last_error() -> Optional[str]:
@@ -107,11 +124,14 @@ def _run_loop():
         # 감시 대상이 없으면 대기
         with _lock:
             targets = list(_watch_symbols)
+            tfs = list(_watch_tfs)
         if not targets:
             time.sleep(2.0)
             continue
-
-        streams = "/".join(f"{s}@kline_{KLINE_INTERVAL}" for s in targets)
+        if not tfs:
+            time.sleep(2.0)
+            continue
+        streams = "/".join(f"{s}@kline_{tf}" for s in targets for tf in tfs)
         url = f"{BINANCE_FSTREAM_WS}?streams={streams}"
 
         def on_message(ws, message):
@@ -120,9 +140,10 @@ def _run_loop():
                 data = payload.get("data", {})
                 stream = payload.get("stream") or ""
                 k = data.get("k") or {}
-                if k.get("i") != KLINE_INTERVAL:
-                    return
                 stream_sym = stream.split("@")[0]
+                tf = k.get("i")
+                if not tf:
+                    return
                 entry = {
                     "ts": k.get("t"),
                     "open": float(k.get("o")),
@@ -132,7 +153,7 @@ def _run_loop():
                     "volume": float(k.get("q") or k.get("v") or 0.0),
                     "closed": bool(k.get("x")),
                 }
-                arr = _kline_cache.setdefault(stream_sym, [])
+                arr = _kline_cache.setdefault((stream_sym, tf), [])
                 # 동일 open time 대체
                 found = False
                 for idx, ex in enumerate(arr):
