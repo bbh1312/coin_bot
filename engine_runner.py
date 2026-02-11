@@ -8404,12 +8404,12 @@ def _run_sr_pro_short_v1_cycle(
             body = abs(c3 - o3)
             bodies = (df_3m_sig["close"] - df_3m_sig["open"]).abs()
             avg_body = float(bodies.iloc[-6:-1].mean()) if len(bodies) >= 6 else float(bodies.iloc[:-1].mean())
-                if avg_body > 0 and c3 < o3 and body >= (avg_body * float(cfg.big_bear_body_mult)):
-                    entry_px = float(df_3m.iloc[-1]["open"])
-                    nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
-                    sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
-                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                    tp_price = entry_px * float(cfg.tp_mult)
+            if avg_body > 0 and c3 < o3 and body >= (avg_body * float(cfg.big_bear_body_mult)):
+                entry_px = float(df_3m.iloc[-1]["open"])
+                nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
+                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
                 if usdt > 0 and _admin_is_active():
                     _append_sr_pro_short_v1_log(
