@@ -1353,6 +1353,7 @@ NOISE_REVERSE_FILE_CACHE_USED: dict = {}
 NOISE_REVERSE_FILE_CACHE_MISS: dict = {}
 NOISE_REVERSE_FILE_CACHE_FAIL: dict = {}
 NOISE_REVERSE_SOURCE_LOGGED: dict = {}
+SR_PRO_USE_COMMON_CACHE = os.getenv("SR_PRO_USE_COMMON_CACHE", "1") not in ("0", "false", "off", "no")
 
 def _common_warmup_cache_dir() -> str:
     base = COMMON_WARMUP_CACHE_DIR or os.path.join("logs", "common_warmup", "ohlcv")
@@ -8124,9 +8125,14 @@ def _run_sr_pro_short_v1_cycle(
         if _entry_blocked_now(ENTRY_BLOCK_HOURS):
             gate_stats["time_block"] += 1
             continue
-        df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch)
-        df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch)
-        df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch)
+        if SR_PRO_USE_COMMON_CACHE:
+            df_3m = _load_common_warmup_ohlcv(symbol, tf_ltf, limit=min_ltf_fetch) or pd.DataFrame()
+            df_15m = _load_common_warmup_ohlcv(symbol, tf_mtf, limit=min_mtf_fetch) or pd.DataFrame()
+            df_1h = _load_common_warmup_ohlcv(symbol, tf_htf, limit=min_htf_fetch) or pd.DataFrame()
+        else:
+            df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch)
+            df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch)
+            df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch)
         if df_3m.empty or df_15m.empty or df_1h.empty:
             no_data += 1
             if df_3m.empty:
@@ -8139,34 +8145,35 @@ def _run_sr_pro_short_v1_cycle(
 
         df_3m_sig = df_3m.iloc[:-1]
         df_15m_sig = df_15m.iloc[:-1]
-        # refresh stale caches if last bar is too old
-        try:
-            now_ms = int(time.time() * 1000)
-            last_3m_ts = int(df_3m.iloc[-1]["ts"]) if not df_3m.empty else 0
-            last_15m_ts = int(df_15m.iloc[-1]["ts"]) if not df_15m.empty else 0
-            last_1h_ts = int(df_1h.iloc[-1]["ts"]) if not df_1h.empty else 0
-            if last_3m_ts and (now_ms - last_3m_ts) > (7 * 60 * 1000):
-                df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
-            if last_15m_ts and (now_ms - last_15m_ts) > (25 * 60 * 1000):
-                df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
-            if last_1h_ts and (now_ms - last_1h_ts) > (70 * 60 * 1000):
-                df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
-        except Exception:
-            pass
+        if not SR_PRO_USE_COMMON_CACHE:
+            # refresh stale caches if last bar is too old
+            try:
+                now_ms = int(time.time() * 1000)
+                last_3m_ts = int(df_3m.iloc[-1]["ts"]) if not df_3m.empty else 0
+                last_15m_ts = int(df_15m.iloc[-1]["ts"]) if not df_15m.empty else 0
+                last_1h_ts = int(df_1h.iloc[-1]["ts"]) if not df_1h.empty else 0
+                if last_3m_ts and (now_ms - last_3m_ts) > (7 * 60 * 1000):
+                    df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
+                if last_15m_ts and (now_ms - last_15m_ts) > (25 * 60 * 1000):
+                    df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                if last_1h_ts and (now_ms - last_1h_ts) > (70 * 60 * 1000):
+                    df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+            except Exception:
+                pass
 
-        # refresh gaps inside series (missing bars)
-        try:
-            if _has_gap(df_3m, 3 * 60 * 1000):
-                df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
-                _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=3m")
-            if _has_gap(df_15m, 15 * 60 * 1000):
-                df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
-                _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=15m")
-            if _has_gap(df_1h, 60 * 60 * 1000):
-                df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
-                _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=1h")
-        except Exception:
-            pass
+            # refresh gaps inside series (missing bars)
+            try:
+                if _has_gap(df_3m, 3 * 60 * 1000):
+                    df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
+                    _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=3m")
+                if _has_gap(df_15m, 15 * 60 * 1000):
+                    df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                    _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=15m")
+                if _has_gap(df_1h, 60 * 60 * 1000):
+                    df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+                    _append_sr_pro_short_v1_log(f"SR_PRO_GAP_REFRESH sym={symbol} tf=1h")
+            except Exception:
+                pass
 
         df_1h_hist = df_1h.iloc[:-1]
         df_1h_sig = df_1h_hist
@@ -8244,6 +8251,18 @@ def _run_sr_pro_short_v1_cycle(
             if h1_close >= ema_now:
                 gate_stats["zone_touch"] += 1
                 continue
+        # Only accept zones touched by the latest confirmed 1h bar
+        for z in zones:
+            if not z.get("live", True):
+                z["_last_touch_ts"] = 0
+                continue
+            touched_now = (
+                z.get("side") == 1
+                and h1_high >= float(z.get("bot", 0.0))
+                and h1_low <= float(z.get("top", 0.0))
+                and h1_touch_px >= float(z.get("bot", 0.0))
+            )
+            z["_last_touch_ts"] = h1_ts if touched_now else 0
         resist_candidates = [
             z for z in zones
             if z.get("live", True)
@@ -8251,8 +8270,17 @@ def _run_sr_pro_short_v1_cycle(
             and dvf_norm <= float(cfg.dvf_norm_max)
             and h1_high >= float(z.get("bot", 0.0))
             and h1_low <= float(z.get("top", 0.0))
+            and z.get("_last_touch_ts") == h1_ts
         ]
         if not resist_candidates:
+            # Only treat touch as valid for the latest confirmed 1h bar.
+            # If current 1h does not touch, clear any prior touch/retest state.
+            sym_state["retest_active"] = False
+            sym_state["retest_level"] = 0.0
+            sym_state["retest_until"] = 0
+            sym_state["break_ts_ms"] = 0
+            sym_state["break_low_min"] = 0.0
+            sym_state["break_type"] = None
             gate_stats["zone_touch"] += 1
             continue
 
@@ -8713,9 +8741,14 @@ def _run_sr_pro_long_v1_cycle(
 
     for symbol in symbols:
         checked += 1
-        df_3m = _get_confirmed_df(symbol, tf_ltf, min_ltf_fetch)
-        df_15m = _get_confirmed_df(symbol, tf_mtf, min_mtf_fetch)
-        df_1h = _get_confirmed_df(symbol, tf_htf, min_htf_fetch)
+        if SR_PRO_USE_COMMON_CACHE:
+            df_3m = _load_common_warmup_ohlcv(symbol, tf_ltf, min_ltf_fetch) or pd.DataFrame()
+            df_15m = _load_common_warmup_ohlcv(symbol, tf_mtf, min_mtf_fetch) or pd.DataFrame()
+            df_1h = _load_common_warmup_ohlcv(symbol, tf_htf, min_htf_fetch) or pd.DataFrame()
+        else:
+            df_3m = _get_confirmed_df(symbol, tf_ltf, min_ltf_fetch)
+            df_15m = _get_confirmed_df(symbol, tf_mtf, min_mtf_fetch)
+            df_1h = _get_confirmed_df(symbol, tf_htf, min_htf_fetch)
         # If still not confirmed, skip this cycle for strict parity with backtest
         def _is_confirmed(df: pd.DataFrame, tf: str) -> bool:
             if df is None or df.empty:
@@ -8741,32 +8774,33 @@ def _run_sr_pro_long_v1_cycle(
         df_3m_sig = _confirmed_df(df_3m, tf_ltf)
         df_15m_sig = _confirmed_df(df_15m, tf_mtf)
         df_1h_hist = _confirmed_df(df_1h, tf_htf)
-        try:
-            now_ms = int(time.time() * 1000)
-            last_3m_ts = int(df_3m.iloc[-1]["ts"]) if not df_3m.empty else 0
-            last_15m_ts = int(df_15m.iloc[-1]["ts"]) if not df_15m.empty else 0
-            last_1h_ts = int(df_1h.iloc[-1]["ts"]) if not df_1h.empty else 0
-            if last_3m_ts and (now_ms - last_3m_ts) > (7 * 60 * 1000):
-                df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
-            if last_15m_ts and (now_ms - last_15m_ts) > (25 * 60 * 1000):
-                df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
-            if last_1h_ts and (now_ms - last_1h_ts) > (70 * 60 * 1000):
-                df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
-        except Exception:
-            pass
+        if not SR_PRO_USE_COMMON_CACHE:
+            try:
+                now_ms = int(time.time() * 1000)
+                last_3m_ts = int(df_3m.iloc[-1]["ts"]) if not df_3m.empty else 0
+                last_15m_ts = int(df_15m.iloc[-1]["ts"]) if not df_15m.empty else 0
+                last_1h_ts = int(df_1h.iloc[-1]["ts"]) if not df_1h.empty else 0
+                if last_3m_ts and (now_ms - last_3m_ts) > (7 * 60 * 1000):
+                    df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
+                if last_15m_ts and (now_ms - last_15m_ts) > (25 * 60 * 1000):
+                    df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                if last_1h_ts and (now_ms - last_1h_ts) > (70 * 60 * 1000):
+                    df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+            except Exception:
+                pass
 
-        try:
-            if _has_gap(df_3m, 3 * 60 * 1000):
-                df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
-                _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=3m")
-            if _has_gap(df_15m, 15 * 60 * 1000):
-                df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
-                _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=15m")
-            if _has_gap(df_1h, 60 * 60 * 1000):
-                df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
-                _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=1h")
-        except Exception:
-            pass
+            try:
+                if _has_gap(df_3m, 3 * 60 * 1000):
+                    df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
+                    _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=3m")
+                if _has_gap(df_15m, 15 * 60 * 1000):
+                    df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                    _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=15m")
+                if _has_gap(df_1h, 60 * 60 * 1000):
+                    df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+                    _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=1h")
+            except Exception:
+                pass
 
         if len(df_3m_sig) < min_ltf or len(df_15m_sig) < min_mtf or len(df_1h_hist) < min_htf:
             no_data += 1
@@ -8834,7 +8868,17 @@ def _run_sr_pro_long_v1_cycle(
             if h1_close <= ema_now:
                 gate_stats["zone_touch"] += 1
                 continue
-
+        # Only accept zones touched by the latest confirmed 1h bar
+        for z in zones:
+            if not z.get("live", True):
+                z["_last_touch_ts"] = 0
+                continue
+            touched_now = (
+                z.get("side") == -1
+                and h1_touch_px <= (z.get("mid") if touch_level == "mid" else z.get("top"))
+                and h1_high >= z.get("bot")
+            )
+            z["_last_touch_ts"] = h1_ts if touched_now else 0
         support_candidates = [
             z for z in zones
             if z.get("live", True)
@@ -8842,6 +8886,7 @@ def _run_sr_pro_long_v1_cycle(
             and dvf_norm >= float(cfg.dvf_norm_min)
             and h1_touch_px <= (z["mid"] if touch_level == "mid" else z["top"])
             and h1_high >= z["bot"]
+            and z.get("_last_touch_ts") == h1_ts
         ]
         if not support_candidates:
             gate_stats["zone_touch"] += 1

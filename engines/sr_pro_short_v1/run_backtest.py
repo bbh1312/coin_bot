@@ -54,6 +54,50 @@ def _fetch_ohlcv_all(
     if use_common_warmup and common_warmup_dir:
         fname = symbol.replace("/", "_").replace(":", "_")
         cached_path = os.path.join(common_warmup_dir, f"{fname}_{timeframe}.csv")
+        if not os.path.exists(cached_path):
+            # allow common_ohlcv_cache files with limit suffix (e.g. *_1h_480.csv)
+            # prefer the largest fresh cache (match live window), otherwise newest
+            try:
+                prefix = f"{fname}_{timeframe}_"
+                candidates = []
+                tf_ms = _tf_to_minutes(timeframe) * 60 * 1000
+                for name in os.listdir(common_warmup_dir):
+                    if not name.startswith(prefix) or not name.endswith(".csv"):
+                        continue
+                    full = os.path.join(common_warmup_dir, name)
+                    try:
+                        mtime = os.path.getmtime(full)
+                        lim = int(name[len(prefix):-4])
+                        # read last ts cheaply (last line)
+                        last_ts = 0
+                        with open(full, "rb") as fh:
+                            try:
+                                fh.seek(-2, os.SEEK_END)
+                                while fh.read(1) != b"\n":
+                                    fh.seek(-2, os.SEEK_CUR)
+                            except Exception:
+                                fh.seek(0)
+                            last_line = fh.readline().decode("utf-8").strip()
+                        if last_line:
+                            try:
+                                last_ts = int(float(last_line.split(",")[0]))
+                            except Exception:
+                                last_ts = 0
+                    except Exception:
+                        continue
+                    candidates.append((lim, last_ts, mtime, full))
+                if candidates:
+                    # prefer largest limit with fresh last_ts near end_ms
+                    fresh = [c for c in candidates if c[1] and c[1] >= (end_ms - max(tf_ms * 2, 1))]
+                    if fresh:
+                        fresh.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                        cached_path = fresh[0][3]
+                    else:
+                        # fallback to newest mtime
+                        candidates.sort(key=lambda x: x[2], reverse=True)
+                        cached_path = candidates[0][3]
+            except Exception:
+                pass
         if os.path.exists(cached_path):
             rows = _read_cached_csv(cached_path)
             return [r for r in rows if start_ms <= r[0] <= end_ms]
@@ -279,8 +323,15 @@ def run_backtest() -> None:
         print("[BACKTEST] rolling_zones requires total_window_days")
         return
 
-    use_common = bool(args.common_warmup_dir)
-    common_dir = args.common_warmup_dir or os.path.join("logs", "common_warmup", "ohlcv")
+    # Prefer live cycle cache for backtest parity when common-only/cache-only is used.
+    use_common = bool(args.common_warmup_dir) or args.common_only or args.cache_only
+    common_dir = args.common_warmup_dir
+    if not common_dir:
+        live_cache_dir = os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
+        if os.path.isdir(live_cache_dir) and os.listdir(live_cache_dir):
+            common_dir = live_cache_dir
+        else:
+            common_dir = os.path.join("logs", "common_warmup", "ohlcv")
     universe = load_common_universe(
         args.universe, exchange, args.cache_only, top_n=args.top_n
     )
@@ -817,6 +868,14 @@ def run_backtest() -> None:
                         f"dvf_norm={dvf_norm:.4f} zones_res={len(live_res)} zones_sup={len(live_sup)}"
                     )
             if not resist_candidates:
+                # Touch is only valid on the latest confirmed 1h bar.
+                # If current 1h does not touch, clear any prior touch/retest state.
+                retest_active = False
+                retest_level = 0.0
+                retest_until = -1
+                break_i3 = -1
+                break_low_min = 0.0
+                break_type = None
                 if args.log_gates:
                     gate_counts["zone_touch"] += 1
                 continue

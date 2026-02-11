@@ -29,7 +29,27 @@ def _read_disk_cache(symbol: str, tf: str, limit: int) -> Optional[list]:
         return None
     path = _disk_path(symbol, tf, limit)
     if not os.path.exists(path):
-        return None
+        # fallback: pick the most recently updated cache for same symbol/tf
+        try:
+            safe = _safe_symbol(symbol)
+            prefix = f"{safe}_{tf}_"
+            candidates = []
+            for name in os.listdir(DISK_CACHE_DIR):
+                if not name.startswith(prefix) or not name.endswith(".csv"):
+                    continue
+                full = os.path.join(DISK_CACHE_DIR, name)
+                try:
+                    mtime = os.path.getmtime(full)
+                except Exception:
+                    continue
+                candidates.append((mtime, full))
+            if candidates:
+                candidates.sort(reverse=True)
+                path = candidates[0][1]
+            else:
+                return None
+        except Exception:
+            return None
     try:
         df = pd.read_csv(path)
         if df.empty:
@@ -162,6 +182,30 @@ def get_df(symbol: str, tf: str, limit: int, force: bool = False) -> pd.DataFram
             set_raw(symbol, tf, raw)
     if not raw:
         return pd.DataFrame()
+    # If data is stale vs timeframe, try refresh from fetcher.
+    if FETCHER and raw:
+        try:
+            tf_ms_map = {
+                "1m": 60 * 1000,
+                "3m": 3 * 60 * 1000,
+                "5m": 5 * 60 * 1000,
+                "15m": 15 * 60 * 1000,
+                "1h": 60 * 60 * 1000,
+                "4h": 4 * 60 * 60 * 1000,
+                "1d": 24 * 60 * 60 * 1000,
+            }
+            tf_ms = tf_ms_map.get(tf, 0)
+            if tf_ms:
+                last_ts = int(raw[-1][0]) if raw else 0
+                now_ms = int(time.time() * 1000)
+                expected_last_open = (now_ms // tf_ms) * tf_ms
+                if last_ts and last_ts < (expected_last_open - tf_ms):
+                    fresh = FETCHER(symbol, tf, limit)
+                    if fresh:
+                        raw = fresh
+                        set_raw(symbol, tf, raw)
+        except Exception:
+            pass
     sliced = raw[-limit:] if len(raw) >= limit else raw
     df = pd.DataFrame(sliced, columns=["ts", "open", "high", "low", "close", "volume"])
     DF_CACHE[key] = df
