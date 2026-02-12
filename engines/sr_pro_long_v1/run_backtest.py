@@ -292,9 +292,9 @@ def run_backtest() -> None:
     parser.add_argument("--aggr-body-ratio-min", type=float, default=0.6)
     parser.add_argument("--aggr-close-atr-min", type=float, default=0.1)
     parser.add_argument("--aggr-entry-cap-atr", type=float, default=0.3)
-    parser.add_argument("--aggr-fast-fail-atr", type=float, default=0.15)
+    parser.add_argument("--aggr-fast-fail-atr", type=float, default=0.10)
     parser.add_argument("--aggr-tp-atr-mult", type=float, default=1.5)
-    parser.add_argument("--aggr-sl-atr-mult", type=float, default=1.0)
+    parser.add_argument("--aggr-sl-atr-mult", type=float, default=0.7)
     parser.add_argument("--retest-dyn", action="store_true")
     parser.add_argument("--retest-dyn-th", type=float, default=0.6)
     parser.add_argument("--retest-dyn-bars", type=int, default=10)
@@ -333,6 +333,24 @@ def run_backtest() -> None:
     parser.add_argument("--break-body-ratio-min", type=float, default=0.50)
     parser.add_argument("--break-close-atr-min", type=float, default=0.05)
     args = parser.parse_args()
+
+    def _count_cache_files(cache_dir: str) -> dict:
+        out = {"3m": 0, "15m": 0, "1h": 0}
+        if not cache_dir or not os.path.isdir(cache_dir):
+            return out
+        try:
+            for name in os.listdir(cache_dir):
+                if not name.endswith(".csv"):
+                    continue
+                if "_3m_" in name:
+                    out["3m"] += 1
+                elif "_15m_" in name:
+                    out["15m"] += 1
+                elif "_1h_" in name:
+                    out["1h"] += 1
+        except Exception:
+            pass
+        return out
 
     cfg = SrProLongV1Config(
         lookback=args.lookback,
@@ -384,13 +402,15 @@ def run_backtest() -> None:
     use_common = bool(args.use_live_cache or args.common_only or args.common_warmup_dir or args.cache_only)
     common_dir = args.common_warmup_dir
     if not common_dir:
-        live_cache_dir = os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
-        if os.path.isdir(live_cache_dir) and os.listdir(live_cache_dir):
-            common_dir = live_cache_dir
-        else:
-            common_dir = os.getenv("COMMON_WARMUP_CACHE_DIR", os.path.join("logs", "common_warmup", "ohlcv"))
-    if not common_dir:
-        common_dir = os.path.join("logs", "common_warmup", "ohlcv")
+        common_dir = os.getenv("COMMON_WARMUP_CACHE_DIR", os.path.join("logs", "common_warmup", "ohlcv"))
+    if use_common:
+        counts = _count_cache_files(common_dir)
+        print(
+            f"[BACKTEST] cache_source=common "
+            f"common_dir='{common_dir}' exists={os.path.isdir(common_dir)} "
+            f"files_3m={counts['3m']} files_15m={counts['15m']} files_1h={counts['1h']} "
+            f"cache_only={args.cache_only} common_only={args.common_only}"
+        )
     universe = load_common_universe(args.universe, exchange, args.cache_only, top_n=args.top_n)
     if not universe:
         print("[BACKTEST] no_universe")

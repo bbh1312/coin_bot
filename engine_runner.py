@@ -8485,7 +8485,7 @@ def _run_sr_pro_short_v1_cycle(
                                 "track": "aggr",
                                 "fast_fail_level": float(high_max),
                                 "fast_fail_atr": float(atr_now),
-                                "fast_fail_atr_mult": float(getattr(cfg, "aggr_fast_fail_atr", 0.15)),
+                                "fast_fail_atr_mult": float(getattr(cfg, "aggr_fast_fail_atr", 0.10)),
                             },
                         )
                         if req_id:

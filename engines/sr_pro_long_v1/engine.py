@@ -42,9 +42,9 @@ class SrProLongV1Config:
     aggr_body_ratio_min: float = 0.6
     aggr_close_atr_min: float = 0.1
     aggr_entry_cap_atr: float = 0.3
-    aggr_fast_fail_atr: float = 0.15
+    aggr_fast_fail_atr: float = 0.10
     aggr_tp_atr_mult: float = 1.5
-    aggr_sl_atr_mult: float = 1.0
+    aggr_sl_atr_mult: float = 0.7
     retest_dyn: bool = False
     retest_dyn_th: float = 0.6
     retest_dyn_bars: int = 10

@@ -19,8 +19,8 @@ class SrProShortV1Config:
     max_zones_per_side: int = 8
     touch_mode: str = "bot"
     touch_use_close: bool = False
-    dvf_norm_max: float = -0.05
-    dvf_norm_immediate: float = -0.20
+    dvf_norm_max: float = -0.10
+    dvf_norm_immediate: float = -0.25
     dvf_norm_diff_th: float = -0.03
     require_reject_close: bool = False
     reject_mode: str = "bot"
@@ -40,7 +40,7 @@ class SrProShortV1Config:
     retest_dyn_bars: int = 10
     shallow_atr_mult: float = 0.25
     shallow_wick_max: float = 0.35
-    shallow_dvf_max: float = 0.0
+    shallow_dvf_max: float = -0.05
     big_bear_body_mult: float = 1.2
     atr_filter_len: int = 20
     atr_filter_mult: float = 0.7
@@ -48,13 +48,13 @@ class SrProShortV1Config:
     ema120_15m_len: int = 120
     ema_slope_min: float = 0.001
     sl_buffer: float = 0.01
-    sl_atr_mult: float = 0.5
+    sl_atr_mult: float = 0.4
     sl_cap_pct: float = 0.02
     sl_cap_atr_mult: float = 0.6
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 0.98
-    tp_mult_weak: float = 0.98
+    tp_mult: float = 0.99
+    tp_mult_weak: float = 0.99
     dvf_confirm_bars: int = 1
 
 

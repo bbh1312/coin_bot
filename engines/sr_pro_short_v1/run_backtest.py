@@ -292,6 +292,24 @@ def run_backtest() -> None:
     if args.verbose:
         args.log_gates = True
 
+    def _count_cache_files(cache_dir: str) -> dict:
+        out = {"3m": 0, "15m": 0, "1h": 0}
+        if not cache_dir or not os.path.isdir(cache_dir):
+            return out
+        try:
+            for name in os.listdir(cache_dir):
+                if not name.endswith(".csv"):
+                    continue
+                if "_3m_" in name:
+                    out["3m"] += 1
+                elif "_15m_" in name:
+                    out["15m"] += 1
+                elif "_1h_" in name:
+                    out["1h"] += 1
+        except Exception:
+            pass
+        return out
+
     cfg = SrProShortV1Config(
         lookback=args.lookback,
         relaxed_lookback=args.relaxed_lookback,
@@ -335,11 +353,15 @@ def run_backtest() -> None:
     use_common = bool(args.common_warmup_dir) or args.common_only or args.cache_only
     common_dir = args.common_warmup_dir
     if not common_dir:
-        live_cache_dir = os.getenv("COMMON_OHLCV_CACHE_DIR", os.path.join("logs", "common_ohlcv_cache"))
-        if os.path.isdir(live_cache_dir) and os.listdir(live_cache_dir):
-            common_dir = live_cache_dir
-        else:
-            common_dir = os.path.join("logs", "common_warmup", "ohlcv")
+        common_dir = os.getenv("COMMON_WARMUP_CACHE_DIR", os.path.join("logs", "common_warmup", "ohlcv"))
+    if use_common:
+        counts = _count_cache_files(common_dir)
+        print(
+            f"[BACKTEST] cache_source=common "
+            f"common_dir='{common_dir}' exists={os.path.isdir(common_dir)} "
+            f"files_3m={counts['3m']} files_15m={counts['15m']} files_1h={counts['1h']} "
+            f"cache_only={args.cache_only} common_only={args.common_only}"
+        )
     universe = load_common_universe(
         args.universe, exchange, args.cache_only, top_n=args.top_n
     )
