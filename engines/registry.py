@@ -5,11 +5,13 @@ from typing import Dict, Type
 from engines.base import BaseEngine
 from engines.sr_pro_long_v1.engine import SrProLongV1Engine
 from engines.sr_pro_short_v1.engine import SrProShortV1Engine
+from engines.sr_pro_short_v2.engine import SrProShortV2Engine
 
 
 _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
     "sr_pro_long_v1": SrProLongV1Engine,
     "sr_pro_short_v1": SrProShortV1Engine,
+    "sr_pro_short_v2": SrProShortV2Engine,
 }
 
 

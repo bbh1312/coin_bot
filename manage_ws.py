@@ -1159,14 +1159,21 @@ def _handle_long_sl(state, symbol, detail, mark_px, now_ts) -> bool:
     open_tr = er._get_open_trade(state, "LONG", symbol)
     engine_label = _trade_engine_label(open_tr)
     sl_price_meta = None
+    sl_order_id = None
     if isinstance(open_tr, dict):
         meta = open_tr.get("meta")
         if isinstance(meta, dict):
             sl_price_meta = meta.get("sl_price")
             if isinstance(sl_price_meta, (int, float)):
                 sl_price_meta = float(sl_price_meta)
+            soid = meta.get("sl_order_id")
+            if isinstance(soid, str) and soid:
+                sl_order_id = soid
+    if engine_label == "SR_PRO_LONG_V1" and sl_order_id:
+        return False
     if isinstance(sl_price_meta, (int, float)):
-        if float(mark_px) < float(sl_price_meta):
+        # LONG SL should trigger only when mark <= sl_price.
+        if float(mark_px) > float(sl_price_meta):
             return False
     else:
         _, sl_pct = er._get_engine_exit_thresholds(engine_label, "LONG")

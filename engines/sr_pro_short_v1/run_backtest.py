@@ -221,7 +221,7 @@ def run_backtest() -> None:
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--universe", type=str, default="common")
     parser.add_argument("--use-confirmed", action="store_true")
-    parser.add_argument("--index-mode", type=str, default="auto", choices=["auto", "ts", "decision"])
+    parser.add_argument("--index-mode", type=str, default="ts", choices=["auto", "ts", "decision"])
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
     parser.add_argument("--common-warmup-dir", type=str, default="")
@@ -236,6 +236,8 @@ def run_backtest() -> None:
     parser.add_argument("--max-zones-per-side", type=int, default=8)
     parser.add_argument("--touch-mode", type=str, default="bot", choices=["bot", "mid"])
     parser.add_argument("--touch-use-close", action="store_true")
+    parser.add_argument("--enable-boundary-guard", action="store_true")
+    parser.add_argument("--enable-hourly-boundary-guard", action="store_true")
     parser.add_argument("--dvf-norm-max", type=float, default=-0.05)
     parser.add_argument("--dvf-norm-immediate", type=float, default=-0.25)
     parser.add_argument("--dvf-norm-diff-th", type=float, default=-0.03)
@@ -517,6 +519,7 @@ def run_backtest() -> None:
         "hold_strong_sum": 0.0,
         "hold_weak_sum": 0.0,
         "time_block": 0,
+        "boundary_block": 0,
         "skip_stale_ts": 0,
         "ltf_sr_bias_block": 0,
     }
@@ -744,6 +747,16 @@ def run_backtest() -> None:
                     if args.log_gates:
                         gate_counts["time_block"] += 1
                     continue
+            # block exact 15m boundary bars to reduce boundary-index sensitivity
+            minute_of_hour = int((ts // 60000) % 60)
+            if args.enable_boundary_guard and (minute_of_hour % 15 == 0):
+                if args.log_gates:
+                    gate_counts["boundary_block"] += 1
+                continue
+            if args.enable_hourly_boundary_guard and (minute_of_hour == 0):
+                if args.log_gates:
+                    gate_counts["boundary_block"] += 1
+                continue
 
             # i3 bar is confirmed when the next 3m bar opens.
             decision_ts = ts + _tf_ms(cfg.tf_ltf)
@@ -1598,12 +1611,14 @@ def run_backtest() -> None:
             f"retest_fail_no_touch={gate_counts['retest_fail_no_touch']} "
             f"entry_by_dvf_accel={gate_counts['entry_by_dvf_accel']} "
             f"entry_by_dvf_slope={gate_counts['entry_by_dvf_slope']} "
+            f"entry_by_big_bear={gate_counts['entry_by_big_bear']} "
             f"entry_by_timeout={gate_counts['entry_by_timeout']} "
             f"entry_by_pass_close={gate_counts['entry_by_pass_close']} "
             f"entry_by_pass_low={gate_counts['entry_by_pass_low']} "
             f"reject_pass_1h={gate_counts['reject_pass_1h']} "
             f"reject_pass_15m={gate_counts['reject_pass_15m']} "
             f"skip_stale_ts={gate_counts['skip_stale_ts']} "
+            f"boundary_block={gate_counts['boundary_block']} "
             f"ema200_pass={gate_counts['ema200_pass']} "
             f"entries_strong={gate_counts['entries_strong']} "
             f"entries_weak={gate_counts['entries_weak']} "
