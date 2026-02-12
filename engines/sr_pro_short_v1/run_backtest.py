@@ -221,6 +221,7 @@ def run_backtest() -> None:
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--universe", type=str, default="common")
     parser.add_argument("--use-confirmed", action="store_true")
+    parser.add_argument("--index-mode", type=str, default="auto", choices=["auto", "ts", "decision"])
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
     parser.add_argument("--common-warmup-dir", type=str, default="")
@@ -293,6 +294,25 @@ def run_backtest() -> None:
         args.verbose = True
     if args.verbose:
         args.log_gates = True
+
+    def _tf_ms(tf: str) -> int:
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1]) * 60 * 1000
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 60 * 60 * 1000
+            if tf.endswith("d"):
+                return int(tf[:-1]) * 24 * 60 * 60 * 1000
+        except Exception:
+            pass
+        return 60 * 1000
+
+    def _use_decision_index() -> bool:
+        if args.index_mode == "decision":
+            return True
+        if args.index_mode == "ts":
+            return False
+        return bool(args.use_confirmed)
 
     def _count_cache_files(cache_dir: str) -> dict:
         out = {"3m": 0, "15m": 0, "1h": 0}
@@ -588,9 +608,19 @@ def run_backtest() -> None:
         df_15m = frames["15m"]
         df_1h = frames["1h"]
         if args.use_confirmed:
-            df_3m = df_3m.iloc[:-1]
-            df_15m = df_15m.iloc[:-1]
-            df_1h = df_1h.iloc[:-1]
+            # Align with live: only trim the tail bar when it is still forming.
+            for tf_name, df_cur in (("3m", df_3m), ("15m", df_15m), ("1h", df_1h)):
+                if df_cur.empty:
+                    continue
+                tf_ms = _tf_ms(tf_name)
+                last_ts = int(df_cur.iloc[-1]["ts"])
+                if last_ts and (end_ms - last_ts) < tf_ms:
+                    if tf_name == "3m":
+                        df_3m = df_cur.iloc[:-1]
+                    elif tf_name == "15m":
+                        df_15m = df_cur.iloc[:-1]
+                    else:
+                        df_1h = df_cur.iloc[:-1]
 
         if len(df_3m) < 10 or len(df_15m) < 5 or len(df_1h) < (cfg.lookback * 2 + 5):
             continue
@@ -715,8 +745,12 @@ def run_backtest() -> None:
                         gate_counts["time_block"] += 1
                     continue
 
-            # resolve current 1h bar index
-            idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
+            # i3 bar is confirmed when the next 3m bar opens.
+            decision_ts = ts + _tf_ms(cfg.tf_ltf)
+            if _use_decision_index():
+                idx_1h = int(np.searchsorted(ts_1h, decision_ts - _tf_ms(cfg.tf_htf), side="right") - 1)
+            else:
+                idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
             if idx_1h < 0:
                 continue
 
@@ -896,7 +930,10 @@ def run_backtest() -> None:
                     if resist_candidates and args.log_gates:
                         gate_counts["reject_pass_1h"] += 1
                 else:
-                    idx_15m_rej = int(np.searchsorted(ts_15m, ts, side="right") - 1)
+                    if _use_decision_index():
+                        idx_15m_rej = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(cfg.tf_mtf), side="right") - 1)
+                    else:
+                        idx_15m_rej = int(np.searchsorted(ts_15m, ts, side="right") - 1)
                     if idx_15m_rej >= 0:
                         close_15m = float(df_15m.at[idx_15m_rej, "close"])
                         resist_candidates = [
@@ -937,7 +974,10 @@ def run_backtest() -> None:
                 continue
 
             # 15m bearish + close below EMA20
-            idx_15m = int(np.searchsorted(ts_15m, ts, side="right") - 1)
+            if _use_decision_index():
+                idx_15m = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(cfg.tf_mtf), side="right") - 1)
+            else:
+                idx_15m = int(np.searchsorted(ts_15m, ts, side="right") - 1)
             if idx_15m < 2:
                 continue
             h15_0 = float(df_15m.at[idx_15m, "high"])

@@ -935,11 +935,18 @@ def get_short_position_detail(symbol: str) -> dict:
 
     entry = info.get("entryPrice") or info.get("avgPrice") or p.get("entryPrice")
     mark = info.get("markPrice") or p.get("markPrice")
+    liq_price = (
+        info.get("liquidationPrice")
+        or info.get("liqPrice")
+        or p.get("liquidationPrice")
+        or p.get("liqPrice")
+    )
     lev = info.get("leverage") or p.get("leverage") or DEFAULT_LEVERAGE
     qty = _position_size_abs(p)
 
     try:
         entry = float(entry); mark = float(mark); lev = float(lev); qty = float(qty)
+        liq_price = float(liq_price) if liq_price not in (None, "", 0, "0") else None
     except Exception:
         return {}
 
@@ -954,6 +961,7 @@ def get_short_position_detail(symbol: str) -> dict:
     return {
         "entry": entry,
         "mark": mark,
+        "liq_price": liq_price,
         "leverage": lev,
         "qty": qty,
         "notional": notional,
@@ -971,11 +979,18 @@ def get_long_position_detail(symbol: str) -> dict:
 
     entry = info.get("entryPrice") or info.get("avgPrice") or p.get("entryPrice")
     mark = info.get("markPrice") or p.get("markPrice")
+    liq_price = (
+        info.get("liquidationPrice")
+        or info.get("liqPrice")
+        or p.get("liquidationPrice")
+        or p.get("liqPrice")
+    )
     lev = info.get("leverage") or p.get("leverage") or DEFAULT_LEVERAGE
     qty = _position_size_abs(p)
 
     try:
         entry = float(entry); mark = float(mark); lev = float(lev); qty = float(qty)
+        liq_price = float(liq_price) if liq_price not in (None, "", 0, "0") else None
     except Exception:
         return {}
 
@@ -990,6 +1005,7 @@ def get_long_position_detail(symbol: str) -> dict:
     return {
         "entry": entry,
         "mark": mark,
+        "liq_price": liq_price,
         "leverage": lev,
         "qty": qty,
         "notional": notional,

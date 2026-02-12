@@ -62,6 +62,7 @@ _FOLLOWER_POS_CACHE = {"ts": 0.0, "items": [], "groups": {}}
 _FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "10"))
 _PNL_CACHE = {"ts": 0.0, "payload": None}
 _PNL_TTL_SEC = float(os.getenv("WEB_PNL_TTL_SEC", "20"))
+_ASSET_DASHBOARD_CACHE_ONLY = os.getenv("ASSET_DASHBOARD_CACHE_ONLY", "1") not in ("0", "false", "off", "no")
 _LIVE_SYNC_COOLDOWN_SEC = float(os.getenv("WEB_LIVE_SYNC_COOLDOWN_SEC", "20"))
 _LIVE_SYNC_SCOPES = ("positions", "asset_dashboard")
 _LIVE_SYNC_LAST_TS_BY_SCOPE = {k: 0.0 for k in _LIVE_SYNC_SCOPES}
@@ -383,7 +384,8 @@ def follower_positions():
 @app.route("/asset_dashboard")
 def asset_dashboard():
     force_req, force_live_sync, live_sync_wait_sec = _resolve_live_sync_request("asset_dashboard")
-    pnl_payload = _build_pnl_payload(force=force_live_sync)
+    cache_only = bool(_ASSET_DASHBOARD_CACHE_ONLY and (not force_live_sync))
+    pnl_payload = _build_pnl_payload(force=force_live_sync, cache_only=cache_only)
     notice = request.args.get("notice")
     if force_req and not force_live_sync:
         msg = f"Live Sync 쿨다운 중: {live_sync_wait_sec:.1f}s 후 재시도"
@@ -745,6 +747,7 @@ def _build_follower_positions(force: bool = False) -> tuple[list[dict], dict]:
                 "notional": notional,
                 "pnl": None,
                 "roi": None,
+                "liq_price": None,
                 "leverage": tr.get("leverage"),
                 "group": "admin" if str(acct_ctx.name) == "admin" else "followers",
             }
@@ -781,6 +784,7 @@ def _build_follower_positions(force: bool = False) -> tuple[list[dict], dict]:
                         "notional": detail.get("notional"),
                         "pnl": detail.get("pnl"),
                         "roi": detail.get("roi"),
+                        "liq_price": detail.get("liq_price"),
                         "leverage": detail.get("leverage"),
                         "group": "admin" if str(acct.name) == "admin" else "followers",
                     }
@@ -800,6 +804,7 @@ def _build_follower_positions(force: bool = False) -> tuple[list[dict], dict]:
                         "notional": detail.get("notional"),
                         "pnl": detail.get("pnl"),
                         "roi": detail.get("roi"),
+                        "liq_price": detail.get("liq_price"),
                         "leverage": detail.get("leverage"),
                         "group": "admin" if str(acct.name) == "admin" else "followers",
                     }
@@ -1150,9 +1155,15 @@ def _fetch_realized_pnl_since(ex, since_ts: float) -> tuple[float | None, int, s
     return _fetch_realized_pnl_range(ex, since_ts, None)
 
 
-def _build_pnl_payload(force: bool = False) -> dict:
+def _build_pnl_payload(force: bool = False, cache_only: bool = False) -> dict:
     now = time.time()
     cached = _PNL_CACHE
+    if cache_only:
+        payload = cached.get("payload") or {}
+        if payload:
+            payload["cached"] = True
+            payload["cache_only"] = True
+            return payload
     if not force and _PNL_TTL_SEC > 0 and (now - float(cached.get("ts") or 0.0)) <= _PNL_TTL_SEC:
         payload = cached.get("payload") or {}
         payload["cached"] = True

@@ -70,28 +70,8 @@ from executor import AccountExecutor
 from env_loader import load_env
 try:
     from engines.base import EngineContext
-    try:
-        from engines.swaggy.swaggy_engine import SwaggyEngine, SwaggyConfig
-        from engines.swaggy.logs import format_cut_top, format_zone_stats
-    except Exception:
-        SwaggyEngine = None
-        SwaggyConfig = None
-        format_cut_top = None
-        format_zone_stats = None
-    from engines.atlas.atlas_engine import AtlasEngine, AtlasSwaggyConfig
-    from engines.rsi.engine import RsiEngine
     from engines.universe import build_universe_from_tickers
     from engines.sr_pro_common import build_sr_zones
-    try:
-        from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
-        from engines.atlas_rs_fail_short.config import AtlasRsFailShortConfig
-    except Exception:
-        AtlasRsFailShortEngine = None
-        AtlasRsFailShortConfig = None
-    from engines.top_fail_short_v1.engine import (
-        TopFailShortV1Config,
-        top_fail_short_entry_signal,
-    )
     from engines.sr_pro_short_v1.engine import SrProShortV1Config
     from engines.sr_pro_long_v1.engine import SrProLongV1Config
     BullPullbackLongConfig = None
@@ -116,6 +96,18 @@ except Exception as _import_err:
         print(f"[import-error] { _IMPORT_ERROR }")
     except Exception:
         pass
+
+SwaggyEngine = None
+SwaggyConfig = None
+format_cut_top = None
+format_zone_stats = None
+AtlasEngine = None
+AtlasSwaggyConfig = None
+RsiEngine = None
+AtlasRsFailShortEngine = None
+AtlasRsFailShortConfig = None
+TopFailShortV1Config = None
+top_fail_short_entry_signal = None
 
 if "SwaggyAtlasLabEngine" not in globals():
     SwaggyAtlasLabEngine = None
@@ -1078,13 +1070,13 @@ ADV_TREND_PULLBACK_RSI_SHORT = float(os.getenv("ADV_TREND_PULLBACK_RSI_SHORT", "
 ADV_TREND_PULLBACK_WAIT_BARS = int(os.getenv("ADV_TREND_PULLBACK_WAIT_BARS", "4"))
 ADV_TREND_PULLBACK_PIVOT = int(os.getenv("ADV_TREND_PULLBACK_PIVOT", "3"))
 
-ANTI_ALPHA_V1_ENABLED = os.getenv("ANTI_ALPHA_V1_ENABLED", "0") == "1"
+ANTI_ALPHA_V1_ENABLED = False
 NOISE_REVERSE_V1_ENABLED = False
-TOP_FAIL_SHORT_V1_ENABLED = os.getenv("TOP_FAIL_SHORT_V1_ENABLED", "0") == "1"
+TOP_FAIL_SHORT_V1_ENABLED = False
 TOP_FAIL_SHORT_USE_CONFIRMED = True
 SR_PRO_SHORT_V1_ENABLED = os.getenv("SR_PRO_SHORT_V1_ENABLED", "0") == "1"
 SR_PRO_LONG_V1_ENABLED = os.getenv("SR_PRO_LONG_V1_ENABLED", "0") == "1"
-SRP_ST_REGIME_PULLBACK_V1_ENABLED = os.getenv("SRP_ST_REGIME_PULLBACK_V1_ENABLED", "0") == "1"
+SRP_ST_REGIME_PULLBACK_V1_ENABLED = False
 ST_FLIP_V1_ENABLED = False
 BULL_PULLBACK_LONG_V1_ENABLED = False
 # Backtest-baseline params (kept identical to backtest)
@@ -1145,12 +1137,12 @@ SWAGGY_ATLAS_LAB_OFF_WINDOWS = os.getenv("SWAGGY_ATLAS_LAB_OFF_WINDOWS", "").str
 SWAGGY_NO_ATLAS_OFF_WINDOWS = os.getenv("SWAGGY_NO_ATLAS_OFF_WINDOWS", "").strip()
 SWAGGY_D1_OVEREXT_ATR_MULT = 1.2
 SATURDAY_TRADE_ENABLED = str(os.getenv("SATURDAY_TRADE_ENABLED", "1")).strip().lower() not in ("0", "false", "off", "no")
-DTFX_ENABLED = True
+DTFX_ENABLED = False
 ATLAS_RS_FAIL_SHORT_ENABLED = False
 DIV15M_LONG_ENABLED = False
 DIV15M_SHORT_ENABLED = False
 ONLY_DIV15M_SHORT = False
-RSI_ENABLED = True
+RSI_ENABLED = False
 MANAGE_EXIT_COOLDOWN_SEC: int = 5
 MANAGE_PING_COOLDOWN_SEC: int = 7200
 MANAGE_EVAL_COOLDOWN_SEC: int = 3
@@ -1375,6 +1367,7 @@ NOISE_REVERSE_FILE_CACHE_MISS: dict = {}
 NOISE_REVERSE_FILE_CACHE_FAIL: dict = {}
 NOISE_REVERSE_SOURCE_LOGGED: dict = {}
 SR_PRO_USE_COMMON_CACHE = os.getenv("SR_PRO_USE_COMMON_CACHE", "1") not in ("0", "false", "off", "no")
+SR_PRO_LONG_DEBUG_NEAREST = os.getenv("SR_PRO_LONG_DEBUG_NEAREST", "0") in ("1", "true", "on", "yes")
 
 def _common_warmup_cache_dir() -> str:
     base = COMMON_WARMUP_CACHE_DIR or os.path.join("logs", "common_warmup", "ohlcv")
@@ -3841,6 +3834,20 @@ def _run_swaggy_no_atlas_cycle(
                 time.sleep(PER_SYMBOL_SLEEP)
                 continue
         if in_pos_same:
+            open_tr_same = _get_open_trade(state, side, symbol)
+            open_engine_same = _engine_label_from_reason(
+                (open_tr_same.get("meta") or {}).get("reason")
+            ) if isinstance(open_tr_same, dict) else ""
+            # SWAGGY_NO_ATLAS should not manage/close positions opened by other engines.
+            if open_engine_same and open_engine_same != "SWAGGY_NO_ATLAS":
+                if isinstance(st.get("_no_atlas_weak"), dict):
+                    st.pop("_no_atlas_weak", None)
+                    state[symbol] = st
+                _append_swaggy_no_atlas_log(
+                    f"SWAGGY_NO_ATLAS_SKIP sym={symbol} reason=FOREIGN_ENGINE_IN_POS engine={open_engine_same} side={side}"
+                )
+                time.sleep(PER_SYMBOL_SLEEP)
+                continue
             weak_ctx = st.get("_no_atlas_weak")
             if isinstance(weak_ctx, dict) and str(weak_ctx.get("side") or "").upper() == side:
                 confirm_fail = ""
@@ -6665,41 +6672,26 @@ def _display_engine_label(label: Optional[str]) -> str:
 
 def _is_engine_enabled(engine: str) -> bool:
     key = (engine or "").upper()
-    if key in ("SWAGGY_ATLAS_LAB", "SWAGGY", "SWAGGY_NO_ATLAS"):
-        if key == "SWAGGY_ATLAS_LAB":
-            return SWAGGY_ATLAS_LAB_ENABLED
-        if key == "SWAGGY_NO_ATLAS":
-            return SWAGGY_NO_ATLAS_ENABLED
-        return SWAGGY_ENABLED
-    if key == "LOSS_HEDGE_ENGINE":
-        return LOSS_HEDGE_ENGINE_ENABLED
-    if key == "DTFX":
-        return DTFX_ENABLED
-    if key == "ATLAS_RS_FAIL_SHORT":
-        return ATLAS_RS_FAIL_SHORT_ENABLED
-    if key == "ADVANCED_TREND_FOLLOWER":
-        return ADV_TREND_ENABLED
-    if key == "ANTI_ALPHA_V1":
-        return ANTI_ALPHA_V1_ENABLED
-    if key == "NOISE_REVERSE_V1":
-        return NOISE_REVERSE_V1_ENABLED
-    if key == "SRP_ST_REGIME_PULLBACK_V1":
-        return SRP_ST_REGIME_PULLBACK_V1_ENABLED
-    if key == "ST_FLIP_V1":
-        return ST_FLIP_V1_ENABLED
-    if key == "TOP_FAIL_SHORT_V1":
-        return TOP_FAIL_SHORT_V1_ENABLED
     if key == "SR_PRO_SHORT_V1":
         return SR_PRO_SHORT_V1_ENABLED
     if key == "SR_PRO_LONG_V1":
         return SR_PRO_LONG_V1_ENABLED
-    if key == "BULL_PULLBACK_LONG_V1":
-        return BULL_PULLBACK_LONG_V1_ENABLED
-    if key in ("RSI", "SCALP"):
-        return RSI_ENABLED
-    if key in ("MANUAL", "UNKNOWN", ""):
+    if key in ("MANUAL", "MANUAL_ADMIN", "관리자수동진입", "UNKNOWN", ""):
         return True
-    return True
+    return False
+
+
+def _is_runtime_managed_engine(engine: Optional[str]) -> bool:
+    key = (engine or "").upper()
+    return key in (
+        "SR_PRO_SHORT_V1",
+        "SR_PRO_LONG_V1",
+        "MANUAL",
+        "MANUAL_ADMIN",
+        "관리자수동진입",
+        "UNKNOWN",
+        "",
+    )
 
 def _normalize_engine_key(engine: str) -> str:
     return (engine or "").strip().upper()
@@ -8149,6 +8141,26 @@ def _run_sr_pro_short_v1_cycle(
             return float(diffs.max()) > (tf_ms * mult)
         except Exception:
             return False
+    def _tf_ms(tf: str) -> int:
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1]) * 60 * 1000
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 60 * 60 * 1000
+            if tf.endswith("d"):
+                return int(tf[:-1]) * 24 * 60 * 60 * 1000
+        except Exception:
+            pass
+        return 60 * 1000
+    def _confirmed_df(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        tf_ms = _tf_ms(tf)
+        now_ms = int(time.time() * 1000)
+        last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns else 0
+        if last_ts and (now_ms - last_ts) < tf_ms:
+            return df.iloc[:-1]
+        return df
     for symbol in symbols:
         if symbol in {"BTC/USDT:USDT", "BTC/USDT"}:
             continue
@@ -8177,8 +8189,6 @@ def _run_sr_pro_short_v1_cycle(
                 gate_stats["no_data_htf"] += 1
             continue
 
-        df_3m_sig = df_3m.iloc[:-1]
-        df_15m_sig = df_15m.iloc[:-1]
         if not SR_PRO_USE_COMMON_CACHE:
             # refresh stale caches if last bar is too old
             try:
@@ -8209,7 +8219,9 @@ def _run_sr_pro_short_v1_cycle(
             except Exception:
                 pass
 
-        df_1h_hist = df_1h.iloc[:-1]
+        df_3m_sig = _confirmed_df(df_3m, tf_ltf)
+        df_15m_sig = _confirmed_df(df_15m, tf_mtf)
+        df_1h_hist = _confirmed_df(df_1h, tf_htf)
         df_1h_sig = df_1h_hist
         if len(df_3m_sig) < min_ltf or len(df_15m_sig) < min_mtf or len(df_1h_hist) < min_htf:
             no_data += 1
@@ -8222,7 +8234,8 @@ def _run_sr_pro_short_v1_cycle(
             continue
 
         sym_state = sr_state.setdefault(symbol, {})
-        latest_ts_ms = int(df_3m.iloc[-1]["ts"])
+        # stale check should use latest confirmed 3m candle ts
+        latest_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
         if sym_state.get("last_eval_ts") == latest_ts_ms:
             gate_stats["skip_stale_ts"] += 1
             continue
@@ -8238,11 +8251,10 @@ def _run_sr_pro_short_v1_cycle(
 
         # refresh zones if new 1h bar
         last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
-        if sym_state.get("zones_ts") != last_1h_hist_ts:
-            zones = build_sr_zones(df_1h_hist, cfg, window_bars=window_bars_1h)
-            sym_state["zones"] = zones
-            sym_state["zones_ts"] = last_1h_hist_ts
-        zones = sym_state.get("zones") or []
+        # Rebuild 1h zones every cycle to avoid state drift and improve backtest parity.
+        zones = build_sr_zones(df_1h_hist, cfg, window_bars=window_bars_1h)
+        sym_state["zones"] = zones
+        sym_state["zones_ts"] = last_1h_hist_ts
 
         # current 1h bar (confirmed, match backtest)
         h1 = df_1h_sig.iloc[-1]
@@ -9038,11 +9050,10 @@ def _run_sr_pro_long_v1_cycle(
             continue
 
         last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
-        if sym_state.get("zones_ts") != last_1h_hist_ts:
-            zones = build_sr_zones(df_1h_hist, cfg, window_bars=window_bars_1h)
-            sym_state["zones"] = zones
-            sym_state["zones_ts"] = last_1h_hist_ts
-        zones = sym_state.get("zones") or []
+        # Rebuild 1h zones every 3m cycle to keep live behavior aligned with backtest replay.
+        zones = build_sr_zones(df_1h_hist, cfg, window_bars=window_bars_1h)
+        sym_state["zones"] = zones
+        sym_state["zones_ts"] = last_1h_hist_ts
 
         h1 = df_1h_hist.iloc[-1]
         h1_ts = int(h1["ts"]) if "ts" in h1 else 0
@@ -9195,6 +9206,17 @@ def _run_sr_pro_long_v1_cycle(
                 entry_px = float(entry_target)
                 nearest = min(support_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 if not (c3 >= nearest["mid"] or entry_px >= nearest["top"] - (atr_now * 0.2)):
+                    if SR_PRO_LONG_DEBUG_NEAREST:
+                        try:
+                            _append_sr_pro_long_v1_log(
+                                "SR_PRO_LONG_NEAREST_FAIL "
+                                f"sym={symbol} ts={_iso_kst(now_ts_ms/1000) if now_ts_ms else 'NA'} "
+                                f"close_3m={c3:.6f} entry={entry_px:.6f} "
+                                f"zone_mid={float(nearest['mid']):.6f} zone_top={float(nearest['top']):.6f} zone_bot={float(nearest['bot']):.6f} "
+                                f"atr3={atr_now:.6f} cond_rhs={(float(nearest['top']) - (atr_now * 0.2)):.6f}"
+                            )
+                        except Exception:
+                            pass
                     sym_state["retest_active"] = True
                     continue
                 sl_raw = nearest["bot"] - (atr_now * float(cfg.sl_atr_mult))
@@ -10618,18 +10640,8 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             continue
         engine = str(req.get("engine") or "").upper()
         allowed_engines = {
-            "SWAGGY_ATLAS_LAB",
-            "SWAGGY_NO_ATLAS",
-            "ATLAS_RS_FAIL_SHORT",
-            "DTFX",
-            "RSI",
-            "ANTI_ALPHA_V1",
-            "NOISE_REVERSE_V1",
-            "TOP_FAIL_SHORT_V1",
             "SR_PRO_SHORT_V1",
             "SR_PRO_LONG_V1",
-            "ST_FLIP_V1",
-            "BULL_PULLBACK_LONG_V1",
             "MANUAL",
             "UNKNOWN",
         }
@@ -11357,6 +11369,14 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
         pass
     if side == "LONG" and str(req.get("engine") or "").upper() == "SR_PRO_LONG_V1":
         sl_price_meta = meta.get("sl_price") if isinstance(meta, dict) else None
+        try:
+            st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+            if not isinstance(st, dict):
+                st = {}
+            st.pop("_srp_long_sl_order_id", None)
+            state[symbol] = st
+        except Exception:
+            pass
         if not isinstance(sl_price_meta, (int, float)) or sl_price_meta <= 0:
             _append_entry_gate_log(
                 "sr_pro_long_v1",
@@ -11386,10 +11406,28 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
                     st["_srp_long_sl_price"] = float(sl_price_meta)
                     state[symbol] = st
                 else:
+                    sl_order_id = _order_id_from_res(res_sl) if isinstance(res_sl, dict) else None
+                    if isinstance(sl_order_id, str) and sl_order_id:
+                        try:
+                            meta["sl_order_id"] = sl_order_id
+                            open_tr = _get_open_trade(state, "LONG", symbol)
+                            if isinstance(open_tr, dict):
+                                open_meta = open_tr.get("meta") if isinstance(open_tr.get("meta"), dict) else {}
+                                if not isinstance(open_meta, dict):
+                                    open_meta = {}
+                                open_meta["sl_order_id"] = sl_order_id
+                                open_tr["meta"] = open_meta
+                            st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+                            if not isinstance(st, dict):
+                                st = {}
+                            st["_srp_long_sl_order_id"] = sl_order_id
+                            state[symbol] = st
+                        except Exception:
+                            pass
                     _append_entry_gate_log(
                         "sr_pro_long_v1",
                         symbol,
-                        f"sl_place_ok sl_price={sl_price_meta}",
+                        f"sl_place_ok sl_price={sl_price_meta} sl_order_id={sl_order_id}",
                         side="LONG",
                     )
             except Exception as e:
@@ -12020,6 +12058,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         engine_label = _engine_label_from_reason(
             (open_tr.get("meta") or {}).get("reason") if open_tr else None
         )
+        if not _is_runtime_managed_engine(engine_label):
+            continue
         if engine_label == "ADVANCED_TREND_FOLLOWER":
             continue
 
@@ -12269,13 +12309,25 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     try:
                         res_sl = place_long_sl_px(sym, float(pending_sl), qty=amt)
                         if isinstance(res_sl, dict) and res_sl.get("status") == "ok":
+                            sl_order_id = _order_id_from_res(res_sl)
+                            try:
+                                open_tr_cur = _get_open_trade(state, "LONG", sym)
+                                if isinstance(open_tr_cur, dict):
+                                    open_meta = open_tr_cur.get("meta") if isinstance(open_tr_cur.get("meta"), dict) else {}
+                                    if isinstance(open_meta, dict):
+                                        if isinstance(sl_order_id, str) and sl_order_id:
+                                            open_meta["sl_order_id"] = sl_order_id
+                                        open_tr_cur["meta"] = open_meta
+                                        _set_open_trade(state, "LONG", sym, open_tr_cur)
+                            except Exception:
+                                pass
                             st.pop("_srp_long_sl_pending", None)
                             st.pop("_srp_long_sl_price", None)
                             state[sym] = st
                             _append_entry_gate_log(
                                 "sr_pro_long_v1",
                                 sym,
-                                f"sl_delay_ok sl_price={pending_sl}",
+                                f"sl_delay_ok sl_price={pending_sl} sl_order_id={sl_order_id}",
                                 side="LONG",
                             )
                         else:
@@ -12510,6 +12562,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             engine_label = _engine_label_from_reason(
                 (open_tr.get("meta") or {}).get("reason") if open_tr else None
             )
+            if not _is_runtime_managed_engine(engine_label):
+                continue
             skip_line = f"[long-exit-skip] sym={sym} reason=no_position_detail engine={engine_label}"
             print(skip_line)
             continue
@@ -12520,6 +12574,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         engine_label = _engine_label_from_reason(
             (open_tr.get("meta") or {}).get("reason") if open_tr else None
         )
+        if not _is_runtime_managed_engine(engine_label):
+            continue
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
         # SR_PRO_LONG_V1: SL 주문 실패 시, SL 가격 도달 전에는 자동청산 금지
         if engine_label == "SR_PRO_LONG_V1" and isinstance(open_tr, dict):
@@ -12553,16 +12609,37 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         closed = False
         tp_pct, sl_pct = _get_engine_exit_thresholds(engine_label, "LONG")
         sl_price_meta = None
+        is_srp_long_meta = False
         if isinstance(open_tr, dict):
             meta = open_tr.get("meta") or {}
             tp_pct_meta = meta.get("tp_pct")
             if isinstance(tp_pct_meta, (int, float)):
                 tp_pct = float(tp_pct_meta)
             try:
+                reason_v = str(meta.get("reason") or "").strip().lower()
+            except Exception:
+                reason_v = ""
+            try:
+                engine_v = str(meta.get("engine") or "").strip().upper()
+            except Exception:
+                engine_v = ""
+            is_srp_long_meta = (
+                reason_v == "sr_pro_long_v1"
+                or engine_v == "SR_PRO_LONG_V1"
+                or engine_label == "SR_PRO_LONG_V1"
+            )
+            try:
                 sl_price_meta = float(meta.get("sl_price"))
             except Exception:
                 sl_price_meta = None
-        if engine_label == "SR_PRO_LONG_V1":
+        if not is_srp_long_meta:
+            st_fallback = state.get(sym) if isinstance(state.get(sym), dict) else {}
+            if isinstance(st_fallback, dict):
+                if isinstance(st_fallback.get("_srp_long_sl_order_id"), str) and st_fallback.get("_srp_long_sl_order_id"):
+                    is_srp_long_meta = True
+                elif isinstance(st_fallback.get("_srp_long_sl_price"), (int, float)):
+                    is_srp_long_meta = True
+        if is_srp_long_meta:
             tp_price_meta = None
             try:
                 tp_price_meta = float(meta.get("tp_price")) if isinstance(meta, dict) else None
@@ -12581,13 +12658,25 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         try:
                             res_sl = place_long_sl_px(sym, float(pending_sl), qty=amt)
                             if isinstance(res_sl, dict) and res_sl.get("status") == "ok":
+                                sl_order_id = _order_id_from_res(res_sl)
+                                try:
+                                    open_tr_cur = _get_open_trade(state, "LONG", sym)
+                                    if isinstance(open_tr_cur, dict):
+                                        open_meta = open_tr_cur.get("meta") if isinstance(open_tr_cur.get("meta"), dict) else {}
+                                        if isinstance(open_meta, dict):
+                                            if isinstance(sl_order_id, str) and sl_order_id:
+                                                open_meta["sl_order_id"] = sl_order_id
+                                            open_tr_cur["meta"] = open_meta
+                                            _set_open_trade(state, "LONG", sym, open_tr_cur)
+                                except Exception:
+                                    pass
                                 st.pop("_srp_long_sl_pending", None)
                                 st.pop("_srp_long_sl_price", None)
                                 state[sym] = st
                                 _append_entry_gate_log(
                                     "sr_pro_long_v1",
                                     sym,
-                                    f"sl_retry_ok sl_price={pending_sl}",
+                                    f"sl_retry_ok sl_price={pending_sl} sl_order_id={sl_order_id}",
                                     side="LONG",
                                 )
                         except Exception:
@@ -12681,19 +12770,67 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             time.sleep(0.15)
             closed = True
         elif AUTO_EXIT_ENABLED and isinstance(sl_price_meta, (int, float)) and mark_px <= float(sl_price_meta):
-            if engine_label == "SR_PRO_LONG_V1":
-                last_px = _fetch_last_price(sym)
-                if isinstance(last_px, (int, float)) and last_px > float(sl_price_meta):
+            if is_srp_long_meta:
+                meta_rt = open_tr.get("meta") if isinstance(open_tr, dict) else None
+                st_rt = state.get(sym) if isinstance(state.get(sym), dict) else {}
+                sl_oid_meta = meta_rt.get("sl_order_id") if isinstance(meta_rt, dict) else None
+                sl_oid_state = st_rt.get("_srp_long_sl_order_id") if isinstance(st_rt, dict) else None
+                if sl_oid_meta or sl_oid_state:
                     _append_entry_gate_log(
                         "auto_exit_long",
                         sym,
                         (
-                            "srp_guard_skip_sl_mark_mismatch "
-                            f"mark={mark_px} last={last_px} sl={sl_price_meta}"
+                            "srp_guard_skip_local_sl_exchange_order "
+                            f"mark={mark_px} sl={sl_price_meta} "
+                            f"sl_oid_meta={sl_oid_meta} sl_oid_state={sl_oid_state}"
                         ),
                         side="LONG",
                     )
                     continue
+                # SR_PRO_LONG_V1: 로컬 시장가 SL 청산은 사용하지 않고, 거래소 SL 재설치만 시도
+                try:
+                    amt = get_long_position_amount(sym)
+                except Exception:
+                    amt = None
+                if isinstance(amt, (int, float)) and amt > 0:
+                    try:
+                        res_sl = place_long_sl_px(sym, float(sl_price_meta), qty=amt)
+                        sl_order_id = _order_id_from_res(res_sl) if isinstance(res_sl, dict) else None
+                        if isinstance(sl_order_id, str) and sl_order_id:
+                            try:
+                                meta_rt2 = open_tr.get("meta") if isinstance(open_tr, dict) and isinstance(open_tr.get("meta"), dict) else {}
+                                if isinstance(meta_rt2, dict):
+                                    meta_rt2["sl_order_id"] = sl_order_id
+                                    open_tr["meta"] = meta_rt2
+                                st2 = state.get(sym) if isinstance(state.get(sym), dict) else {}
+                                if not isinstance(st2, dict):
+                                    st2 = {}
+                                st2["_srp_long_sl_order_id"] = sl_order_id
+                                state[sym] = st2
+                            except Exception:
+                                pass
+                            _append_entry_gate_log(
+                                "auto_exit_long",
+                                sym,
+                                (
+                                    "srp_guard_rearm_exchange_sl "
+                                    f"mark={mark_px} sl={sl_price_meta} sl_order_id={sl_order_id}"
+                                ),
+                                side="LONG",
+                            )
+                            continue
+                    except Exception:
+                        pass
+                _append_entry_gate_log(
+                    "auto_exit_long",
+                    sym,
+                    (
+                        "srp_guard_hard_block_local_sl_no_exchange_order "
+                        f"mark={mark_px} sl={sl_price_meta}"
+                    ),
+                    side="LONG",
+                )
+                continue
             _append_entry_gate_log(
                 "auto_exit_long",
                 sym,
@@ -12760,6 +12897,17 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             and profit_unlev < 0
             and profit_unlev <= -float(sl_pct)
         ):
+            if is_srp_long_meta:
+                _append_entry_gate_log(
+                    "auto_exit_long",
+                    sym,
+                    (
+                        "srp_guard_hard_block_local_sl_pct "
+                        f"mark={mark_px} sl_pct={sl_pct} profit={profit_unlev:.4f}%"
+                    ),
+                    side="LONG",
+                )
+                continue
             _append_entry_gate_log(
                 "auto_exit_long",
                 sym,
@@ -14283,22 +14431,15 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                 if (cmd in ("/realtime_only", "realtime_only")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        REALTIME_ONLY_ENABLED = True
-                        state["_realtime_only"] = True
-                        state_dirty = True
-                        resp = "✅ realtime_only ON (헤비스캔 OFF)"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        REALTIME_ONLY_ENABLED = False
-                        state["_realtime_only"] = False
-                        state_dirty = True
-                        resp = "⛔ realtime_only OFF (헤비스캔 ON)"
+                    REALTIME_ONLY_ENABLED = True
+                    state["_realtime_only"] = True
+                    state_dirty = True
+                    if arg in ("off", "0", "false", "disable", "disabled"):
+                        resp = "ℹ️ heavy-scan은 현재 비활성 고정입니다. realtime_only는 ON으로 유지됩니다."
+                    elif arg in ("on", "1", "true", "enable", "enabled"):
+                        resp = "✅ realtime_only ON (heavy-scan 비활성 고정)"
                     else:
-                        resp = (
-                            f"ℹ️ realtime_only 상태: {'ON' if REALTIME_ONLY_ENABLED else 'OFF'}\n"
-                            "사용법: /realtime_only on|off|status"
-                        )
+                        resp = "ℹ️ realtime_only 상태: ON (heavy-scan 비활성 고정)"
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] realtime_only cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
@@ -14523,7 +14664,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/user_active(유저활성): {'ON' if _admin_is_active() else 'OFF'}\n"
                             f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
                             f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
-                            f"/realtime_only(헤비스캔OFF): {'ON' if REALTIME_ONLY_ENABLED else 'OFF'}\n"
+                            "/realtime_only: ON (heavy-scan 비활성 고정)\n"
                             f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                             f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                             f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -14590,7 +14731,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/user_active(유저활성): {'ON' if _admin_is_active() else 'OFF'}\n"
                         f"/auto_exit(자동청산): {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
                         f"/sat_trade(토요일진입): {'ON' if SATURDAY_TRADE_ENABLED else 'OFF'}\n"
-                        f"/realtime_only(헤비스캔OFF): {'ON' if REALTIME_ONLY_ENABLED else 'OFF'}\n"
+                        "/realtime_only: ON (heavy-scan 비활성 고정)\n"
                         f"/long_live(롱실주문): {'ON' if LONG_LIVE_TRADING else 'OFF'}\n"
                         f"/live(숏실주문): {'ON' if LIVE_TRADING else 'OFF'}\n"
                         f"/max_pos(동시진입): {MAX_OPEN_POSITIONS}\n"
@@ -16705,9 +16846,8 @@ def run():
                     last_open_kst = _fmt_ms_kst(last_open_ts)
                     prev_open_kst = _fmt_ms_kst(prev_open_ts)
                     cycle_kst = _fmt_ms_kst(cycle_ts)
-                    heavy_scan = bool(cycle_ts and cycle_ts != last_cycle_ts)
-                    if REALTIME_ONLY_ENABLED or state.get("_realtime_only") is True:
-                        heavy_scan = False
+                    # Heavy-scan mode is fully disabled: run realtime-only path for all cycles.
+                    heavy_scan = False
                     last_cycle_kst = _fmt_ms_kst(last_cycle_ts)
                     if COMMON_WARMUP_DONE:
                         if heavy_scan:
@@ -16727,10 +16867,8 @@ def run():
                                     f"cycle_ts={cycle_kst} last_cycle_ts={last_cycle_kst} mode=realtime-only skip=heavy-only"
                                 )
                     if not heavy_scan:
-                        if not _realtime_only_required():
-                            time.sleep(REALTIME_CYCLE_SLEEP)
-                            continue
-                        # realtime-only: align to minute boundary + delay for confirmed-candle logic
+                        # Heavy-scan disabled globally: always run realtime path.
+                        # Align to minute boundary + delay for confirmed-candle logic.
                         _sleep_until_next_minute_delay(exchange, REALTIME_ALIGN_DELAY_SEC)
 
                     # 사이클 캐시/통계 초기화

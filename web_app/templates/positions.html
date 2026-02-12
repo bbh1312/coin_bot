@@ -353,6 +353,7 @@
                         <th>Qty</th>
                         <th>Entry</th>
                         <th>Mark</th>
+                        <th>Liq.Price</th>
                         <th>Notional</th>
                         <th>PnL</th>
                         <th>ROI%</th>
@@ -370,13 +371,14 @@
                             {% endif %}
                         </td>
                         <td class="{{ 'side-long' if row.side == 'LONG' else 'side-short' }}">{{ row.side }}</td>
-                        <td>{{ row.symbol }}</td>
+                        <td>{{ (row.symbol or '').replace(':USDT', '') }}</td>
                         <td>{{ '%.6g'|format(row.qty) if row.qty is not none else '-' }}</td>
                         <td>{{ '%.6g'|format(row.entry) if row.entry is not none else '-' }}</td>
                         <td>{{ '%.6g'|format(row.mark) if row.mark is not none else '-' }}</td>
+                        <td>{{ '%.6g'|format(row.liq_price) if row.liq_price is not none else '-' }}</td>
                         <td>{{ '%.2f'|format(row.notional) if row.notional is not none else '-' }}</td>
                         <td class="{{ 'pnl-pos' if row.pnl is not none and row.pnl >= 0 else 'pnl-neg' }}">
-                            {{ '%.4f'|format(row.pnl) if row.pnl is not none else '-' }}
+                            {{ '%.2f'|format(row.pnl) if row.pnl is not none else '-' }}
                         </td>
                         <td>{{ '%.2f'|format(row.roi) if row.roi is not none else '-' }}</td>
                         <td>{{ '%.2f'|format(row.leverage) if row.leverage is not none else '-' }}</td>

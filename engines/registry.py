@@ -3,26 +3,14 @@ from __future__ import annotations
 from typing import Dict, Type
 
 from engines.base import BaseEngine
-from engines.rsi.engine import RsiEngine
-try:
-    from engines.swaggy.swaggy_engine import SwaggyEngine
-except Exception:
-    SwaggyEngine = None
-from engines.atlas.atlas_engine import AtlasEngine
-try:
-    from engines.atlas_rs_fail_short.engine import AtlasRsFailShortEngine
-except Exception:
-    AtlasRsFailShortEngine = None
+from engines.sr_pro_long_v1.engine import SrProLongV1Engine
+from engines.sr_pro_short_v1.engine import SrProShortV1Engine
 
 
 _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
-    "rsi": RsiEngine,
-    "atlas": AtlasEngine,
+    "sr_pro_long_v1": SrProLongV1Engine,
+    "sr_pro_short_v1": SrProShortV1Engine,
 }
-if SwaggyEngine:
-    _ENGINE_REGISTRY["swaggy"] = SwaggyEngine
-if AtlasRsFailShortEngine:
-    _ENGINE_REGISTRY["atlas_rs_fail_short"] = AtlasRsFailShortEngine
 
 
 def get_engine(name: str) -> BaseEngine:

@@ -28,7 +28,7 @@ class SrProLongV1Config:
     total_window_days: int = 14
     rolling_zones: bool = True
     retest_bars: int = 6
-    retest_atr_mult: float = 0.25
+    retest_atr_mult: float = 0.20
     retest_near_atr_mult: float = 0.15
     retest_wick_max: float = 0.4
     retest_dyn: bool = False
@@ -40,10 +40,10 @@ class SrProLongV1Config:
     entry_ema_len: int = 7
     entry_atr_offset: float = 0.15
     sl_buffer: float = 0.01
-    sl_atr_mult: float = 0.4
+    sl_atr_mult: float = 0.10
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 1.02
+    tp_mult: float = 1.015
     tp_mult_weak: float = 1.02
 
 

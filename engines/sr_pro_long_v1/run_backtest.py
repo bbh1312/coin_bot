@@ -198,6 +198,11 @@ def _ts_kst(ts_ms: int) -> str:
     return (dt + pd.Timedelta(hours=9)).strftime("%Y-%m-%d %H:%M")
 
 
+def _iso_kst(ts_ms: int) -> str:
+    dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+09:00")
+
+
 def _minute_str(ts_ms: int) -> str:
     return _ts_kst(ts_ms)
 
@@ -305,8 +310,23 @@ def run_backtest() -> None:
     parser.add_argument("--zones-snapshot-out", type=str, default="")
     parser.add_argument("--log-gates", action="store_true")
     parser.add_argument("--debug-zone", action="store_true")
+    parser.add_argument("--ltf-sr-bias", action="store_true")
+    parser.add_argument("--ltf-sr-lookback", type=int, default=60)
+    parser.add_argument("--debug-symbol", type=str, default="")
     parser.add_argument("--block-hours", type=str, default="")
     args = parser.parse_args()
+
+    def _tf_ms(tf: str) -> int:
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1]) * 60 * 1000
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 60 * 60 * 1000
+            if tf.endswith("d"):
+                return int(tf[:-1]) * 24 * 60 * 60 * 1000
+        except Exception:
+            pass
+        return 60 * 1000
 
     cfg = SrProLongV1Config(
         lookback=args.lookback,
@@ -451,6 +471,7 @@ def run_backtest() -> None:
         "reject_pass_15m": 0,
         "ema200_pass": 0,
         "time_block": 0,
+        "ltf_sr_bias_block": 0,
     }
 
     def _load_entry_block_hours() -> set[int]:
@@ -495,13 +516,35 @@ def run_backtest() -> None:
     for sym, frames in data.items():
         sym_stats = _new_stats()
         per_symbol_stats[sym] = sym_stats
+        dbg_on = bool(str(args.debug_symbol or "").strip()) and (sym.upper() == str(args.debug_symbol).strip().upper())
+        dbg_counts = {
+            "eval_bars": 0,
+            "fail_zone": 0,
+            "fail_hl_15m": 0,
+            "fail_break_3m": 0,
+            "fail_retest": 0,
+            "fail_entry_target": 0,
+            "fail_nearest_zone": 0,
+            "entries": 0,
+            "exits": 0,
+        } if dbg_on else None
         df_3m = frames["3m"]
         df_15m = frames["15m"]
         df_1h = frames["1h"]
         if args.use_confirmed:
-            df_3m = df_3m.iloc[:-1]
-            df_15m = df_15m.iloc[:-1]
-            df_1h = df_1h.iloc[:-1]
+            # Align with live: only trim the tail bar when it is still forming.
+            for tf_name, df_cur in (("3m", df_3m), ("15m", df_15m), ("1h", df_1h)):
+                if df_cur.empty:
+                    continue
+                tf_ms = _tf_ms(tf_name)
+                last_ts = int(df_cur.iloc[-1]["ts"])
+                if last_ts and (end_ms - last_ts) < tf_ms:
+                    if tf_name == "3m":
+                        df_3m = df_cur.iloc[:-1]
+                    elif tf_name == "15m":
+                        df_15m = df_cur.iloc[:-1]
+                    else:
+                        df_1h = df_cur.iloc[:-1]
 
         if len(df_3m) < 10 or len(df_15m) < 5 or len(df_1h) < (cfg.lookback * 2 + 5):
             continue
@@ -587,11 +630,18 @@ def run_backtest() -> None:
             ts = int(ts_3m[i3])
             if ts < eval_start_ms:
                 continue
+            if dbg_on:
+                dbg_counts["eval_bars"] += 1
             cd_until = cooldown_until.get((sym, "LONG"))
             if isinstance(cd_until, int) and ts < cd_until:
                 continue
 
-            idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
+            # i3 bar is confirmed when the next 3m bar opens.
+            decision_ts = ts + _tf_ms(cfg.tf_ltf)
+            if args.use_confirmed:
+                idx_1h = int(np.searchsorted(ts_1h, decision_ts - _tf_ms(cfg.tf_htf), side="right") - 1)
+            else:
+                idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
             if idx_1h < 0:
                 continue
 
@@ -657,6 +707,8 @@ def run_backtest() -> None:
                         }
                     )
                     cooldown_until[(sym, "LONG")] = ts + (60 * 60 * 1000)
+                    if dbg_on:
+                        dbg_counts["exits"] += 1
                     trade = None
                 elif high_i >= trade["tp_price"]:
                     exit_px = trade["tp_price"]
@@ -688,6 +740,8 @@ def run_backtest() -> None:
                             "pnl_pct": pnl_pct,
                         }
                     )
+                    if dbg_on:
+                        dbg_counts["exits"] += 1
                     trade = None
                 continue
 
@@ -739,7 +793,10 @@ def run_backtest() -> None:
                     if support_candidates and args.log_gates:
                         gate_counts["reject_pass_1h"] += 1
                 else:
-                    idx_15m_rej = int(np.searchsorted(ts_15m, ts, side="right") - 1)
+                    if args.use_confirmed:
+                        idx_15m_rej = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(cfg.tf_mtf), side="right") - 1)
+                    else:
+                        idx_15m_rej = int(np.searchsorted(ts_15m, ts, side="right") - 1)
                     if idx_15m_rej >= 0:
                         close_15m = float(df_15m.at[idx_15m_rej, "close"])
                         support_candidates = [
@@ -748,21 +805,30 @@ def run_backtest() -> None:
                         if support_candidates and args.log_gates:
                             gate_counts["reject_pass_15m"] += 1
             if not support_candidates:
+                if dbg_on:
+                    dbg_counts["fail_zone"] += 1
                 if args.log_gates:
                     gate_counts["zone_touch"] += 1
                 continue
 
-            idx_15m = int(np.searchsorted(ts_15m, ts, side="right") - 1)
+            if args.use_confirmed:
+                idx_15m = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(cfg.tf_mtf), side="right") - 1)
+            else:
+                idx_15m = int(np.searchsorted(ts_15m, ts, side="right") - 1)
             if idx_15m < 2:
                 continue
             l15_0 = float(df_15m.at[idx_15m, "low"])
             l15_1 = float(df_15m.at[idx_15m - 1, "low"])
             l15_2 = float(df_15m.at[idx_15m - 2, "low"])
             if not (l15_0 > l15_1 or l15_1 > l15_2):
+                if dbg_on:
+                    dbg_counts["fail_hl_15m"] += 1
                 if args.log_gates:
                     gate_counts["hl_15m"] += 1
                 continue
             if not (float(df_15m.at[idx_15m, "close"]) > float(df_15m.at[idx_15m, "open"])):
+                if dbg_on:
+                    dbg_counts["fail_hl_15m"] += 1
                 if args.log_gates:
                     gate_counts["hl_15m"] += 1
                 continue
@@ -778,6 +844,8 @@ def run_backtest() -> None:
             strong_break = close_now > high_max
             weak_break = (float(df_3m.at[i3, "high"]) > high_max) and (close_now <= high_max) and (close_now > open_now)
             if not strong_break and not weak_break:
+                if dbg_on:
+                    dbg_counts["fail_break_3m"] += 1
                 if args.log_gates:
                     gate_counts["break_3m"] += 1
                 continue
@@ -831,6 +899,8 @@ def run_backtest() -> None:
                         if args.log_gates:
                             gate_counts["retest_pass_high"] += 1
                     else:
+                        if dbg_on:
+                            dbg_counts["fail_retest"] += 1
                         continue
 
                     ema_entry = float(ema_3m_entry.iloc[i3]) if len(ema_3m_entry) > i3 and not np.isnan(ema_3m_entry.iloc[i3]) else None
@@ -839,10 +909,56 @@ def run_backtest() -> None:
                     if isinstance(ema_entry, (int, float)) and atr_now > 0:
                         entry_target = float(ema_entry) - (atr_now * entry_offset)
                     if entry_target is None or low_now > entry_target:
+                        if dbg_on:
+                            dbg_counts["fail_entry_target"] += 1
                         continue
                     entry_px = float(entry_target)
+                    if args.ltf_sr_bias:
+                        lb = max(5, int(args.ltf_sr_lookback))
+                        start = max(0, i3 - lb + 1)
+                        seg = df_3m.iloc[start : i3 + 1]
+                        if not seg.empty:
+                            try:
+                                sup = float(seg["low"].astype(float).min())
+                                res = float(seg["high"].astype(float).max())
+                            except Exception:
+                                sup = None
+                                res = None
+                            if (
+                                isinstance(sup, (int, float))
+                                and isinstance(res, (int, float))
+                                and np.isfinite(sup)
+                                and np.isfinite(res)
+                                and res > sup
+                            ):
+                                dist_sup = abs(entry_px - sup)
+                                dist_res = abs(res - entry_px)
+                                if dist_sup > dist_res:
+                                    if args.log_gates:
+                                        gate_counts["ltf_sr_bias_block"] += 1
+                                    if args.debug_zone:
+                                        print(
+                                            "[BACKTEST][LTF_SR_BLOCK] "
+                                            f"sym={sym} ts={_ts_kst(ts)} track={entry_reason or 'retest'} "
+                                            f"entry={entry_px:.6f} sup={sup:.6f} res={res:.6f} "
+                                            f"dist_sup={dist_sup:.6f} dist_res={dist_res:.6f}"
+                                        )
+                                    continue
                     nearest = min(support_candidates, key=lambda z: abs(z.mid - entry_px))
                     if not (close_now >= nearest.mid or entry_px >= nearest.top - (atr_now * 0.2)):
+                        if dbg_on:
+                            try:
+                                print(
+                                    "[BACKTEST] SR_PRO_LONG_NEAREST_FAIL "
+                                    f"sym={sym} ts={_iso_kst(ts)} "
+                                    f"close_3m={close_now:.6f} entry={entry_px:.6f} "
+                                    f"zone_mid={nearest.mid:.6f} zone_top={nearest.top:.6f} zone_bot={nearest.bot:.6f} "
+                                    f"atr3={atr_now:.6f} cond_rhs={(nearest.top - (atr_now * 0.2)):.6f}"
+                                )
+                            except Exception:
+                                pass
+                        if dbg_on:
+                            dbg_counts["fail_nearest_zone"] += 1
                         if args.log_gates:
                             gate_counts["retest_fail_shallow"] += 1
                         continue
@@ -867,6 +983,8 @@ def run_backtest() -> None:
                     }
                     stats["entries"] += 1
                     sym_stats["entries"] += 1
+                    if dbg_on:
+                        dbg_counts["entries"] += 1
                     if args.log_gates:
                         if entry_reason == "close_reclaim":
                             gate_counts["entry_by_pass_close"] += 1
@@ -907,6 +1025,15 @@ def run_backtest() -> None:
                     "last_ts": last_ts,
                     "unrealized_pct": unrealized_pct,
                 }
+            )
+        if dbg_on and dbg_counts is not None:
+            print(
+                "[BACKTEST] SR_PRO_LONG_DEBUG_SUMMARY "
+                f"sym={sym} eval_bars={dbg_counts['eval_bars']} "
+                f"fail_zone={dbg_counts['fail_zone']} fail_hl_15m={dbg_counts['fail_hl_15m']} "
+                f"fail_break_3m={dbg_counts['fail_break_3m']} fail_retest={dbg_counts['fail_retest']} "
+                f"fail_entry_target={dbg_counts['fail_entry_target']} fail_nearest_zone={dbg_counts['fail_nearest_zone']} "
+                f"entries={dbg_counts['entries']} exits={dbg_counts['exits']} open={1 if trade else 0}"
             )
 
     # enrich exit stats by hour/dow using entry times
