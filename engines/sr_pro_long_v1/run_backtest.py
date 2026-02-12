@@ -249,10 +249,12 @@ class Zone:
 
 
 def run_backtest() -> None:
+    cfg_live = SrProLongV1Config()
     parser = argparse.ArgumentParser("sr_pro_long_v1 backtest")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--universe", type=str, default="common")
-    parser.add_argument("--use-confirmed", action="store_true")
+    parser.add_argument("--use-confirmed", action="store_true", default=True)
+    parser.add_argument("--no-use-confirmed", action="store_false", dest="use_confirmed")
     parser.add_argument("--use-live-cache", action="store_true")
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
@@ -286,7 +288,7 @@ def run_backtest() -> None:
     parser.add_argument("--shallow-wick-max", type=float, default=0.35)
     parser.add_argument("--shallow-dvf-min", type=float, default=0.0)
     parser.add_argument("--entry-ema-len", type=int, default=7)
-    parser.add_argument("--entry-atr-offset", type=float, default=0.15)
+    parser.add_argument("--entry-atr-offset", type=float, default=float(cfg_live.entry_atr_offset))
     parser.add_argument("--sl-buffer", type=float, default=0.01)
     parser.add_argument("--sl-atr-mult", type=float, default=0.4)
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
@@ -305,6 +307,8 @@ def run_backtest() -> None:
     parser.add_argument("--debug-zone", action="store_true")
     parser.add_argument("--block-hours", type=str, default="")
     args = parser.parse_args()
+    # Keep backtest in live-mode parity: always evaluate confirmed bars.
+    args.use_confirmed = True
 
     cfg = SrProLongV1Config(
         lookback=args.lookback,
@@ -840,7 +844,7 @@ def run_backtest() -> None:
                         entry_target = float(ema_entry) - (atr_now * entry_offset)
                     if entry_target is None or low_now > entry_target:
                         continue
-                    entry_px = float(close_now)
+                    entry_px = float(entry_target)
                     nearest = min(support_candidates, key=lambda z: abs(z.mid - entry_px))
                     if not (close_now >= nearest.mid or entry_px >= nearest.top - (atr_now * 0.2)):
                         if args.log_gates:
