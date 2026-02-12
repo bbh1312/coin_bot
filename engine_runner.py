@@ -6814,28 +6814,6 @@ def _close_trade(
                 pass
             if not tr.get("engine_label"):
                 tr["engine_label"] = _engine_label_from_reason((tr.get("meta") or {}).get("reason"))
-            if (
-                side == "SHORT"
-                and reason == "auto_exit_sl"
-                and tr.get("engine_label") == "SR_PRO_SHORT_V1"
-            ):
-                try:
-                    sr_state = state.setdefault("_sr_pro_short_v1_state", {})
-                    sym_state = sr_state.setdefault(symbol, {})
-                    sym_state["cooldown_until_short"] = int(float(exit_ts) * 1000) + (60 * 60 * 1000)
-                except Exception:
-                    pass
-            if (
-                side == "LONG"
-                and reason == "auto_exit_sl"
-                and tr.get("engine_label") == "SR_PRO_LONG_V1"
-            ):
-                try:
-                    sr_state = state.setdefault("_sr_pro_long_v1_state", {})
-                    sym_state = sr_state.setdefault(symbol, {})
-                    sym_state["cooldown_until_long"] = int(float(exit_ts) * 1000) + (60 * 60 * 1000)
-                except Exception:
-                    pass
             _update_report_csv(tr)
             return
     log.append(
@@ -8253,8 +8231,8 @@ def _run_sr_pro_short_v1_cycle(
         if isinstance(cd_until, (int, float)) and latest_ts_ms < int(cd_until):
             gate_stats["cooldown"] += 1
             remaining_min = max(0.0, (float(cd_until) - float(latest_ts_ms)) / 60000.0)
-            _append_sr_pro_long_v1_log(
-                f"SR_PRO_LONG_COOLDOWN sym={symbol} until={int(cd_until)} remaining_min={remaining_min:.1f}"
+            _append_sr_pro_short_v1_log(
+                f"SR_PRO_SHORT_COOLDOWN sym={symbol} until={int(cd_until)} remaining_min={remaining_min:.1f}"
             )
             continue
 
@@ -10842,6 +10820,10 @@ def _detect_position_events(state: dict, send_telegram) -> None:
         open_tr = _get_open_trade(state, side, symbol)
         managed = isinstance(open_tr, dict)
         managed_engine = (open_tr.get("meta") or {}).get("engine") if managed else None
+        if managed:
+            reason_key = str(((open_tr.get("meta") or {}).get("reason") or "")).strip().lower()
+            if reason_key in ("manual", "manual_entry", "manual_admin", "admin_manual", "manual_admin_entry"):
+                managed_engine = "MANUAL"
         changed = False
         entry_price = None
         exit_price = None
@@ -11986,15 +11968,16 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 reason=exit_reason,
             )
             _append_report_line(sym, "SHORT", None, None, engine_label)
-            last_entry_val = float(st.get("last_entry", 0))
-            state[sym] = {
-                "in_pos": False,
-                "last_ok": False,
-                "last_entry": last_entry_val,
-                "dca_adds": 0,
-                "dca_adds_long": 0,
-                "dca_adds_short": 0,
-            }
+            st_after = state.get(sym, {}) if isinstance(state, dict) else {}
+            if not isinstance(st_after, dict):
+                st_after = {}
+            # Keep exit timestamps/reasons set by _close_trade() and only reset runtime flags.
+            _set_in_pos_side(st_after, "SHORT", False)
+            st_after["last_ok"] = False
+            st_after["dca_adds"] = 0
+            st_after["dca_adds_long"] = 0
+            st_after["dca_adds_short"] = 0
+            state[sym] = st_after
             if exit_reason == "auto_exit_sl" and engine_label == "SWAGGY":
                 st = state.get(sym, {})
                 if isinstance(st, dict):
@@ -13993,12 +13976,20 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             if rec is None:
                                 continue
                             entry_by_symbol_flat[sym_norm] = rec
+                    def _is_manual_reason(reason_val: Optional[str]) -> bool:
+                        key = str(reason_val or "").strip().lower()
+                        return key in ("manual", "manual_entry", "manual_admin", "admin_manual", "manual_admin_entry")
+
                     for tr in open_trades:
                         sym = tr.get("symbol")
                         side = (tr.get("side") or "").upper()
                         if not sym or not side:
                             continue
-                        engine = tr.get("engine_label") or (tr.get("meta") or {}).get("engine") or (tr.get("meta") or {}).get("reason")
+                        meta_tr = tr.get("meta") or {}
+                        reason_tr = meta_tr.get("reason")
+                        if _is_manual_reason(reason_tr):
+                            continue
+                        engine = tr.get("engine_label") or meta_tr.get("engine") or reason_tr
                         if engine:
                             eng_norm = str(engine).strip()
                             eng_upper = eng_norm.upper()
@@ -14076,7 +14067,12 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                                 if not engine:
                                     print(f"[positions-map] unresolved {debug_info}", flush=True)
                                 print(f"[positions-map] sym={sym} side={side} engine={engine}", flush=True)
-                                if not engine or str(engine).strip().upper() in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                                open_tr = _get_open_trade(state, side, sym)
+                                open_meta = (open_tr.get("meta") or {}) if isinstance(open_tr, dict) else {}
+                                manual_open = _is_manual_reason(open_meta.get("reason"))
+                                if manual_open:
+                                    engine = "MANUAL"
+                                elif not engine or str(engine).strip().upper() in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
                                     rec = swaggy_trade_map.get((sym, side))
                                     if isinstance(rec, dict):
                                         swaggy_engine = rec.get("engine")
@@ -14087,7 +14083,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                                 sym_col = max(sym_col, len(base))
                                 eng_col = max(eng_col, len(str(engine)))
                                 tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
-                                open_tr = _get_open_trade(state, side, sym)
                                 if isinstance(open_tr, dict):
                                     meta = open_tr.get("meta") or {}
                                     entry_px = open_tr.get("entry_price")
@@ -14167,7 +14162,12 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             if not engine:
                                 print(f"[positions-map] unresolved {debug_info}", flush=True)
                             print(f"[positions-map] sym={sym} side={side} engine={engine}", flush=True)
-                            if not engine or str(engine).strip().upper() in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
+                            open_tr = _get_open_trade(state, side, sym)
+                            open_meta = (open_tr.get("meta") or {}) if isinstance(open_tr, dict) else {}
+                            manual_open = _is_manual_reason(open_meta.get("reason"))
+                            if manual_open:
+                                engine = "MANUAL"
+                            elif not engine or str(engine).strip().upper() in ("UNKNOWN", "MANUAL", "MANUAL_ENTRY"):
                                 rec = swaggy_trade_map.get((sym, side))
                                 if isinstance(rec, dict):
                                     swaggy_engine = rec.get("engine")
@@ -14178,7 +14178,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             sym_col = max(sym_col, len(base))
                             eng_col = max(eng_col, len(str(engine)))
                             tp_pct, sl_pct = _get_engine_exit_thresholds(engine, side)
-                            open_tr = _get_open_trade(state, side, sym)
                             if isinstance(open_tr, dict):
                                 meta = open_tr.get("meta") or {}
                                 entry_px = open_tr.get("entry_price")
