@@ -304,6 +304,7 @@
             <div class="nav-links">
                 <a href="/">설정</a>
                 <a class="active" href="/positions">포지션</a>
+                <a href="/asset_dashboard">Asset Dashboard</a>
                 <a href="/manual_entry">포지션 진입</a>
             </div>
         </div>
@@ -317,79 +318,11 @@
             </div>
             <div class="top-actions">
                 <a class="link-btn" href="/">Control Deck</a>
+                <a class="link-btn" href="/asset_dashboard">Asset Dashboard</a>
                 <a class="link-btn" href="/positions">Refresh</a>
                 <a class="link-btn" id="live-sync-btn" href="/positions?force=1" title="거래소 즉시 재조회 (쿨다운 적용)">Live Sync</a>
             </div>
         </header>
-        <section class="card pnl-card">
-            <div class="pnl-grid-3">
-                <div class="pnl-subcard" id="pnl-balance">
-                    <h3>현재 선물 잔고</h3>
-                    <div class="pnl-list">
-                        <div class="pnl-row">
-                            <span class="pnl-name">Loading...</span>
-                            <span class="pnl-value">--</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="pnl-subcard" id="pnl-entry-available">
-                    <h3>현재 진입 가능 금액</h3>
-                    <div class="pnl-list">
-                        <div class="pnl-row">
-                            <span class="pnl-name">Loading...</span>
-                            <span class="pnl-value">--</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="pnl-subcard" id="pnl-unrealized">
-                    <h3>현재 Unrealized PNL</h3>
-                    <div class="pnl-list">
-                        <div class="pnl-row">
-                            <span class="pnl-name">Loading...</span>
-                            <span class="pnl-value">--</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            <div class="pnl-grid-4">
-                <div class="pnl-subcard" id="pnl-monthly">
-                    <h3>이번달 순이익</h3>
-                    <div class="pnl-list">
-                        <div class="pnl-row">
-                            <span class="pnl-name">Loading...</span>
-                            <span class="pnl-value">--</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="pnl-subcard" id="pnl-weekly">
-                    <h3>이번주 순이익</h3>
-                    <div class="pnl-list">
-                        <div class="pnl-row">
-                            <span class="pnl-name">Loading...</span>
-                            <span class="pnl-value">--</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="pnl-subcard" id="pnl-yesterday">
-                    <h3>어제 순이익</h3>
-                    <div class="pnl-list">
-                        <div class="pnl-row">
-                            <span class="pnl-name">Loading...</span>
-                            <span class="pnl-value">--</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="pnl-subcard" id="pnl-today">
-                    <h3>오늘 순이익</h3>
-                    <div class="pnl-list">
-                        <div class="pnl-row">
-                            <span class="pnl-name">Loading...</span>
-                            <span class="pnl-value">--</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
         <section class="card">
             <div class="meta">
                 <span>updated: {{ updated_at }}</span>
@@ -479,15 +412,7 @@
     <script>
         const tabs = document.querySelectorAll(".tab-btn");
         const rows = document.querySelectorAll("tbody tr");
-        const pnlTodayBox = document.getElementById("pnl-today");
-        const pnlYesterdayBox = document.getElementById("pnl-yesterday");
-        const pnlUnrealBox = document.getElementById("pnl-unrealized");
-        const pnlBalanceBox = document.getElementById("pnl-balance");
-        const pnlEntryAvailableBox = document.getElementById("pnl-entry-available");
-        const pnlMonthlyBox = document.getElementById("pnl-monthly");
-        const pnlWeeklyBox = document.getElementById("pnl-weekly");
         const liveSyncBtn = document.getElementById("live-sync-btn");
-        const initialPnlPayload = {{ (pnl_payload or {}) | tojson }};
         const liveSyncCooldownSec = Number({{ live_sync_cooldown_sec or 0 }});
         let liveSyncRemainingSec = Number({{ live_sync_remaining_sec or 0 }});
         tabs.forEach((btn) => {
@@ -510,125 +435,6 @@
                 });
             });
         });
-
-        function renderPnlList(container, items) {
-            const pnlList = container.querySelector(".pnl-list");
-            pnlList.innerHTML = "";
-            if (!items.length) {
-                const row = document.createElement("div");
-                row.className = "pnl-row";
-                row.innerHTML = `<span class="pnl-name">no data</span><span class="pnl-value">--</span>`;
-                pnlList.appendChild(row);
-                return;
-            }
-            items.forEach((item) => {
-                const row = document.createElement("div");
-                row.className = "pnl-row";
-                const name = item.name || "unknown";
-                if (item.error) {
-                    row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="pnl-value">N/A</span></div>`;
-                } else {
-                    const pnlVal = item.pnl;
-                    const pnlText = typeof pnlVal === "number" ? `${pnlVal >= 0 ? "+" : ""}${pnlVal.toFixed(1)} USDT` : "N/A";
-                    const cls = typeof pnlVal === "number" ? (pnlVal >= 0 ? "pnl-value pos" : "pnl-value neg") : "pnl-value";
-                    row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="${cls}">${pnlText}</span></div>`;
-                }
-                pnlList.appendChild(row);
-            });
-        }
-
-        function applyPnlPayload(data) {
-            const pnlItems = data.pnl_today || [];
-            const pnlMonthlyItems = data.pnl_monthly || [];
-            const pnlWeeklyItems = data.pnl_weekly || [];
-            const pnlYesterdayItems = data.pnl_yesterday || [];
-            const pnlUnrealItems = data.pnl_unrealized || [];
-            const pnlBalanceItems = data.pnl_balance || [];
-            const pnlEntryAvailableItems = data.pnl_entry_available || [];
-            renderPnlList(pnlTodayBox, pnlItems);
-            renderPnlList(pnlMonthlyBox, pnlMonthlyItems);
-            renderPnlList(pnlWeeklyBox, pnlWeeklyItems);
-            renderPnlList(pnlYesterdayBox, pnlYesterdayItems);
-            renderPnlList(pnlUnrealBox, pnlUnrealItems);
-            renderBalanceList(pnlBalanceBox, pnlBalanceItems);
-            renderEntryAvailableList(pnlEntryAvailableBox, pnlEntryAvailableItems);
-        }
-
-        async function refreshPnlToday(force = false) {
-            const endpoint = force ? "/pnl_summary?force=1" : "/pnl_summary";
-            const res = await fetch(endpoint);
-            if (!res.ok) {
-                return;
-            }
-            const data = await res.json();
-            applyPnlPayload(data);
-        }
-
-        function renderBalanceList(container, items) {
-            const pnlList = container.querySelector(".pnl-list");
-            pnlList.innerHTML = "";
-            if (!items.length) {
-                const row = document.createElement("div");
-                row.className = "pnl-row";
-                row.innerHTML = `<span class="pnl-name">no data</span><span class="pnl-value">--</span>`;
-                pnlList.appendChild(row);
-                return;
-            }
-            items.forEach((item) => {
-                const row = document.createElement("div");
-                row.className = "pnl-row";
-                const name = item.name || "unknown";
-                const isActive = item.is_active !== false;
-                if (item.error) {
-                    row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="pnl-value">N/A</span></div>`;
-                } else {
-                    const balanceVal = item.balance;
-                    const balanceText = typeof balanceVal === "number" ? `${balanceVal.toFixed(1)} USDT` : "N/A";
-                    row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="pnl-value">${balanceText}</span></div>`;
-                }
-                const controls = row.querySelector(".pnl-controls");
-                if (controls) {
-                    const toggle = document.createElement("button");
-                    toggle.className = `pnl-toggle${isActive ? " active" : ""}`;
-                    toggle.textContent = isActive ? "ACTIVE" : "OFF";
-                    toggle.addEventListener("click", async () => {
-                        toggle.disabled = true;
-                        await fetch("/admin/accounts", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({
-                                account_id: item.account_id,
-                                is_active: !isActive,
-                            }),
-                        });
-                        await refreshPnlToday();
-                    });
-                    controls.appendChild(toggle);
-                }
-                pnlList.appendChild(row);
-            });
-        }
-
-        function renderEntryAvailableList(container, items) {
-            const pnlList = container.querySelector(".pnl-list");
-            pnlList.innerHTML = "";
-            if (!items.length) {
-                const row = document.createElement("div");
-                row.className = "pnl-row";
-                row.innerHTML = `<span class="pnl-name">no data</span><span class="pnl-value">--</span>`;
-                pnlList.appendChild(row);
-                return;
-            }
-            items.forEach((item) => {
-                const row = document.createElement("div");
-                row.className = "pnl-row";
-                const name = item.name || "unknown";
-                const val = item.entry_usdt_available;
-                const text = typeof val === "number" ? `${val.toFixed(1)} USDT` : "N/A";
-                row.innerHTML = `<span class="pnl-name">${name}</span><div class="pnl-controls"><span class="pnl-value">${text}</span></div>`;
-                pnlList.appendChild(row);
-            });
-        }
 
         function renderLiveSyncButton() {
             if (!liveSyncBtn) {
@@ -665,7 +471,6 @@
             liveSyncRemainingSec = Math.max(0, liveSyncRemainingSec - 1);
             renderLiveSyncButton();
         }, 1000);
-        applyPnlPayload(initialPnlPayload || {});
     </script>
 </body>
 </html>

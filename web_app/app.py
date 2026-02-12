@@ -63,10 +63,40 @@ _FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "10"))
 _PNL_CACHE = {"ts": 0.0, "payload": None}
 _PNL_TTL_SEC = float(os.getenv("WEB_PNL_TTL_SEC", "20"))
 _LIVE_SYNC_COOLDOWN_SEC = float(os.getenv("WEB_LIVE_SYNC_COOLDOWN_SEC", "20"))
-_LIVE_SYNC_LAST_TS = 0.0
+_LIVE_SYNC_SCOPES = ("positions", "asset_dashboard")
+_LIVE_SYNC_LAST_TS_BY_SCOPE = {k: 0.0 for k in _LIVE_SYNC_SCOPES}
 _LIVE_SYNC_LOCK = threading.Lock()
 _WEB_MAX_WORKERS = int(os.getenv("WEB_MAX_WORKERS", "8"))
 KST = timezone(timedelta(hours=9))
+
+
+def _resolve_live_sync_request(scope: str) -> tuple[bool, bool, float]:
+    if scope not in _LIVE_SYNC_LAST_TS_BY_SCOPE:
+        scope = "positions"
+    force_req = str(request.args.get("force", "")).lower() in ("1", "true", "yes")
+    force_live_sync = False
+    live_sync_wait_sec = 0.0
+    if force_req:
+        now = time.time()
+        with _LIVE_SYNC_LOCK:
+            last_ts = float(_LIVE_SYNC_LAST_TS_BY_SCOPE.get(scope) or 0.0)
+            elapsed = now - last_ts
+            remain = max(0.0, _LIVE_SYNC_COOLDOWN_SEC - elapsed)
+            if remain <= 0.0:
+                force_live_sync = True
+                _LIVE_SYNC_LAST_TS_BY_SCOPE[scope] = now
+            else:
+                live_sync_wait_sec = remain
+    return force_req, force_live_sync, live_sync_wait_sec
+
+
+def _live_sync_remaining_sec(scope: str) -> float:
+    if scope not in _LIVE_SYNC_LAST_TS_BY_SCOPE:
+        scope = "positions"
+    with _LIVE_SYNC_LOCK:
+        last_ts = float(_LIVE_SYNC_LAST_TS_BY_SCOPE.get(scope) or 0.0)
+        elapsed_now = time.time() - last_ts
+        return max(0.0, _LIVE_SYNC_COOLDOWN_SEC - elapsed_now)
 
 def _run_parallel_tasks(tasks: list) -> list:
     if not tasks:
@@ -306,22 +336,8 @@ DEFAULTS = {
 
 @app.route("/positions")
 def follower_positions():
-    global _LIVE_SYNC_LAST_TS
-    force_req = str(request.args.get("force", "")).lower() in ("1", "true", "yes")
-    force_live_sync = False
-    live_sync_wait_sec = 0.0
-    if force_req:
-        now = time.time()
-        with _LIVE_SYNC_LOCK:
-            elapsed = now - float(_LIVE_SYNC_LAST_TS or 0.0)
-            remain = max(0.0, _LIVE_SYNC_COOLDOWN_SEC - elapsed)
-            if remain <= 0.0:
-                force_live_sync = True
-                _LIVE_SYNC_LAST_TS = now
-            else:
-                live_sync_wait_sec = remain
+    force_req, force_live_sync, live_sync_wait_sec = _resolve_live_sync_request("positions")
     items, groups = _build_follower_positions(force=force_live_sync)
-    pnl_payload = _build_pnl_payload(force=force_live_sync)
     total = len(items)
     admin_total = len(groups.get("admin") or [])
     follower_total = len(groups.get("followers") or [])
@@ -348,9 +364,7 @@ def follower_positions():
     elif force_live_sync:
         msg = "Live Sync 완료 (거래소 즉시 재동기화)"
         notice = f"{notice} | {msg}" if notice else msg
-    with _LIVE_SYNC_LOCK:
-        elapsed_now = time.time() - float(_LIVE_SYNC_LAST_TS or 0.0)
-        live_sync_remaining_sec = max(0.0, _LIVE_SYNC_COOLDOWN_SEC - elapsed_now)
+    live_sync_remaining_sec = _live_sync_remaining_sec("positions")
     return render_template(
         "positions.html",
         items=items,
@@ -361,9 +375,29 @@ def follower_positions():
         user_counts=user_counts,
         updated_at=updated_at,
         notice=notice,
-        pnl_payload=pnl_payload,
         live_sync_cooldown_sec=_LIVE_SYNC_COOLDOWN_SEC,
         live_sync_remaining_sec=live_sync_remaining_sec,
+    )
+
+
+@app.route("/asset_dashboard")
+def asset_dashboard():
+    force_req, force_live_sync, live_sync_wait_sec = _resolve_live_sync_request("asset_dashboard")
+    pnl_payload = _build_pnl_payload(force=force_live_sync)
+    notice = request.args.get("notice")
+    if force_req and not force_live_sync:
+        msg = f"Live Sync 쿨다운 중: {live_sync_wait_sec:.1f}s 후 재시도"
+        notice = f"{notice} | {msg}" if notice else msg
+    elif force_live_sync:
+        msg = "Live Sync 완료 (거래소 즉시 재동기화)"
+        notice = f"{notice} | {msg}" if notice else msg
+    return render_template(
+        "asset_dashboard.html",
+        updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        notice=notice,
+        pnl_payload=pnl_payload,
+        live_sync_cooldown_sec=_LIVE_SYNC_COOLDOWN_SEC,
+        live_sync_remaining_sec=_live_sync_remaining_sec("asset_dashboard"),
     )
 
 
