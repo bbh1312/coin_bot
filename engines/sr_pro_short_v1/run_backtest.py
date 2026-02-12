@@ -645,6 +645,7 @@ def run_backtest() -> None:
 
         trade = None
         retest_active = False
+        retest_is_strong = False
         retest_level = 0.0
         retest_until = -1
         break_i3 = -1
@@ -1025,6 +1026,7 @@ def run_backtest() -> None:
                 retest_until = i3 + retest_bars
                 break_i3 = i3
                 break_low_min = low_min
+                retest_is_strong = strong_break
                 if args.debug_retest:
                     print(
                         "[BACKTEST][RET_ARM] "
@@ -1052,7 +1054,7 @@ def run_backtest() -> None:
             reclaim_up_buf = 0.0
             approach_tol = 0.0
             if retest_active and i3 <= retest_until:
-                retest_touch_mult = float(args.retest_atr_mult) if strong_break else 0.5
+                retest_touch_mult = float(args.retest_atr_mult) if retest_is_strong else 0.5
                 reclaim_up_buf = atr_now * float(args.reclaim_up_atr_mult)
                 approach_tol = atr_now * retest_touch_mult
                 touch_approach = high_now >= (retest_level - approach_tol)
@@ -1070,6 +1072,21 @@ def run_backtest() -> None:
                         f"atr3={atr_now:.6f} approach_tol={approach_tol:.6f} "
                         f"reclaim_up={reclaim_up_buf:.6f} touch={int(retest_touch)}"
                     )
+                if retest_touch:
+                    if args.log_gates:
+                        gate_counts["retest_seen"] += 1
+                    if args.debug_retest:
+                        touch_type = "reclaim_fail" if touch_reclaim_fail else "approach"
+                        print(
+                            "[BACKTEST][RET_TOUCH] "
+                            f"sym={sym} ts={_ts_kst(ts)} type={touch_type} "
+                            f"level={retest_level:.6f} high={high_now:.6f} close={close_now:.6f} "
+                            f"approach_tol={approach_tol:.6f} reclaim_up={reclaim_up_buf:.6f}"
+                        )
+            elif retest_active and i3 > retest_until:
+                if args.log_gates:
+                    gate_counts["retest_fail_far"] += 1
+                retest_active = False
 
             # DVF pending confirm (next bar check)
             if dvf_pending_active and (not args.require_retest_touch or retest_touch):
@@ -1320,16 +1337,6 @@ def run_backtest() -> None:
                     continue
 
                 if retest_touch:
-                    if args.log_gates:
-                        gate_counts["retest_seen"] += 1
-                    if args.debug_retest:
-                        touch_type = "reclaim_fail" if touch_reclaim_fail else "approach"
-                        print(
-                            "[BACKTEST][RET_TOUCH] "
-                            f"sym={sym} ts={_ts_kst(ts)} type={touch_type} "
-                            f"level={retest_level:.6f} high={high_now:.6f} close={close_now:.6f} "
-                            f"approach_tol={approach_tol:.6f} reclaim_up={reclaim_up_buf:.6f}"
-                        )
                     rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
                     upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
                     wick_ratio = (upper_wick / rng) if rng > 0 else 0.0

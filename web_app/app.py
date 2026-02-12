@@ -359,6 +359,41 @@ def _extract_fill(res: dict) -> tuple[object, object]:
     return fill_price, qty
 
 
+def _manual_entry_meta(side: str, settings: dict, entry_price: object = None) -> dict:
+    side_key = (side or "").strip().upper()
+    if side_key == "SHORT":
+        tp_pct = float(settings.get("short_tp_pct") or 0.0)
+        sl_pct = float(settings.get("short_sl_pct") or 0.0)
+    else:
+        tp_pct = float(settings.get("long_tp_pct") or 0.0)
+        sl_pct = float(settings.get("long_sl_pct") or 0.0)
+    meta = {
+        "reason": "manual_admin",
+        "engine": "MANUAL_ADMIN",
+        "source": "admin_web",
+    }
+    if tp_pct > 0:
+        meta["tp_pct"] = tp_pct
+    if sl_pct > 0:
+        meta["sl_pct"] = sl_pct
+    try:
+        px = float(entry_price) if entry_price is not None else None
+    except Exception:
+        px = None
+    if isinstance(px, float) and px > 0:
+        if tp_pct > 0:
+            if side_key == "SHORT":
+                meta["tp_price"] = px * (1.0 - (tp_pct / 100.0))
+            else:
+                meta["tp_price"] = px * (1.0 + (tp_pct / 100.0))
+        if sl_pct > 0:
+            if side_key == "SHORT":
+                meta["sl_price"] = px * (1.0 + (sl_pct / 100.0))
+            else:
+                meta["sl_price"] = px * (1.0 - (sl_pct / 100.0))
+    return meta
+
+
 @app.post("/manual_entry")
 def manual_entry_submit():
     symbol = _normalize_symbol(request.form.get("symbol") or "")
@@ -409,6 +444,21 @@ def manual_entry_submit():
             entry_order_id = _order_id_from_res(res)
             state_path = _state_path_for_account(acct.meta.get("db") or {"id": acct.account_id, "name": acct.name})
             state = load_state_from(state_path)
+            meta = _manual_entry_meta(side, settings, entry_price=entry_price)
+            sl_order_id = None
+            sl_price = meta.get("sl_price")
+            if isinstance(sl_price, (int, float)) and float(sl_price) > 0:
+                try:
+                    with executor.activate():
+                        if side == "LONG":
+                            sl_res = executor.place_long_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
+                        else:
+                            sl_res = executor.place_short_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
+                    sl_order_id = _order_id_from_res(sl_res) if isinstance(sl_res, dict) else None
+                except Exception:
+                    sl_order_id = None
+            if sl_order_id:
+                meta["sl_order_id"] = sl_order_id
             _log_trade_entry(
                 state,
                 side=side,
@@ -418,7 +468,7 @@ def manual_entry_submit():
                 qty=qty if isinstance(qty, (int, float)) else None,
                 usdt=usdt_amount,
                 entry_order_id=entry_order_id,
-                meta={"reason": "관리자수동진입", "engine": "관리자수동진입"},
+                meta=meta,
             )
             save_state_to(state, state_path)
             return {"account": acct.name, "status": "ok"}
@@ -1527,7 +1577,21 @@ def admin_entry():
             entry_price = res.get("last") or res.get("price")
             qty = res.get("amount")
             order_id = res.get("order_id")
-            meta = {"reason": "manual_admin", "source": "admin_web"}
+            meta = _manual_entry_meta(side, settings, entry_price=entry_price)
+            sl_order_id = None
+            sl_price = meta.get("sl_price")
+            if isinstance(sl_price, (int, float)) and float(sl_price) > 0:
+                try:
+                    with executor.activate():
+                        if side == "LONG":
+                            sl_res = executor.place_long_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
+                        else:
+                            sl_res = executor.place_short_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
+                    sl_order_id = _order_id_from_res(sl_res) if isinstance(sl_res, dict) else None
+                except Exception:
+                    sl_order_id = None
+            if sl_order_id:
+                meta["sl_order_id"] = sl_order_id
             _log_trade_entry(
                 acct_state,
                 side,

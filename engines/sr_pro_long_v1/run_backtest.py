@@ -268,7 +268,12 @@ def run_backtest() -> None:
     parser.add_argument("--max-zones-per-side", type=int, default=8)
     parser.add_argument("--touch-mode", type=str, default="top", choices=["top", "mid"])
     parser.add_argument("--touch-use-close", action="store_true")
-    parser.add_argument("--dvf-norm-min", type=float, default=0.2)
+    parser.add_argument("--touch-recent-bars", type=int, default=2)
+    parser.add_argument("--touch-react", action="store_true", default=True)
+    parser.add_argument("--no-touch-react", action="store_false", dest="touch_react")
+    parser.add_argument("--zone-height-atr-min", type=float, default=0.3)
+    parser.add_argument("--zone-height-atr-max", type=float, default=2.0)
+    parser.add_argument("--dvf-norm-min", type=float, default=0.1)
     parser.add_argument("--require-reject-close", action="store_true")
     parser.add_argument("--reject-mode", type=str, default="top", choices=["top", "mid"])
     parser.add_argument("--reject-source", type=str, default="1h", choices=["1h", "15m"])
@@ -276,21 +281,35 @@ def run_backtest() -> None:
     parser.add_argument("--no-ema200-filter", action="store_false", dest="ema200_filter")
     parser.add_argument("--ema-filter-len", type=int, default=200)
     parser.add_argument("--retest-bars", type=int, default=6)
-    parser.add_argument("--retest-atr-mult", type=float, default=0.25)
+    parser.add_argument("--retest-atr-mult", type=float, default=0.4)
     parser.add_argument("--retest-near-atr-mult", type=float, default=0.15)
-    parser.add_argument("--retest-wick-max", type=float, default=0.4)
+    parser.add_argument("--retest-wick-max", type=float, default=0.35)
+    parser.add_argument("--retest-sweep-atr-mult", type=float, default=0.05)
+    parser.add_argument("--retest-close-atr-tol", type=float, default=0.05)
+    parser.add_argument("--aggr-break", action="store_true")
+    parser.add_argument("--no-aggr-break", action="store_false", dest="aggr_break")
+    parser.set_defaults(aggr_break=True)
+    parser.add_argument("--aggr-body-ratio-min", type=float, default=0.6)
+    parser.add_argument("--aggr-close-atr-min", type=float, default=0.1)
+    parser.add_argument("--aggr-entry-cap-atr", type=float, default=0.3)
+    parser.add_argument("--aggr-fast-fail-atr", type=float, default=0.15)
+    parser.add_argument("--aggr-tp-atr-mult", type=float, default=1.5)
+    parser.add_argument("--aggr-sl-atr-mult", type=float, default=1.0)
     parser.add_argument("--retest-dyn", action="store_true")
     parser.add_argument("--retest-dyn-th", type=float, default=0.6)
     parser.add_argument("--retest-dyn-bars", type=int, default=10)
     parser.add_argument("--shallow-atr-mult", type=float, default=0.35)
     parser.add_argument("--shallow-wick-max", type=float, default=0.35)
-    parser.add_argument("--shallow-dvf-min", type=float, default=0.0)
+    parser.add_argument("--shallow-dvf-min", type=float, default=0.1)
+    parser.add_argument("--shallow-reclaim-atr-mult", type=float, default=0.05)
     parser.add_argument("--entry-ema-len", type=int, default=7)
-    parser.add_argument("--entry-atr-offset", type=float, default=0.15)
+    parser.add_argument("--entry-atr-offset", type=float, default=0.01)
+    parser.add_argument("--entry-target-allow-atr", type=float, default=0.12)
+    parser.add_argument("--entry-max-atr-over-retest", type=float, default=0.60)
     parser.add_argument("--sl-buffer", type=float, default=0.01)
-    parser.add_argument("--sl-atr-mult", type=float, default=0.4)
-    parser.add_argument("--tp-atr-mult", type=float, default=0.0)
-    parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
+    parser.add_argument("--sl-atr-mult", type=float, default=1.0)
+    parser.add_argument("--tp-atr-mult", type=float, default=1.0)
+    parser.add_argument("--tp-atr-mult-weak", type=float, default=1.0)
     parser.add_argument("--tp-mult", type=float, default=1.02)
     parser.add_argument("--tp-mult-weak", type=float, default=1.02)
     parser.add_argument("--base-usdt", type=float, default=1000.0)
@@ -304,6 +323,15 @@ def run_backtest() -> None:
     parser.add_argument("--log-gates", action="store_true")
     parser.add_argument("--debug-zone", action="store_true")
     parser.add_argument("--block-hours", type=str, default="")
+    parser.add_argument("--hl-min-count", type=int, default=2)
+    parser.add_argument("--hl-require-ema20", action="store_true", default=True)
+    parser.add_argument("--no-hl-require-ema20", action="store_false", dest="hl_require_ema20")
+    parser.add_argument("--overext-k-atr-15m", type=float, default=2.0)
+    parser.add_argument("--break-pivot-left", type=int, default=2)
+    parser.add_argument("--break-pivot-right", type=int, default=2)
+    parser.add_argument("--break-fallback-lookback", type=int, default=5)
+    parser.add_argument("--break-body-ratio-min", type=float, default=0.50)
+    parser.add_argument("--break-close-atr-min", type=float, default=0.05)
     args = parser.parse_args()
 
     cfg = SrProLongV1Config(
@@ -320,6 +348,13 @@ def run_backtest() -> None:
         tp_mult=args.tp_mult,
         entry_ema_len=args.entry_ema_len,
         entry_atr_offset=args.entry_atr_offset,
+    )
+    print(
+        "[PARAMS] "
+        f"entry_atr_offset={args.entry_atr_offset} "
+        f"gap_allow={args.entry_target_allow_atr} "
+        f"cap_atr={args.entry_max_atr_over_retest} "
+        f"block_hours={args.block_hours!r}"
     )
 
     exchange = None if args.cache_only else ccxt.binance({"enableRateLimit": True})
@@ -445,11 +480,26 @@ def run_backtest() -> None:
         "retest_fail_shallow": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_high": 0,
+        "reject_entry_price_cap": 0,
+        "reject_entry_target": 0,
+        "entry_target_touch": 0,
+        "entry_target_near": 0,
+        "reject_entry_target_far": 0,
+        "reject_entry_target_far_0_01": 0,
+        "reject_entry_target_far_01_02": 0,
+        "reject_entry_target_far_02_03": 0,
+        "reject_entry_target_far_03p": 0,
+        "reject_entry_target_near_quality": 0,
+        "reject_entry_support": 0,
         "reject_pass_1h": 0,
         "reject_pass_15m": 0,
         "ema200_pass": 0,
         "time_block": 0,
+        "aggr_break": 0,
+        "aggr_entry": 0,
+        "aggr_cap_reject": 0,
     }
+    far_gap_logs = 0
 
     def _load_entry_block_hours() -> set[int]:
         # prefer explicit args, else read from state.json or ENV ENTRY_BLOCK_HOURS
@@ -478,6 +528,20 @@ def run_backtest() -> None:
         return set()
 
     block_hours = _load_entry_block_hours()
+
+    def _last_pivot_high(highs: pd.Series, idx: int, left: int, right: int) -> Optional[float]:
+        if idx <= left:
+            return None
+        start = idx - right
+        if start <= left:
+            start = left + 1
+        for i in range(start, left, -1):
+            h = float(highs.iloc[i])
+            ok_left = all(h > float(highs.iloc[i - j]) for j in range(1, left + 1))
+            ok_right = all(h >= float(highs.iloc[i + j]) for j in range(1, right + 1) if i + j < len(highs))
+            if ok_left and ok_right:
+                return h
+        return None
 
     entries_by_day: Dict[str, int] = {}
     cooldown_until: Dict[tuple, int] = {}
@@ -517,6 +581,10 @@ def run_backtest() -> None:
         atr_3m = _atr(df_3m, 14)
         ema_3m_entry = _ema(df_3m["close"].astype(float), int(cfg.entry_ema_len))
         atr_15m = _atr(df_15m, 14)
+        atr_1h = _atr(df_1h, 14)
+        ema20_15m = _ema(df_15m["close"].astype(float), 20)
+        ema50_15m = _ema(df_15m["close"].astype(float), 50)
+        ema200_15m = _ema(df_15m["close"].astype(float), 200)
 
         zones: List[Zone] = []
         if args.zones_snapshot_in and sym in zones_snapshot_in:
@@ -623,9 +691,53 @@ def run_backtest() -> None:
             if trade:
                 high_i = float(df_3m.at[i3, "high"])
                 low_i = float(df_3m.at[i3, "low"])
+                close_i = float(df_3m.at[i3, "close"])
                 trade["hold_bars"] += 1
                 trade["mfe"] = max(trade["mfe"], max(0.0, (high_i - trade["entry_px"]) / trade["entry_px"]))
                 trade["mae"] = max(trade["mae"], max(0.0, (trade["entry_px"] - low_i) / trade["entry_px"]))
+                fast_fail_level = trade.get("fast_fail_level")
+                fast_fail_atr_mult = trade.get("fast_fail_atr_mult", 0.05)
+                fast_fail_atr = trade.get("fast_fail_atr", atr_3m.iloc[i3] if atr_now > 0 else 0.0)
+                if trade["hold_bars"] <= 1 and isinstance(fast_fail_level, (int, float)):
+                    ff_atr = float(fast_fail_atr) if isinstance(fast_fail_atr, (int, float)) else 0.0
+                    ff_mult = float(fast_fail_atr_mult) if isinstance(fast_fail_atr_mult, (int, float)) else 0.05
+                    ff_level = float(fast_fail_level) - (ff_atr * ff_mult if ff_atr > 0 else 0.0)
+                    if close_i < ff_level:
+                        exit_px = close_i
+                        pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
+                        for bucket in (stats, sym_stats):
+                            bucket["exits"] += 1
+                            bucket["trades"] += 1
+                            bucket["mfe_sum"] += trade["mfe"]
+                            bucket["mae_sum"] += trade["mae"]
+                            bucket["hold_sum"] += trade["hold_bars"] * ltf_minutes
+                            bucket["net_sum"] += pnl_pct
+                            bucket["sl_sum"] += pnl_pct
+                            bucket["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
+                            bucket["sl_sum_usdt"] += pnl_pct * float(args.entry_usdt)
+                            if pnl_pct >= 0:
+                                bucket["wins"] += 1
+                            else:
+                                bucket["losses"] += 1
+                                bucket["sl"] = bucket.get("sl", 0) + 1
+                        exit_logs.append(
+                            {
+                                "sym": sym,
+                                "mode": "sr_pro_long_v1",
+                                "side": "LONG",
+                                "entry_ts": trade["entry_ts"],
+                                "exit_ts": ts,
+                                "entry_px": trade["entry_px"],
+                                "exit_px": exit_px,
+                                "reason": "FAST_FAIL",
+                                "tp_pct": _tp_sl_pct_from_trade(trade)[0],
+                                "sl_pct": _tp_sl_pct_from_trade(trade)[1],
+                                "pnl_pct": pnl_pct,
+                            }
+                        )
+                        cooldown_until[(sym, "LONG")] = ts + (60 * 60 * 1000)
+                        trade = None
+                        continue
                 if low_i <= trade["sl_price"]:
                     exit_px = trade["sl_price"]
                     pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
@@ -708,28 +820,44 @@ def run_backtest() -> None:
                 if args.log_gates:
                     gate_counts["ema200_pass"] += 1
 
-            # Only accept zones touched by the latest confirmed 1h bar
             h1_ts = int(df_1h.at[idx_1h, "ts"]) if "ts" in df_1h.columns else 0
+            h1_open = float(open_1h.iloc[idx_1h])
+            atr1h_now = float(atr_1h.iloc[idx_1h]) if not np.isnan(atr_1h.iloc[idx_1h]) else 0.0
+            recent_bars = max(1, int(args.touch_recent_bars))
             for z in zones:
                 if not z.live:
-                    setattr(z, "last_touch_ts", 0)
+                    setattr(z, "last_touch_idx", -1)
                     continue
                 touched_now = (
                     z.side == -1
                     and h1_touch_px <= (z.mid if h1_touch_level == "mid" else z.top)
                     and h1_high >= z.bot
                 )
-                setattr(z, "last_touch_ts", h1_ts if touched_now else 0)
-            support_candidates = [
-                z
-                for z in zones
-                if z.live
-                and z.side == -1
-                and dvf_norm >= float(args.dvf_norm_min)
-                and h1_touch_px <= (z.mid if h1_touch_level == "mid" else z.top)
-                and h1_high >= z.bot
-                and getattr(z, "last_touch_ts", 0) == h1_ts
-            ]
+                if touched_now:
+                    setattr(z, "last_touch_idx", idx_1h)
+            support_candidates = []
+            for z in zones:
+                if not z.live or z.side != -1:
+                    continue
+                if dvf_norm < float(args.dvf_norm_min):
+                    continue
+                if atr1h_now > 0:
+                    zone_height_atr = (z.top - z.bot) / atr1h_now
+                    if zone_height_atr < float(args.zone_height_atr_min) or zone_height_atr > float(args.zone_height_atr_max):
+                        continue
+                last_touch_idx = getattr(z, "last_touch_idx", -1)
+                recent_ok = last_touch_idx >= 0 and (idx_1h - last_touch_idx) <= (recent_bars - 1)
+                if not recent_ok:
+                    continue
+                touch_ok = (
+                    h1_touch_px <= (z.mid if h1_touch_level == "mid" else z.top)
+                    and h1_high >= z.bot
+                ) or (h1_close >= z.mid)
+                if not touch_ok:
+                    continue
+                if args.touch_react and not (h1_close > h1_open or h1_close >= z.mid):
+                    continue
+                support_candidates.append(z)
             if support_candidates and args.require_reject_close:
                 reject_level = "mid" if args.reject_mode == "mid" else "top"
                 if args.reject_source == "1h":
@@ -753,34 +881,104 @@ def run_backtest() -> None:
                 continue
 
             idx_15m = int(np.searchsorted(ts_15m, ts, side="right") - 1)
-            if idx_15m < 2:
+            if idx_15m < 3:
                 continue
-            l15_0 = float(df_15m.at[idx_15m, "low"])
-            l15_1 = float(df_15m.at[idx_15m - 1, "low"])
-            l15_2 = float(df_15m.at[idx_15m - 2, "low"])
-            if not (l15_0 > l15_1 or l15_1 > l15_2):
+            close_15m_now = float(df_15m.at[idx_15m, "close"])
+            ema20_now = float(ema20_15m.iloc[idx_15m])
+            ema50_now = float(ema50_15m.iloc[idx_15m])
+            if not (close_15m_now > ema20_now or ema20_now > ema50_now):
                 if args.log_gates:
                     gate_counts["hl_15m"] += 1
                 continue
-            if not (float(df_15m.at[idx_15m, "close"]) > float(df_15m.at[idx_15m, "open"])):
+            # overextension filter
+            atr15_now = float(atr_15m.iloc[idx_15m]) if not np.isnan(atr_15m.iloc[idx_15m]) else 0.0
+            ema200_now = float(ema200_15m.iloc[idx_15m])
+            if atr15_now > 0 and (close_15m_now - ema200_now) > (atr15_now * float(args.overext_k_atr_15m)):
                 if args.log_gates:
                     gate_counts["hl_15m"] += 1
                 continue
 
             close_now = float(df_3m.at[i3, "close"])
             open_now = float(df_3m.at[i3, "open"])
-            high_prev = [
-                float(df_3m.at[i3 - 1, "high"]),
-                float(df_3m.at[i3 - 2, "high"]),
-                float(df_3m.at[i3 - 3, "high"]),
-            ]
-            high_max = max(high_prev)
-            strong_break = close_now > high_max
-            weak_break = (float(df_3m.at[i3, "high"]) > high_max) and (close_now <= high_max) and (close_now > open_now)
+            high_now = float(df_3m.at[i3, "high"])
+            low_now = float(df_3m.at[i3, "low"])
+            atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
+            highs = df_3m["high"].astype(float)
+            pivot_high = _last_pivot_high(highs, i3 - 1, int(args.break_pivot_left), int(args.break_pivot_right))
+            if pivot_high is None:
+                lookback = max(3, int(args.break_fallback_lookback))
+                lookback = min(lookback, i3)
+                highs_slice = [
+                    float(df_3m.at[i3 - j, "high"]) for j in range(1, lookback + 1)
+                ]
+                high_max = max(highs_slice)
+            else:
+                high_max = float(pivot_high)
+            rng = high_now - low_now
+            body_ratio = abs(close_now - open_now) / rng if rng > 0 else 0.0
+            break_body_ok = body_ratio >= float(args.break_body_ratio_min)
+            break_dist_ok = (atr_now > 0) and ((close_now - high_max) >= (atr_now * float(args.break_close_atr_min)))
+            strong_break = close_now > high_max and break_body_ok and break_dist_ok
+            weak_break = (high_now > high_max) and (close_now > open_now) and (atr_now > 0) and ((high_now - high_max) >= (atr_now * float(args.break_close_atr_min)))
             if not strong_break and not weak_break:
                 if args.log_gates:
                     gate_counts["break_3m"] += 1
                 continue
+            # aggressive break entry (no retest)
+            if args.aggr_break and strong_break:
+                aggr_body_ok = body_ratio >= float(args.aggr_body_ratio_min)
+                aggr_dist_ok = (atr_now > 0) and ((close_now - high_max) >= (atr_now * float(args.aggr_close_atr_min)))
+                ema20_3m = _ema(df_3m["close"].astype(float), 20)
+                ema20_now_3m = float(ema20_3m.iloc[i3]) if not np.isnan(ema20_3m.iloc[i3]) else close_now
+                if aggr_body_ok and aggr_dist_ok and close_now > open_now and close_now > ema20_now_3m:
+                    if args.log_gates:
+                        gate_counts["aggr_break"] += 1
+                    try:
+                        entry_px = float(df_3m.at[i3 + 1, "open"])
+                    except Exception:
+                        entry_px = float("nan")
+                    if np.isnan(entry_px):
+                        continue
+                    if atr_now > 0 and entry_px > (close_now + (atr_now * float(args.aggr_entry_cap_atr))):
+                        if args.log_gates:
+                            gate_counts["aggr_cap_reject"] += 1
+                        continue
+                    sl_price = entry_px - (atr_now * float(args.aggr_sl_atr_mult))
+                    tp_price = entry_px + (atr_now * float(args.aggr_tp_atr_mult))
+                    trade = {
+                        "entry_px": entry_px,
+                        "sl_price": sl_price,
+                        "tp_price": tp_price,
+                        "mfe": 0.0,
+                        "mae": 0.0,
+                        "hold_bars": 0,
+                        "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                        "track": "aggr",
+                        "reason": "aggr_break",
+                        "fast_fail_level": high_max,
+                        "fast_fail_atr_mult": float(args.aggr_fast_fail_atr),
+                        "fast_fail_atr": atr_now,
+                    }
+                    stats["entries"] += 1
+                    sym_stats["entries"] += 1
+                    if args.log_gates:
+                        gate_counts["aggr_entry"] += 1
+                    day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
+                    entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                    date_stats.setdefault(
+                        day_key, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0}
+                    )
+                    date_stats[day_key]["entries"] += 1
+                    entry_symbols.add(sym)
+                    dt_kst = datetime.fromtimestamp(trade["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
+                    hour_bucket = dt_kst.hour
+                    dow_bucket = _dow_label(dt_kst)
+                    hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
+                    dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
+                    hour_stats[hour_bucket]["entries"] += 1
+                    dow_stats[dow_bucket]["entries"] += 1
+                    retest_active = False
+                    continue
             # time block (KST hours)
             hour_kst = int(_ts_kst(ts).split(" ")[1].split(":")[0])
             if block_hours and hour_kst in block_hours:
@@ -806,26 +1004,28 @@ def run_backtest() -> None:
                 gate_counts["retest_seen"] += 1
 
             if retest_active and i3 <= retest_until:
-                low_now = float(df_3m.at[i3, "low"])
-                high_now = float(df_3m.at[i3, "high"])
-                rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
-                lower_wick = min(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"])) - float(df_3m.at[i3, "low"])
+                rng = high_now - low_now
+                lower_wick = min(open_now, close_now) - low_now
                 lower_wick_ratio = (lower_wick / rng) if rng > 0 else 0.0
-                atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
                 if low_now <= retest_level + (atr_now * float(args.retest_atr_mult)):
                     entry_ok = False
                     entry_reason = None
-                    if close_now > retest_level:
+                    if close_now >= retest_level:
                         entry_ok = True
                         entry_reason = "close_reclaim"
                         if args.log_gates:
                             gate_counts["retest_pass_close"] += 1
-                    elif high_now > retest_level and close_now > open_now and lower_wick_ratio <= 0.40:
+                    elif (close_now >= (retest_level - (atr_now * float(args.retest_close_atr_tol)))) and (close_now > open_now):
                         entry_ok = True
-                        entry_reason = "high_sweep"
+                        entry_reason = "near_reclaim"
+                        if args.log_gates:
+                            gate_counts["retest_pass_close"] += 1
+                    elif (low_now < retest_level - (atr_now * float(args.retest_sweep_atr_mult))) and (close_now > retest_level):
+                        entry_ok = True
+                        entry_reason = "sweep_reclaim"
                         if args.log_gates:
                             gate_counts["retest_pass_high"] += 1
-                    elif (not strong_break) and (low_now > retest_level - (atr_now * float(args.shallow_atr_mult))) and close_now > open_now and dvf_norm >= float(args.shallow_dvf_min) and lower_wick_ratio <= float(args.shallow_wick_max):
+                    elif (not strong_break) and (low_now > retest_level - (atr_now * float(args.shallow_atr_mult))) and close_now > open_now and dvf_norm >= float(args.shallow_dvf_min) and lower_wick_ratio <= float(args.shallow_wick_max) and close_now > (retest_level + (atr_now * float(args.shallow_reclaim_atr_mult))):
                         entry_ok = True
                         entry_reason = "shallow"
                         if args.log_gates:
@@ -838,21 +1038,63 @@ def run_backtest() -> None:
                     entry_target = None
                     if isinstance(ema_entry, (int, float)) and atr_now > 0:
                         entry_target = float(ema_entry) - (atr_now * entry_offset)
-                    if entry_target is None or low_now > entry_target:
+                    allow_atr = float(args.entry_target_allow_atr)
+                    if entry_target is not None and atr_now > 0:
+                        gap = (low_now - entry_target) / atr_now
+                        if gap <= 0.0:
+                            if args.log_gates:
+                                gate_counts["entry_target_touch"] += 1
+                        elif gap <= allow_atr:
+                            if args.log_gates:
+                                gate_counts["entry_target_near"] += 1
+                        else:
+                            if args.log_gates:
+                                gate_counts["reject_entry_target_far"] += 1
+                                if gap <= 0.10:
+                                    gate_counts["reject_entry_target_far_0_01"] += 1
+                                elif gap <= 0.20:
+                                    gate_counts["reject_entry_target_far_01_02"] += 1
+                                elif gap <= 0.30:
+                                    gate_counts["reject_entry_target_far_02_03"] += 1
+                                else:
+                                    gate_counts["reject_entry_target_far_03p"] += 1
+                                if far_gap_logs < 5:
+                                    far_gap_logs += 1
+                                    print(
+                                        "[BACKTEST][REJECT_TARGET_FAR] "
+                                        f"sym={sym} ts={_ts_kst(ts)} "
+                                        f"ema7={ema_entry:.6f} atr={atr_now:.6f} "
+                                        f"offset={entry_offset:.6f} "
+                                        f"target={entry_target:.6f} low={low_now:.6f} gap={gap:.3f}"
+                                    )
+                    try:
+                        entry_px = float(df_3m.at[i3 + 1, "open"])
+                    except Exception:
+                        entry_px = float("nan")
+                    if np.isnan(entry_px):
                         continue
-                    entry_px = float(close_now)
+                    cap_base = max(retest_level, entry_target)
+                    if atr_now > 0 and entry_px > (cap_base + (atr_now * float(args.entry_max_atr_over_retest))):
+                        if args.log_gates:
+                            gate_counts["reject_entry_price_cap"] += 1
+                        continue
+                    if entry_reason == "close_reclaim" and args.log_gates:
+                        try:
+                            next_open = float(df_3m.at[i3 + 1, "open"])
+                        except Exception:
+                            next_open = float("nan")
+                        z = (next_open - retest_level) / atr_now if atr_now > 0 else 0.0
+                        print(
+                            f"[BACKTEST][PASS_CLOSE] sym={sym} ts={_ts_kst(ts)} retest={retest_level:.6f} atr={atr_now:.6f} next_open={next_open:.6f} z={z:.3f}"
+                        )
                     nearest = min(support_candidates, key=lambda z: abs(z.mid - entry_px))
                     if not (close_now >= nearest.mid or entry_px >= nearest.top - (atr_now * 0.2)):
                         if args.log_gates:
-                            gate_counts["retest_fail_shallow"] += 1
+                            gate_counts["reject_entry_support"] += 1
                         continue
-                    sl_raw = nearest.bot - (atr_now * float(args.sl_atr_mult))
-                    sl_price = min(sl_raw, entry_px - (atr_now * 1.0))
+                    sl_price = entry_px - (atr_now * float(args.sl_atr_mult))
                     tp_atr = float(args.tp_atr_mult_weak) if (not strong_break and float(args.tp_atr_mult_weak) > 0) else float(args.tp_atr_mult)
-                    if tp_atr > 0:
-                        tp_price = entry_px + (atr_now * tp_atr)
-                    else:
-                        tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
+                    tp_price = entry_px + (atr_now * tp_atr) if tp_atr > 0 else entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
 
                     trade = {
                         "entry_px": entry_px,
@@ -864,6 +1106,7 @@ def run_backtest() -> None:
                         "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
                         "track": "strong" if strong_break else "weak",
                         "reason": entry_reason,
+                        "fast_fail_level": retest_level,
                     }
                     stats["entries"] += 1
                     sym_stats["entries"] += 1
