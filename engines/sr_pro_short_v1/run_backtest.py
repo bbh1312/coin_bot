@@ -714,8 +714,6 @@ def run_backtest() -> None:
 
             # resolve current 1h bar index
             idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
-            if args.use_confirmed:
-                idx_1h -= 1
             if idx_1h < 0:
                 continue
 
@@ -849,7 +847,7 @@ def run_backtest() -> None:
                 continue
 
             # 1h in-progress bar touching resistance zone with negative delta
-            idx_1h_touch = idx_1h + 1 if args.use_confirmed and (idx_1h + 1) < len(df_1h) else idx_1h
+            idx_1h_touch = idx_1h
             h1_high = float(high_1h.iloc[idx_1h_touch])
             h1_low = float(low_1h.iloc[idx_1h_touch])
             h1_close = float(close_1h.iloc[idx_1h_touch])
