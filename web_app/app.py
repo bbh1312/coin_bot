@@ -58,7 +58,7 @@ from executor import AccountExecutor
 from account_context import AccountContext, AccountSettings
 
 _FOLLOWER_POS_CACHE = {"ts": 0.0, "items": [], "groups": {}}
-_FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "0"))
+_FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "10"))
 _PNL_CACHE = {"ts": 0.0, "payload": None}
 _PNL_TTL_SEC = float(os.getenv("WEB_PNL_TTL_SEC", "20"))
 _WEB_MAX_WORKERS = int(os.getenv("WEB_MAX_WORKERS", "8"))
@@ -1076,6 +1076,19 @@ def _build_pnl_payload(force: bool = False) -> dict:
     pnl_week_start_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_week_start_ts + 9 * 3600))
     pnl_yesterday_start_ts = pnl_start_ts - 86400
     pnl_yesterday_date_kst = time.strftime("%Y-%m-%d", time.gmtime(pnl_yesterday_start_ts + 9 * 3600))
+    unrealized_from_pos_cache: dict[int, float] = {}
+    if _FOLLOWER_POS_TTL_SEC > 0:
+        pos_cached = _FOLLOWER_POS_CACHE
+        pos_ts = float(pos_cached.get("ts") or 0.0)
+        if (now - pos_ts) <= _FOLLOWER_POS_TTL_SEC:
+            for row in (pos_cached.get("items") or []):
+                try:
+                    account_id = int(row.get("account_id"))
+                except Exception:
+                    continue
+                pnl_val = row.get("pnl")
+                if isinstance(pnl_val, (int, float)):
+                    unrealized_from_pos_cache[account_id] = unrealized_from_pos_cache.get(account_id, 0.0) + float(pnl_val)
 
     for acct in _list_accounts_all():
         account_id = int(acct["id"])
@@ -1108,7 +1121,10 @@ def _build_pnl_payload(force: bool = False) -> dict:
                 pnl_y_val, pnl_y_trades, pnl_y_err = _fetch_realized_pnl_range(
                     executor.ctx.exchange, pnl_yesterday_start_ts, pnl_start_ts
                 )
-                pnl_unreal = _sum_unrealized_pnl(executor, acct_state)
+                if account_id in unrealized_from_pos_cache:
+                    pnl_unreal = float(unrealized_from_pos_cache.get(account_id, 0.0))
+                else:
+                    pnl_unreal = _sum_unrealized_pnl(executor, acct_state)
         except Exception:
             pnl_err = pnl_err or "error"
         pnl_today_payload.append(

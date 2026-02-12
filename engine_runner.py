@@ -9144,6 +9144,8 @@ def _run_sr_pro_long_v1_cycle(
         dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
         vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
         dvf_norm = float(dvf.iloc[-1]) / float(vol_ema.iloc[-1]) if float(vol_ema.iloc[-1]) > 0 else 0.0
+        atr_1h = atr(df_1h_hist, 14)
+        atr1h_now = float(atr_1h.iloc[-1]) if not np.isnan(atr_1h.iloc[-1]) else 0.0
 
         # invalidate zones on confirmed 1h close (match backtest behavior)
         try:
