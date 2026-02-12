@@ -318,6 +318,7 @@
             <div class="top-actions">
                 <a class="link-btn" href="/">Control Deck</a>
                 <a class="link-btn" href="/positions">Refresh</a>
+                <a class="link-btn" id="live-sync-btn" href="/positions?force=1" title="거래소 즉시 재조회 (쿨다운 적용)">Live Sync</a>
             </div>
         </header>
         <section class="card pnl-card">
@@ -485,6 +486,10 @@
         const pnlEntryAvailableBox = document.getElementById("pnl-entry-available");
         const pnlMonthlyBox = document.getElementById("pnl-monthly");
         const pnlWeeklyBox = document.getElementById("pnl-weekly");
+        const liveSyncBtn = document.getElementById("live-sync-btn");
+        const initialPnlPayload = {{ (pnl_payload or {}) | tojson }};
+        const liveSyncCooldownSec = Number({{ live_sync_cooldown_sec or 0 }});
+        let liveSyncRemainingSec = Number({{ live_sync_remaining_sec or 0 }});
         tabs.forEach((btn) => {
             btn.addEventListener("click", () => {
                 tabs.forEach((el) => el.classList.remove("active"));
@@ -532,12 +537,7 @@
             });
         }
 
-        async function refreshPnlToday() {
-            const res = await fetch("/pnl_summary");
-            if (!res.ok) {
-                return;
-            }
-            const data = await res.json();
+        function applyPnlPayload(data) {
             const pnlItems = data.pnl_today || [];
             const pnlMonthlyItems = data.pnl_monthly || [];
             const pnlWeeklyItems = data.pnl_weekly || [];
@@ -552,6 +552,16 @@
             renderPnlList(pnlUnrealBox, pnlUnrealItems);
             renderBalanceList(pnlBalanceBox, pnlBalanceItems);
             renderEntryAvailableList(pnlEntryAvailableBox, pnlEntryAvailableItems);
+        }
+
+        async function refreshPnlToday(force = false) {
+            const endpoint = force ? "/pnl_summary?force=1" : "/pnl_summary";
+            const res = await fetch(endpoint);
+            if (!res.ok) {
+                return;
+            }
+            const data = await res.json();
+            applyPnlPayload(data);
         }
 
         function renderBalanceList(container, items) {
@@ -620,7 +630,42 @@
             });
         }
 
-        refreshPnlToday();
+        function renderLiveSyncButton() {
+            if (!liveSyncBtn) {
+                return;
+            }
+            if (liveSyncRemainingSec > 0) {
+                liveSyncBtn.textContent = `Live Sync (${Math.ceil(liveSyncRemainingSec)}s)`;
+                liveSyncBtn.style.pointerEvents = "none";
+                liveSyncBtn.style.opacity = "0.7";
+                return;
+            }
+            liveSyncBtn.textContent = "Live Sync";
+            liveSyncBtn.style.pointerEvents = "auto";
+            liveSyncBtn.style.opacity = "1";
+        }
+
+        if (liveSyncBtn) {
+            liveSyncBtn.addEventListener("click", (e) => {
+                if (liveSyncRemainingSec > 0) {
+                    e.preventDefault();
+                    return;
+                }
+                liveSyncRemainingSec = Math.max(liveSyncCooldownSec, 0);
+                renderLiveSyncButton();
+                liveSyncBtn.style.pointerEvents = "none";
+                liveSyncBtn.style.opacity = "0.7";
+            });
+        }
+        renderLiveSyncButton();
+        window.setInterval(() => {
+            if (liveSyncRemainingSec <= 0) {
+                return;
+            }
+            liveSyncRemainingSec = Math.max(0, liveSyncRemainingSec - 1);
+            renderLiveSyncButton();
+        }, 1000);
+        applyPnlPayload(initialPnlPayload || {});
     </script>
 </body>
 </html>

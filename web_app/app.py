@@ -7,6 +7,7 @@ import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ast
+import threading
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 import sys
@@ -61,6 +62,9 @@ _FOLLOWER_POS_CACHE = {"ts": 0.0, "items": [], "groups": {}}
 _FOLLOWER_POS_TTL_SEC = float(os.getenv("FOLLOWER_POS_TTL_SEC", "10"))
 _PNL_CACHE = {"ts": 0.0, "payload": None}
 _PNL_TTL_SEC = float(os.getenv("WEB_PNL_TTL_SEC", "20"))
+_LIVE_SYNC_COOLDOWN_SEC = float(os.getenv("WEB_LIVE_SYNC_COOLDOWN_SEC", "20"))
+_LIVE_SYNC_LAST_TS = 0.0
+_LIVE_SYNC_LOCK = threading.Lock()
 _WEB_MAX_WORKERS = int(os.getenv("WEB_MAX_WORKERS", "8"))
 KST = timezone(timedelta(hours=9))
 
@@ -302,7 +306,22 @@ DEFAULTS = {
 
 @app.route("/positions")
 def follower_positions():
-    items, groups = _build_follower_positions()
+    global _LIVE_SYNC_LAST_TS
+    force_req = str(request.args.get("force", "")).lower() in ("1", "true", "yes")
+    force_live_sync = False
+    live_sync_wait_sec = 0.0
+    if force_req:
+        now = time.time()
+        with _LIVE_SYNC_LOCK:
+            elapsed = now - float(_LIVE_SYNC_LAST_TS or 0.0)
+            remain = max(0.0, _LIVE_SYNC_COOLDOWN_SEC - elapsed)
+            if remain <= 0.0:
+                force_live_sync = True
+                _LIVE_SYNC_LAST_TS = now
+            else:
+                live_sync_wait_sec = remain
+    items, groups = _build_follower_positions(force=force_live_sync)
+    pnl_payload = _build_pnl_payload(force=force_live_sync)
     total = len(items)
     admin_total = len(groups.get("admin") or [])
     follower_total = len(groups.get("followers") or [])
@@ -323,6 +342,15 @@ def follower_positions():
     user_filters.sort()
     updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     notice = request.args.get("notice")
+    if force_req and not force_live_sync:
+        msg = f"Live Sync 쿨다운 중: {live_sync_wait_sec:.1f}s 후 재시도"
+        notice = f"{notice} | {msg}" if notice else msg
+    elif force_live_sync:
+        msg = "Live Sync 완료 (거래소 즉시 재동기화)"
+        notice = f"{notice} | {msg}" if notice else msg
+    with _LIVE_SYNC_LOCK:
+        elapsed_now = time.time() - float(_LIVE_SYNC_LAST_TS or 0.0)
+        live_sync_remaining_sec = max(0.0, _LIVE_SYNC_COOLDOWN_SEC - elapsed_now)
     return render_template(
         "positions.html",
         items=items,
@@ -333,6 +361,9 @@ def follower_positions():
         user_counts=user_counts,
         updated_at=updated_at,
         notice=notice,
+        pnl_payload=pnl_payload,
+        live_sync_cooldown_sec=_LIVE_SYNC_COOLDOWN_SEC,
+        live_sync_remaining_sec=live_sync_remaining_sec,
     )
 
 
@@ -421,11 +452,24 @@ def manual_entry_submit():
         except Exception:
             settings = accounts_db.DEFAULT_SETTINGS
         executor = acct.executor
-        usdt_amount = _entry_usdt_available(executor, entry_pct)
-        if usdt_amount <= 0:
-            return {"account": acct.name, "status": "skip", "reason": "no_usdt"}
         try:
             with executor.activate():
+                avail = None
+                try:
+                    avail = _resolve_entry_balance_usdt(executor)
+                except Exception:
+                    avail = None
+                if not isinstance(avail, (int, float)) or avail <= 0:
+                    if executor.ctx.dry_run:
+                        try:
+                            avail = float(os.getenv("SIM_USDT_BALANCE", "1000"))
+                        except Exception:
+                            avail = 1000.0
+                    else:
+                        return {"account": acct.name, "status": "skip", "reason": "no_usdt"}
+                usdt_amount = max(0.0, float(avail) * (float(entry_pct) / 100.0))
+                if usdt_amount <= 0:
+                    return {"account": acct.name, "status": "skip", "reason": "no_usdt"}
                 if side == "LONG":
                     res = executor.long_market(
                         symbol,
@@ -440,23 +484,22 @@ def manual_entry_submit():
                         leverage=int(settings.get("leverage") or 10),
                         margin_mode=str(settings.get("margin_mode") or "cross"),
                     )
-            entry_price, qty = _extract_fill(res)
-            entry_order_id = _order_id_from_res(res)
-            state_path = _state_path_for_account(acct.meta.get("db") or {"id": acct.account_id, "name": acct.name})
-            state = load_state_from(state_path)
-            meta = _manual_entry_meta(side, settings, entry_price=entry_price)
-            sl_order_id = None
-            sl_price = meta.get("sl_price")
-            if isinstance(sl_price, (int, float)) and float(sl_price) > 0:
-                try:
-                    with executor.activate():
+                entry_price, qty = _extract_fill(res)
+                entry_order_id = _order_id_from_res(res)
+                state_path = _state_path_for_account(acct.meta.get("db") or {"id": acct.account_id, "name": acct.name})
+                state = load_state_from(state_path)
+                meta = _manual_entry_meta(side, settings, entry_price=entry_price)
+                sl_order_id = None
+                sl_price = meta.get("sl_price")
+                if isinstance(sl_price, (int, float)) and float(sl_price) > 0:
+                    try:
                         if side == "LONG":
                             sl_res = executor.place_long_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
                         else:
                             sl_res = executor.place_short_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
-                    sl_order_id = _order_id_from_res(sl_res) if isinstance(sl_res, dict) else None
-                except Exception:
-                    sl_order_id = None
+                        sl_order_id = _order_id_from_res(sl_res) if isinstance(sl_res, dict) else None
+                    except Exception:
+                        sl_order_id = None
             if sl_order_id:
                 meta["sl_order_id"] = sl_order_id
             _log_trade_entry(
@@ -514,9 +557,6 @@ def close_positions():
         contexts = []
     def _close_task(acct: AccountContext) -> dict:
         try:
-            is_active = bool((acct.meta.get("db") or {}).get("is_active", 1))
-            if not is_active:
-                return {"account": acct.name, "status": "skip", "reason": "inactive"}
             with acct.executor.activate():
                 if side == "LONG":
                     amt = acct.executor.get_long_position_amount(symbol)
@@ -631,10 +671,10 @@ def _load_account_settings(account_id: int) -> dict:
     return settings
 
 
-def _build_follower_positions() -> tuple[list[dict], dict]:
+def _build_follower_positions(force: bool = False) -> tuple[list[dict], dict]:
     now = time.time()
     cached = _FOLLOWER_POS_CACHE
-    if _FOLLOWER_POS_TTL_SEC > 0 and (now - float(cached.get("ts") or 0.0)) <= _FOLLOWER_POS_TTL_SEC:
+    if (not force) and _FOLLOWER_POS_TTL_SEC > 0 and (now - float(cached.get("ts") or 0.0)) <= _FOLLOWER_POS_TTL_SEC:
         return cached.get("items") or [], cached.get("groups") or {}
     items: list[dict] = []
     groups: dict = {"admin": [], "followers": []}
@@ -687,7 +727,7 @@ def _build_follower_positions() -> tuple[list[dict], dict]:
         is_active = bool((acct.meta.get("db") or {}).get("is_active", 1))
         try:
             with acct.executor.activate():
-                syms = acct.executor.list_open_position_symbols(force=True)
+                syms = acct.executor.list_open_position_symbols(force=force)
                 if not (syms.get("long") or syms.get("short")) and state:
                     for row in _rows_from_state(acct, state):
                         items.append(row)
@@ -786,7 +826,8 @@ def _entry_usdt_available(executor: AccountExecutor, entry_pct: float) -> float:
         pct = 100.0
     avail = None
     try:
-        avail = executor.get_available_usdt()
+        with executor.activate():
+            avail = _resolve_entry_balance_usdt(executor)
     except Exception:
         avail = None
     if not isinstance(avail, (int, float)) or avail <= 0:
@@ -800,10 +841,32 @@ def _entry_usdt_available(executor: AccountExecutor, entry_pct: float) -> float:
     return max(0.0, float(avail) * (pct / 100.0))
 
 
-def _open_positions_for_account(executor: AccountExecutor, state: dict) -> list[dict]:
+def _resolve_entry_balance_usdt(executor: AccountExecutor, retries: int = 2) -> Optional[float]:
+    attempts = max(1, int(retries) + 1)
+    for idx in range(attempts):
+        avail = None
+        total = None
+        try:
+            avail = executor.get_available_usdt(ttl_sec=0.0)
+        except Exception:
+            avail = None
+        if isinstance(avail, (int, float)) and float(avail) > 0:
+            return float(avail)
+        try:
+            total = executor.get_futures_usdt_balance(ttl_sec=0.0)
+        except Exception:
+            total = None
+        if isinstance(total, (int, float)) and float(total) > 0:
+            return float(total)
+        if idx < attempts - 1:
+            time.sleep(0.15)
+    return None
+
+
+def _open_positions_for_account(executor: AccountExecutor, state: dict, force: bool = False) -> list[dict]:
     positions = []
     with executor.activate():
-        sym_map = executor.list_open_position_symbols(force=True)
+        sym_map = executor.list_open_position_symbols(force=force)
         # Fallback: if positions API returns empty, probe symbols from state.
         if not (sym_map.get("long") or sym_map.get("short")):
             cand_long = set()
@@ -874,11 +937,11 @@ def _open_positions_for_account(executor: AccountExecutor, state: dict) -> list[
     return positions
 
 
-def _sum_unrealized_pnl(executor: AccountExecutor, state: dict) -> float | None:
+def _sum_unrealized_pnl(executor: AccountExecutor, state: dict, force: bool = False) -> float | None:
     total = 0.0
     has_any = False
     with executor.activate():
-        sym_map = executor.list_open_position_symbols(force=True)
+        sym_map = executor.list_open_position_symbols(force=force)
         if not (sym_map.get("long") or sym_map.get("short")):
             return None
         for sym in sym_map.get("long") or []:
@@ -1124,7 +1187,7 @@ def _build_pnl_payload(force: bool = False) -> dict:
                 if account_id in unrealized_from_pos_cache:
                     pnl_unreal = float(unrealized_from_pos_cache.get(account_id, 0.0))
                 else:
-                    pnl_unreal = _sum_unrealized_pnl(executor, acct_state)
+                    pnl_unreal = _sum_unrealized_pnl(executor, acct_state, force=force)
         except Exception:
             pnl_err = pnl_err or "error"
         pnl_today_payload.append(
@@ -1558,7 +1621,8 @@ def admin_entry():
         return jsonify({"status": "invalid side"}), 400
     if not isinstance(account_ids, list) or not account_ids:
         return jsonify({"status": "missing account_ids"}), 400
-    accounts = {int(a["id"]): a for a in _list_accounts()}
+    # Web manual entry should target all selected users regardless of is_active flag.
+    accounts = {int(a["id"]): a for a in _list_accounts_all()}
     now_ts = time.time()
     def _entry_task(account_id: int) -> dict:
         acct = accounts.get(account_id)
@@ -1578,12 +1642,28 @@ def admin_entry():
             return {"account_id": account_id, "status": "skip", "reason": "manual_entry_disabled"}
         settings = _load_account_settings(account_id)
         executor = _build_executor(acct, settings, force_hedge=True)
-        usdt_amount = _entry_usdt_available(executor, float(settings.get("entry_pct") or 0.0))
-        if usdt_amount <= 0:
-            return {"account_id": account_id, "status": "skip", "reason": "entry_usdt_unavailable"}
+        entry_pct = float(settings.get("entry_pct") or 0.0)
+        if entry_pct <= 0:
+            return {"account_id": account_id, "status": "skip", "reason": "entry_pct_invalid"}
         leverage = int(settings.get("leverage") or 10)
         margin_mode = str(settings.get("margin_mode") or "cross")
         with executor.activate():
+            avail = None
+            try:
+                avail = _resolve_entry_balance_usdt(executor)
+            except Exception:
+                avail = None
+            if not isinstance(avail, (int, float)) or avail <= 0:
+                if executor.ctx.dry_run:
+                    try:
+                        avail = float(os.getenv("SIM_USDT_BALANCE", "1000"))
+                    except Exception:
+                        avail = 1000.0
+                else:
+                    return {"account_id": account_id, "status": "skip", "reason": "entry_usdt_unavailable"}
+            usdt_amount = max(0.0, float(avail) * (entry_pct / 100.0))
+            if usdt_amount <= 0:
+                return {"account_id": account_id, "status": "skip", "reason": "entry_usdt_unavailable"}
             if side == "LONG":
                 res = executor.long_market(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
             else:
