@@ -8906,22 +8906,6 @@ def _run_sr_pro_long_v1_cycle(
         "retest_seen": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_high": 0,
-        "reject_entry_price_cap": 0,
-        "entry_target_touch": 0,
-        "entry_target_near": 0,
-        "reject_entry_target_far": 0,
-        "reject_entry_target_far_0_01": 0,
-        "reject_entry_target_far_01_02": 0,
-        "reject_entry_target_far_02_03": 0,
-        "reject_entry_target_far_03p": 0,
-        "reject_entry_target_near_quality": 0,
-        "reject_entry_target": 0,
-        "reject_entry_support": 0,
-        "fast_fail_count": 0,
-        "fast_fail_recovery_count": 0,
-        "aggr_break": 0,
-        "aggr_entry": 0,
-        "aggr_cap_reject": 0,
         "no_data_ltf": 0,
         "no_data_mtf": 0,
         "no_data_htf": 0,
@@ -8987,21 +8971,6 @@ def _run_sr_pro_long_v1_cycle(
             return df.iloc[:-1]
         return df
 
-    def _last_pivot_high(highs: pd.Series, left: int, right: int) -> Optional[float]:
-        try:
-            n = len(highs)
-            if n <= left + right + 1:
-                return None
-            for i in range(n - 1 - right, left, -1):
-                h = float(highs.iloc[i])
-                ok_left = all(h > float(highs.iloc[i - j]) for j in range(1, left + 1))
-                ok_right = all(h >= float(highs.iloc[i + j]) for j in range(1, right + 1) if i + j < n)
-                if ok_left and ok_right:
-                    return h
-        except Exception:
-            return None
-        return None
-
     def _get_confirmed_df(symbol: str, tf: str, limit: int, retry_sec: float = 3.0) -> pd.DataFrame:
         df = cycle_cache.get_df(symbol, tf, limit=limit)
         if df is None or df.empty:
@@ -9027,22 +8996,31 @@ def _run_sr_pro_long_v1_cycle(
             df_3m = _get_confirmed_df(symbol, tf_ltf, min_ltf_fetch)
             df_15m = _get_confirmed_df(symbol, tf_mtf, min_mtf_fetch)
             df_1h = _get_confirmed_df(symbol, tf_htf, min_htf_fetch)
-        # Use confirmed bars by dropping the forming bar (no hard skip)
+        # If still not confirmed, skip this cycle for strict parity with backtest
+        def _is_confirmed(df: pd.DataFrame, tf: str) -> bool:
+            if df is None or df.empty:
+                return False
+            tf_ms = _tf_ms(tf)
+            now_ms = int(time.time() * 1000)
+            last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns else 0
+            return bool(last_ts and (now_ms - last_ts) >= tf_ms)
+
+        if not (_is_confirmed(df_3m, tf_ltf) and _is_confirmed(df_15m, tf_mtf) and _is_confirmed(df_1h, tf_htf)):
+            gate_stats["skip_stale_ts"] += 1
+            continue
+        if df_3m.empty or df_15m.empty or df_1h.empty:
+            no_data += 1
+            if df_3m.empty:
+                gate_stats["no_data_ltf"] += 1
+            if df_15m.empty:
+                gate_stats["no_data_mtf"] += 1
+            if df_1h.empty:
+                gate_stats["no_data_htf"] += 1
+            continue
+
         df_3m_sig = _confirmed_df(df_3m, tf_ltf)
         df_15m_sig = _confirmed_df(df_15m, tf_mtf)
         df_1h_hist = _confirmed_df(df_1h, tf_htf)
-        if df_3m_sig is None or df_15m_sig is None or df_1h_hist is None:
-            gate_stats["skip_stale_ts"] += 1
-            continue
-        if df_3m_sig.empty or df_15m_sig.empty or df_1h_hist.empty:
-            no_data += 1
-            if df_3m_sig.empty:
-                gate_stats["no_data_ltf"] += 1
-            if df_15m_sig.empty:
-                gate_stats["no_data_mtf"] += 1
-            if df_1h_hist.empty:
-                gate_stats["no_data_htf"] += 1
-            continue
         if not SR_PRO_USE_COMMON_CACHE:
             try:
                 now_ms = int(time.time() * 1000)
@@ -9082,7 +9060,7 @@ def _run_sr_pro_long_v1_cycle(
             continue
 
         sym_state = sr_state.setdefault(symbol, {})
-        latest_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
+        latest_ts_ms = int(df_3m.iloc[-1]["ts"])
         if sym_state.get("last_eval_ts") == latest_ts_ms:
             gate_stats["skip_stale_ts"] += 1
             continue
@@ -9090,38 +9068,7 @@ def _run_sr_pro_long_v1_cycle(
         cd_until = sym_state.get("cooldown_until_long")
         if isinstance(cd_until, (int, float)) and latest_ts_ms < int(cd_until):
             gate_stats["cooldown"] += 1
-            remaining_min = max(0.0, (float(cd_until) - float(latest_ts_ms)) / 60000.0)
-            _append_sr_pro_long_v1_log(
-                f"SR_PRO_LONG_COOLDOWN sym={symbol} until={int(cd_until)} remaining_min={remaining_min:.1f}"
-            )
             continue
-
-        # fast-fail recovery check (within 30 minutes after fast fail)
-        try:
-            last_ff_ts = sym_state.get("last_fast_fail_ts")
-            last_ff_level = sym_state.get("last_fast_fail_level")
-            last_ff_atr = sym_state.get("last_fast_fail_atr")
-            if (
-                isinstance(last_ff_ts, (int, float))
-                and (time.time() - float(last_ff_ts)) <= (30 * 60)
-                and isinstance(last_ff_level, (int, float))
-            ):
-                close3 = float(df_3m_sig.iloc[-1]["close"])
-                if close3 > float(last_ff_level):
-                    gate_stats["fast_fail_recovery_count"] = gate_stats.get("fast_fail_recovery_count", 0) + 1
-                    gap_atr = None
-                    if isinstance(last_ff_atr, (int, float)) and float(last_ff_atr) > 0:
-                        gap_atr = (close3 - float(last_ff_level)) / float(last_ff_atr)
-                    _append_sr_pro_long_v1_log(
-                        f"SR_PRO_LONG_FAST_FAIL_RECOVERY sym={symbol} close={close3} "
-                        f"level={last_ff_level} gap_atr={gap_atr}"
-                    )
-                    sym_state.pop("last_fast_fail_ts", None)
-                    sym_state.pop("last_fast_fail_level", None)
-                    sym_state.pop("last_fast_fail_atr", None)
-                    sym_state.pop("last_fast_fail_entry_ts", None)
-        except Exception:
-            pass
 
         last_1h_hist_ts = int(df_1h_hist.iloc[-1]["ts"])
         if sym_state.get("zones_ts") != last_1h_hist_ts:
@@ -9144,8 +9091,6 @@ def _run_sr_pro_long_v1_cycle(
         dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
         vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
         dvf_norm = float(dvf.iloc[-1]) / float(vol_ema.iloc[-1]) if float(vol_ema.iloc[-1]) > 0 else 0.0
-        atr_1h = atr(df_1h_hist, 14)
-        atr1h_now = float(atr_1h.iloc[-1]) if not np.isnan(atr_1h.iloc[-1]) else 0.0
 
         # invalidate zones on confirmed 1h close (match backtest behavior)
         try:
@@ -9170,58 +9115,40 @@ def _run_sr_pro_long_v1_cycle(
             if h1_close <= ema_now:
                 gate_stats["zone_touch"] += 1
                 continue
-        # Only accept zones touched by the latest confirmed 1h bar (recent touch window)
+        # Only accept zones touched by the latest confirmed 1h bar
         for z in zones:
             if not z.get("live", True):
-                z["_last_touch_idx"] = -1
+                z["_last_touch_ts"] = 0
                 continue
             touched_now = (
                 z.get("side") == -1
                 and h1_touch_px <= (z.get("mid") if touch_level == "mid" else z.get("top"))
                 and h1_high >= z.get("bot")
             )
-            if touched_now:
-                z["_last_touch_idx"] = len(df_1h_hist) - 1
-        support_candidates = []
-        recent_bars = max(1, int(getattr(cfg, "touch_recent_bars", 2)))
-        for z in zones:
-            if not z.get("live", True) or z.get("side") != -1:
-                continue
-            if dvf_norm < float(cfg.dvf_norm_min):
-                continue
-            if atr1h_now > 0:
-                zone_height_atr = (float(z.get("top")) - float(z.get("bot"))) / atr1h_now
-                if zone_height_atr < float(getattr(cfg, "zone_height_atr_min", 0.3)) or zone_height_atr > float(getattr(cfg, "zone_height_atr_max", 2.0)):
-                    continue
-            last_touch_idx = int(z.get("_last_touch_idx", -1))
-            if last_touch_idx < 0 or ((len(df_1h_hist) - 1) - last_touch_idx) > (recent_bars - 1):
-                continue
-            touch_ok = (
-                h1_touch_px <= (z.get("mid") if touch_level == "mid" else z.get("top"))
-                and h1_high >= z.get("bot")
-            ) or (h1_close >= float(z.get("mid")))
-            if not touch_ok:
-                continue
-            if getattr(cfg, "touch_react_require", True) and not (h1_close > float(h1["open"]) or h1_close >= float(z.get("mid"))):
-                continue
-            support_candidates.append(z)
+            z["_last_touch_ts"] = h1_ts if touched_now else 0
+        support_candidates = [
+            z for z in zones
+            if z.get("live", True)
+            and z["side"] == -1
+            and dvf_norm >= float(cfg.dvf_norm_min)
+            and h1_touch_px <= (z["mid"] if touch_level == "mid" else z["top"])
+            and h1_high >= z["bot"]
+            and z.get("_last_touch_ts") == h1_ts
+        ]
         if not support_candidates:
             gate_stats["zone_touch"] += 1
             continue
 
-        if len(df_15m_sig) < 4:
+        if len(df_15m_sig) < 3:
             gate_stats["hl_15m"] += 1
             continue
-        close_15m_now = float(df_15m_sig.iloc[-1]["close"])
-        ema20_15m = ema(df_15m_sig["close"], 20)
-        ema50_15m = ema(df_15m_sig["close"], 50)
-        if not (close_15m_now > float(ema20_15m.iloc[-1]) or float(ema20_15m.iloc[-1]) > float(ema50_15m.iloc[-1])):
+        l15_0 = float(df_15m_sig.iloc[-1]["low"])
+        l15_1 = float(df_15m_sig.iloc[-2]["low"])
+        l15_2 = float(df_15m_sig.iloc[-3]["low"])
+        if not (l15_0 > l15_1 or l15_1 > l15_2):
             gate_stats["hl_15m"] += 1
             continue
-        atr_15m = atr(df_15m_sig, 14)
-        atr15_now = float(atr_15m.iloc[-1]) if not np.isnan(atr_15m.iloc[-1]) else 0.0
-        ema200_15m = ema(df_15m_sig["close"], 200)
-        if atr15_now > 0 and (close_15m_now - float(ema200_15m.iloc[-1])) > (atr15_now * float(getattr(cfg, "overext_k_atr_15m", 2.0))):
+        if not (float(df_15m_sig.iloc[-1]["close"]) > float(df_15m_sig.iloc[-1]["open"])):
             gate_stats["hl_15m"] += 1
             continue
 
@@ -9232,34 +9159,23 @@ def _run_sr_pro_long_v1_cycle(
         o3 = float(df_3m_sig.iloc[-1]["open"])
         h3 = float(df_3m_sig.iloc[-1]["high"])
         l3 = float(df_3m_sig.iloc[-1]["low"])
-        atr_3m = atr(df_3m_sig, 14)
-        atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
-        highs = df_3m_sig["high"].astype(float)
-        pivot_high = _last_pivot_high(highs, int(cfg.break_pivot_left), int(cfg.break_pivot_right))
-        if pivot_high is None:
-            lookback = max(3, int(getattr(cfg, "break_fallback_lookback", 5)))
-            lookback = min(lookback, len(df_3m_sig) - 1)
-            highs_slice = [
-                float(df_3m_sig.iloc[-(j + 1)]["high"]) for j in range(1, lookback + 1)
-            ]
-            high_max = max(highs_slice)
-        else:
-            high_max = float(pivot_high)
-        rng = h3 - l3
-        body_ratio = abs(c3 - o3) / rng if rng > 0 else 0.0
-        break_body_ok = body_ratio >= float(cfg.break_body_ratio_min)
-        break_dist_ok = (atr_now > 0) and ((c3 - high_max) >= (atr_now * float(cfg.break_close_atr_min)))
-        strong_break = c3 > high_max and break_body_ok and break_dist_ok
-        weak_break = (h3 > high_max) and (c3 > o3) and (atr_now > 0) and ((h3 - high_max) >= (atr_now * float(cfg.break_close_atr_min)))
+        high_prev = [
+            float(df_3m_sig.iloc[-2]["high"]),
+            float(df_3m_sig.iloc[-3]["high"]),
+            float(df_3m_sig.iloc[-4]["high"]),
+        ]
+        high_max = max(high_prev)
+        strong_break = c3 > high_max
+        weak_break = (h3 > high_max) and (c3 <= high_max) and (c3 > o3)
         if not strong_break and not weak_break:
             gate_stats["break_3m"] += 1
             continue
 
-            retest_active = bool(sym_state.get("retest_active"))
-            retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
-            retest_until = int(sym_state.get("retest_until", 0) or 0)
-            break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
-            now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
+        retest_active = bool(sym_state.get("retest_active"))
+        retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
+        retest_until = int(sym_state.get("retest_until", 0) or 0)
+        break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
+        now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
 
         retest_bars = int(cfg.retest_bars)
         if cfg.retest_dyn:
@@ -9280,21 +9196,20 @@ def _run_sr_pro_long_v1_cycle(
             gate_stats["retest_seen"] += 1
 
         if sym_state.get("retest_active") and now_ts_ms <= int(sym_state.get("retest_until", 0) or 0):
-            rng = h3 - l3
-            lower_wick = min(o3, c3) - l3
+            atr_3m = atr(df_3m_sig, 14)
+            atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
+            rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
+            lower_wick = min(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"])) - float(df_3m_sig.iloc[-1]["low"])
             lower_wick_ratio = (lower_wick / rng) if rng > 0 else 0.0
             if l3 <= retest_level + (atr_now * float(cfg.retest_atr_mult)):
                 entry_ok = False
-                if c3 >= retest_level:
+                if c3 > retest_level:
                     entry_ok = True
                     gate_stats["entry_by_pass_close"] += 1
-                elif (c3 >= (retest_level - (atr_now * float(cfg.retest_close_atr_tol)))) and (c3 > o3):
-                    entry_ok = True
-                    gate_stats["entry_by_pass_close"] += 1
-                elif (l3 < retest_level - (atr_now * float(cfg.retest_sweep_atr_mult))) and (c3 > retest_level):
+                elif h3 > retest_level and c3 > o3 and lower_wick_ratio <= 0.40:
                     entry_ok = True
                     gate_stats["entry_by_pass_high"] += 1
-                elif (not strong_break) and (l3 > retest_level - (atr_now * float(cfg.shallow_atr_mult))) and (c3 > o3) and dvf_norm >= float(cfg.shallow_dvf_min) and lower_wick_ratio <= float(cfg.shallow_wick_max) and (c3 > retest_level + (atr_now * float(cfg.shallow_reclaim_atr_mult))):
+                elif (not strong_break) and (l3 > retest_level - (atr_now * float(cfg.shallow_atr_mult))) and (c3 > o3) and dvf_norm >= float(cfg.shallow_dvf_min) and lower_wick_ratio <= float(cfg.shallow_wick_max):
                     entry_ok = True
                     gate_stats["entry_by_pass_high"] += 1
                 if not entry_ok:
@@ -9308,42 +9223,20 @@ def _run_sr_pro_long_v1_cycle(
                 entry_target = None
                 if isinstance(ema_entry, (int, float)) and atr_now > 0:
                     entry_target = float(ema_entry) - (atr_now * float(cfg.entry_atr_offset))
-                allow_atr = float(cfg.entry_target_allow_atr)
-                if entry_target is not None and atr_now > 0:
-                    gap = (l3 - entry_target) / atr_now
-                    if gap <= 0.0:
-                        gate_stats["entry_target_touch"] += 1
-                    elif gap <= allow_atr:
-                        gate_stats["entry_target_near"] += 1
-                    else:
-                        gate_stats["reject_entry_target_far"] += 1
-                        if gap <= 0.10:
-                            gate_stats["reject_entry_target_far_0_01"] += 1
-                        elif gap <= 0.20:
-                            gate_stats["reject_entry_target_far_01_02"] += 1
-                        elif gap <= 0.30:
-                            gate_stats["reject_entry_target_far_02_03"] += 1
-                        else:
-                            gate_stats["reject_entry_target_far_03p"] += 1
-                entry_px = float(df_3m_sig.iloc[-1]["open"])
-                if not isinstance(entry_px, (int, float)):
-                    entry_px = float(c3)
-                cap_base = max(retest_level, entry_target) if isinstance(entry_target, (int, float)) else retest_level
-                if atr_now > 0 and entry_px > (cap_base + (atr_now * float(cfg.entry_max_atr_over_retest))):
-                    gate_stats["reject_entry_price_cap"] += 1
-                    _append_sr_pro_long_v1_log(
-                        f"SR_PRO_LONG_ENTRY_CAP_SKIP sym={symbol} entry={entry_px:.6f} retest={retest_level:.6f} atr={atr_now:.6f} cap={float(cfg.entry_max_atr_over_retest):.2f}"
-                    )
-                    sym_state["retest_active"] = True
+                if entry_target is None or l3 > entry_target:
                     continue
+                entry_px = float(entry_target)
                 nearest = min(support_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 if not (c3 >= nearest["mid"] or entry_px >= nearest["top"] - (atr_now * 0.2)):
-                    gate_stats["reject_entry_support"] += 1
                     sym_state["retest_active"] = True
                     continue
-                sl_price = entry_px - (atr_now * float(cfg.sl_atr_mult))
+                sl_raw = nearest["bot"] - (atr_now * float(cfg.sl_atr_mult))
+                sl_price = min(sl_raw, entry_px - (atr_now * 1.0))
                 tp_atr = cfg.tp_atr_mult_weak if break_type == "weak" else cfg.tp_atr_mult
-                tp_price = entry_px + (atr_now * float(tp_atr)) if tp_atr and tp_atr > 0 else entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
+                if tp_atr and tp_atr > 0:
+                    tp_price = entry_px + (atr_now * float(tp_atr))
+                else:
+                    tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
 
                 usdt = _resolve_entry_usdt()
                 if usdt <= 0 or not _admin_is_active():
@@ -9366,9 +9259,6 @@ def _run_sr_pro_long_v1_cycle(
                         "sl_pct": ((entry_px - float(sl_price)) / entry_px * 100.0) if entry_px > 0 else None,
                         "tp_pct": ((float(tp_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
                         "track": break_type,
-                        "fast_fail_level": float(retest_level),
-                        "fast_fail_atr": float(atr_now),
-                        "fast_fail_atr_mult": 0.05,
                     },
                 )
                 if req_id:
@@ -9386,22 +9276,6 @@ def _run_sr_pro_long_v1_cycle(
         f"retest_seen={gate_stats['retest_seen']} "
         f"entry_by_pass_close={gate_stats['entry_by_pass_close']} "
         f"entry_by_pass_high={gate_stats['entry_by_pass_high']} "
-        f"reject_entry_price_cap={gate_stats['reject_entry_price_cap']} "
-        f"reject_entry_target={gate_stats['reject_entry_target']} "
-        f"entry_target_touch={gate_stats['entry_target_touch']} "
-        f"entry_target_near={gate_stats['entry_target_near']} "
-        f"reject_entry_target_far={gate_stats['reject_entry_target_far']} "
-        f"reject_entry_target_far_0_01={gate_stats['reject_entry_target_far_0_01']} "
-        f"reject_entry_target_far_01_02={gate_stats['reject_entry_target_far_01_02']} "
-        f"reject_entry_target_far_02_03={gate_stats['reject_entry_target_far_02_03']} "
-        f"reject_entry_target_far_03p={gate_stats['reject_entry_target_far_03p']} "
-        f"reject_entry_target_near_quality={gate_stats['reject_entry_target_near_quality']} "
-        f"reject_entry_support={gate_stats['reject_entry_support']} "
-        f"fast_fail_count={gate_stats['fast_fail_count']} "
-        f"fast_fail_recovery_count={gate_stats['fast_fail_recovery_count']} "
-        f"aggr_break={gate_stats['aggr_break']} "
-        f"aggr_entry={gate_stats['aggr_entry']} "
-        f"aggr_cap_reject={gate_stats['aggr_cap_reject']} "
         f"no_data_ltf={gate_stats['no_data_ltf']} "
         f"no_data_mtf={gate_stats['no_data_mtf']} "
         f"no_data_htf={gate_stats['no_data_htf']} "
@@ -9419,22 +9293,6 @@ def _run_sr_pro_long_v1_cycle(
             f"retest_seen={gate_stats['retest_seen']} "
             f"entry_by_pass_close={gate_stats['entry_by_pass_close']} "
             f"entry_by_pass_high={gate_stats['entry_by_pass_high']} "
-            f"reject_entry_price_cap={gate_stats['reject_entry_price_cap']} "
-            f"reject_entry_target={gate_stats['reject_entry_target']} "
-            f"entry_target_touch={gate_stats['entry_target_touch']} "
-            f"entry_target_near={gate_stats['entry_target_near']} "
-            f"reject_entry_target_far={gate_stats['reject_entry_target_far']} "
-            f"reject_entry_target_far_0_01={gate_stats['reject_entry_target_far_0_01']} "
-            f"reject_entry_target_far_01_02={gate_stats['reject_entry_target_far_01_02']} "
-            f"reject_entry_target_far_02_03={gate_stats['reject_entry_target_far_02_03']} "
-            f"reject_entry_target_far_03p={gate_stats['reject_entry_target_far_03p']} "
-            f"reject_entry_target_near_quality={gate_stats['reject_entry_target_near_quality']} "
-            f"reject_entry_support={gate_stats['reject_entry_support']} "
-            f"fast_fail_count={gate_stats['fast_fail_count']} "
-            f"fast_fail_recovery_count={gate_stats['fast_fail_recovery_count']} "
-            f"aggr_break={gate_stats['aggr_break']} "
-            f"aggr_entry={gate_stats['aggr_entry']} "
-            f"aggr_cap_reject={gate_stats['aggr_cap_reject']} "
             f"no_data_ltf={gate_stats['no_data_ltf']} "
             f"no_data_mtf={gate_stats['no_data_mtf']} "
             f"no_data_htf={gate_stats['no_data_htf']} "
