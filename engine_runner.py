@@ -8974,18 +8974,6 @@ def _run_sr_pro_long_v1_cycle(
             df_3m = _get_confirmed_df(symbol, tf_ltf, min_ltf_fetch)
             df_15m = _get_confirmed_df(symbol, tf_mtf, min_mtf_fetch)
             df_1h = _get_confirmed_df(symbol, tf_htf, min_htf_fetch)
-        # If still not confirmed, skip this cycle for strict parity with backtest
-        def _is_confirmed(df: pd.DataFrame, tf: str) -> bool:
-            if df is None or df.empty:
-                return False
-            tf_ms = _tf_ms(tf)
-            now_ms = int(time.time() * 1000)
-            last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns else 0
-            return bool(last_ts and (now_ms - last_ts) >= tf_ms)
-
-        if not (_is_confirmed(df_3m, tf_ltf) and _is_confirmed(df_15m, tf_mtf) and _is_confirmed(df_1h, tf_htf)):
-            gate_stats["skip_stale_ts"] += 1
-            continue
         if df_3m.empty or df_15m.empty or df_1h.empty:
             no_data += 1
             if df_3m.empty:
@@ -9038,7 +9026,8 @@ def _run_sr_pro_long_v1_cycle(
             continue
 
         sym_state = sr_state.setdefault(symbol, {})
-        latest_ts_ms = int(df_3m.iloc[-1]["ts"])
+        # stale check should use latest confirmed 3m candle ts (not raw in-progress candle)
+        latest_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
         if sym_state.get("last_eval_ts") == latest_ts_ms:
             gate_stats["skip_stale_ts"] += 1
             continue
@@ -12692,6 +12681,19 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             time.sleep(0.15)
             closed = True
         elif AUTO_EXIT_ENABLED and isinstance(sl_price_meta, (int, float)) and mark_px <= float(sl_price_meta):
+            if engine_label == "SR_PRO_LONG_V1":
+                last_px = _fetch_last_price(sym)
+                if isinstance(last_px, (int, float)) and last_px > float(sl_price_meta):
+                    _append_entry_gate_log(
+                        "auto_exit_long",
+                        sym,
+                        (
+                            "srp_guard_skip_sl_mark_mismatch "
+                            f"mark={mark_px} last={last_px} sl={sl_price_meta}"
+                        ),
+                        side="LONG",
+                    )
+                    continue
             _append_entry_gate_log(
                 "auto_exit_long",
                 sym,
