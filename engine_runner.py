@@ -823,11 +823,11 @@ def close_short_market(symbol: str) -> dict:
         follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_short_market(symbol)})
     if not any(call.get("fn") for call in follower_calls):
         return res
-    _broadcast_followers("close_short_market", follower_calls, {"symbol": symbol})
+    _broadcast_followers("close_short_market", follower_calls, {"symbol": symbol}, enforce_active=False)
     return res
 
 def _close_followers_short_only(symbol: str) -> None:
-    followers = FOLLOWER_CONTEXTS
+    followers = _follower_contexts_for_sync(include_inactive=True)
     if not followers:
         return
     follower_calls = []
@@ -906,12 +906,12 @@ def close_long_market(symbol: str) -> dict:
         follower_calls.append({"acct": acct, "fn": lambda a=acct: a.executor.close_long_market(symbol)})
     if not any(call.get("fn") for call in follower_calls):
         return res
-    _broadcast_followers("close_long_market", follower_calls, {"symbol": symbol})
+    _broadcast_followers("close_long_market", follower_calls, {"symbol": symbol}, enforce_active=False)
     return res
     return res
 
 def _close_followers_long_only(symbol: str) -> None:
-    followers = FOLLOWER_CONTEXTS
+    followers = _follower_contexts_for_sync(include_inactive=True)
     if not followers:
         return
     follower_calls = []
@@ -8292,14 +8292,6 @@ def _run_sr_pro_short_v1_cycle(
             gate_stats["skip_stale_ts"] += 1
             continue
         sym_state["last_eval_ts"] = latest_ts_ms
-        cd_until = sym_state.get("cooldown_until_short")
-        if isinstance(cd_until, (int, float)) and latest_ts_ms < int(cd_until):
-            gate_stats["cooldown"] += 1
-            remaining_min = max(0.0, (float(cd_until) - float(latest_ts_ms)) / 60000.0)
-            _append_sr_pro_short_v1_log(
-                f"SR_PRO_SHORT_COOLDOWN sym={symbol} until={int(cd_until)} remaining_min={remaining_min:.1f}"
-            )
-            continue
         # block exact 15m boundary bars to reduce boundary-index sensitivity
         if SR_PRO_SHORT_BOUNDARY_GUARD_ENABLED and (((latest_ts_ms // 60000) % 60) % 15 == 0):
             gate_stats["boundary_block"] += 1
@@ -8327,6 +8319,7 @@ def _run_sr_pro_short_v1_cycle(
         dv = pd.Series(dv, index=df_1h_sig.index)
         dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
         vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
+        idx_1h = len(df_1h_sig) - 1  # latest confirmed 1h candle index
         dvf_norm = float(dvf.iloc[idx_1h]) / float(vol_ema.iloc[idx_1h]) if float(vol_ema.iloc[idx_1h]) > 0 else 0.0
         atr_1h = atr(df_1h_hist, 14)
         atr1h_now = float(atr_1h.iloc[-1]) if not np.isnan(atr_1h.iloc[-1]) else 0.0
@@ -11406,11 +11399,12 @@ def _detect_position_events(state: dict, send_telegram) -> None:
                     state=state,
                 )
                 seen_key = f"{symbol}|{side}"
-                if seen_key not in seen and FOLLOWER_CONTEXTS:
+                manual_followers = _follower_contexts_for_sync(include_inactive=True)
+                if seen_key not in seen and manual_followers:
                     follower_calls = []
                     def _skip_result(reason: str):
                         return {"status": "skip", "reason": reason}
-                    for acct in FOLLOWER_CONTEXTS:
+                    for acct in manual_followers:
                         follower_state = load_state_from(acct.state_path)
                         admin_follow_enabled = follower_state.get("_admin_follow_enabled")
                         if admin_follow_enabled is None:
@@ -11626,7 +11620,8 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                 entry_order_id=None,
                 meta={"reason": "manual_entry"},
             )
-            if FOLLOWER_CONTEXTS:
+            manual_followers = _follower_contexts_for_sync(include_inactive=True)
+            if manual_followers:
                 if _entry_blocked_now(ENTRY_BLOCK_HOURS):
                     try:
                         send_telegram(f"⛔ manual follow blocked (entry_block_hours) {sym} {side_label}")
@@ -11636,7 +11631,7 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                     follower_calls = []
                     def _skip_result(reason: str):
                         return {"status": "skip", "reason": reason}
-                    for acct in FOLLOWER_CONTEXTS:
+                    for acct in manual_followers:
                         follower_state = load_state_from(acct.state_path)
                         admin_follow_enabled = follower_state.get("_admin_follow_enabled")
                         if admin_follow_enabled is None:
@@ -16550,9 +16545,9 @@ def _coerce_bool(val: Any) -> bool:
         return val.strip().lower() in ("1", "true", "yes", "on")
     return False
 
-def _build_account_contexts() -> List[AccountContext]:
+def _build_account_contexts(include_inactive: bool = False) -> List[AccountContext]:
     accounts_db.ensure_default_account("admin")
-    accounts = accounts_db.list_active_accounts()
+    accounts = accounts_db.list_all_accounts() if include_inactive else accounts_db.list_active_accounts()
     contexts: List[AccountContext] = []
     position_mode = os.getenv("POSITION_MODE", "hedge").lower().strip()
     admin_account_id = None
@@ -16622,6 +16617,20 @@ def _build_account_contexts() -> List[AccountContext]:
             )
         )
     return contexts
+
+
+def _follower_contexts_for_sync(include_inactive: bool = False) -> List[AccountContext]:
+    if not include_inactive:
+        return list(FOLLOWER_CONTEXTS or [])
+    try:
+        contexts = _build_account_contexts(include_inactive=True)
+        if not contexts:
+            return list(FOLLOWER_CONTEXTS or [])
+        prev_admin_name = ADMIN_ACCOUNT_CONTEXT.name if ADMIN_ACCOUNT_CONTEXT else None
+        admin_ctx = _pick_admin_context(contexts, prev_admin_name=prev_admin_name)
+        return [c for c in contexts if c is not admin_ctx]
+    except Exception:
+        return list(FOLLOWER_CONTEXTS or [])
 
 def _pick_admin_context(
     contexts: List[AccountContext],

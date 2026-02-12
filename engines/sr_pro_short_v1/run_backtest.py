@@ -238,7 +238,7 @@ def run_backtest() -> None:
     parser.add_argument("--touch-use-close", action="store_true")
     parser.add_argument("--enable-boundary-guard", action="store_true")
     parser.add_argument("--enable-hourly-boundary-guard", action="store_true")
-    parser.add_argument("--dvf-norm-max", type=float, default=-0.05)
+    parser.add_argument("--dvf-norm-max", type=float, default=-0.10)
     parser.add_argument("--dvf-norm-immediate", type=float, default=-0.25)
     parser.add_argument("--dvf-norm-diff-th", type=float, default=-0.03)
     parser.add_argument("--dvf-confirm-bars", type=int, default=1)
@@ -261,7 +261,7 @@ def run_backtest() -> None:
     parser.add_argument("--retest-dyn-bars", type=int, default=10)
     parser.add_argument("--shallow-atr-mult", type=float, default=0.25)
     parser.add_argument("--shallow-wick-max", type=float, default=0.35)
-    parser.add_argument("--shallow-dvf-max", type=float, default=0.0)
+    parser.add_argument("--shallow-dvf-max", type=float, default=-0.05)
     parser.add_argument("--big-bear-body-mult", type=float, default=1.2)
     parser.add_argument("--atr-filter-len", type=int, default=20)
     parser.add_argument("--atr-filter-mult", type=float, default=0.7)
@@ -269,12 +269,12 @@ def run_backtest() -> None:
     parser.add_argument("--ema120-15m-len", type=int, default=120)
     parser.add_argument("--ema-slope-min", type=float, default=0.001)
     parser.add_argument("--sl-buffer", type=float, default=0.01)
-    parser.add_argument("--sl-atr-mult", type=float, default=0.5)
+    parser.add_argument("--sl-atr-mult", type=float, default=0.4)
     parser.add_argument("--sl-cap-pct", type=float, default=0.02)
     parser.add_argument("--sl-cap-atr-mult", type=float, default=0.6)
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
     parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
-    parser.add_argument("--tp-mult", type=float, default=0.98)
+    parser.add_argument("--tp-mult", type=float, default=0.99)
     parser.add_argument("--tp-mult-weak", type=float, default=0.99)
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
@@ -581,7 +581,6 @@ def run_backtest() -> None:
     block_hours = _load_entry_block_hours()
 
     entries_by_day: Dict[str, int] = {}
-    cooldown_until: Dict[str, int] = {}
     entry_symbols: set[str] = set()
     ltf_minutes = _tf_to_minutes(cfg.tf_ltf)
     hour_stats: Dict[int, Dict[str, int]] = {}
@@ -737,9 +736,6 @@ def run_backtest() -> None:
                     )
                 except Exception:
                     pass
-            cd_until = cooldown_until.get(sym)
-            if isinstance(cd_until, int) and ts < cd_until:
-                continue
             # entry block hours (KST) - apply to all entry paths
             if block_hours:
                 hour_kst = int(_ts_kst(ts).split(" ")[1].split(":")[0])
@@ -845,7 +841,6 @@ def run_backtest() -> None:
                             "pnl_pct": pnl_pct,
                         }
                     )
-                    cooldown_until[sym] = ts + (60 * 60 * 1000)
                     trade = None
                     continue
                 elif low_i <= trade.get("tp_price", -1):

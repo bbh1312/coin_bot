@@ -40,16 +40,13 @@ def _follow_manual_entry(symbol: str, side: str) -> None:
     if not symbol or side not in ("LONG", "SHORT"):
         return
     _ensure_broadcast_contexts()
-    if not er.FOLLOWER_CONTEXTS:
+    followers = er._follower_contexts_for_sync(include_inactive=True)
+    if not followers:
         return
     follower_calls = []
-    active_names = er._active_account_names()
     def _skip_result(reason: str):
         return {"status": "skip", "reason": reason}
-    for acct in er.FOLLOWER_CONTEXTS:
-        if active_names and str(acct.name) not in active_names:
-            follower_calls.append({"acct": acct, "fn": lambda r="inactive": _skip_result(r)})
-            continue
+    for acct in followers:
         follower_state = er.load_state_from(acct.state_path)
         admin_follow_enabled = follower_state.get("_admin_follow_enabled")
         if admin_follow_enabled is None:

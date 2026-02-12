@@ -640,6 +640,9 @@ def close_single_position():
     account_name = (request.form.get("account") or "").strip()
     if not symbol or side not in ("LONG", "SHORT") or not account_name:
         return redirect(url_for("follower_positions", notice="잘못된 요청"))
+    if account_name.lower() == "admin":
+        # Admin manual close should fan out to all accounts for the same symbol/side.
+        return close_positions()
     try:
         contexts = _build_account_contexts_web(include_inactive=True)
     except Exception:
