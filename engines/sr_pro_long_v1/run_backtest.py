@@ -307,8 +307,17 @@ def run_backtest() -> None:
     parser.add_argument("--debug-zone", action="store_true")
     parser.add_argument("--block-hours", type=str, default="")
     args = parser.parse_args()
-    # Keep backtest in live-mode parity: always evaluate confirmed bars.
+    # Fixed profile: align with the user's standard command preset.
+    args.days = 3
+    args.universe = "common"
+    args.cache_only = True
+    args.common_only = True
+    args.common_warmup_dir = "logs/common_warmup/ohlcv"
+    args.total_window_days = 14
+    args.rolling_zones = True
     args.use_confirmed = True
+    args.entry_atr_offset = 0.15
+    args.log_gates = True
 
     cfg = SrProLongV1Config(
         lookback=args.lookback,
@@ -594,8 +603,6 @@ def run_backtest() -> None:
                 continue
 
             idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
-            if args.use_confirmed:
-                idx_1h -= 1
             if idx_1h < 0:
                 continue
 

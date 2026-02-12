@@ -286,6 +286,8 @@ def run_backtest() -> None:
     parser.add_argument("--debug-retest", action="store_true")
     parser.add_argument("--require-retest-touch", action="store_true")
     parser.add_argument("--debug-zone", action="store_true")
+    parser.add_argument("--ltf-sr-bias", action="store_true")
+    parser.add_argument("--ltf-sr-lookback", type=int, default=60)
     args = parser.parse_args()
     if args.log_gates:
         args.verbose = True
@@ -496,6 +498,7 @@ def run_backtest() -> None:
         "hold_weak_sum": 0.0,
         "time_block": 0,
         "skip_stale_ts": 0,
+        "ltf_sr_bias_block": 0,
     }
     def _parse_entry_block_hours_raw(raw: str) -> set[int]:
         if not isinstance(raw, str):
@@ -1069,6 +1072,35 @@ def run_backtest() -> None:
                     cap_pct = max(cap_pct, (atr_now * float(args.sl_cap_atr_mult)) / entry_px)
                 return min(sl_price, entry_px * (1.0 + cap_pct))
 
+            def _ltf_sr_bias_pass(entry_px: float, track: str = "") -> bool:
+                if not args.ltf_sr_bias:
+                    return True
+                lb = max(5, int(args.ltf_sr_lookback))
+                start = max(0, i3 - lb + 1)
+                seg = df_3m.iloc[start : i3 + 1]
+                if seg.empty:
+                    return True
+                try:
+                    sup = float(seg["low"].astype(float).min())
+                    res = float(seg["high"].astype(float).max())
+                except Exception:
+                    return True
+                if (not np.isfinite(sup)) or (not np.isfinite(res)) or res <= sup:
+                    return True
+                dist_res = abs(res - entry_px)
+                dist_sup = abs(entry_px - sup)
+                passed = dist_res <= dist_sup
+                if not passed and args.log_gates:
+                    gate_counts["ltf_sr_bias_block"] += 1
+                if (not passed) and args.debug_break:
+                    print(
+                        "[BACKTEST][LTF_SR_BLOCK] "
+                        f"sym={sym} ts={_ts_kst(ts)} track={track} "
+                        f"entry={entry_px:.6f} sup={sup:.6f} res={res:.6f} "
+                        f"dist_res={dist_res:.6f} dist_sup={dist_sup:.6f}"
+                    )
+                return passed
+
             retest_touch = False
             touch_reclaim_fail = False
             reclaim_up_buf = 0.0
@@ -1116,6 +1148,8 @@ def run_backtest() -> None:
                 else:
                     if low_now < dvf_pending_level or close_now < dvf_pending_level:
                         entry_px = float(df_3m.at[i3 + 1, "open"])
+                        if not _ltf_sr_bias_pass(entry_px, track=str(dvf_pending_type or "dvf_pending")):
+                            continue
                         nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                         sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                         sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
@@ -1193,6 +1227,8 @@ def run_backtest() -> None:
                 avg_body = float(bodies.iloc[i3-6:i3].mean()) if i3 >= 6 else float(bodies.iloc[:i3].mean())
                 if avg_body > 0 and close_now < open_now and body >= (avg_body * float(args.big_bear_body_mult)):
                     entry_px = float(df_3m.at[i3 + 1, "open"])
+                    if not _ltf_sr_bias_pass(entry_px, track="big_bear"):
+                        continue
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
@@ -1239,6 +1275,8 @@ def run_backtest() -> None:
                         dvf_pending_type = "dvf_accel"
                         continue
                     entry_px = float(df_3m.at[i3 + 1, "open"])
+                    if not _ltf_sr_bias_pass(entry_px, track="dvf_accel"):
+                        continue
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
@@ -1285,6 +1323,8 @@ def run_backtest() -> None:
                         dvf_pending_type = "dvf_slope"
                         continue
                     entry_px = float(df_3m.at[i3 + 1, "open"])
+                    if not _ltf_sr_bias_pass(entry_px, track="dvf_slope"):
+                        continue
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
@@ -1331,6 +1371,8 @@ def run_backtest() -> None:
                         retest_active = False
                         continue
                     entry_px = float(df_3m.at[i3 + 1, "open"])
+                    if not _ltf_sr_bias_pass(entry_px, track="timeout"):
+                        continue
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
@@ -1361,6 +1403,8 @@ def run_backtest() -> None:
                     upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
                     wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
                     entry_px = float(df_3m.at[i3 + 1, "open"])
+                    if not _ltf_sr_bias_pass(entry_px, track="retest"):
+                        continue
                     nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
                     sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
                     sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
@@ -1534,7 +1578,8 @@ def run_backtest() -> None:
             f"mae_strong={gate_counts['mae_strong_sum']:.3f} "
             f"mae_weak={gate_counts['mae_weak_sum']:.3f} "
             f"hold_strong={gate_counts['hold_strong_sum']:.1f} "
-            f"hold_weak={gate_counts['hold_weak_sum']:.1f}"
+            f"hold_weak={gate_counts['hold_weak_sum']:.1f} "
+            f"ltf_sr_bias_block={gate_counts['ltf_sr_bias_block']}"
         )
 
     print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
