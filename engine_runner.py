@@ -6075,7 +6075,10 @@ def _clear_manual_alerted(state: Dict[str, dict], symbol: str, side: str) -> Non
     cache = _get_manual_alerted(state)
     cache.pop(_manual_alert_key(symbol, side), None)
 
-def _entry_alert_key(symbol: str, side: str) -> str:
+def _entry_alert_key(symbol: str, side: str, entry_order_id: Optional[str] = None) -> str:
+    oid = str(entry_order_id or "").strip()
+    if oid:
+        return f"{symbol}|{side.upper()}|oid:{oid}"
     return f"{symbol}|{side.upper()}"
 
 def _get_entry_alerted(state: Dict[str, dict]) -> Dict[str, dict]:
@@ -6085,9 +6088,18 @@ def _get_entry_alerted(state: Dict[str, dict]) -> Dict[str, dict]:
         state["_entry_alerted"] = cache
     return cache
 
-def _entry_alert_info(state: Dict[str, dict], symbol: str, side: str) -> Optional[dict]:
+def _entry_alert_info(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    entry_order_id: Optional[str] = None,
+) -> Optional[dict]:
     cache = _get_entry_alerted(state)
-    info = cache.get(_entry_alert_key(symbol, side))
+    info = None
+    if entry_order_id:
+        info = cache.get(_entry_alert_key(symbol, side, entry_order_id=entry_order_id))
+    if not isinstance(info, dict):
+        info = cache.get(_entry_alert_key(symbol, side))
     return info if isinstance(info, dict) else None
 
 def _mark_entry_alerted(
@@ -6100,12 +6112,17 @@ def _mark_entry_alerted(
 ) -> None:
     cache = _get_entry_alerted(state)
     now_ts = time.time()
-    cache[_entry_alert_key(symbol, side)] = {
+    payload = {
         "ts": now_ts,
         "engine": engine,
         "reason": reason,
         "entry_order_id": entry_order_id,
     }
+    # backward-compatible side key
+    cache[_entry_alert_key(symbol, side)] = payload
+    # order-id key (preferred for de-duplication)
+    if entry_order_id:
+        cache[_entry_alert_key(symbol, side, entry_order_id=entry_order_id)] = payload
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     if not isinstance(st, dict):
         st = {}
@@ -6122,7 +6139,10 @@ def _mark_entry_alerted(
 
 def _clear_entry_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
     cache = _get_entry_alerted(state)
-    cache.pop(_entry_alert_key(symbol, side), None)
+    prefix = f"{symbol}|{side.upper()}"
+    for key in list(cache.keys()):
+        if str(key).startswith(prefix):
+            cache.pop(key, None)
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
     if not isinstance(st, dict):
         return
@@ -6134,8 +6154,11 @@ def _clear_entry_alerted(state: Dict[str, dict], symbol: str, side: str) -> None
     st.pop(f"entry_alerted_{suffix}_order_id", None)
     state[symbol] = st
 
-def _dca_alert_key(symbol: str, side: str, adds_done: int) -> str:
-    return f"{symbol}|{side.upper()}|{adds_done}"
+def _dca_alert_key(symbol: str, side: str, adds_done: int, order_id: Optional[str] = None) -> str:
+    oid = str(order_id or "").strip()
+    if oid:
+        return f"{symbol}|{side.upper()}|oid:{oid}"
+    return f"{symbol}|{side.upper()}|adds:{int(adds_done)}"
 
 def _get_dca_alerted(state: Dict[str, dict]) -> Dict[str, float]:
     cache = state.get("_dca_alerted")
@@ -6144,13 +6167,25 @@ def _get_dca_alerted(state: Dict[str, dict]) -> Dict[str, float]:
         state["_dca_alerted"] = cache
     return cache
 
-def _dca_alerted(state: Dict[str, dict], symbol: str, side: str, adds_done: int) -> bool:
+def _dca_alerted(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    adds_done: int,
+    order_id: Optional[str] = None,
+) -> bool:
     cache = _get_dca_alerted(state)
-    return _dca_alert_key(symbol, side, adds_done) in cache
+    return _dca_alert_key(symbol, side, adds_done, order_id=order_id) in cache
 
-def _mark_dca_alerted(state: Dict[str, dict], symbol: str, side: str, adds_done: int) -> None:
+def _mark_dca_alerted(
+    state: Dict[str, dict],
+    symbol: str,
+    side: str,
+    adds_done: int,
+    order_id: Optional[str] = None,
+) -> None:
     cache = _get_dca_alerted(state)
-    cache[_dca_alert_key(symbol, side, adds_done)] = time.time()
+    cache[_dca_alert_key(symbol, side, adds_done, order_id=order_id)] = time.time()
 
 def _clear_dca_alerted(state: Dict[str, dict], symbol: str, side: str) -> None:
     cache = _get_dca_alerted(state)
@@ -6371,15 +6406,16 @@ def _log_trade_entry(
             st = {}
         _set_last_entry_state(st, side, entry_ts)
         _set_in_pos_side(st, side, True)
+        side_key = side.lower()
+        if entry_order_id:
+            st[f"entry_order_id_{side_key}"] = entry_order_id
+            st["last_entry_order_id"] = entry_order_id
+            st[f"last_entry_order_id_{side_key}"] = entry_order_id
+        else:
+            st.pop(f"entry_order_id_{side_key}", None)
         state[symbol] = st
     except Exception:
         pass
-    if entry_order_id:
-        st = state.get(symbol) if isinstance(state, dict) else {}
-        if not isinstance(st, dict):
-            st = {}
-        st[f"entry_order_id_{side.lower()}"] = entry_order_id
-        state[symbol] = st
 
 def _append_trade_log_only(
     state: Dict[str, dict],
@@ -6425,8 +6461,13 @@ def _append_trade_log_only(
             st = {}
         _set_last_entry_state(st, side, float(entry_ts))
         _set_in_pos_side(st, side, True)
+        side_key = side.lower()
         if entry_order_id:
-            st[f"entry_order_id_{side.lower()}"] = entry_order_id
+            st[f"entry_order_id_{side_key}"] = entry_order_id
+            st["last_entry_order_id"] = entry_order_id
+            st[f"last_entry_order_id_{side_key}"] = entry_order_id
+        else:
+            st.pop(f"entry_order_id_{side_key}", None)
         state[symbol] = st
     except Exception:
         pass
@@ -6575,10 +6616,19 @@ def _find_entry_event_for_backfill(
     ref_ts: Optional[float] = None,
     now_ts: Optional[float] = None,
     window_sec: float = 7 * 24 * 3600,
+    expected_entry_order_id: Optional[str] = None,
 ) -> Optional[dict]:
     now_ts = float(now_ts if isinstance(now_ts, (int, float)) else time.time())
     since_ts = now_ts - float(window_sec)
-    _, by_symbol = _load_entry_events_map(since_ts=since_ts)
+    by_id, by_symbol = _load_entry_events_map(since_ts=since_ts, end_ts=now_ts)
+    expected_oid = str(expected_entry_order_id or "").strip()
+    if expected_oid:
+        rec = by_id.get(expected_oid) if isinstance(by_id, dict) else None
+        if isinstance(rec, dict):
+            rec_symbol = str(rec.get("symbol") or "")
+            rec_side = str(rec.get("side") or "").upper()
+            if rec_symbol == str(symbol or "") and rec_side == str(side or "").upper():
+                return rec
     recs = by_symbol.get((symbol, (side or "").upper())) if isinstance(by_symbol, dict) else None
     if not recs:
         return None
@@ -6608,7 +6658,22 @@ def _backfill_open_trade_from_db(
     if not isinstance(pos, dict):
         return None
     ref_ts = pos.get("ts")
-    rec = _find_entry_event_for_backfill(symbol, side, ref_ts=ref_ts, now_ts=now_ts)
+    st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    if not isinstance(st, dict):
+        st = {}
+    side_key = str(side or "").lower()
+    expected_entry_order_id = (
+        st.get(f"entry_order_id_{side_key}")
+        or st.get(f"last_entry_order_id_{side_key}")
+        or st.get("last_entry_order_id")
+    )
+    rec = _find_entry_event_for_backfill(
+        symbol,
+        side,
+        ref_ts=ref_ts,
+        now_ts=now_ts,
+        expected_entry_order_id=expected_entry_order_id,
+    )
     entry_ts = None
     entry_order_id = None
     engine_label = None
@@ -6881,8 +6946,44 @@ def _close_trade(
     exit_order_id: Optional[str] = None,
 ) -> None:
     st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+    open_tr = _get_open_trade(state, side, symbol)
+    entry_oid = ""
+    if isinstance(open_tr, dict):
+        raw_entry_oid = open_tr.get("entry_order_id")
+        if raw_entry_oid:
+            entry_oid = str(raw_entry_oid).strip()
     st["last_entry"] = float(exit_ts)
     _set_last_exit_state(st, side, exit_ts, reason)
+    exit_oid = str(exit_order_id).strip() if exit_order_id else ""
+    if (not exit_oid) and reason == "auto_exit_sl":
+        try:
+            open_tr = _get_open_trade(state, side, symbol)
+            meta = open_tr.get("meta") if isinstance(open_tr, dict) else {}
+            sl_oid = meta.get("sl_order_id") if isinstance(meta, dict) else None
+            if sl_oid:
+                exit_oid = str(sl_oid).strip()
+        except Exception:
+            exit_oid = exit_oid
+    if side == "LONG":
+        st.pop("entry_order_id_long", None)
+        if entry_oid:
+            st["last_closed_entry_order_id_long"] = entry_oid
+        if exit_oid:
+            st["last_exit_order_id_long"] = exit_oid
+        else:
+            st.pop("last_exit_order_id_long", None)
+    elif side == "SHORT":
+        st.pop("entry_order_id_short", None)
+        if entry_oid:
+            st["last_closed_entry_order_id_short"] = entry_oid
+        if exit_oid:
+            st["last_exit_order_id_short"] = exit_oid
+        else:
+            st.pop("last_exit_order_id_short", None)
+    if entry_oid:
+        st["last_closed_entry_order_id"] = entry_oid
+    if exit_oid:
+        st["last_exit_order_id"] = exit_oid
     _set_in_pos_side(st, side, False)
     suffix = "long" if side == "LONG" else "short"
     st.pop(f"manual_entry_alerted_{suffix}", None)
@@ -6908,11 +7009,15 @@ def _close_trade(
     log = _get_trade_log(state)
     for tr in reversed(log):
         if tr.get("side") == side and tr.get("symbol") == symbol and tr.get("status") == "open":
+            entry_for_event = str(tr.get("entry_order_id") or "").strip()
             tr["exit_ts"] = float(exit_ts)
             tr["exit_price"] = exit_price
             tr["pnl_usdt"] = pnl_usdt
             tr["status"] = "closed"
             tr["exit_reason"] = reason
+            if entry_oid and not entry_for_event:
+                tr["entry_order_id"] = entry_oid
+                entry_for_event = entry_oid
             if exit_order_id:
                 tr["exit_order_id"] = exit_order_id
             elif reason == "auto_exit_sl":
@@ -6920,6 +7025,7 @@ def _close_trade(
                 sl_id = meta.get("sl_order_id")
                 if sl_id:
                     tr["exit_order_id"] = sl_id
+            exit_for_event = str(tr.get("exit_order_id") or "").strip()
             try:
                 entry_px = tr.get("entry_price")
                 if isinstance(entry_px, (int, float)) and isinstance(exit_price, (int, float)) and entry_px > 0:
@@ -6939,6 +7045,22 @@ def _close_trade(
                 except Exception:
                     pass
             _update_report_csv(tr)
+            _record_position_event(
+                symbol=symbol,
+                side=side,
+                event_type="EXIT",
+                source=reason,
+                qty=tr.get("qty") if isinstance(tr.get("qty"), (int, float)) else None,
+                avg_entry=tr.get("entry_price") if isinstance(tr.get("entry_price"), (int, float)) else None,
+                price=exit_price if isinstance(exit_price, (int, float)) else None,
+                meta={
+                    "reason": reason,
+                    "engine": tr.get("engine_label") or _engine_label_from_reason((tr.get("meta") or {}).get("reason")),
+                    "source": "close_trade",
+                },
+                entry_order_id=entry_for_event or None,
+                exit_order_id=exit_for_event or None,
+            )
             return
     log.append(
         {
@@ -6953,9 +7075,22 @@ def _close_trade(
             "exit_price": exit_price,
             "pnl_usdt": pnl_usdt,
             "exit_reason": reason,
+            "entry_order_id": entry_oid or None,
             "exit_order_id": exit_order_id,
             "meta": {},
         }
+    )
+    _record_position_event(
+        symbol=symbol,
+        side=side,
+        event_type="EXIT",
+        source=reason,
+        qty=None,
+        avg_entry=None,
+        price=exit_price if isinstance(exit_price, (int, float)) else None,
+        meta={"reason": reason, "source": "close_trade_fallback"},
+        entry_order_id=entry_oid or None,
+        exit_order_id=exit_oid or None,
     )
 
 def _prune_trade_log(state: Dict[str, dict], keep_days: int = 14) -> None:
@@ -11611,9 +11746,18 @@ def _record_position_event(
     avg_entry: Optional[float],
     price: Optional[float],
     meta: Optional[dict],
+    entry_order_id: Optional[str] = None,
+    exit_order_id: Optional[str] = None,
 ) -> None:
     if not dbrec or not dbrec.ENABLED:
         return
+    payload = dict(meta) if isinstance(meta, dict) else {}
+    entry_oid = str(entry_order_id).strip() if entry_order_id else ""
+    exit_oid = str(exit_order_id).strip() if exit_order_id else ""
+    if entry_oid:
+        payload["entry_order_id"] = entry_oid
+    if exit_oid:
+        payload["exit_order_id"] = exit_oid
     try:
         dbrec.record_event(
             symbol=symbol,
@@ -11623,7 +11767,7 @@ def _record_position_event(
             qty=qty,
             avg_entry=avg_entry,
             price=price,
-            meta=meta,
+            meta=payload or None,
             ts=time.time(),
         )
     except Exception:
@@ -11709,9 +11853,33 @@ def _detect_position_events(state: dict, send_telegram) -> None:
     stale_keys = [k for k in seen.keys() if k not in current_keys]
     for k in stale_keys:
         seen.pop(k, None)
-    def _recent_entry_event(symbol: str, side: str, now_ts: float, window_sec: float = 180.0) -> Optional[dict]:
+    def _recent_entry_event(
+        symbol: str,
+        side: str,
+        now_ts: float,
+        window_sec: float = 180.0,
+        expected_entry_order_id: Optional[str] = None,
+    ) -> Optional[dict]:
         report_date = _report_day_str(now_ts)
-        _by_id, by_symbol = _load_entry_events_map(report_date)
+        by_id, by_symbol = _load_entry_events_map(
+            report_date,
+            since_ts=(now_ts - float(window_sec)),
+            end_ts=now_ts,
+        )
+        expected_oid = str(expected_entry_order_id or "").strip()
+        if expected_oid:
+            rec = by_id.get(expected_oid) if isinstance(by_id, dict) else None
+            if isinstance(rec, dict):
+                ts_val = rec.get("entry_ts")
+                rec_sym = str(rec.get("symbol") or "")
+                rec_side = str(rec.get("side") or "").upper()
+                if (
+                    isinstance(ts_val, (int, float))
+                    and (now_ts - float(ts_val)) <= window_sec
+                    and rec_sym == str(symbol or "")
+                    and rec_side == str(side or "").upper()
+                ):
+                    return rec
         recs = by_symbol.get((symbol, side)) or []
         if not recs:
             return None
@@ -11730,6 +11898,15 @@ def _detect_position_events(state: dict, send_telegram) -> None:
     now = time.time()
     def _handle(symbol: str, side: str, detail: Optional[dict]) -> None:
         open_tr = _get_open_trade(state, side, symbol)
+        st_side = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
+        if not isinstance(st_side, dict):
+            st_side = {}
+        side_key = side.lower()
+        expected_entry_order_id = (
+            st_side.get(f"entry_order_id_{side_key}")
+            or st_side.get(f"last_entry_order_id_{side_key}")
+            or st_side.get("last_entry_order_id")
+        )
         managed = isinstance(open_tr, dict)
         managed_engine = (open_tr.get("meta") or {}).get("engine") if managed else None
         if managed:
@@ -11747,7 +11924,6 @@ def _detect_position_events(state: dict, send_telegram) -> None:
         prev_qty = prev.get("qty") if isinstance(prev, dict) else None
         prev_entry = prev.get("entry") if isinstance(prev, dict) else None
         if isinstance(prev, dict):
-            st_side = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
             last_exit_ts = None
             if isinstance(st_side, dict):
                 last_exit_ts = st_side.get(f"last_exit_ts_{side.lower()}") or st_side.get("last_exit_ts")
@@ -11798,7 +11974,12 @@ def _detect_position_events(state: dict, send_telegram) -> None:
                             meta={"reason": "manual_entry", "engine": "MANUAL"},
                         )
                         return
-                recent = _recent_entry_event(symbol, side, now)
+                recent = _recent_entry_event(
+                    symbol,
+                    side,
+                    now,
+                    expected_entry_order_id=expected_entry_order_id,
+                )
                 if isinstance(recent, dict):
                     engine_label = str(recent.get("engine") or "").upper()
                     reason = _reason_from_engine_label(engine_label, side)
@@ -11891,7 +12072,22 @@ def _detect_position_events(state: dict, send_telegram) -> None:
         elif prev_qty is not None and qty is None:
             source = managed_engine or ("AUTO" if managed else "MANUAL")
             cancel_stop_orders(symbol)
-            _record_position_event(symbol, side, "EXIT", source, prev_qty, prev_entry, mark, {"source": "pos_snapshot"})
+            entry_order_id_evt = None
+            if isinstance(open_tr, dict):
+                entry_order_id_evt = open_tr.get("entry_order_id")
+            if not entry_order_id_evt:
+                entry_order_id_evt = st_side.get(f"entry_order_id_{side_key}") or st_side.get(f"last_entry_order_id_{side_key}")
+            _record_position_event(
+                symbol,
+                side,
+                "EXIT",
+                source,
+                prev_qty,
+                prev_entry,
+                mark,
+                {"source": "pos_snapshot"},
+                entry_order_id=entry_order_id_evt,
+            )
             changed = True
             if send_telegram:
                 entry_price = None
@@ -12290,6 +12486,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
         fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
         fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint"),
         {"source": "manage_queue", "reason": req.get("reason"), **(extra_meta if isinstance(extra_meta, dict) else {})},
+        entry_order_id=entry_order_id,
     )
     try:
         _sync_trade_log_from_db(state, symbol, side)
@@ -12376,8 +12573,13 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
     except Exception:
         pass
     # avoid duplicate entry alerts (signal + fill)
-    recent_alert = _entry_alert_info(state, symbol, side)
+    recent_alert = _entry_alert_info(state, symbol, side, entry_order_id=entry_order_id)
     if isinstance(recent_alert, dict):
+        recent_entry_id = str(recent_alert.get("entry_order_id") or "").strip()
+        cur_entry_id = str(entry_order_id or "").strip()
+        if cur_entry_id and recent_entry_id and cur_entry_id == recent_entry_id:
+            _clear_manage_pending(state, symbol, side)
+            return True, "duplicate_alert_skipped_by_order_id"
         try:
             recent_ts = float(recent_alert.get("ts") or 0.0)
         except Exception:
@@ -13270,7 +13472,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             order_id = dca_res.get("order_id") or order_obj.get("id") or (order_obj.get("info") or {}).get("orderId")
             order_id = str(order_id) if order_id is not None else ""
             prev_order_id = str(st.get("last_dca_order_id_short") or "")
-            dca_key_alerted = _dca_alerted(state, sym, "SHORT", adds_done + 1)
+            dca_key_alerted = _dca_alerted(state, sym, "SHORT", adds_done + 1, order_id=order_id)
             is_new_order = bool(order_id) and order_id != prev_order_id
             if (not dca_key_alerted) or is_new_order:
                 st["dca_adds_short"] = adds_done + 1
@@ -13290,14 +13492,16 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         "engine": engine_label or "AUTO",
                         "adds_done": adds_done + 1,
                         "dca_usdt": dca_res.get("dca_usdt"),
+                        "dca_order_id": order_id or None,
                         "source": "manage_dca",
                     },
+                    entry_order_id=order_id or None,
                 )
                 send_telegram(
                     f"➕ <b>DCA</b> {sym} adds {adds_done}->{adds_done+1} mark={dca_res.get('mark')} "
                     f"entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
                 )
-                _mark_dca_alerted(state, sym, "SHORT", adds_done + 1)
+                _mark_dca_alerted(state, sym, "SHORT", adds_done + 1, order_id=order_id)
                 try:
                     save_state(state)
                 except Exception:
@@ -14006,7 +14210,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     order_id = dca_res.get("order_id") or order_obj.get("id") or (order_obj.get("info") or {}).get("orderId")
                     order_id = str(order_id) if order_id is not None else ""
                     prev_order_id = str(st.get("last_dca_order_id_long") or "")
-                    dca_key_alerted = _dca_alerted(state, sym, "LONG", adds_done + 1)
+                    dca_key_alerted = _dca_alerted(state, sym, "LONG", adds_done + 1, order_id=order_id)
                     is_new_order = bool(order_id) and order_id != prev_order_id
                     if (not dca_key_alerted) or is_new_order:
                         st["dca_adds_long"] = adds_done + 1
@@ -14026,14 +14230,16 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                                 "engine": engine_label or "AUTO",
                                 "adds_done": adds_done + 1,
                                 "dca_usdt": dca_res.get("dca_usdt"),
+                                "dca_order_id": order_id or None,
                                 "source": "manage_dca",
                             },
+                            entry_order_id=order_id or None,
                         )
                         send_telegram(
                             f"➕ <b>DCA</b> {sym} LONG adds {adds_done}->{adds_done+1} "
                             f"mark={dca_res.get('mark')} entry={dca_res.get('entry')} usdt={dca_res.get('dca_usdt')}"
                         )
-                        _mark_dca_alerted(state, sym, "LONG", adds_done + 1)
+                        _mark_dca_alerted(state, sym, "LONG", adds_done + 1, order_id=order_id)
                         try:
                             save_state(state)
                         except Exception:

@@ -128,7 +128,7 @@ COMMAND_DEFS = [
     {"cmd": "/dca1", "key": "_dca_first_pct", "label": "DCA1(%)", "type": "number", "step": 0.1},
     {"cmd": "/dca2", "key": "_dca_second_pct", "label": "DCA2(%)", "type": "number", "step": 0.1},
     {"cmd": "/dca3", "key": "_dca_third_pct", "label": "DCA3(%)", "type": "number", "step": 0.1},
-    {"cmd": "/exit_cd_h", "key": "_exit_cooldown_hours", "label": "재진입 시간(h)", "type": "number", "step": 0.1},
+    {"cmd": "/exit_cd_h", "key": "_exit_cooldown_hours", "label": "재진입 시간(분)", "type": "number", "step": 1},
     {"cmd": "/entry_usdt", "key": "_entry_usdt", "label": "진입 금액(%)", "type": "number", "step": 0.1},
     {"cmd": "/entry_block_hours", "key": "_entry_block_hours", "label": "진입 금지 시간(시,CSV)", "type": "text"},
     {"cmd": "/l_exit_tp", "key": "_auto_exit_long_tp_pct", "label": "롱 TP (%)", "type": "number", "step": 0.1},
@@ -140,6 +140,22 @@ COMMAND_DEFS = [
 ]
 COMMANDS_BY_CMD = {d["cmd"]: d for d in COMMAND_DEFS}
 COMMANDS_BY_KEY = {d["key"]: d for d in COMMAND_DEFS}
+
+
+def _hours_to_minutes(val: object) -> float | None:
+    try:
+        hrs = float(val)
+    except Exception:
+        return None
+    return hrs * 60.0
+
+
+def _minutes_to_hours(val: object) -> float | None:
+    try:
+        mins = float(val)
+    except Exception:
+        return None
+    return mins / 60.0
 
 def _normalize_engine_exit_overrides(raw: dict) -> dict:
     if not isinstance(raw, dict):
@@ -1049,6 +1065,11 @@ def _format_value(item: dict, value: object) -> str:
         return "ON" if bool(value) else "OFF"
     if item.get("type") == "int":
         return str(int(value))
+    if item.get("key") == "_exit_cooldown_hours":
+        mins = _hours_to_minutes(value)
+        if mins is None:
+            return str(value)
+        return f"{mins:.0f}"
     if item.get("type") == "json":
         try:
             return json.dumps(value, ensure_ascii=True)
@@ -1376,6 +1397,8 @@ def status():
             value = None
         if value is None and key in DEFAULTS:
             value = DEFAULTS[key]
+        if key == "_exit_cooldown_hours" and isinstance(value, (int, float)):
+            value = _hours_to_minutes(value)
         payload[key] = value
     lite = str(request.args.get("lite", "")).lower() in ("1", "true", "yes")
     if not lite:
@@ -1517,6 +1540,11 @@ def command():
                 num = float(value)
             except Exception:
                 return jsonify({"status": "invalid number", "key": key}), 400
+            if key == "_exit_cooldown_hours":
+                hrs = _minutes_to_hours(num)
+                if hrs is None:
+                    return jsonify({"status": "invalid number", "key": key}), 400
+                num = hrs
             if item["type"] == "int":
                 num = int(num)
             state[key] = num
@@ -1574,7 +1602,10 @@ def command():
             except Exception:
                 pass
         _notify_change(item, state.get(key))
-        return jsonify({"status": "ok", "key": key, "value": state.get(key)})
+        ret_val = state.get(key)
+        if key == "_exit_cooldown_hours" and isinstance(ret_val, (int, float)):
+            ret_val = _hours_to_minutes(ret_val)
+        return jsonify({"status": "ok", "key": key, "value": ret_val})
     if not cmd:
         return jsonify({"status": "missing cmd"}), 400
     parts = cmd.split()
