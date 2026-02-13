@@ -36,7 +36,9 @@ from engine_runner import (
     BASE_ENTRY_USDT,
     REALTIME_ONLY_ENABLED,
     SR_PRO_SHORT_V1_ENABLED,
+    SR_PRO_SHORT_V2_ENABLED,
     SR_PRO_LONG_V1_ENABLED,
+    SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED,
     SATURDAY_TRADE_ENABLED,
     DCA_ENABLED,
     DCA_PCT,
@@ -118,7 +120,9 @@ COMMAND_DEFS = [
     {"cmd": "/sat_trade", "key": "_sat_trade", "label": "토요일 진입", "type": "toggle"},
     {"cmd": "/realtime_only", "key": "_realtime_only", "label": "Realtime Only (헤비스캔 OFF)", "type": "toggle"},
     {"cmd": "/sr_pro_short_v1", "key": "_sr_pro_short_v1_enabled", "label": "SR Pro Short V1", "type": "toggle"},
+    {"cmd": "/sr_pro_short_v2", "key": "_sr_pro_short_v2_enabled", "label": "SR Pro Short V2", "type": "toggle"},
     {"cmd": "/sr_pro_long_v1", "key": "_sr_pro_long_v1_enabled", "label": "SR Pro Long V1", "type": "toggle"},
+    {"cmd": "/scout_only_exhaustion_short", "key": "_scout_only_exhaustion_short_enabled", "label": "Scout Only Exhaustion Short", "type": "toggle"},
     {"cmd": "/dca", "key": "_dca_enabled", "label": "DCA", "type": "toggle"},
     {"cmd": "/dca_pct", "key": "_dca_pct", "label": "DCA 진입 금액(%)", "type": "number", "step": 0.1},
     {"cmd": "/dca1", "key": "_dca_first_pct", "label": "DCA1(%)", "type": "number", "step": 0.1},
@@ -318,7 +322,9 @@ DEFAULTS = {
     "_dca_third_pct": DCA_THIRD_PCT,
     "_exit_cooldown_hours": EXIT_COOLDOWN_HOURS,
     "_sr_pro_short_v1_enabled": SR_PRO_SHORT_V1_ENABLED,
+    "_sr_pro_short_v2_enabled": SR_PRO_SHORT_V2_ENABLED,
     "_sr_pro_long_v1_enabled": SR_PRO_LONG_V1_ENABLED,
+    "_scout_only_exhaustion_short_enabled": SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED,
     "_auto_exit_long_tp_pct": AUTO_EXIT_LONG_TP_PCT,
     "_auto_exit_long_sl_pct": AUTO_EXIT_LONG_SL_PCT,
     "_auto_exit_short_tp_pct": AUTO_EXIT_SHORT_TP_PCT,
@@ -417,6 +423,24 @@ def _extract_fill(res: dict) -> tuple[object, object]:
         qty = order.get("amount")
     return fill_price, qty
 
+def _entry_filled(executor: AccountExecutor, symbol: str, side: str) -> bool:
+    side_key = (side or "").strip().upper()
+    try:
+        executor.refresh_positions_cache(force=True)
+    except Exception:
+        pass
+    try:
+        if side_key == "LONG":
+            amt = executor.get_long_position_amount(symbol)
+        else:
+            amt = executor.get_short_position_amount(symbol)
+    except Exception:
+        return False
+    try:
+        return float(amt) > 0.0
+    except Exception:
+        return False
+
 
 def _manual_entry_meta(side: str, settings: dict, entry_price: object = None) -> dict:
     side_key = (side or "").strip().upper()
@@ -512,24 +536,15 @@ def manual_entry_submit():
                         leverage=int(settings.get("leverage") or 10),
                         margin_mode=str(settings.get("margin_mode") or "cross"),
                     )
+                status = str(res.get("status") or "").lower() if isinstance(res, dict) else ""
+                if status == "ok" and not executor.ctx.dry_run:
+                    if not _entry_filled(executor, symbol, side):
+                        return {"account": acct.name, "status": "fail", "error": "no_fill"}
                 entry_price, qty = _extract_fill(res)
                 entry_order_id = _order_id_from_res(res)
                 state_path = _state_path_for_account(acct.meta.get("db") or {"id": acct.account_id, "name": acct.name})
                 state = load_state_from(state_path)
                 meta = _manual_entry_meta(side, settings, entry_price=entry_price)
-                sl_order_id = None
-                sl_price = meta.get("sl_price")
-                if isinstance(sl_price, (int, float)) and float(sl_price) > 0:
-                    try:
-                        if side == "LONG":
-                            sl_res = executor.place_long_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
-                        else:
-                            sl_res = executor.place_short_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
-                        sl_order_id = _order_id_from_res(sl_res) if isinstance(sl_res, dict) else None
-                    except Exception:
-                        sl_order_id = None
-            if sl_order_id:
-                meta["sl_order_id"] = sl_order_id
             _log_trade_entry(
                 state,
                 side=side,
@@ -1709,25 +1724,15 @@ def admin_entry():
             else:
                 res = executor.short_market(symbol, usdt_amount=usdt_amount, leverage=leverage, margin_mode=margin_mode)
         status = res.get("status")
+        if status == "ok" and not executor.ctx.dry_run:
+            with executor.activate():
+                if not _entry_filled(executor, symbol, side):
+                    return {"account_id": account_id, "status": "fail", "reason": "no_fill", "result": res}
         if status in ("ok", "dry_run"):
             entry_price = res.get("last") or res.get("price")
             qty = res.get("amount")
             order_id = res.get("order_id")
             meta = _manual_entry_meta(side, settings, entry_price=entry_price)
-            sl_order_id = None
-            sl_price = meta.get("sl_price")
-            if isinstance(sl_price, (int, float)) and float(sl_price) > 0:
-                try:
-                    with executor.activate():
-                        if side == "LONG":
-                            sl_res = executor.place_long_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
-                        else:
-                            sl_res = executor.place_short_sl_px(symbol, float(sl_price), qty=qty if isinstance(qty, (int, float)) else None)
-                    sl_order_id = _order_id_from_res(sl_res) if isinstance(sl_res, dict) else None
-                except Exception:
-                    sl_order_id = None
-            if sl_order_id:
-                meta["sl_order_id"] = sl_order_id
             _log_trade_entry(
                 acct_state,
                 side,

@@ -16,6 +16,13 @@ TF_MINUTES = {
     "1d": 1440,
 }
 
+COMMON_UNIVERSE_FORCE_EXCLUDE = ("TSLA/USDT:USDT", "PAXG/USDT:USDT")
+
+
+def _exclude_forced_common_symbols(universe: List[str]) -> List[str]:
+    blocked = {s for s in COMMON_UNIVERSE_FORCE_EXCLUDE if s}
+    return [sym for sym in (universe or []) if sym not in blocked]
+
 
 def calc_warmup_window(
     eval_days: int,
@@ -77,6 +84,7 @@ def load_common_universe(
         )
     # Restrict to USDT-margined symbols to avoid BadSymbol for non-USDT markets.
     universe = [sym for sym in universe if sym.endswith("/USDT") or "/USDT:" in sym]
+    universe = _exclude_forced_common_symbols(universe)
     return universe
 
 
