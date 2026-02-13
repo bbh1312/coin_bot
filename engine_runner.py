@@ -221,6 +221,7 @@ EXIT_ICON = os.getenv("EXIT_ICON", "😄😄😄")
 EXIT_SL_ICON = os.getenv("EXIT_SL_ICON", "🚨🚨🚨")
 MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "14"))
 MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "600"))
+MANAGE_QUEUE_ENTRY_MAX_AGE_SEC = float(os.getenv("MANAGE_QUEUE_ENTRY_MAX_AGE_SEC", "180"))
 MANUAL_ALERT_TTL_SEC = float(os.getenv("MANUAL_ALERT_TTL_SEC", "3600"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 USDT_PER_TRADE = float(os.getenv("ENTRY_USDT_PCT", "8.0"))
@@ -6315,6 +6316,21 @@ def _log_trade_entry(
     meta: Optional[dict] = None,
 ) -> None:
     log = _get_trade_log(state)
+    # Defensive dedupe: there must be only one open trade per (symbol, side).
+    # If stale opens remain (e.g., after restart/snapshot drift), close them first
+    # so exit alerts and engine labels do not get resolved from an old engine.
+    for old in log:
+        if old.get("status") != "open":
+            continue
+        if old.get("side") != side or old.get("symbol") != symbol:
+            continue
+        old["status"] = "closed"
+        old["exit_ts"] = float(entry_ts)
+        old["exit_price"] = entry_price if isinstance(entry_price, (int, float)) else old.get("entry_price")
+        old["pnl_usdt"] = None
+        old["exit_reason"] = "stale_replaced_on_new_entry"
+        if not old.get("engine_label"):
+            old["engine_label"] = _engine_label_from_reason((old.get("meta") or {}).get("reason"))
     tr = {
         "side": side,
         "symbol": symbol,
@@ -6370,6 +6386,18 @@ def _append_trade_log_only(
     meta: Optional[dict] = None,
 ) -> None:
     log = _get_trade_log(state)
+    for old in log:
+        if old.get("status") != "open":
+            continue
+        if old.get("side") != side or old.get("symbol") != symbol:
+            continue
+        old["status"] = "closed"
+        old["exit_ts"] = float(entry_ts)
+        old["exit_price"] = entry_price if isinstance(entry_price, (int, float)) else old.get("entry_price")
+        old["pnl_usdt"] = None
+        old["exit_reason"] = "stale_replaced_on_new_entry"
+        if not old.get("engine_label"):
+            old["engine_label"] = _engine_label_from_reason((old.get("meta") or {}).get("reason"))
     tr = {
         "side": side,
         "symbol": symbol,
@@ -11155,6 +11183,28 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
         st = status.get(req_id)
         if isinstance(st, dict) and st.get("status") in ("done", "executing"):
             continue
+        req_ts = req.get("ts")
+        req_age = None
+        try:
+            if isinstance(req_ts, (int, float)):
+                req_age = now - float(req_ts)
+        except Exception:
+            req_age = None
+        # Prevent stale queue replay after restart/state loss.
+        if (
+            isinstance(req_age, (int, float))
+            and req_age > float(MANAGE_QUEUE_ENTRY_MAX_AGE_SEC)
+            and engine not in ("MANUAL", "UNKNOWN")
+        ):
+            symbol = str(req.get("symbol") or "")
+            side = str(req.get("side") or "").upper()
+            _clear_manage_pending(state, symbol, side)
+            status[req_id] = {
+                "status": "failed",
+                "ts": now,
+                "reason": f"stale_request age={req_age:.1f}s",
+            }
+            continue
         status[req_id] = {"status": "executing", "ts": now}
         symbol = str(req.get("symbol") or "")
         side = str(req.get("side") or "").upper()
@@ -11936,23 +11986,13 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
 
     sl_disp = None
     tp_disp = None
-    if isinstance(extra_meta, dict):
-        sl_price_meta = extra_meta.get("sl_price")
+    if isinstance(meta, dict):
+        sl_price_meta = meta.get("sl_price")
+        tp_price_meta = meta.get("tp_price")
         if isinstance(sl_price_meta, (int, float)):
             sl_disp = f"{float(sl_price_meta):.6g}"
-        tp_pct_meta = extra_meta.get("tp_pct")
-        if isinstance(tp_pct_meta, (int, float)):
-            base_px = fill_price if isinstance(fill_price, (int, float)) else req.get("entry_price_hint")
-            try:
-                base_px = float(base_px) if base_px is not None else None
-            except Exception:
-                base_px = None
-            if isinstance(base_px, (int, float)) and base_px > 0:
-                pct = float(tp_pct_meta) / 100.0
-                if side == "SHORT":
-                    tp_disp = f"{(base_px * (1.0 - pct)):.6g}"
-                else:
-                    tp_disp = f"{(base_px * (1.0 + pct)):.6g}"
+        if isinstance(tp_price_meta, (int, float)):
+            tp_disp = f"{float(tp_price_meta):.6g}"
 
     if not sl_disp:
         sl_disp = _fmt_price_safe(
