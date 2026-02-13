@@ -74,8 +74,8 @@ try:
     from engines.universe import build_universe_from_tickers
     from engines.sr_pro_common import build_sr_zones
     from engines.sr_pro_short_v1.engine import SrProShortV1Config
-    from engines.sr_pro_short_v2.engine import SrProShortV2Config
     from engines.sr_pro_long_v1.engine import SrProLongV1Config
+    SrProShortV2Config = None
     BullPullbackLongConfig = None
 except Exception as _import_err:
     SwaggyEngine = None
@@ -15204,7 +15204,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             "--------------\n"
                             f"엔진요약: "
                             f"sr_pro={'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'} "
-                            f"sr_pro_v2={'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'} "
                             f"sr_pro_long={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
                             ""
                             "--------------\n"
@@ -15213,7 +15212,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"max_fetch={COMMON_WARMUP_MAX_FETCH}\n"
                             "--------------\n"
                             f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
-                            f"/sr_pro_short_v2(추가진입): {'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'}\n"
                             f"/sr_pro_long_v1(롱진입): {'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'}\n"
                             "\n"
                             ""
@@ -15264,12 +15262,10 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/engine_exit: {_format_engine_exit_overrides()}\n"
                         "--------------\n"
                         f"엔진요약: sr_pro={'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'} "
-                        f"sr_pro_v2={'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'} "
                         f"sr_pro_long={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
                         ""
                         "--------------\n"
                         f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
-                        f"/sr_pro_short_v2(추가진입): {'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'}\n"
                         f"/sr_pro_long_v1(롱진입): {'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'}\n"
                         "\n"
                         ""
@@ -15634,7 +15630,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     }:
                         ok = _reply(
                             "⛔ 삭제된 엔진 명령입니다.\n"
-                            "사용 가능: /sr_pro_short_v1, /sr_pro_short_v2, /sr_pro_long_v1"
+                            "사용 가능: /sr_pro_short_v1, /sr_pro_long_v1"
                         )
                         print(f"[telegram] deleted-engine cmd blocked: {cmd_norm} send={'ok' if ok else 'fail'}")
                         responded = True
@@ -15790,29 +15786,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] sr_pro_short_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
-                        responded = True
-                if (cmd in ("/sr_pro_short_v2", "sr_pro_short_v2", "sr_pro_short2")) and not responded:
-                    parts = lower.split()
-                    arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        SR_PRO_SHORT_V2_ENABLED = True
-                        state["_sr_pro_short_v2_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ sr_pro_short_v2 ON"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        SR_PRO_SHORT_V2_ENABLED = False
-                        state["_sr_pro_short_v2_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ sr_pro_short_v2 OFF"
-                    else:
-                        resp = (
-                            f"ℹ️ sr_pro_short_v2 상태: {'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'}\n"
-                            "사용법: /sr_pro_short_v2 on|off|status"
-                        )
-                    if resp:
-                        ok = _reply(resp)
-                        print(f"[telegram] sr_pro_short_v2 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/sr_pro_long_v1", "sr_pro_long_v1", "sr_pro_long")) and not responded:
                     parts = lower.split()
@@ -17264,7 +17237,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /sr_pro_short_v1 on|off|status, /sr_pro_short_v2 on|off|status, /sr_pro_long_v1 on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /sr_pro_short_v1 on|off|status, /sr_pro_long_v1 on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -17785,7 +17758,6 @@ def run():
                     adv_trend_ran = bool(heavy_scan and ADV_TREND_ENABLED and adv_trend_universe)
                     top_fail_short_ran = bool(TOP_FAIL_SHORT_V1_ENABLED and top_fail_short_universe and (not heavy_scan) and new_3m_bar)
                     sr_pro_short_ran = bool(SR_PRO_SHORT_V1_ENABLED and sr_pro_short_universe and (not heavy_scan) and new_3m_bar)
-                    sr_pro_short_v2_ran = bool(SR_PRO_SHORT_V2_ENABLED and sr_pro_short_universe and (not heavy_scan) and new_3m_bar)
                     sr_pro_long_ran = bool(SR_PRO_LONG_V1_ENABLED and sr_pro_long_universe and (not heavy_scan) and new_3m_bar)
                     dtfx_ran = bool(DTFX_ENABLED and dtfx_engine and dtfx_cfg and dtfx_universe)
                     atlas_rs_fail_short_ran = bool(
@@ -18110,10 +18082,8 @@ def run():
                     top_fail_result = {}
                     top_fail_thread = None
                     sr_pro_result = {}
-                    sr_pro_v2_result = {}
                     sr_pro_long_result = {}
                     sr_pro_thread = None
-                    sr_pro_v2_thread = None
                     st_flip_result = {}
                     st_flip_thread = None
                     srp_result = {}
@@ -18238,18 +18208,7 @@ def run():
                             daemon=True,
                         )
                         sr_pro_thread.start()
-                    if SR_PRO_SHORT_V2_ENABLED and new_3m_bar:
-                        sr_pro_v2_thread = threading.Thread(
-                            target=lambda: sr_pro_v2_result.update(
-                                _run_sr_pro_short_v2_cycle(
-                                    sr_pro_short_universe,
-                                    state,
-                                    send_telegram,
-                                )
-                            ),
-                            daemon=True,
-                        )
-                        sr_pro_v2_thread.start()
+                    # sr_pro_short_v2 deleted
                     if SR_PRO_LONG_V1_ENABLED and new_3m_bar:
                         sr_pro_long_thread = threading.Thread(
                             target=lambda: sr_pro_long_result.update(
@@ -18962,13 +18921,11 @@ def run():
                         f"union={universe_union_len}"
                     )
                     print(
-                        "[engines] sr_pro_long_v1=%s(%d) sr_pro_short_v1=%s(%d) sr_pro_short_v2=%s(%d)"
+                        "[engines] sr_pro_long_v1=%s(%d) sr_pro_short_v1=%s(%d)"
                         % (
                             "ON" if sr_pro_long_ran else "OFF",
                             sr_pro_long_universe_len,
                             "ON" if sr_pro_short_ran else "OFF",
-                            sr_pro_short_universe_len,
-                            "ON" if sr_pro_short_v2_ran else "OFF",
                             sr_pro_short_universe_len,
                         )
                     )
