@@ -217,6 +217,7 @@ class Zone:
 
 
 def run_backtest() -> None:
+    cfg_live = SrProShortV1Config()
     parser = argparse.ArgumentParser("sr_pro_short_v1 backtest")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--universe", type=str, default="common")
@@ -229,7 +230,9 @@ def run_backtest() -> None:
     parser.add_argument("--exclude-symbols", type=str, default="")
     parser.add_argument("--lookback", type=int, default=20)
     parser.add_argument("--relaxed-lookback", type=int, default=10)
-    parser.add_argument("--auto-relax", action="store_true", default=True)
+    parser.add_argument("--auto-relax", action="store_true", dest="auto_relax")
+    parser.add_argument("--no-auto-relax", action="store_false", dest="auto_relax")
+    parser.set_defaults(auto_relax=bool(cfg_live.auto_relax))
     parser.add_argument("--atr-mult", type=float, default=1.0)
     parser.add_argument("--delta-len", type=int, default=2)
     parser.add_argument("--cluster-atr", type=float, default=1.5)
@@ -241,6 +244,9 @@ def run_backtest() -> None:
     parser.add_argument("--dvf-norm-max", type=float, default=-0.10)
     parser.add_argument("--dvf-norm-immediate", type=float, default=-0.25)
     parser.add_argument("--dvf-norm-diff-th", type=float, default=-0.03)
+    parser.add_argument("--dvf-slope-enabled", action="store_true", dest="dvf_slope_enabled")
+    parser.add_argument("--no-dvf-slope-enabled", action="store_false", dest="dvf_slope_enabled")
+    parser.set_defaults(dvf_slope_enabled=bool(getattr(cfg_live, "dvf_slope_enabled", False)))
     parser.add_argument("--dvf-confirm-bars", type=int, default=1)
     parser.add_argument("--require-reject-close", action="store_true")
     parser.add_argument("--reject-mode", type=str, default="bot", choices=["bot", "mid"])
@@ -262,7 +268,10 @@ def run_backtest() -> None:
     parser.add_argument("--shallow-atr-mult", type=float, default=0.25)
     parser.add_argument("--shallow-wick-max", type=float, default=0.35)
     parser.add_argument("--shallow-dvf-max", type=float, default=-0.05)
-    parser.add_argument("--big-bear-body-mult", type=float, default=1.2)
+    parser.add_argument("--big-bear-body-mult", type=float, default=float(getattr(cfg_live, "big_bear_body_mult", 1.2)))
+    parser.add_argument("--big-bear-strong-only", action="store_true", dest="big_bear_strong_only")
+    parser.add_argument("--no-big-bear-strong-only", action="store_false", dest="big_bear_strong_only")
+    parser.set_defaults(big_bear_strong_only=bool(getattr(cfg_live, "big_bear_strong_only", True)))
     parser.add_argument("--atr-filter-len", type=int, default=20)
     parser.add_argument("--atr-filter-mult", type=float, default=0.7)
     parser.add_argument("--ema60-15m-len", type=int, default=60)
@@ -479,6 +488,7 @@ def run_backtest() -> None:
 
     stats = _new_stats()
     per_symbol_stats: Dict[str, Dict[str, float]] = {}
+    track_stats: Dict[str, Dict[str, float]] = {}
     exit_logs: List[dict] = []
     open_logs: List[dict] = []
     gate_counts = {
@@ -496,6 +506,7 @@ def run_backtest() -> None:
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
         "entry_by_big_bear": 0,
+        "big_bear_weak_block": 0,
         "entry_by_dvf_accel": 0,
         "entry_by_dvf_slope": 0,
         "entry_by_timeout": 0,
@@ -522,6 +533,7 @@ def run_backtest() -> None:
         "boundary_block": 0,
         "skip_stale_ts": 0,
         "ltf_sr_bias_block": 0,
+        "both_hit_sl_priority": 0,
     }
     def _parse_entry_block_hours_raw(raw: str) -> set[int]:
         if not isinstance(raw, str):
@@ -797,11 +809,18 @@ def run_backtest() -> None:
                 trade["hold_bars"] += 1
                 trade["mfe"] = max(trade["mfe"], max(0.0, (trade["entry_px"] - low_i) / trade["entry_px"]))
                 trade["mae"] = max(trade["mae"], max(0.0, (high_i - trade["entry_px"]) / trade["entry_px"]))
-                if high_i >= trade["sl_price"]:
+                hit_sl = high_i >= trade["sl_price"]
+                hit_tp = low_i <= trade.get("tp_price", -1)
+                # On same bar, SL has priority to avoid optimistic fill ordering.
+                if hit_sl and hit_tp:
+                    gate_counts["both_hit_sl_priority"] += 1
+                if hit_sl:
                     exit_px = trade["sl_price"]
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
                     pnl_total = pnl_pct
-                    for bucket in (stats, sym_stats):
+                    track_name = str(trade.get("track") or "unknown")
+                    track_bucket = track_stats.setdefault(track_name, _new_stats())
+                    for bucket in (stats, sym_stats, track_bucket):
                         bucket["exits"] += 1
                         bucket["trades"] += 1
                         bucket["mfe_sum"] += trade["mfe"]
@@ -843,11 +862,13 @@ def run_backtest() -> None:
                     )
                     trade = None
                     continue
-                elif low_i <= trade.get("tp_price", -1):
+                elif hit_tp:
                     exit_px = trade["tp_price"]
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
                     pnl_total = pnl_pct
-                    for bucket in (stats, sym_stats):
+                    track_name = str(trade.get("track") or "unknown")
+                    track_bucket = track_stats.setdefault(track_name, _new_stats())
+                    for bucket in (stats, sym_stats, track_bucket):
                         bucket["exits"] += 1
                         bucket["trades"] += 1
                         bucket["mfe_sum"] += trade["mfe"]
@@ -1274,6 +1295,10 @@ def run_backtest() -> None:
                 bodies = (df_3m["close"] - df_3m["open"]).abs()
                 avg_body = float(bodies.iloc[i3-6:i3].mean()) if i3 >= 6 else float(bodies.iloc[:i3].mean())
                 if avg_body > 0 and close_now < open_now and body >= (avg_body * float(args.big_bear_body_mult)):
+                    if args.big_bear_strong_only and (not strong_break):
+                        if args.log_gates:
+                            gate_counts["big_bear_weak_block"] += 1
+                        continue
                     entry_px = float(df_3m.at[i3 + 1, "open"])
                     if not _ltf_sr_bias_pass(entry_px, track="big_bear"):
                         continue
@@ -1359,7 +1384,7 @@ def run_backtest() -> None:
 
             # DVF slope acceleration -> immediate entry (skip retest)
             try:
-                if dvf_norm_diff <= float(args.dvf_norm_diff_th):
+                if args.dvf_slope_enabled and dvf_norm_diff <= float(args.dvf_norm_diff_th):
                     if args.require_retest_touch and not retest_touch:
                         if args.log_gates:
                             gate_counts["retest_fail_no_touch"] += 1
@@ -1590,6 +1615,24 @@ def run_backtest() -> None:
             len(entry_symbols),
         )
     )
+    if track_stats:
+        print("[BACKTEST] BY_TRACK track trades wins losses winrate tp sl avg_mfe avg_mae avg_hold net_sum net_sum_usdt")
+        for track, bucket in sorted(track_stats.items(), key=lambda x: int(x[1].get("trades", 0)), reverse=True):
+            trades = int(bucket.get("trades", 0))
+            wins = int(bucket.get("wins", 0))
+            losses = int(bucket.get("losses", 0))
+            tp = int(bucket.get("tp", 0))
+            sl = int(bucket.get("sl", 0))
+            winrate = (wins / trades * 100.0) if trades > 0 else 0.0
+            avg_mfe = bucket.get("mfe_sum", 0.0) / trades if trades > 0 else 0.0
+            avg_mae = bucket.get("mae_sum", 0.0) / trades if trades > 0 else 0.0
+            avg_hold = bucket.get("hold_sum", 0.0) / trades if trades > 0 else 0.0
+            print(
+                f"[BACKTEST] TRACK {track} trades={trades} wins={wins} losses={losses} "
+                f"winrate={winrate:.2f}% tp={tp} sl={sl} avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} "
+                f"avg_hold={avg_hold:.1f} net_sum={bucket.get('net_sum', 0.0):.3f} "
+                f"net_sum_usdt={bucket.get('net_sum_usdt', 0.0):.3f}"
+            )
     if args.verbose:
         print(
             "[BACKTEST] GATE_COUNTS "
@@ -1607,6 +1650,7 @@ def run_backtest() -> None:
             f"entry_by_dvf_accel={gate_counts['entry_by_dvf_accel']} "
             f"entry_by_dvf_slope={gate_counts['entry_by_dvf_slope']} "
             f"entry_by_big_bear={gate_counts['entry_by_big_bear']} "
+            f"big_bear_weak_block={gate_counts['big_bear_weak_block']} "
             f"entry_by_timeout={gate_counts['entry_by_timeout']} "
             f"entry_by_pass_close={gate_counts['entry_by_pass_close']} "
             f"entry_by_pass_low={gate_counts['entry_by_pass_low']} "
@@ -1629,7 +1673,8 @@ def run_backtest() -> None:
             f"mae_weak={gate_counts['mae_weak_sum']:.3f} "
             f"hold_strong={gate_counts['hold_strong_sum']:.1f} "
             f"hold_weak={gate_counts['hold_weak_sum']:.1f} "
-            f"ltf_sr_bias_block={gate_counts['ltf_sr_bias_block']}"
+            f"ltf_sr_bias_block={gate_counts['ltf_sr_bias_block']} "
+            f"both_hit_sl_priority={gate_counts['both_hit_sl_priority']}"
         )
 
     print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")

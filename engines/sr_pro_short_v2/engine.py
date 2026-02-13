@@ -12,7 +12,7 @@ class SrProShortV2Config:
     tf_htf: str = "1h"
     lookback: int = 20
     relaxed_lookback: int = 10
-    auto_relax: bool = True
+    auto_relax: bool = False
     atr_mult: float = 1.0
     delta_len: int = 2
     cluster_atr: float = 1.5
@@ -25,6 +25,10 @@ class SrProShortV2Config:
     reject_source: str = "1h"
     ema200_filter: bool = True
     ema_filter_len: int = 200
+    mtf_ema_len: int = 20
+    ltf_ema200_entry_block: bool = False
+    ltf_ema200_len: int = 200
+    ltf_ema200_max: float = 0.012
     total_window_days: int = 14
     rolling_zones: bool = True
     retest_bars: int = 6

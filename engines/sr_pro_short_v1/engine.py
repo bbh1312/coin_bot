@@ -12,7 +12,7 @@ class SrProShortV1Config:
     tf_htf: str = "1h"
     lookback: int = 20
     relaxed_lookback: int = 10
-    auto_relax: bool = True
+    auto_relax: bool = False
     atr_mult: float = 1.0
     delta_len: int = 2
     cluster_atr: float = 1.5
@@ -22,6 +22,7 @@ class SrProShortV1Config:
     dvf_norm_max: float = -0.10
     dvf_norm_immediate: float = -0.25
     dvf_norm_diff_th: float = -0.03
+    dvf_slope_enabled: bool = False
     require_reject_close: bool = False
     reject_mode: str = "bot"
     reject_source: str = "1h"
@@ -42,6 +43,7 @@ class SrProShortV1Config:
     shallow_wick_max: float = 0.35
     shallow_dvf_max: float = -0.05
     big_bear_body_mult: float = 1.2
+    big_bear_strong_only: bool = True
     atr_filter_len: int = 20
     atr_filter_mult: float = 0.7
     ema60_15m_len: int = 60

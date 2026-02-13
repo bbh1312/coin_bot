@@ -1376,7 +1376,7 @@ COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "30"))
 COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "false", "off", "no")
 COMMON_WARMUP_WS = os.getenv("COMMON_WARMUP_WS", "0") in ("1", "true", "on", "yes")
 COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
-COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "9"))
+COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "12"))
 COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "50"))
 COMMON_WARMUP_NOTIFY_COOLDOWN_SEC = int(os.getenv("COMMON_WARMUP_NOTIFY_COOLDOWN_SEC", "3600"))
 _COMMON_WARMUP_NOTIFY_TS_MEM = 0.0
@@ -2755,9 +2755,22 @@ def _send_entry_alert(
 ) -> None:
     if not send_alert:
         return
-    if isinstance(engine, str) and engine.strip().upper() == "MANUAL" and not MANAGE_WS_MODE:
-        return
     side_key = (side or "").upper()
+    if isinstance(engine, str) and engine.strip().upper() == "MANUAL" and not MANAGE_WS_MODE:
+        # Keep manual-entry alerts mostly muted in non-WS mode, but allow hedge-side entries
+        # so opposite-side manual adds are visible to operators.
+        opp_open = False
+        try:
+            opp_amt = (
+                get_short_position_amount(symbol)
+                if side_key == "LONG"
+                else get_long_position_amount(symbol)
+            )
+            opp_open = isinstance(opp_amt, (int, float)) and float(opp_amt) > 0
+        except Exception:
+            opp_open = False
+        if not opp_open:
+            return
     icon = "🟢" if side_key == "LONG" else "🔴" if side_key == "SHORT" else "⚪"
     side_label = "롱" if side_key == "LONG" else "숏" if side_key == "SHORT" else side_key
     header = f"{icon} <b>{side_label} 시그널</b>"
@@ -8149,6 +8162,7 @@ def _run_sr_pro_short_v1_cycle(
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
         "entry_by_big_bear": 0,
+        "big_bear_weak_block": 0,
         "entry_by_dvf_accel": 0,
         "entry_by_dvf_slope": 0,
         "entry_by_timeout": 0,
@@ -8606,6 +8620,9 @@ def _run_sr_pro_short_v1_cycle(
             bodies = (df_3m_sig["close"] - df_3m_sig["open"]).abs()
             avg_body = float(bodies.iloc[-6:-1].mean()) if len(bodies) >= 6 else float(bodies.iloc[:-1].mean())
             if avg_body > 0 and c3 < o3 and body >= (avg_body * float(cfg.big_bear_body_mult)):
+                if bool(getattr(cfg, "big_bear_strong_only", True)) and (not strong_break):
+                    gate_stats["big_bear_weak_block"] += 1
+                    continue
                 entry_px = float(df_3m.iloc[-1]["open"])
                 nearest = min(resist_candidates, key=lambda z: abs(z["mid"] - entry_px))
                 sl_raw = float(nearest["top"]) + (atr_now * float(cfg.sl_atr_mult))
@@ -8697,7 +8714,7 @@ def _run_sr_pro_short_v1_cycle(
             pass
         # DVF slope acceleration -> immediate entry (skip retest)
         try:
-            if dvf_norm_diff <= float(cfg.dvf_norm_diff_th):
+            if bool(getattr(cfg, "dvf_slope_enabled", False)) and dvf_norm_diff <= float(cfg.dvf_norm_diff_th):
                 if int(getattr(cfg, "dvf_confirm_bars", 0)) > 0:
                     sym_state["dvf_pending_until"] = now_ts_ms + int(cfg.dvf_confirm_bars) * 3 * 60 * 1000
                     sym_state["dvf_pending_level"] = low_min
@@ -9361,14 +9378,17 @@ def _run_sr_pro_short_v2_cycle(
         "break_3m": 0,
         "break_3m_strong": 0,
         "break_3m_weak": 0,
+        "retest_armed": 0,
         "retest_seen": 0,
         "retest_pass_close": 0,
         "retest_pass_low": 0,
+        "retest_fail_wait": 0,
         "retest_fail_no_touch": 0,
         "retest_fail_window_expire": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
         "ema200_pass": 0,
+        "ltf_ema200_block": 0,
         "no_data_ltf": 0,
         "no_data_mtf": 0,
         "no_data_htf": 0,
@@ -9574,15 +9594,11 @@ def _run_sr_pro_short_v2_cycle(
             gate_stats["zone_touch"] += 1
             continue
 
-        h15_0 = float(df_15m_sig.iloc[idx_15m]["high"])
-        h15_1 = float(df_15m_sig.iloc[idx_15m - 1]["high"])
-        h15_2 = float(df_15m_sig.iloc[idx_15m - 2]["high"])
         close15 = float(df_15m_sig.iloc[idx_15m]["close"])
-        open15 = float(df_15m_sig.iloc[idx_15m]["open"])
-        if not (h15_0 < h15_1 or h15_1 < h15_2):
-            gate_stats["lh_15m"] += 1
-            continue
-        if not (close15 < open15):
+        mtf_ema_len = max(1, int(getattr(cfg, "mtf_ema_len", 20)))
+        ema15_line = ema(df_15m_sig["close"].astype(float), mtf_ema_len)
+        ema15_now = float(ema15_line.iloc[idx_15m]) if not np.isnan(ema15_line.iloc[idx_15m]) else close15
+        if not (close15 < ema15_now):
             gate_stats["lh_15m"] += 1
             continue
 
@@ -9645,13 +9661,14 @@ def _run_sr_pro_short_v2_cycle(
             sym_state["retest_active"] = True
             sym_state["retest_touched"] = False
             sym_state["break_type"] = break_type
-            gate_stats["retest_seen"] += 1
+            gate_stats["retest_armed"] += 1
             _append_sr_pro_short_v2_log(
                 f"BREAK_ARMED sym={symbol} ts={now_ts_ms} retest_level={retest_level:.6f} "
                 f"low_min={low_min:.6f} window_end={retest_until}"
             )
 
         if retest_active and now_ts_ms <= retest_until:
+            gate_stats["retest_seen"] += 1
             atr_3m_sig = atr(df_3m_sig, 14)
             atr_now = float(atr_3m_sig.iloc[-1]) if not np.isnan(atr_3m_sig.iloc[-1]) else 0.0
             if h3 >= retest_level - (atr_now * float(cfg.retest_atr_mult)):
@@ -9685,6 +9702,15 @@ def _run_sr_pro_short_v2_cycle(
                 if entry_target is None or h3 < entry_target:
                     continue
                 entry_px = float(entry_target)
+                if bool(getattr(cfg, "ltf_ema200_entry_block", False)):
+                    c3_series = df_3m_sig["close"].astype(float)
+                    ltf_ema_len = max(1, int(getattr(cfg, "ltf_ema200_len", 200)))
+                    ema200 = ema(c3_series, ltf_ema_len)
+                    e200 = float(ema200.iloc[-1]) if not np.isnan(ema200.iloc[-1]) else c3
+                    dist_ema3 = (e200 - c3) / c3 if c3 > 0 else 0.0
+                    if dist_ema3 > float(getattr(cfg, "ltf_ema200_max", 0.012)):
+                        gate_stats["ltf_ema200_block"] += 1
+                        continue
                 nearest = min(resist_candidates, key=lambda z: abs(float(z.get("mid", 0.0)) - entry_px))
                 if not (c3 <= float(nearest["mid"]) or entry_px <= float(nearest["bot"]) + (atr_now * 0.2)):
                     continue
@@ -9729,6 +9755,8 @@ def _run_sr_pro_short_v2_cycle(
                 sym_state["retest_active"] = False
                 sym_state["retest_touched"] = False
                 continue
+            else:
+                gate_stats["retest_fail_wait"] += 1
 
         if retest_active and now_ts_ms > retest_until:
             if retest_touched:
@@ -11405,19 +11433,6 @@ def _detect_position_events(state: dict, send_telegram) -> None:
                     def _skip_result(reason: str):
                         return {"status": "skip", "reason": reason}
                     for acct in manual_followers:
-                        follower_state = load_state_from(acct.state_path)
-                        admin_follow_enabled = follower_state.get("_admin_follow_enabled")
-                        if admin_follow_enabled is None:
-                            admin_follow_enabled = True
-                        manual_entry_enabled = follower_state.get("_admin_manual_entry_enabled")
-                        if manual_entry_enabled is None:
-                            manual_entry_enabled = True
-                        if not admin_follow_enabled:
-                            follower_calls.append({"acct": acct, "fn": lambda r="admin_follow_disabled": _skip_result(r)})
-                            continue
-                        if not manual_entry_enabled:
-                            follower_calls.append({"acct": acct, "fn": lambda r="manual_entry_disabled": _skip_result(r)})
-                            continue
                         pct = None
                         try:
                             pct = float(getattr(acct.settings, "entry_pct", USDT_PER_TRADE))
@@ -11632,19 +11647,6 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                     def _skip_result(reason: str):
                         return {"status": "skip", "reason": reason}
                     for acct in manual_followers:
-                        follower_state = load_state_from(acct.state_path)
-                        admin_follow_enabled = follower_state.get("_admin_follow_enabled")
-                        if admin_follow_enabled is None:
-                            admin_follow_enabled = True
-                        manual_entry_enabled = follower_state.get("_admin_manual_entry_enabled")
-                        if manual_entry_enabled is None:
-                            manual_entry_enabled = True
-                        if not admin_follow_enabled:
-                            follower_calls.append({"acct": acct, "fn": lambda r="admin_follow_disabled": _skip_result(r)})
-                            continue
-                        if not manual_entry_enabled:
-                            follower_calls.append({"acct": acct, "fn": lambda r="manual_entry_disabled": _skip_result(r)})
-                            continue
                         pct = None
                         try:
                             pct = float(getattr(acct.settings, "entry_pct", USDT_PER_TRADE))
@@ -12985,9 +12987,10 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     except Exception:
                         sl_price_meta = None
                 mark_px = _fetch_last_price(sym)
-                if engine_label != "SR_PRO_LONG_V1":
-                    if mark_px is None and isinstance(sl_price_meta, (int, float)):
-                        mark_px = float(sl_price_meta)
+                # If mark is unavailable at close-detection time, use SL price as fallback
+                # for reason classification so SL-triggered exchange closes are not labeled manual.
+                if mark_px is None and isinstance(sl_price_meta, (int, float)):
+                    mark_px = float(sl_price_meta)
                 if isinstance(entry_px, (int, float)) and isinstance(mark_px, (int, float)) and entry_px > 0:
                     profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
                     if isinstance(tp_pct, (int, float)) and profit_unlev >= float(tp_pct):
@@ -18919,18 +18922,14 @@ def run():
                         f"union={universe_union_len}"
                     )
                     print(
-                        "[engines] rsi=%s(%d) top_fail=%s(%d) sr_pro=%s(%d) sr_pro_v2=%s(%d) swaggy_atlas_lab=%s(%d)"
+                        "[engines] sr_pro_long_v1=%s(%d) sr_pro_short_v1=%s(%d) sr_pro_short_v2=%s(%d)"
                         % (
-                            "ON" if rsi_ran else "OFF",
-                            rsi_universe_len,
-                            "ON" if top_fail_short_ran else "OFF",
-                            top_fail_short_universe_len,
+                            "ON" if sr_pro_long_ran else "OFF",
+                            sr_pro_long_universe_len,
                             "ON" if sr_pro_short_ran else "OFF",
                             sr_pro_short_universe_len,
                             "ON" if sr_pro_short_v2_ran else "OFF",
                             sr_pro_short_universe_len,
-                            "ON" if swaggy_atlas_lab_ran else "OFF",
-                            swaggy_atlas_lab_universe_len,
                         )
                     )
                     print(f"[cycle] heavy_scan={'Y' if heavy_scan else 'N'} elapsed={elapsed:.2f}s")

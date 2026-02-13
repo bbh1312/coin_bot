@@ -268,7 +268,9 @@ def run_backtest() -> None:
     parser.add_argument("--top-n", type=int, default=50)
     parser.add_argument("--lookback", type=int, default=20)
     parser.add_argument("--relaxed-lookback", type=int, default=10)
-    parser.add_argument("--auto-relax", action="store_true")
+    parser.add_argument("--auto-relax", action="store_true", dest="auto_relax")
+    parser.add_argument("--no-auto-relax", action="store_false", dest="auto_relax")
+    parser.set_defaults(auto_relax=bool(cfg_live.auto_relax))
     parser.add_argument("--atr-mult", type=float, default=1.0)
     parser.add_argument("--delta-len", type=int, default=2)
     parser.add_argument("--cluster-atr", type=float, default=1.5)
@@ -282,6 +284,11 @@ def run_backtest() -> None:
     parser.add_argument("--ema200-filter", action="store_true", default=True)
     parser.add_argument("--no-ema200-filter", action="store_false", dest="ema200_filter")
     parser.add_argument("--ema-filter-len", type=int, default=200)
+    parser.add_argument("--mtf-ema-len", type=int, default=int(cfg_live.mtf_ema_len))
+    parser.add_argument("--ltf-ema200-entry-block", action="store_true", default=bool(cfg_live.ltf_ema200_entry_block))
+    parser.add_argument("--no-ltf-ema200-entry-block", action="store_false", dest="ltf_ema200_entry_block")
+    parser.add_argument("--ltf-ema200-len", type=int, default=int(cfg_live.ltf_ema200_len))
+    parser.add_argument("--ltf-ema200-max", type=float, default=float(cfg_live.ltf_ema200_max))
     parser.add_argument("--retest-bars", type=int, default=6)
     parser.add_argument("--retest-atr-mult", type=float, default=0.20)
     parser.add_argument("--retest-near-atr-mult", type=float, default=0.15)
@@ -342,6 +349,10 @@ def run_backtest() -> None:
         tp_mult=args.tp_mult,
         entry_ema_len=args.entry_ema_len,
         entry_atr_offset=args.entry_atr_offset,
+        mtf_ema_len=args.mtf_ema_len,
+        ltf_ema200_entry_block=args.ltf_ema200_entry_block,
+        ltf_ema200_len=args.ltf_ema200_len,
+        ltf_ema200_max=args.ltf_ema200_max,
     )
 
     exchange = None if args.cache_only else ccxt.binance({"enableRateLimit": True})
@@ -461,9 +472,11 @@ def run_backtest() -> None:
         "break_3m": 0,
         "break_3m_strong": 0,
         "break_3m_weak": 0,
+        "retest_armed": 0,
         "retest_seen": 0,
         "retest_pass_close": 0,
         "retest_pass_low": 0,
+        "retest_fail_wait": 0,
         "retest_fail_no_touch": 0,
         "retest_fail_window_expire": 0,
         "entry_by_pass_close": 0,
@@ -471,6 +484,7 @@ def run_backtest() -> None:
         "reject_pass_1h": 0,
         "reject_pass_15m": 0,
         "ema200_pass": 0,
+        "ltf_ema200_block": 0,
         "time_block": 0,
         "ltf_sr_bias_block": 0,
     }
@@ -625,6 +639,8 @@ def run_backtest() -> None:
         retest_touched = False
         retest_level = 0.0
         retest_until = -1
+        retest_zone: Zone | None = None
+        retest_break_type = "strong"
         last_zone_end_idx = None
 
         for i3 in range(3, len(df_3m) - 1):
@@ -674,7 +690,10 @@ def run_backtest() -> None:
                 trade["hold_bars"] += 1
                 trade["mfe"] = max(trade["mfe"], max(0.0, (trade["entry_px"] - low_i) / trade["entry_px"]))
                 trade["mae"] = max(trade["mae"], max(0.0, (high_i - trade["entry_px"]) / trade["entry_px"]))
-                if high_i >= trade["sl_price"]:
+                sl_hit = high_i >= trade["sl_price"]
+                tp_hit = low_i <= trade["tp_price"]
+                # On same-bar TP/SL touch, force SL-first to avoid optimistic fills.
+                if sl_hit:
                     exit_px = trade["sl_price"]
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
                     for bucket in (stats, sym_stats):
@@ -707,7 +726,7 @@ def run_backtest() -> None:
                     if dbg_on:
                         dbg_counts["exits"] += 1
                     trade = None
-                elif low_i <= trade["tp_price"]:
+                elif tp_hit:
                     exit_px = trade["tp_price"]
                     pnl_pct = (trade["entry_px"] - exit_px) / trade["entry_px"]
                     for bucket in (stats, sym_stats):
@@ -741,6 +760,177 @@ def run_backtest() -> None:
                         dbg_counts["exits"] += 1
                     trade = None
                 continue
+
+            # Retest FSM: once armed, evaluate every 3m bar in window before looking for a new break.
+            if retest_active:
+                if i3 > retest_until:
+                    if args.log_gates:
+                        if retest_touched:
+                            gate_counts["retest_fail_window_expire"] += 1
+                        else:
+                            gate_counts["retest_fail_no_touch"] += 1
+                    if args.debug_zone:
+                        close_now_dbg = float(df_3m.at[i3, "close"])
+                        print(
+                            "[BACKTEST] RETEST_EXPIRE "
+                            f"sym={sym} ts={_iso_kst(ts)} touched={int(retest_touched)} "
+                            f"close={close_now_dbg:.6f} retest_level={retest_level:.6f}"
+                        )
+                    retest_active = False
+                    retest_touched = False
+                    retest_zone = None
+                else:
+                    if args.log_gates:
+                        gate_counts["retest_seen"] += 1
+                    open_now = float(df_3m.at[i3, "open"])
+                    close_now = float(df_3m.at[i3, "close"])
+                    low_now = float(df_3m.at[i3, "low"])
+                    high_now = float(df_3m.at[i3, "high"])
+                    rng = high_now - low_now
+                    upper_wick = high_now - max(open_now, close_now)
+                    upper_wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+                    atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
+
+                    if high_now >= retest_level - (atr_now * float(args.retest_atr_mult)):
+                        retest_touched = True
+                        if args.debug_zone:
+                            print(
+                                "[BACKTEST] RETEST_TOUCH "
+                                f"sym={sym} ts={_iso_kst(ts)} high={high_now:.6f} "
+                                f"retest_level={retest_level:.6f} touch_th={(retest_level - (atr_now * float(args.retest_atr_mult))):.6f}"
+                            )
+
+                        entry_reason = None
+                        if close_now < retest_level:
+                            entry_reason = "pass_close"
+                            if args.log_gates:
+                                gate_counts["retest_pass_close"] += 1
+                        elif low_now < retest_level and close_now < open_now and upper_wick_ratio <= 0.40:
+                            entry_reason = "pass_low"
+                            if args.log_gates:
+                                gate_counts["retest_pass_low"] += 1
+                        else:
+                            if dbg_on:
+                                dbg_counts["fail_retest"] += 1
+                            if args.log_gates:
+                                gate_counts["retest_fail_wait"] += 1
+                            continue
+
+                        ema_entry = float(ema_3m_entry.iloc[i3]) if len(ema_3m_entry) > i3 and not np.isnan(ema_3m_entry.iloc[i3]) else None
+                        entry_offset = float(cfg.entry_atr_offset)
+                        entry_target = None
+                        if isinstance(ema_entry, (int, float)) and atr_now > 0:
+                            entry_target = float(ema_entry) + (atr_now * entry_offset)
+                        if entry_target is None or high_now < entry_target:
+                            if dbg_on:
+                                dbg_counts["fail_entry_target"] += 1
+                            continue
+                        entry_px = float(entry_target)
+                        if args.ltf_ema200_entry_block:
+                            close_3m = df_3m["close"].astype(float)
+                            ltf_ema_len = max(1, int(args.ltf_ema200_len))
+                            ema200 = _ema(close_3m, ltf_ema_len)
+                            e200 = float(ema200.iloc[i3]) if not np.isnan(ema200.iloc[i3]) else close_now
+                            dist_ema3 = (e200 - close_now) / close_now if close_now > 0 else 0.0
+                            if dist_ema3 > float(args.ltf_ema200_max):
+                                if args.log_gates:
+                                    gate_counts["ltf_ema200_block"] += 1
+                                continue
+                        if args.ltf_sr_bias:
+                            lb = max(5, int(args.ltf_sr_lookback))
+                            start = max(0, i3 - lb + 1)
+                            seg = df_3m.iloc[start : i3 + 1]
+                            if not seg.empty:
+                                try:
+                                    sup = float(seg["low"].astype(float).min())
+                                    res = float(seg["high"].astype(float).max())
+                                except Exception:
+                                    sup = None
+                                    res = None
+                                if (
+                                    isinstance(sup, (int, float))
+                                    and isinstance(res, (int, float))
+                                    and np.isfinite(sup)
+                                    and np.isfinite(res)
+                                    and res > sup
+                                ):
+                                    dist_sup = abs(entry_px - sup)
+                                    dist_res = abs(res - entry_px)
+                                    if dist_sup < dist_res:
+                                        if args.log_gates:
+                                            gate_counts["ltf_sr_bias_block"] += 1
+                                        if args.debug_zone:
+                                            print(
+                                                "[BACKTEST][LTF_SR_BLOCK] "
+                                                f"sym={sym} ts={_ts_kst(ts)} track={entry_reason or 'retest'} "
+                                                f"entry={entry_px:.6f} sup={sup:.6f} res={res:.6f} "
+                                                f"dist_sup={dist_sup:.6f} dist_res={dist_res:.6f}"
+                                            )
+                                        continue
+
+                        nearest = retest_zone
+                        if nearest is None:
+                            resist_live = [z for z in zones if z.live and z.side == 1]
+                            if not resist_live:
+                                if dbg_on:
+                                    dbg_counts["fail_nearest_zone"] += 1
+                                continue
+                            nearest = min(resist_live, key=lambda z: abs(z.mid - entry_px))
+                        if not (close_now <= nearest.mid or entry_px <= nearest.bot + (atr_now * 0.2)):
+                            if dbg_on:
+                                dbg_counts["fail_nearest_zone"] += 1
+                            continue
+
+                        sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
+                        sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                        tp_atr = float(args.tp_atr_mult_weak) if (retest_break_type != "strong" and float(args.tp_atr_mult_weak) > 0) else float(args.tp_atr_mult)
+                        if tp_atr > 0:
+                            tp_price = entry_px - (atr_now * tp_atr)
+                        else:
+                            tp_price = entry_px * (cfg.tp_mult if retest_break_type == "strong" else float(args.tp_mult_weak))
+
+                        trade = {
+                            "entry_px": entry_px,
+                            "sl_price": sl_price,
+                            "tp_price": tp_price,
+                            "mfe": 0.0,
+                            "mae": 0.0,
+                            "hold_bars": 0,
+                            "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                            "track": retest_break_type,
+                            "reason": entry_reason,
+                        }
+                        stats["entries"] += 1
+                        sym_stats["entries"] += 1
+                        if dbg_on:
+                            dbg_counts["entries"] += 1
+                        if args.log_gates:
+                            if entry_reason == "pass_close":
+                                gate_counts["entry_by_pass_close"] += 1
+                            else:
+                                gate_counts["entry_by_pass_low"] += 1
+                        day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
+                        entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+                        date_stats.setdefault(
+                            day_key, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0}
+                        )
+                        date_stats[day_key]["entries"] += 1
+                        entry_symbols.add(sym)
+                        dt_kst = datetime.fromtimestamp(trade["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
+                        hour_bucket = dt_kst.hour
+                        dow_bucket = _dow_label(dt_kst)
+                        hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
+                        dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
+                        hour_stats[hour_bucket]["entries"] += 1
+                        dow_stats[dow_bucket]["entries"] += 1
+                        retest_active = False
+                        retest_touched = False
+                        retest_zone = None
+                        continue
+                    else:
+                        if args.log_gates:
+                            gate_counts["retest_fail_wait"] += 1
+                    continue
 
             h1_high = float(high_1h.iloc[idx_1h])
             h1_low = float(low_1h.iloc[idx_1h])
@@ -815,16 +1005,11 @@ def run_backtest() -> None:
                 idx_15m = int(np.searchsorted(ts_15m, ts, side="right") - 1)
             if idx_15m < 2:
                 continue
-            h15_0 = float(df_15m.at[idx_15m, "high"])
-            h15_1 = float(df_15m.at[idx_15m - 1, "high"])
-            h15_2 = float(df_15m.at[idx_15m - 2, "high"])
-            if not (h15_0 < h15_1 or h15_1 < h15_2):
-                if dbg_on:
-                    dbg_counts["fail_lh_15m"] += 1
-                if args.log_gates:
-                    gate_counts["lh_15m"] += 1
-                continue
-            if not (float(df_15m.at[idx_15m, "close"]) < float(df_15m.at[idx_15m, "open"])):
+            close15 = float(df_15m.at[idx_15m, "close"])
+            mtf_ema_len = max(1, int(args.mtf_ema_len))
+            ema15_line = _ema(df_15m["close"].astype(float), mtf_ema_len)
+            ema15_now = float(ema15_line.iloc[idx_15m]) if not np.isnan(ema15_line.iloc[idx_15m]) else close15
+            if not (close15 < ema15_now):
                 if dbg_on:
                     dbg_counts["fail_lh_15m"] += 1
                 if args.log_gates:
@@ -870,161 +1055,16 @@ def run_backtest() -> None:
                     retest_bars = max(retest_bars, int(args.retest_dyn_bars))
             retest_until = i3 + retest_bars
             if args.log_gates:
-                gate_counts["retest_seen"] += 1
+                gate_counts["retest_armed"] += 1
+            retest_zone = min(resist_candidates, key=lambda z: abs(z.mid - close_now))
+            retest_break_type = "strong" if strong_break else "weak"
             if args.debug_zone:
                 print(
                     "[BACKTEST] BREAK_ARMED "
                     f"sym={sym} ts={_iso_kst(ts)} retest_level={retest_level:.6f} "
                     f"low_min={low_min:.6f} window_end={retest_until}"
                 )
-
-            if retest_active and i3 <= retest_until:
-                low_now = float(df_3m.at[i3, "low"])
-                high_now = float(df_3m.at[i3, "high"])
-                rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
-                upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
-                upper_wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
-                atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
-                if high_now >= retest_level - (atr_now * float(args.retest_atr_mult)):
-                    retest_touched = True
-                    if args.debug_zone:
-                        print(
-                            "[BACKTEST] RETEST_TOUCH "
-                            f"sym={sym} ts={_iso_kst(ts)} high={high_now:.6f} "
-                            f"retest_level={retest_level:.6f} touch_th={(retest_level - (atr_now * float(args.retest_atr_mult))):.6f}"
-                        )
-                    entry_ok = False
-                    entry_reason = None
-                    if close_now < retest_level:
-                        entry_ok = True
-                        entry_reason = "pass_close"
-                        if args.log_gates:
-                            gate_counts["retest_pass_close"] += 1
-                    elif low_now < retest_level and close_now < open_now and upper_wick_ratio <= 0.40:
-                        entry_ok = True
-                        entry_reason = "pass_low"
-                        if args.log_gates:
-                            gate_counts["retest_pass_low"] += 1
-                    else:
-                        if dbg_on:
-                            dbg_counts["fail_retest"] += 1
-                        continue
-
-                    ema_entry = float(ema_3m_entry.iloc[i3]) if len(ema_3m_entry) > i3 and not np.isnan(ema_3m_entry.iloc[i3]) else None
-                    entry_offset = float(cfg.entry_atr_offset)
-                    entry_target = None
-                    if isinstance(ema_entry, (int, float)) and atr_now > 0:
-                        entry_target = float(ema_entry) + (atr_now * entry_offset)
-                    if entry_target is None or high_now < entry_target:
-                        if dbg_on:
-                            dbg_counts["fail_entry_target"] += 1
-                        continue
-                    entry_px = float(entry_target)
-                    if args.ltf_sr_bias:
-                        lb = max(5, int(args.ltf_sr_lookback))
-                        start = max(0, i3 - lb + 1)
-                        seg = df_3m.iloc[start : i3 + 1]
-                        if not seg.empty:
-                            try:
-                                sup = float(seg["low"].astype(float).min())
-                                res = float(seg["high"].astype(float).max())
-                            except Exception:
-                                sup = None
-                                res = None
-                            if (
-                                isinstance(sup, (int, float))
-                                and isinstance(res, (int, float))
-                                and np.isfinite(sup)
-                                and np.isfinite(res)
-                                and res > sup
-                            ):
-                                dist_sup = abs(entry_px - sup)
-                                dist_res = abs(res - entry_px)
-                                if dist_sup < dist_res:
-                                    if args.log_gates:
-                                        gate_counts["ltf_sr_bias_block"] += 1
-                                    if args.debug_zone:
-                                        print(
-                                            "[BACKTEST][LTF_SR_BLOCK] "
-                                            f"sym={sym} ts={_ts_kst(ts)} track={entry_reason or 'retest'} "
-                                            f"entry={entry_px:.6f} sup={sup:.6f} res={res:.6f} "
-                                            f"dist_sup={dist_sup:.6f} dist_res={dist_res:.6f}"
-                                        )
-                                    continue
-                    nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
-                    if not (close_now <= nearest.mid or entry_px <= nearest.bot + (atr_now * 0.2)):
-                        if dbg_on:
-                            try:
-                                print(
-                                    "[BACKTEST] SR_PRO_SHORT_V2_NEAREST_FAIL "
-                                    f"sym={sym} ts={_iso_kst(ts)} "
-                                    f"close_3m={close_now:.6f} entry={entry_px:.6f} "
-                                    f"zone_mid={nearest.mid:.6f} zone_top={nearest.top:.6f} zone_bot={nearest.bot:.6f} "
-                                    f"atr3={atr_now:.6f} cond_rhs={(nearest.bot + (atr_now * 0.2)):.6f}"
-                                )
-                            except Exception:
-                                pass
-                        if dbg_on:
-                            dbg_counts["fail_nearest_zone"] += 1
-                        continue
-                    sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
-                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                    tp_atr = float(args.tp_atr_mult_weak) if (not strong_break and float(args.tp_atr_mult_weak) > 0) else float(args.tp_atr_mult)
-                    if tp_atr > 0:
-                        tp_price = entry_px - (atr_now * tp_atr)
-                    else:
-                        tp_price = entry_px * (cfg.tp_mult if strong_break else float(args.tp_mult_weak))
-
-                    trade = {
-                        "entry_px": entry_px,
-                        "sl_price": sl_price,
-                        "tp_price": tp_price,
-                        "mfe": 0.0,
-                        "mae": 0.0,
-                        "hold_bars": 0,
-                        "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
-                        "track": "strong" if strong_break else "weak",
-                        "reason": entry_reason,
-                    }
-                    stats["entries"] += 1
-                    sym_stats["entries"] += 1
-                    if dbg_on:
-                        dbg_counts["entries"] += 1
-                    if args.log_gates:
-                        if entry_reason == "pass_close":
-                            gate_counts["entry_by_pass_close"] += 1
-                        else:
-                            gate_counts["entry_by_pass_low"] += 1
-                    day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
-                    entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
-                    date_stats.setdefault(
-                        day_key, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0}
-                    )
-                    date_stats[day_key]["entries"] += 1
-                    entry_symbols.add(sym)
-                    dt_kst = datetime.fromtimestamp(trade["entry_ts"] / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
-                    hour_bucket = dt_kst.hour
-                    dow_bucket = _dow_label(dt_kst)
-                    hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
-                    dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
-                    hour_stats[hour_bucket]["entries"] += 1
-                    dow_stats[dow_bucket]["entries"] += 1
-                    retest_active = False
-                    retest_touched = False
-            if retest_active and i3 > retest_until:
-                if args.log_gates:
-                    if retest_touched:
-                        gate_counts["retest_fail_window_expire"] += 1
-                    else:
-                        gate_counts["retest_fail_no_touch"] += 1
-                if args.debug_zone:
-                    print(
-                        "[BACKTEST] RETEST_EXPIRE "
-                        f"sym={sym} ts={_iso_kst(ts)} touched={int(retest_touched)} "
-                        f"close={close_now:.6f} retest_level={retest_level:.6f}"
-                    )
-                retest_active = False
-                retest_touched = False
+            continue
 
         if trade:
             last_idx = len(df_3m) - 2 if args.use_confirmed else len(df_3m) - 1

@@ -266,40 +266,42 @@ def run_backtest() -> None:
     parser.add_argument("--auto-fill-cache", action="store_true", default=False)
     parser.add_argument("--common-warmup-dir", type=str, default="")
     parser.add_argument("--top-n", type=int, default=50)
-    parser.add_argument("--lookback", type=int, default=20)
-    parser.add_argument("--relaxed-lookback", type=int, default=10)
-    parser.add_argument("--auto-relax", action="store_true")
-    parser.add_argument("--atr-mult", type=float, default=1.0)
-    parser.add_argument("--delta-len", type=int, default=2)
-    parser.add_argument("--cluster-atr", type=float, default=1.5)
-    parser.add_argument("--max-zones-per-side", type=int, default=8)
-    parser.add_argument("--touch-mode", type=str, default="top", choices=["top", "mid"])
+    parser.add_argument("--lookback", type=int, default=int(cfg_live.lookback))
+    parser.add_argument("--relaxed-lookback", type=int, default=int(cfg_live.relaxed_lookback))
+    parser.add_argument("--auto-relax", action="store_true", dest="auto_relax")
+    parser.add_argument("--no-auto-relax", action="store_false", dest="auto_relax")
+    parser.set_defaults(auto_relax=bool(cfg_live.auto_relax))
+    parser.add_argument("--atr-mult", type=float, default=float(cfg_live.atr_mult))
+    parser.add_argument("--delta-len", type=int, default=int(cfg_live.delta_len))
+    parser.add_argument("--cluster-atr", type=float, default=float(cfg_live.cluster_atr))
+    parser.add_argument("--max-zones-per-side", type=int, default=int(cfg_live.max_zones_per_side))
+    parser.add_argument("--touch-mode", type=str, default=str(cfg_live.touch_mode), choices=["top", "mid"])
     parser.add_argument("--touch-use-close", action="store_true")
-    parser.add_argument("--dvf-norm-min", type=float, default=0.2)
+    parser.add_argument("--dvf-norm-min", type=float, default=float(cfg_live.dvf_norm_min))
     parser.add_argument("--require-reject-close", action="store_true")
     parser.add_argument("--reject-mode", type=str, default="top", choices=["top", "mid"])
     parser.add_argument("--reject-source", type=str, default="1h", choices=["1h", "15m"])
     parser.add_argument("--ema200-filter", action="store_true", default=True)
     parser.add_argument("--no-ema200-filter", action="store_false", dest="ema200_filter")
-    parser.add_argument("--ema-filter-len", type=int, default=200)
-    parser.add_argument("--retest-bars", type=int, default=6)
-    parser.add_argument("--retest-atr-mult", type=float, default=0.25)
-    parser.add_argument("--retest-near-atr-mult", type=float, default=0.15)
-    parser.add_argument("--retest-wick-max", type=float, default=0.4)
-    parser.add_argument("--retest-dyn", action="store_true")
-    parser.add_argument("--retest-dyn-th", type=float, default=0.6)
-    parser.add_argument("--retest-dyn-bars", type=int, default=10)
-    parser.add_argument("--shallow-atr-mult", type=float, default=0.35)
-    parser.add_argument("--shallow-wick-max", type=float, default=0.35)
-    parser.add_argument("--shallow-dvf-min", type=float, default=0.0)
-    parser.add_argument("--entry-ema-len", type=int, default=7)
+    parser.add_argument("--ema-filter-len", type=int, default=int(cfg_live.ema_filter_len))
+    parser.add_argument("--retest-bars", type=int, default=int(cfg_live.retest_bars))
+    parser.add_argument("--retest-atr-mult", type=float, default=float(cfg_live.retest_atr_mult))
+    parser.add_argument("--retest-near-atr-mult", type=float, default=float(cfg_live.retest_near_atr_mult))
+    parser.add_argument("--retest-wick-max", type=float, default=float(cfg_live.retest_wick_max))
+    parser.add_argument("--retest-dyn", action="store_true", default=bool(cfg_live.retest_dyn))
+    parser.add_argument("--retest-dyn-th", type=float, default=float(cfg_live.retest_dyn_th))
+    parser.add_argument("--retest-dyn-bars", type=int, default=int(cfg_live.retest_dyn_bars))
+    parser.add_argument("--shallow-atr-mult", type=float, default=float(cfg_live.shallow_atr_mult))
+    parser.add_argument("--shallow-wick-max", type=float, default=float(cfg_live.shallow_wick_max))
+    parser.add_argument("--shallow-dvf-min", type=float, default=float(cfg_live.shallow_dvf_min))
+    parser.add_argument("--entry-ema-len", type=int, default=int(cfg_live.entry_ema_len))
     parser.add_argument("--entry-atr-offset", type=float, default=float(cfg_live.entry_atr_offset))
-    parser.add_argument("--sl-buffer", type=float, default=0.01)
-    parser.add_argument("--sl-atr-mult", type=float, default=0.4)
+    parser.add_argument("--sl-buffer", type=float, default=float(cfg_live.sl_buffer))
+    parser.add_argument("--sl-atr-mult", type=float, default=float(cfg_live.sl_atr_mult))
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
     parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
-    parser.add_argument("--tp-mult", type=float, default=1.02)
-    parser.add_argument("--tp-mult-weak", type=float, default=1.02)
+    parser.add_argument("--tp-mult", type=float, default=float(cfg_live.tp_mult))
+    parser.add_argument("--tp-mult-weak", type=float, default=float(cfg_live.tp_mult_weak))
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
@@ -503,6 +505,7 @@ def run_backtest() -> None:
     block_hours = _load_entry_block_hours()
 
     entries_by_day: Dict[str, int] = {}
+    entry_reason_stats: Dict[str, Dict[str, float]] = {}
     cooldown_until: Dict[tuple, int] = {}
     exit_logs: List[dict] = []
     open_logs: List[dict] = []
@@ -519,6 +522,10 @@ def run_backtest() -> None:
         dbg_on = bool(str(args.debug_symbol or "").strip()) and (sym.upper() == str(args.debug_symbol).strip().upper())
         dbg_counts = {
             "eval_bars": 0,
+            "fail_cooldown": 0,
+            "fail_time_block": 0,
+            "fail_idx_1h": 0,
+            "fail_idx_15m": 0,
             "fail_zone": 0,
             "fail_hl_15m": 0,
             "fail_break_3m": 0,
@@ -528,6 +535,17 @@ def run_backtest() -> None:
             "entries": 0,
             "exits": 0,
         } if dbg_on else None
+        def _dbg(ts_ms: int, stage: str, extra: str = "") -> None:
+            if not dbg_on:
+                return
+            try:
+                msg = (
+                    f"[BACKTEST][DBG] sym={sym} ts={_iso_kst(ts_ms)} stage={stage}"
+                    + (f" {extra}" if extra else "")
+                )
+                print(msg)
+            except Exception:
+                pass
         df_3m = frames["3m"]
         df_15m = frames["15m"]
         df_1h = frames["1h"]
@@ -634,6 +652,9 @@ def run_backtest() -> None:
                 dbg_counts["eval_bars"] += 1
             cd_until = cooldown_until.get((sym, "LONG"))
             if isinstance(cd_until, int) and ts < cd_until:
+                if dbg_on:
+                    dbg_counts["fail_cooldown"] += 1
+                    _dbg(ts, "cooldown", f"cd_until={_iso_kst(cd_until)}")
                 continue
 
             # i3 bar is confirmed when the next 3m bar opens.
@@ -643,6 +664,9 @@ def run_backtest() -> None:
             else:
                 idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
             if idx_1h < 0:
+                if dbg_on:
+                    dbg_counts["fail_idx_1h"] += 1
+                    _dbg(ts, "idx_1h", "idx_1h<0")
                 continue
 
             if args.rolling_zones and not zones_snapshot_in:
@@ -676,7 +700,10 @@ def run_backtest() -> None:
                 trade["hold_bars"] += 1
                 trade["mfe"] = max(trade["mfe"], max(0.0, (high_i - trade["entry_px"]) / trade["entry_px"]))
                 trade["mae"] = max(trade["mae"], max(0.0, (trade["entry_px"] - low_i) / trade["entry_px"]))
-                if low_i <= trade["sl_price"]:
+                sl_hit = low_i <= trade["sl_price"]
+                tp_hit = high_i >= trade["tp_price"]
+                # On same-bar TP/SL touch, force SL-first to avoid optimistic fills.
+                if sl_hit:
                     exit_px = trade["sl_price"]
                     pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
                     for bucket in (stats, sym_stats):
@@ -691,6 +718,13 @@ def run_backtest() -> None:
                         bucket["sl_sum_usdt"] += pnl_pct * float(args.entry_usdt)
                         bucket["losses"] += 1
                         bucket["sl"] = bucket.get("sl", 0) + 1
+                    er_key = str(trade.get("reason") or "unknown")
+                    er_bucket = entry_reason_stats.setdefault(
+                        er_key, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0}
+                    )
+                    er_bucket["sl"] += 1
+                    er_bucket["net_sum"] += pnl_pct
+                    er_bucket["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
                     exit_logs.append(
                         {
                             "sym": sym,
@@ -701,6 +735,8 @@ def run_backtest() -> None:
                             "entry_px": trade["entry_px"],
                             "exit_px": exit_px,
                             "reason": "SL",
+                            "entry_reason": trade.get("reason"),
+                            "entry_track": trade.get("track"),
                             "tp_pct": _tp_sl_pct_from_trade(trade)[0],
                             "sl_pct": _tp_sl_pct_from_trade(trade)[1],
                             "pnl_pct": pnl_pct,
@@ -709,8 +745,9 @@ def run_backtest() -> None:
                     cooldown_until[(sym, "LONG")] = ts + (60 * 60 * 1000)
                     if dbg_on:
                         dbg_counts["exits"] += 1
+                        _dbg(ts, "exit_sl", f"entry_ts={_iso_kst(trade['entry_ts'])} exit_px={exit_px:.6f}")
                     trade = None
-                elif high_i >= trade["tp_price"]:
+                elif tp_hit:
                     exit_px = trade["tp_price"]
                     pnl_pct = (exit_px - trade["entry_px"]) / trade["entry_px"]
                     for bucket in (stats, sym_stats):
@@ -725,6 +762,13 @@ def run_backtest() -> None:
                         bucket["tp_sum_usdt"] += pnl_pct * float(args.entry_usdt)
                         bucket["wins"] += 1
                         bucket["tp"] = bucket.get("tp", 0) + 1
+                    er_key = str(trade.get("reason") or "unknown")
+                    er_bucket = entry_reason_stats.setdefault(
+                        er_key, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0}
+                    )
+                    er_bucket["tp"] += 1
+                    er_bucket["net_sum"] += pnl_pct
+                    er_bucket["net_sum_usdt"] += pnl_pct * float(args.entry_usdt)
                     exit_logs.append(
                         {
                             "sym": sym,
@@ -735,6 +779,8 @@ def run_backtest() -> None:
                             "entry_px": trade["entry_px"],
                             "exit_px": exit_px,
                             "reason": "TP",
+                            "entry_reason": trade.get("reason"),
+                            "entry_track": trade.get("track"),
                             "tp_pct": _tp_sl_pct_from_trade(trade)[0],
                             "sl_pct": _tp_sl_pct_from_trade(trade)[1],
                             "pnl_pct": pnl_pct,
@@ -742,6 +788,7 @@ def run_backtest() -> None:
                     )
                     if dbg_on:
                         dbg_counts["exits"] += 1
+                        _dbg(ts, "exit_tp", f"entry_ts={_iso_kst(trade['entry_ts'])} exit_px={exit_px:.6f}")
                     trade = None
                 continue
 
@@ -758,6 +805,8 @@ def run_backtest() -> None:
                 if h1_close <= ema_now:
                     if args.log_gates:
                         gate_counts["zone_touch"] += 1
+                    if dbg_on:
+                        _dbg(ts, "ema200", f"h1_close={h1_close:.6f} ema200={ema_now:.6f}")
                     continue
                 if args.log_gates:
                     gate_counts["ema200_pass"] += 1
@@ -807,6 +856,22 @@ def run_backtest() -> None:
             if not support_candidates:
                 if dbg_on:
                     dbg_counts["fail_zone"] += 1
+                    try:
+                        live_sup = [z for z in zones if z.live and z.side == -1]
+                        near = min(live_sup, key=lambda z: abs(z.mid - h1_touch_px)) if live_sup else None
+                        near_txt = (
+                            f"near_mid={near.mid:.6f} near_bot={near.bot:.6f} near_top={near.top:.6f} "
+                            f"touch_px={h1_touch_px:.6f} h1_high={h1_high:.6f} h1_low={h1_low:.6f} "
+                            f"touch_cond={int((h1_touch_px <= near.top) and (h1_high >= near.bot))}"
+                        ) if near else "near=none"
+                    except Exception:
+                        near_txt = "near=err"
+                    _dbg(
+                        ts,
+                        "zone",
+                        f"support_candidates=0 live_sup={len([z for z in zones if z.live and z.side == -1])} "
+                        f"dvf_norm={dvf_norm:.4f} idx_1h={idx_1h} h1_ts={_iso_kst(h1_ts)} {near_txt}",
+                    )
                 if args.log_gates:
                     gate_counts["zone_touch"] += 1
                 continue
@@ -816,6 +881,9 @@ def run_backtest() -> None:
             else:
                 idx_15m = int(np.searchsorted(ts_15m, ts, side="right") - 1)
             if idx_15m < 2:
+                if dbg_on:
+                    dbg_counts["fail_idx_15m"] += 1
+                    _dbg(ts, "idx_15m", f"idx_15m={idx_15m}")
                 continue
             l15_0 = float(df_15m.at[idx_15m, "low"])
             l15_1 = float(df_15m.at[idx_15m - 1, "low"])
@@ -823,12 +891,18 @@ def run_backtest() -> None:
             if not (l15_0 > l15_1 or l15_1 > l15_2):
                 if dbg_on:
                     dbg_counts["fail_hl_15m"] += 1
+                    _dbg(ts, "hl_15m", f"cond=HL_FAIL l0={l15_0:.6f} l1={l15_1:.6f} l2={l15_2:.6f}")
                 if args.log_gates:
                     gate_counts["hl_15m"] += 1
                 continue
             if not (float(df_15m.at[idx_15m, "close"]) > float(df_15m.at[idx_15m, "open"])):
                 if dbg_on:
                     dbg_counts["fail_hl_15m"] += 1
+                    _dbg(
+                        ts,
+                        "hl_15m",
+                        f"cond=BULL_FAIL c15={float(df_15m.at[idx_15m, 'close']):.6f} o15={float(df_15m.at[idx_15m, 'open']):.6f}",
+                    )
                 if args.log_gates:
                     gate_counts["hl_15m"] += 1
                 continue
@@ -846,12 +920,16 @@ def run_backtest() -> None:
             if not strong_break and not weak_break:
                 if dbg_on:
                     dbg_counts["fail_break_3m"] += 1
+                    _dbg(ts, "break_3m", f"strong=0 weak=0 c3={close_now:.6f} o3={open_now:.6f} high_max={high_max:.6f}")
                 if args.log_gates:
                     gate_counts["break_3m"] += 1
                 continue
             # time block (KST hours)
             hour_kst = int(_ts_kst(ts).split(" ")[1].split(":")[0])
             if block_hours and hour_kst in block_hours:
+                if dbg_on:
+                    dbg_counts["fail_time_block"] += 1
+                    _dbg(ts, "time_block", f"hour={hour_kst}")
                 if args.log_gates:
                     gate_counts["time_block"] += 1
                 continue
@@ -901,6 +979,13 @@ def run_backtest() -> None:
                     else:
                         if dbg_on:
                             dbg_counts["fail_retest"] += 1
+                            _dbg(
+                                ts,
+                                "retest",
+                                f"pattern_fail strong={int(strong_break)} weak={int(weak_break)} "
+                                f"close={close_now:.6f} open={open_now:.6f} high={high_now:.6f} low={low_now:.6f} "
+                                f"retest_level={retest_level:.6f}",
+                            )
                         continue
 
                     ema_entry = float(ema_3m_entry.iloc[i3]) if len(ema_3m_entry) > i3 and not np.isnan(ema_3m_entry.iloc[i3]) else None
@@ -911,6 +996,12 @@ def run_backtest() -> None:
                     if entry_target is None or low_now > entry_target:
                         if dbg_on:
                             dbg_counts["fail_entry_target"] += 1
+                            _dbg(
+                                ts,
+                                "entry_target",
+                                f"low={low_now:.6f} target={(entry_target if isinstance(entry_target,(int,float)) else float('nan')):.6f} "
+                                f"ema_entry={(ema_entry if isinstance(ema_entry,(int,float)) else float('nan')):.6f} atr3={atr_now:.6f}",
+                            )
                         continue
                     entry_px = float(entry_target)
                     if args.ltf_sr_bias:
@@ -985,11 +1076,23 @@ def run_backtest() -> None:
                     sym_stats["entries"] += 1
                     if dbg_on:
                         dbg_counts["entries"] += 1
+                        _dbg(
+                            ts,
+                            "entry",
+                            f"entry_ts={_iso_kst(trade['entry_ts'])} reason={entry_reason or 'unknown'} "
+                            f"entry_px={entry_px:.6f} tp={tp_price:.6f} sl={sl_price:.6f} "
+                            f"strong={int(strong_break)} weak={int(weak_break)}",
+                        )
                     if args.log_gates:
                         if entry_reason == "close_reclaim":
                             gate_counts["entry_by_pass_close"] += 1
                         else:
                             gate_counts["entry_by_pass_high"] += 1
+                    er_key = str(entry_reason or "unknown")
+                    er_bucket = entry_reason_stats.setdefault(
+                        er_key, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0}
+                    )
+                    er_bucket["entries"] += 1
                     day_key = _ts_kst(trade["entry_ts"]).split(" ")[0]
                     entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
                     date_stats.setdefault(
@@ -1030,6 +1133,8 @@ def run_backtest() -> None:
             print(
                 "[BACKTEST] SR_PRO_LONG_DEBUG_SUMMARY "
                 f"sym={sym} eval_bars={dbg_counts['eval_bars']} "
+                f"fail_cooldown={dbg_counts['fail_cooldown']} fail_time_block={dbg_counts['fail_time_block']} "
+                f"fail_idx_1h={dbg_counts['fail_idx_1h']} fail_idx_15m={dbg_counts['fail_idx_15m']} "
                 f"fail_zone={dbg_counts['fail_zone']} fail_hl_15m={dbg_counts['fail_hl_15m']} "
                 f"fail_break_3m={dbg_counts['fail_break_3m']} fail_retest={dbg_counts['fail_retest']} "
                 f"fail_entry_target={dbg_counts['fail_entry_target']} fail_nearest_zone={dbg_counts['fail_nearest_zone']} "
@@ -1134,6 +1239,20 @@ def run_backtest() -> None:
         print(
             f"[BACKTEST] DOW {dow} entries={entries} tp={bucket['tp']} "
             f"sl={sl} sl_rate={sl_rate:.2f}%"
+        )
+
+    print("[BACKTEST] BY_ENTRY_REASON reason entries tp sl sl_rate winrate net_sum net_sum_usdt")
+    for reason in sorted(entry_reason_stats.keys()):
+        bucket = entry_reason_stats.get(reason, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0})
+        entries = int(bucket.get("entries", 0))
+        tp_cnt = int(bucket.get("tp", 0))
+        sl_cnt = int(bucket.get("sl", 0))
+        sl_rate = (sl_cnt / entries * 100.0) if entries > 0 else 0.0
+        winrate = (tp_cnt / entries * 100.0) if entries > 0 else 0.0
+        print(
+            f"[BACKTEST] ENTRY_REASON {reason} entries={entries} tp={tp_cnt} sl={sl_cnt} "
+            f"sl_rate={sl_rate:.2f}% winrate={winrate:.2f}% net_sum={float(bucket.get('net_sum', 0.0)):.3f} "
+            f"net_sum_usdt={float(bucket.get('net_sum_usdt', 0.0)):.3f}"
         )
 
     if date_stats:

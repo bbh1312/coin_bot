@@ -12,7 +12,7 @@ class SrProLongV1Config:
     tf_htf: str = "1h"
     lookback: int = 20
     relaxed_lookback: int = 10
-    auto_relax: bool = True
+    auto_relax: bool = False
     atr_mult: float = 1.0
     delta_len: int = 2
     cluster_atr: float = 1.5
