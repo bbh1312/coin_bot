@@ -15,7 +15,7 @@
 심볼마다 1줄 요약을 출력한다:
 
 ```
-[BACKTEST] <SYMBOL> entries=<N> exits=<N> trades=<N> wins=<N> losses=<N> winrate=<PCT>% tp=<N> sl=<N> avg_mfe=<F> avg_mae=<F> avg_hold=<F> last_day_exits=<N> base_usdt=<F> tp_sum=<F> sl_sum=<F> net_sum=<F> entry_syms=<N>
+[BACKTEST] <SYMBOL> entries=<N> exits=<N> trades=<N> wins=<N> losses=<N> winrate=<PCT>% tp=<N> sl=<N> avg_mfe=<F> avg_mae=<F> avg_hold=<F> last_day_exits=<N> base_usdt=<F> tp_sum=<F> sl_sum=<F> net_sum=<F> net_sum_usdt=<F> entry_syms=<N>
 ```
 
 참고:
@@ -58,14 +58,14 @@ ENTRY는 중복 방지를 위해 콘솔에 출력하지 않는다.
 멀티 모드일 경우:
 
 ```
-[BACKTEST] TOTAL@<MODE> entries=<N> exits=<N> trades=<N> wins=<N> losses=<N> winrate=<PCT>% tp=<N> sl=<N> avg_mfe=<F> avg_mae=<F> avg_hold=<F> last_day_exits=<N> base_usdt=<F> tp_sum=<F> sl_sum=<F> net_sum=<F> entry_syms=<N>
-[BACKTEST] TOTAL entries=<N> exits=<N> trades=<N> wins=<N> losses=<N> winrate=<PCT>% tp=<N> sl=<N> avg_mfe=<F> avg_mae=<F> avg_hold=<F> last_day_exits=<N> base_usdt=<F> tp_sum=<F> sl_sum=<F> net_sum=<F> entry_syms=<N>
+[BACKTEST] TOTAL@<MODE> entries=<N> exits=<N> trades=<N> wins=<N> losses=<N> winrate=<PCT>% tp=<N> sl=<N> avg_mfe=<F> avg_mae=<F> avg_hold=<F> last_day_exits=<N> base_usdt=<F> tp_sum=<F> sl_sum=<F> net_sum=<F> net_sum_usdt=<F> entry_syms=<N>
+[BACKTEST] TOTAL entries=<N> exits=<N> trades=<N> wins=<N> losses=<N> winrate=<PCT>% tp=<N> sl=<N> avg_mfe=<F> avg_mae=<F> avg_hold=<F> last_day_exits=<N> base_usdt=<F> tp_sum=<F> sl_sum=<F> net_sum=<F> net_sum_usdt=<F> entry_syms=<N>
 ```
 
 싱글 모드일 경우:
 
 ```
-[BACKTEST] TOTAL entries=<N> exits=<N> trades=<N> wins=<N> losses=<N> winrate=<PCT>% tp=<N> sl=<N> avg_mfe=<F> avg_mae=<F> avg_hold=<F> last_day_exits=<N> base_usdt=<F> tp_sum=<F> sl_sum=<F> net_sum=<F> entry_syms=<N>
+[BACKTEST] TOTAL entries=<N> exits=<N> trades=<N> wins=<N> losses=<N> winrate=<PCT>% tp=<N> sl=<N> avg_mfe=<F> avg_mae=<F> avg_hold=<F> last_day_exits=<N> base_usdt=<F> tp_sum=<F> sl_sum=<F> net_sum=<F> net_sum_usdt=<F> entry_syms=<N>
 ```
 
 합계는 트레이드 수 가중 평균으로 계산한다:

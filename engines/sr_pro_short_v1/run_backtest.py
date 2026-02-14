@@ -256,7 +256,7 @@ def run_backtest() -> None:
     parser.add_argument("--btc-filter-enabled", action="store_true")
     parser.add_argument("--btc-filter-tf", type=str, default="1h", choices=["1h", "30m"])
     parser.add_argument("--btc-filter-ema-len", type=int, default=200)
-    parser.add_argument("--block-hours", type=str, default="")
+    parser.add_argument("--block-hours", type=str, default="4,5,9,11,15")
     parser.add_argument("--disable-weak", action="store_true")
     parser.add_argument("--retest-bars", type=int, default=6)
     parser.add_argument("--retest-atr-mult", type=float, default=0.6)

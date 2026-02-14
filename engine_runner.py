@@ -74,6 +74,7 @@ try:
     from engines.universe import build_universe_from_tickers
     from engines.sr_pro_common import build_sr_zones
     from engines.scout_only_exhaustion_short.engine import ScoutOnlyExhaustionShortConfig
+    from engines.range_edge_3m.engine import RangeEdge3MConfig
     from engines.sr_pro_short_v1.engine import SrProShortV1Config
     from engines.sr_pro_short_v2.engine import SrProShortV2Config
     from engines.sr_pro_long_v1.engine import SrProLongV1Config
@@ -87,6 +88,7 @@ except Exception as _import_err:
     format_cut_top = None
     format_zone_stats = None
     ScoutOnlyExhaustionShortConfig = None
+    RangeEdge3MConfig = None
     SrProShortV1Config = None
     SrProShortV2Config = None
     SrProLongV1Config = None
@@ -634,6 +636,8 @@ def _realtime_only_required() -> bool:
     if SR_PRO_LONG_V1_ENABLED:
         return True
     if SR_PRO_LONG_V2_ENABLED:
+        return True
+    if RANGE_EDGE_3M_ENABLED:
         return True
     if BULL_PULLBACK_LONG_V1_ENABLED:
         return True
@@ -1199,6 +1203,7 @@ SR_PRO_SHORT_V2_ENABLED = os.getenv("SR_PRO_SHORT_V2_ENABLED", "0") == "1"
 SR_PRO_LONG_V1_ENABLED = os.getenv("SR_PRO_LONG_V1_ENABLED", "0") == "1"
 SR_PRO_LONG_V2_ENABLED = os.getenv("SR_PRO_LONG_V2_ENABLED", "0") == "1"
 SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED = os.getenv("SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED", "1") == "1"
+RANGE_EDGE_3M_ENABLED = os.getenv("RANGE_EDGE_3M_ENABLED", "0") == "1"
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = False
 ST_FLIP_V1_ENABLED = False
 BULL_PULLBACK_LONG_V1_ENABLED = False
@@ -2333,6 +2338,7 @@ def _maybe_refresh_common_cycle_cache(state: dict, exchange, universe: list) -> 
         "15m": 15 * 60 * 1000,
         "1h": 60 * 60 * 1000,
         "4h": 4 * 60 * 60 * 1000,
+        "1d": 24 * 60 * 60 * 1000,
     }
     refreshed = 0
     checked = 0
@@ -3325,6 +3331,12 @@ def _append_scout_only_exhaustion_short_log(line: str) -> None:
     date_tag = time.strftime("%Y-%m-%d")
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join("scout_only_exhaustion_short", f"scout_only_exhaustion_short-{date_tag}.log")
+    _append_log_lines(path, [f"{ts} {line}"])
+
+def _append_range_edge_3m_log(line: str) -> None:
+    date_tag = time.strftime("%Y-%m-%d")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = os.path.join("range_edge_3m", f"range_edge_3m-{date_tag}.log")
     _append_log_lines(path, [f"{ts} {line}"])
 
 def _iso_kst(ts: Optional[float] = None) -> str:
@@ -6801,6 +6813,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "VERTICAL_EXHAUSTION_TRAP_SHORT"
     if key in ("scout_only_exhaustion_short", "scout_exhaustion_short", "tier_b_short"):
         return "SCOUT_ONLY_EXHAUSTION_SHORT"
+    if key in ("range_edge_3m", "range_edge3m", "range_edge"):
+        return "RANGE_EDGE_3M"
     return "UNKNOWN"
 
 def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optional[str]:
@@ -6831,6 +6845,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "vertical_exhaustion_trap_short"
     if label == "SCOUT_ONLY_EXHAUSTION_SHORT":
         return "scout_only_exhaustion_short"
+    if label == "RANGE_EDGE_3M":
+        return "range_edge_3m"
     if label == "SCALP":
         return "long_entry"
     if label == "MANUAL":
@@ -6861,6 +6877,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "SR_PRO_LONG_V2": "SR프로롱v2",
         "VERTICAL_EXHAUSTION_TRAP_SHORT": "수직소진트랩숏(A)",
         "SCOUT_ONLY_EXHAUSTION_SHORT": "정찰소진숏(B)",
+        "RANGE_EDGE_3M": "횡보역추세3m",
     }
     return overrides.get(name, name)
 
@@ -6868,6 +6885,8 @@ def _telegram_reason_text(engine_label: Optional[str], fallback: Optional[str] =
     key = (engine_label or "").strip().upper()
     if key == "SCOUT_ONLY_EXHAUSTION_SHORT":
         return "정찰숏"
+    if key == "RANGE_EDGE_3M":
+        return "횡보역추세3m"
     text = (fallback or "").strip()
     return text if text else "N/A"
 
@@ -6877,6 +6896,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return False
     if key == "SCOUT_ONLY_EXHAUSTION_SHORT":
         return SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED
+    if key == "RANGE_EDGE_3M":
+        return RANGE_EDGE_3M_ENABLED
     if key == "SR_PRO_SHORT_V1":
         return SR_PRO_SHORT_V1_ENABLED
     if key == "SR_PRO_SHORT_V2":
@@ -6898,6 +6919,7 @@ def _is_runtime_managed_engine(engine: Optional[str]) -> bool:
         "SR_PRO_LONG_V1",
         "SR_PRO_LONG_V2",
         "SCOUT_ONLY_EXHAUSTION_SHORT",
+        "RANGE_EDGE_3M",
         "MANUAL",
         "MANUAL_ADMIN",
         "관리자수동진입",
@@ -10555,6 +10577,320 @@ def _run_scout_only_exhaustion_short_cycle(
         pass
     return result
 
+def _range_edge_flip_side_and_risk(side: str, entry_px: float, tp_price: float, sl_price: float) -> tuple[str, float, float]:
+    tp_dist = abs(float(tp_price) - float(entry_px))
+    sl_dist = abs(float(entry_px) - float(sl_price))
+    new_side = "SHORT" if str(side).upper() == "LONG" else "LONG"
+    new_tp_dist = sl_dist
+    new_sl_dist = tp_dist
+    if new_side == "LONG":
+        new_tp = float(entry_px) + new_tp_dist
+        new_sl = float(entry_px) - new_sl_dist
+    else:
+        new_tp = float(entry_px) - new_tp_dist
+        new_sl = float(entry_px) + new_sl_dist
+    return new_side, new_tp, new_sl
+
+
+def _run_range_edge_3m_cycle(
+    range_universe,
+    state,
+    send_alert,
+    cycle_id: Optional[int] = None,
+):
+    result = {"entries": 0}
+    if (not RANGE_EDGE_3M_ENABLED) or (not range_universe) or (RangeEdge3MConfig is None):
+        return result
+    cfg = RangeEdge3MConfig()
+    start_ts = time.time()
+    checked = 0
+    no_data = 0
+    gate = {
+        "no_data": 0,
+        "regime_fail": 0,
+        "edge_fail": 0,
+        "zone_fail": 0,
+        "liq_fail": 0,
+        "breakout_block": 0,
+        "daily_sl_block": 0,
+        "sfp_hit": 0,
+        "vbp_hit": 0,
+        "delta_hit": 0,
+        "bull_rev_hit": 0,
+        "trigger3m_hit": 0,
+        "short_blocked": 0,
+        "in_pos": 0,
+        "time_block": 0,
+        "cooldown": 0,
+    }
+    _append_range_edge_3m_log(
+        f"RANGE_EDGE_3M_CYCLE_START cycle_id={cycle_id} universe={len(range_universe)}"
+    )
+    min_fetch = max(int(cfg.lookback) + 10, 120)
+    min_fetch_limit = max(min_fetch + 5, 150)
+    daily_sl_state = state.setdefault("_range_edge_3m_daily_sl", {})
+    symbols = list(range_universe or [])
+
+    def _confirmed_df(df: pd.DataFrame, tf_ms: int) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        now_ms = int(time.time() * 1000)
+        last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns else 0
+        if last_ts and (now_ms - last_ts) < tf_ms:
+            return df.iloc[:-1]
+        return df
+
+    for symbol in symbols:
+        checked += 1
+        st = state.get(symbol, {"in_pos": False, "last_entry": 0})
+        if bool(st.get("in_pos", False)):
+            gate["in_pos"] += 1
+            continue
+        try:
+            if get_short_position_amount(symbol) > 0 or get_long_position_amount(symbol) > 0:
+                st["in_pos"] = True
+                state[symbol] = st
+                gate["in_pos"] += 1
+                continue
+        except Exception:
+            pass
+
+        if SR_PRO_USE_COMMON_CACHE:
+            _df = _load_common_warmup_ohlcv(symbol, "3m", limit=min_fetch_limit)
+            df_3m = _df if _df is not None else pd.DataFrame()
+        else:
+            df_3m = cycle_cache.get_df(symbol, "3m", limit=min_fetch_limit)
+        if df_3m is None or df_3m.empty:
+            no_data += 1
+            gate["no_data"] += 1
+            continue
+        df_3m_sig = _confirmed_df(df_3m, 3 * 60 * 1000)
+        if df_3m_sig is None or df_3m_sig.empty or len(df_3m_sig) < min_fetch:
+            no_data += 1
+            gate["no_data"] += 1
+            continue
+        latest_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
+        if _entry_blocked_now(ENTRY_BLOCK_HOURS, now_ts=(latest_ts_ms / 1000.0)):
+            gate["time_block"] += 1
+            continue
+
+        day_key = _date_str_kst(latest_ts_ms / 1000.0)
+        if int(daily_sl_state.get(day_key, 0) or 0) >= int(cfg.max_daily_sl):
+            gate["daily_sl_block"] += 1
+            continue
+
+        df = df_3m_sig.copy()
+        close = df["close"].astype(float)
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        vol = df["volume"].astype(float)
+        df["ema5"] = ema(close, 5)
+        bb_mid = close.rolling(int(cfg.bb_len), min_periods=1).mean()
+        bb_std = close.rolling(int(cfg.bb_len), min_periods=1).std(ddof=0).fillna(0.0)
+        bb_up = bb_mid + float(cfg.bb_std) * bb_std
+        bb_dn = bb_mid - float(cfg.bb_std) * bb_std
+        bb_width = ((bb_up - bb_dn) / bb_mid.replace(0.0, np.nan)).fillna(0.0)
+        df["bb_width"] = bb_width
+        df["bb_width_avg"] = bb_width.rolling(100, min_periods=20).mean().fillna(bb_width)
+        df["atr"] = atr(df, int(cfg.atr_len)).fillna(0.0)
+        df["atr_avg"] = df["atr"].rolling(100, min_periods=20).mean().fillna(df["atr"])
+        df["adx"] = _adv_adx(df, int(cfg.adx_len)).fillna(50.0)
+        df["mfi"] = _adv_mfi(df, 14).fillna(50.0)
+
+        obv_delta = np.sign(close.diff().fillna(0.0)) * vol
+        df["obv"] = obv_delta.cumsum().fillna(0.0)
+        df["obv_ema"] = ema(df["obv"], 21)
+        candle_delta = ((close - df["open"].astype(float)) / (high - low).replace(0.0, np.nan)).fillna(0.0) * vol
+        df["cvd"] = candle_delta.cumsum().fillna(0.0)
+        df["cvd_ema"] = ema(df["cvd"], 21)
+        df["vol_sma20"] = vol.rolling(20, min_periods=1).mean()
+
+        i = len(df) - 1
+        if i < max(int(cfg.lookback), 120):
+            no_data += 1
+            gate["no_data"] += 1
+            continue
+
+        c = float(df.iloc[i]["close"])
+        o = float(df.iloc[i]["open"])
+        h = float(df.iloc[i]["high"])
+        l = float(df.iloc[i]["low"])
+        adx_v = float(df.iloc[i]["adx"])
+        atr_v = float(df.iloc[i]["atr"])
+        atr_avg_v = max(float(df.iloc[i]["atr_avg"]), 1e-12)
+        bb_w_v = float(df.iloc[i]["bb_width"])
+        bb_w_avg_v = max(float(df.iloc[i]["bb_width_avg"]), 1e-12)
+
+        upper = float(df["high"].iloc[i - int(cfg.lookback) : i + 1].max())
+        lower = float(df["low"].iloc[i - int(cfg.lookback) : i + 1].min())
+        box_mid = (upper + lower) * 0.5
+        box_range = max(upper - lower, 1e-12)
+        range_pct = box_range / max(box_mid, 1e-12)
+
+        breakout_up = c > upper * (1.0 + 0.0015)
+        breakout_dn = c < lower * (1.0 - 0.0015)
+        if breakout_up or breakout_dn:
+            gate["breakout_block"] += 1
+            continue
+
+        regime_ok = ((adx_v < float(cfg.adx_threshold)) or (range_pct <= 0.020)) and (
+            bb_w_v <= bb_w_avg_v * float(cfg.bb_rel_mult)
+        )
+        regime_ok = regime_ok and (atr_v <= atr_avg_v * float(cfg.atr_filter_mult))
+        if not regime_ok:
+            gate["regime_fail"] += 1
+            continue
+
+        obv_delta_now = float(df.iloc[i]["obv"] - df.iloc[i - 3]["obv"])
+        cvd_delta_now = float(df.iloc[i]["cvd"] - df.iloc[i - 3]["cvd"])
+        edge_score = 0
+        edge_score += int(float(df.iloc[i]["obv"]) > float(df.iloc[i]["obv_ema"]) or obv_delta_now > 0.0)
+        edge_score += int(float(df.iloc[i]["cvd"]) > float(df.iloc[i]["cvd_ema"]) or cvd_delta_now > 0.0)
+        edge_score += int(float(df.iloc[i]["mfi"]) > float(df.iloc[i - 1]["mfi"]))
+        if edge_score < int(cfg.edge_min_score):
+            gate["edge_fail"] += 1
+            continue
+
+        dominant_side = "LONG" if ((1 if obv_delta_now > 0 else -1) + (1 if cvd_delta_now > 0 else -1)) >= 0 else "SHORT"
+        side = "SHORT" if dominant_side == "LONG" else "LONG"
+        if side == "SHORT" and not bool(cfg.allow_shorts):
+            gate["short_blocked"] += 1
+            continue
+
+        near_lower = c <= lower * (1.0 + float(cfg.zone_tolerance))
+        near_upper = c >= upper * (1.0 - float(cfg.zone_tolerance))
+        zone_ok = near_lower if side == "LONG" else near_upper
+        if not zone_ok:
+            gate["zone_fail"] += 1
+            continue
+
+        vol_now = float(df.iloc[i]["volume"])
+        vol_avg = max(float(df.iloc[i]["vol_sma20"]), 1e-12)
+        if vol_now < vol_avg * 0.80:
+            gate["liq_fail"] += 1
+            continue
+
+        sfp = False
+        if side == "LONG":
+            sfp = (l < lower * (1.0 - float(cfg.sfp_tolerance))) and (c > lower) and (vol_now >= vol_avg * 1.2)
+        else:
+            sfp = (h > upper * (1.0 + float(cfg.sfp_tolerance))) and (c < upper) and (vol_now >= vol_avg * 1.2)
+        if sfp:
+            gate["sfp_hit"] += 1
+
+        w_close = df["close"].iloc[i - 20 : i + 1]
+        w_vol = df["volume"].iloc[i - 20 : i + 1]
+        poc = float((w_close * w_vol).sum() / max(w_vol.sum(), 1e-12))
+        vbp = (c > poc and l <= poc) if side == "LONG" else (c < poc and h >= poc)
+        if vbp:
+            gate["vbp_hit"] += 1
+
+        prev_low = float(df["low"].iloc[i - 8 : i].min())
+        prev_high = float(df["high"].iloc[i - 8 : i].max())
+        prev_cvd_low = float(df["cvd"].iloc[i - 8 : i].min())
+        prev_cvd_high = float(df["cvd"].iloc[i - 8 : i].max())
+        delta_div = False
+        if side == "LONG":
+            delta_div = (l <= prev_low * 1.001) and (float(df.iloc[i]["cvd"]) > prev_cvd_low)
+        else:
+            delta_div = (h >= prev_high * 0.999) and (float(df.iloc[i]["cvd"]) < prev_cvd_high)
+        if delta_div:
+            gate["delta_hit"] += 1
+
+        bull_rev = (c > o and c > float(df.iloc[i]["ema5"])) if side == "LONG" else (c < o and c < float(df.iloc[i]["ema5"]))
+        if bull_rev:
+            gate["bull_rev_hit"] += 1
+        trigger_core = sfp or vbp or delta_div
+        confirm = (c > lower and c < float(df.iloc[i]["ema5"])) if side == "LONG" else (c < upper and c > float(df.iloc[i]["ema5"]))
+        if not (trigger_core and confirm):
+            continue
+        gate["trigger3m_hit"] += 1
+
+        entry_px = c
+        atr_now = max(float(df.iloc[i]["atr"]), 1e-12)
+        if side == "LONG":
+            sl_by_atr = entry_px - atr_now * float(cfg.sl_atr_mult)
+            sl_by_floor = entry_px * (1.0 - abs(float(cfg.sl_min_pct)))
+            sl_price = min(lower * (1.0 - 0.0005), sl_by_atr, sl_by_floor)
+            risk = max(entry_px - sl_price, entry_px * 0.001)
+            tp_by_rr = entry_px + risk * float(cfg.rr_min)
+            tp_by_floor = entry_px * (1.0 + abs(float(cfg.tp_min_pct)))
+            tp_price = max(upper * 0.999, tp_by_rr, tp_by_floor)
+        else:
+            sl_by_atr = entry_px + atr_now * float(cfg.sl_atr_mult)
+            sl_by_floor = entry_px * (1.0 + abs(float(cfg.sl_min_pct)))
+            sl_price = max(upper * (1.0 + 0.0005), sl_by_atr, sl_by_floor)
+            risk = max(sl_price - entry_px, entry_px * 0.001)
+            tp_by_rr = entry_px - risk * float(cfg.rr_min)
+            tp_by_floor = entry_px * (1.0 - abs(float(cfg.tp_min_pct)))
+            tp_price = min(lower * 1.001, tp_by_rr, tp_by_floor)
+
+        # 최종 단계에서만 반전 + TP/SL 거리 스왑 (재계산 금지)
+        side, tp_price, sl_price = _range_edge_flip_side_and_risk(side, entry_px, tp_price, sl_price)
+        if _exit_cooldown_blocked(state, symbol, "range_edge_3m", side):
+            gate["cooldown"] += 1
+            continue
+        usdt = _resolve_entry_usdt()
+        if usdt <= 0 or not _admin_is_active():
+            continue
+
+        lock_ok, lock_owner, lock_age = _entry_lock_acquire(
+            state, symbol, owner="range_edge_3m", side=side
+        )
+        if not lock_ok:
+            print(
+                f"[ENTRY-LOCK] sym={symbol} owner=range_edge_3m ok=0 held_by={lock_owner} age_s={lock_age:.1f}"
+            )
+            continue
+        try:
+            guard_key = _entry_guard_key(state, symbol, side)
+            if not _entry_guard_acquire(state, symbol, key=guard_key, engine="range_edge_3m", side=side):
+                continue
+            try:
+                meta = {
+                    "tp_price": float(tp_price),
+                    "sl_price": float(sl_price),
+                    "tp_pct": (abs(float(tp_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                    "sl_pct": (abs(entry_px - float(sl_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                    "track": "range_edge_3m",
+                    "final_flip": True,
+                }
+                _append_range_edge_3m_log(
+                    f"RANGE_EDGE_3M_SIGNAL sym={symbol} side={side} entry={entry_px:.6f} "
+                    f"tp={float(tp_price):.6f} sl={float(sl_price):.6f} adx={adx_v:.2f} edge={edge_score}"
+                )
+                req_id = _enqueue_entry_request(
+                    state,
+                    symbol=symbol,
+                    side=side,
+                    engine="RANGE_EDGE_3M",
+                    reason="range_edge_3m",
+                    usdt=usdt,
+                    live=LIVE_TRADING if side == "SHORT" else LONG_LIVE_TRADING,
+                    entry_price_hint=entry_px,
+                    meta=meta,
+                )
+                if req_id:
+                    result["entries"] += 1
+            finally:
+                _entry_guard_release(state, symbol, key=guard_key)
+        finally:
+            _entry_lock_release(state, symbol, owner="range_edge_3m", side=side)
+
+    elapsed = time.time() - start_ts
+    _append_range_edge_3m_log(
+        f"RANGE_EDGE_3M_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} "
+        f"no_data={no_data} " + " ".join([f"{k}={v}" for k, v in gate.items()])
+    )
+    try:
+        print(
+            f"RANGE_EDGE_3M_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} "
+            f"no_data={no_data} regime_fail={gate['regime_fail']} edge_fail={gate['edge_fail']}"
+        )
+    except Exception:
+        pass
+    return result
+
 def _calc_realized_pnl_from_trades(ex, symbol: str, since_ms: int) -> Optional[float]:
     try:
         trades = ex.fetch_my_trades(symbol, since=since_ms)
@@ -11748,6 +12084,7 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             "SR_PRO_SHORT_V1",
             "SR_PRO_SHORT_V2",
             "SR_PRO_LONG_V1",
+            "RANGE_EDGE_3M",
             "MANUAL",
             "UNKNOWN",
         }
@@ -14392,7 +14729,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
-    global ANTI_ALPHA_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED
+    global ANTI_ALPHA_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, RANGE_EDGE_3M_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -14461,6 +14798,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_sr_pro_long_v1_enabled",
         "_sr_pro_long_v2_enabled",
         "_scout_only_exhaustion_short_enabled",
+        "_range_edge_3m_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_loss_hedge_engine_enabled",
         "_loss_hedge_interval_min",
@@ -14580,6 +14918,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         SR_PRO_LONG_V2_ENABLED = bool(state.get("_sr_pro_long_v2_enabled"))
     if (not skip_keys or "_scout_only_exhaustion_short_enabled" not in skip_keys) and isinstance(state.get("_scout_only_exhaustion_short_enabled"), bool):
         SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED = bool(state.get("_scout_only_exhaustion_short_enabled"))
+    if (not skip_keys or "_range_edge_3m_enabled" not in skip_keys) and isinstance(state.get("_range_edge_3m_enabled"), bool):
+        RANGE_EDGE_3M_ENABLED = bool(state.get("_range_edge_3m_enabled"))
     if (not skip_keys or "_srp_st_regime_pullback_v1_enabled" not in skip_keys) and isinstance(state.get("_srp_st_regime_pullback_v1_enabled"), bool):
         SRP_ST_REGIME_PULLBACK_V1_ENABLED = False
         state["_srp_st_regime_pullback_v1_enabled"] = False
@@ -15336,7 +15676,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, RANGE_EDGE_3M_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     global ENTRY_BLOCK_HOURS
@@ -16044,6 +16384,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"sr_pro_long_v1={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
                             f"sr_pro_long_v2={'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'} "
                             f"scout_only={'ON' if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED else 'OFF'} "
+                            f"range_edge_3m={'ON' if RANGE_EDGE_3M_ENABLED else 'OFF'} "
                             ""
                             "--------------\n"
                             f"common_warmup: done={'YES' if COMMON_WARMUP_DONE else 'NO'} "
@@ -16055,6 +16396,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/sr_pro_long_v1(롱진입): {'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'}\n"
                             f"/sr_pro_long_v2(롱진입): {'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'}\n"
                             f"/scout_only_exhaustion_short(정찰숏): {'ON' if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED else 'OFF'}\n"
+                            f"/range_edge_3m(횡보역추세): {'ON' if RANGE_EDGE_3M_ENABLED else 'OFF'}\n"
                             "\n"
                             ""
                             "--------------\n"
@@ -16108,6 +16450,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"sr_pro_long_v1={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
                         f"sr_pro_long_v2={'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'} "
                         f"scout_only={'ON' if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED else 'OFF'} "
+                        f"range_edge_3m={'ON' if RANGE_EDGE_3M_ENABLED else 'OFF'} "
                         ""
                         "--------------\n"
                         f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
@@ -16115,6 +16458,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/sr_pro_long_v1(롱진입): {'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'}\n"
                         f"/sr_pro_long_v2(롱진입): {'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'}\n"
                         f"/scout_only_exhaustion_short(정찰숏): {'ON' if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED else 'OFF'}\n"
+                        f"/range_edge_3m(횡보역추세): {'ON' if RANGE_EDGE_3M_ENABLED else 'OFF'}\n"
                         "\n"
                         ""
                         "--------------\n"
@@ -16476,7 +16820,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     }:
                         ok = _reply(
                             "⛔ 삭제된 엔진 명령입니다.\n"
-                            "사용 가능: /sr_pro_short_v1, /sr_pro_short_v2, /sr_pro_long_v1, /sr_pro_long_v2, /scout_only_exhaustion_short"
+                            "사용 가능: /sr_pro_short_v1, /sr_pro_short_v2, /sr_pro_long_v1, /sr_pro_long_v2, /scout_only_exhaustion_short, /range_edge_3m"
                         )
                         print(f"[telegram] deleted-engine cmd blocked: {cmd_norm} send={'ok' if ok else 'fail'}")
                         responded = True
@@ -16701,6 +17045,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] scout_only_exhaustion_short cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/range_edge_3m", "range_edge_3m", "range_edge3m", "range_edge")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        RANGE_EDGE_3M_ENABLED = True
+                        state["_range_edge_3m_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ range_edge_3m ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        RANGE_EDGE_3M_ENABLED = False
+                        state["_range_edge_3m_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ range_edge_3m OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ range_edge_3m 상태: {'ON' if RANGE_EDGE_3M_ENABLED else 'OFF'}\n"
+                            "사용법: /range_edge_3m on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] range_edge_3m cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/loss_hedge_engine", "loss_hedge_engine")) and not responded:
                     parts = lower.split()
@@ -17301,14 +17668,50 @@ def load_state() -> Dict[str, dict]:
     path = _STATE_FILE_OVERRIDE or STATE_FILE
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                _sanitize_state_meta_keys(data)
+                return data
+            return {}
     except Exception:
         return {}
+
+def _read_common_universe_latest() -> List[str]:
+    try:
+        path = os.path.join("logs", "common_universe", "latest.txt")
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            out = [line.strip() for line in f.read().splitlines() if line.strip()]
+        return out
+    except Exception:
+        return []
+
+def _sanitize_state_meta_keys(state: Dict[str, Any]) -> None:
+    if not isinstance(state, dict):
+        return
+    # Must remain list[str] for common-universe restore/reuse logic.
+    cu = state.get("_common_universe")
+    if not isinstance(cu, list):
+        latest = _read_common_universe_latest()
+        state["_common_universe"] = latest if latest else []
+    else:
+        state["_common_universe"] = [s for s in cu if isinstance(s, str) and s]
+    # These control flow flags must be bool; polluted dict/object values break logic.
+    for k in ("_common_universe_ready", "_common_warmup_done"):
+        v = state.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float, str)):
+            state[k] = _coerce_bool(v)
+        else:
+            state[k] = False
 
 def save_state(state: Dict[str, dict]) -> None:
     path = _STATE_FILE_OVERRIDE or STATE_FILE
     if not ENGINE_WRITE_STATE:
         return
+    _sanitize_state_meta_keys(state)
     disk = None
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -17351,6 +17754,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_sr_pro_long_v1_enabled",
                 "_sr_pro_long_v2_enabled",
                 "_scout_only_exhaustion_short_enabled",
+                "_range_edge_3m_enabled",
                 "_srp_st_regime_pullback_v1_enabled",
                 "_dtfx_enabled",
                 "_rsi_enabled",
@@ -17384,6 +17788,7 @@ def load_state_from(path: str) -> Dict[str, dict]:
         return {}
 
 def save_state_to(state: Dict[str, dict], path: str) -> None:
+    _sanitize_state_meta_keys(state)
     disk = None
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -17422,6 +17827,7 @@ def save_state_to(state: Dict[str, dict], path: str) -> None:
                 "_sr_pro_long_v1_enabled",
                 "_sr_pro_long_v2_enabled",
                 "_scout_only_exhaustion_short_enabled",
+                "_range_edge_3m_enabled",
                 "_runtime_cfg_ts",
             ]
             for key in runtime_keys:
@@ -17704,7 +18110,7 @@ def run():
     global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, RATE_LIMIT_LOG_TS, _LAST_ACCOUNT_REFRESH_TS
     global TOTAL_CYCLES, TOTAL_ELAPSED, TOTAL_REST_CALLS, TOTAL_429_COUNT
     global MANAGE_LOOP_ENABLED, MANAGE_WS_MODE
-    global SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED
+    global SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, RANGE_EDGE_3M_ENABLED
     global COMMON_WARMUP_DONE, COMMON_UNIVERSE_READY, COMMON_UNIVERSE, _COMMON_WARMUP_NOTIFY_TS_MEM
     _install_error_hooks()
     print("[시작] RSI 스캐너 초기화 중...")
@@ -17814,6 +18220,14 @@ def run():
                 COMMON_UNIVERSE_READY = True
                 state["_common_universe_ready"] = True
                 print(f"[common-universe] startup refresh skipped (odd KST day), reuse size={len(COMMON_UNIVERSE)}")
+        # Keep file-based consumers (backtest/tools) aligned with runtime universe on startup.
+        if COMMON_UNIVERSE:
+            try:
+                os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
+                with open(os.path.join("logs", "common_universe", "latest.txt"), "w", encoding="utf-8") as f:
+                    f.write("\n".join(COMMON_UNIVERSE))
+            except Exception:
+                pass
     except Exception as e:
         COMMON_UNIVERSE = []
         COMMON_UNIVERSE_READY = False
@@ -17847,7 +18261,7 @@ def run():
             pass
     # state에 저장된 설정 복원 (없으면 기본값 사용)
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN_STRONG, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED, ONLY_DIV15M_SHORT, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, RANGE_EDGE_3M_ENABLED
     global REALTIME_ONLY_ENABLED
     global SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS
     global SWAGGY_NO_ATLAS_STRUCTURE_LOOKBACK, SWAGGY_NO_ATLAS_STRUCTURE_WAIT_BARS, SWAGGY_NO_ATLAS_USE_WICK_BREAK
@@ -18090,6 +18504,10 @@ def run():
         SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED = bool(state.get("_scout_only_exhaustion_short_enabled"))
     else:
         state["_scout_only_exhaustion_short_enabled"] = SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED
+    if isinstance(state.get("_range_edge_3m_enabled"), bool):
+        RANGE_EDGE_3M_ENABLED = bool(state.get("_range_edge_3m_enabled"))
+    else:
+        state["_range_edge_3m_enabled"] = RANGE_EDGE_3M_ENABLED
     if isinstance(state.get("_swaggy_no_atlas_enabled"), dict):
         state["_swaggy_no_atlas_enabled"] = False
     if isinstance(state.get("_loss_hedge_engine_enabled"), dict):
@@ -18150,7 +18568,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /sr_pro_short_v1 on|off|status, /sr_pro_short_v2 on|off|status, /sr_pro_long_v1 on|off|status, /sr_pro_long_v2 on|off|status, /scout_only_exhaustion_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /sr_pro_short_v1 on|off|status, /sr_pro_short_v2 on|off|status, /sr_pro_long_v1 on|off|status, /sr_pro_long_v2 on|off|status, /scout_only_exhaustion_short on|off|status, /range_edge_3m on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -18499,6 +18917,8 @@ def run():
                     sr_pro_long_v2_universe_len = len(sr_pro_long_v2_universe)
                     scout_only_exhaustion_short_universe = list(shared_universe)
                     scout_only_exhaustion_short_universe_len = len(scout_only_exhaustion_short_universe)
+                    range_edge_3m_universe = list(shared_universe)
+                    range_edge_3m_universe_len = len(range_edge_3m_universe)
                     swaggy_cfg = SwaggyConfig() if SwaggyConfig else None
                     swaggy_atlas_lab_cfg = SwaggyAtlasLabConfig() if SwaggyAtlasLabConfig else None
                     swaggy_atlas_lab_atlas_cfg = SwaggyAtlasLabAtlasConfig() if SwaggyAtlasLabAtlasConfig else None
@@ -18702,6 +19122,12 @@ def run():
                     scout_only_exhaustion_short_ran = bool(
                         SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED
                         and scout_only_exhaustion_short_universe
+                        and (not heavy_scan)
+                        and new_3m_bar
+                    )
+                    range_edge_3m_ran = bool(
+                        RANGE_EDGE_3M_ENABLED
+                        and range_edge_3m_universe
                         and (not heavy_scan)
                         and new_3m_bar
                     )
@@ -19030,11 +19456,13 @@ def run():
                     sr_pro_long_result = {}
                     sr_pro_long_v2_result = {}
                     scout_only_exhaustion_short_result = {}
+                    range_edge_3m_result = {}
                     sr_pro_thread = None
                     sr_pro_short_v2_thread = None
                     sr_pro_long_thread = None
                     sr_pro_long_v2_thread = None
                     scout_only_exhaustion_short_thread = None
+                    range_edge_3m_thread = None
                     st_flip_result = {}
                     st_flip_thread = None
                     srp_result = {}
@@ -19198,6 +19626,18 @@ def run():
                             daemon=True,
                         )
                         scout_only_exhaustion_short_thread.start()
+                    if RANGE_EDGE_3M_ENABLED and new_3m_bar:
+                        range_edge_3m_thread = threading.Thread(
+                            target=lambda: range_edge_3m_result.update(
+                                _run_range_edge_3m_cycle(
+                                    range_edge_3m_universe,
+                                    state,
+                                    send_telegram,
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        range_edge_3m_thread.start()
                     if DTFX_ENABLED and dtfx_cfg and dtfx_engine:
                         dtfx_thread = threading.Thread(
                             target=lambda: dtfx_result.update(
@@ -19865,6 +20305,8 @@ def run():
                         sr_pro_long_thread.join()
                     if scout_only_exhaustion_short_thread:
                         scout_only_exhaustion_short_thread.join()
+                    if range_edge_3m_thread:
+                        range_edge_3m_thread.join()
                     if dtfx_thread:
                         dtfx_thread.join()
                     if atlas_rs_fail_short_thread:
@@ -19906,7 +20348,7 @@ def run():
                         f"union={universe_union_len}"
                     )
                     print(
-                        "[engines] sr_pro_long_v1=%s(%d) sr_pro_long_v2=%s(%d) sr_pro_short_v1=%s(%d) sr_pro_short_v2=%s(%d) scout_only_exhaustion_short=%s(%d)"
+                        "[engines] sr_pro_long_v1=%s(%d) sr_pro_long_v2=%s(%d) sr_pro_short_v1=%s(%d) sr_pro_short_v2=%s(%d) scout_only_exhaustion_short=%s(%d) range_edge_3m=%s(%d)"
                         % (
                             "ON" if sr_pro_long_ran else "OFF",
                             sr_pro_long_universe_len,
@@ -19918,6 +20360,8 @@ def run():
                             sr_pro_short_v2_universe_len,
                             "ON" if scout_only_exhaustion_short_ran else "OFF",
                             scout_only_exhaustion_short_universe_len,
+                            "ON" if range_edge_3m_ran else "OFF",
+                            range_edge_3m_universe_len,
                         )
                     )
                     print(f"[cycle] heavy_scan={'Y' if heavy_scan else 'N'} elapsed={elapsed:.2f}s")

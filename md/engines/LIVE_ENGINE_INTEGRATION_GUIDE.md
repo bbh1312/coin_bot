@@ -35,10 +35,15 @@
 - 텔레그램 명령 `/engine_name on|off|status` 추가
 - 웹 UI 토글 추가 (`web_app/app.py`, `index.html`)
 - `/status`에 엔진 상태 표시
+- 체크 포인트(필수):
+  - `engine_runner.py` 텔레그램 핸들러에 명령 분기 추가
+  - `web_app/app.py`의 `COMMAND_DEFS`와 `DEFAULTS`에 토글 키 추가
+  - `/status` 메시지에 엔진 상태 문자열 추가
 
 ## 6-1) 관리모드(관리 큐) 연결
 - `engine_runner.py`의 `_process_manage_queue()` 내 `allowed_engines`에 엔진 라벨 추가
 - 관리모드에서 `engine_removed`로 스킵되면 이 목록 누락이 원인
+- 예시: `RANGE_EDGE_3M`를 추가하지 않으면 관리모드에서 `engine_removed`로 차단됨
 
 ## 7) 엔진 라벨 매핑
 - `_engine_label_from_reason`
@@ -69,10 +74,13 @@
 - 메인 루프에서 엔진 스레드가 실제 호출되는지 확인
 - 콘솔 로그에 `*_CYCLE_START/END`가 찍히는지 확인
 - 텔레그램/웹에 엔진 ON/OFF 토글이 있는지 확인
+- 텔레그램 `/engine_name on|off|status`가 실제 상태키를 갱신하는지 확인
+- 웹 `/status` 응답에 엔진 토글 키가 포함되는지 확인
 - `/status`에 엔진 상태/공통 워밍업 상태가 표시되는지 확인
 - 엔진 라벨 매핑이 등록되어 있는지 확인
 - 팔로워 계정 동기화(엔트리/청산) 동작 확인
 - 관리모드에서 엔진 요청이 `engine_removed`로 스킵되지 않는지 확인
+- 관리큐 화이트리스트(`allowed_engines`)에 엔진 라벨이 포함되는지 확인
 - 텔레그램 청산 로그에 TP/SL 퍼센트가 함께 출력되는지 확인
 - **런타임 설정 동기화 키 목록에 엔진 토글 키가 포함되는지 확인**
   - `_reload_runtime_settings_from_disk()`의 `keys`
