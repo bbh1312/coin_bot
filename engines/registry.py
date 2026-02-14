@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Dict, Type
 
 from engines.base import BaseEngine
-from engines.range_edge_3m.engine import RangeEdge3MEngine
 from engines.scout_only_exhaustion_short.engine import ScoutOnlyExhaustionShortEngine
 from engines.sr_pro_long_v1.engine import SrProLongV1Engine
 from engines.sr_pro_short_v1.engine import SrProShortV1Engine
@@ -12,7 +11,6 @@ from engines.sr_pro_short_v2.engine import SrProShortV2Engine
 
 _ENGINE_REGISTRY: Dict[str, Type[BaseEngine]] = {
     "scout_only_exhaustion_short": ScoutOnlyExhaustionShortEngine,
-    "range_edge_3m": RangeEdge3MEngine,
     "sr_pro_long_v1": SrProLongV1Engine,
     "sr_pro_short_v1": SrProShortV1Engine,
     "sr_pro_short_v2": SrProShortV2Engine,

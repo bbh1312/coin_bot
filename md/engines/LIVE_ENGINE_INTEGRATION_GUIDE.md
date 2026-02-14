@@ -43,7 +43,6 @@
 ## 6-1) 관리모드(관리 큐) 연결
 - `engine_runner.py`의 `_process_manage_queue()` 내 `allowed_engines`에 엔진 라벨 추가
 - 관리모드에서 `engine_removed`로 스킵되면 이 목록 누락이 원인
-- 예시: `RANGE_EDGE_3M`를 추가하지 않으면 관리모드에서 `engine_removed`로 차단됨
 
 ## 7) 엔진 라벨 매핑
 - `_engine_label_from_reason`

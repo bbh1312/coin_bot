@@ -819,7 +819,8 @@ def _trade_engine_label(tr: Optional[dict]) -> str:
     if isinstance(tr, dict):
         meta = tr.get("meta") if isinstance(tr.get("meta"), dict) else {}
         reason = (meta or {}).get("reason")
-        if reason == "manual_entry" and not tr.get("entry_order_id"):
+        # manual_entry reason should always win over stale engine_label metadata.
+        if reason == "manual_entry":
             return "MANUAL"
         label = tr.get("engine_label")
         if isinstance(label, str) and label:
@@ -1928,6 +1929,25 @@ def main():
             _maybe_update_open_trade_engine(state, symbol, "SHORT", now_ts)
             open_long = er._get_open_trade(state, "LONG", symbol)
             if isinstance(open_long, dict):
+                # If live position entry drifted from logged entry, treat it as manual rebinding.
+                if long_amt > 0:
+                    try:
+                        live_detail = executor_mod.get_long_position_detail(symbol) or {}
+                    except Exception:
+                        live_detail = {}
+                    live_entry = live_detail.get("entry") if isinstance(live_detail, dict) else None
+                    live_qty = live_detail.get("qty") if isinstance(live_detail, dict) else None
+                    if _should_rebind_to_manual(open_long, live_entry):
+                        _rebind_open_trade_to_manual(
+                            state=state,
+                            symbol=symbol,
+                            side="LONG",
+                            open_tr=open_long,
+                            live_entry=float(live_entry),
+                            live_qty=live_qty if isinstance(live_qty, (int, float)) else None,
+                            now_ts=now_ts,
+                        )
+                        open_long = er._get_open_trade(state, "LONG", symbol)
                 entry_price = open_long.get("entry_price")
                 eng_label = _trade_engine_label(open_long)
                 pending_key = "manual_entry_pending_long_ts"
@@ -1995,6 +2015,25 @@ def main():
                 state[symbol] = st
             open_short = er._get_open_trade(state, "SHORT", symbol)
             if isinstance(open_short, dict):
+                # If live position entry drifted from logged entry, treat it as manual rebinding.
+                if short_amt > 0:
+                    try:
+                        live_detail = executor_mod.get_short_position_detail(symbol) or {}
+                    except Exception:
+                        live_detail = {}
+                    live_entry = live_detail.get("entry") if isinstance(live_detail, dict) else None
+                    live_qty = live_detail.get("qty") if isinstance(live_detail, dict) else None
+                    if _should_rebind_to_manual(open_short, live_entry):
+                        _rebind_open_trade_to_manual(
+                            state=state,
+                            symbol=symbol,
+                            side="SHORT",
+                            open_tr=open_short,
+                            live_entry=float(live_entry),
+                            live_qty=live_qty if isinstance(live_qty, (int, float)) else None,
+                            now_ts=now_ts,
+                        )
+                        open_short = er._get_open_trade(state, "SHORT", symbol)
                 entry_price = open_short.get("entry_price")
                 eng_label = _trade_engine_label(open_short)
                 pending_key = "manual_entry_pending_short_ts"
