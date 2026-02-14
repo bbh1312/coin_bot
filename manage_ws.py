@@ -8,13 +8,22 @@ WebSocket 기반 관리 모듈(테스트용).
 import time
 import os
 import json
+import threading
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from env_loader import load_env
 load_env()
 
 import ws_manager
+try:
+    import websocket  # websocket-client
+except Exception:
+    websocket = None
+try:
+    import requests
+except Exception:
+    requests = None
 import executor as executor_mod
 import engine_runner as er
 import db_reconcile as dbrecon
@@ -22,11 +31,25 @@ import db_reconcile as dbrecon
 MANAGE_WS_WRITE_STATE = os.getenv("MANAGE_WS_WRITE_STATE", "1") == "1"
 MANAGE_WS_SAVE_RUNTIME = os.getenv("MANAGE_WS_SAVE_RUNTIME", "1") == "1"
 MANAGE_WS_TFS = os.getenv("MANAGE_WS_TFS", "3m,15m,1h")
+MANAGE_POS_WS_ENABLED = os.getenv("MANAGE_POS_WS_ENABLED", "1") == "1"
+MANAGE_POS_WS_STALE_SEC = float(os.getenv("MANAGE_POS_WS_STALE_SEC", "120"))
+MANAGE_POS_WS_REST_SYNC_SEC = float(os.getenv("MANAGE_POS_WS_REST_SYNC_SEC", "300"))
+MANAGE_POS_WS_KEEPALIVE_SEC = float(os.getenv("MANAGE_POS_WS_KEEPALIVE_SEC", "1800"))
 
 _ENTRY_EVENTS_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_BY_SYMBOL_CACHE = {"ts": 0.0, "mtime": 0.0, "map": {}}
 _ENTRY_EVENTS_TTL_SEC = 5.0
 MANUAL_REBIND_ENTRY_DIFF_PCT = float(os.getenv("MANUAL_REBIND_ENTRY_DIFF_PCT", "0.01"))
+_POS_WS = {
+    "lock": threading.Lock(),
+    "stop": threading.Event(),
+    "thread": None,
+    "running": False,
+    "ts": 0.0,
+    "listen_key": "",
+    "last_error": "",
+    "by_symbol": {},  # ccxt_symbol -> {"long": float, "short": float}
+}
 
 
 def _ensure_broadcast_contexts() -> None:
@@ -337,18 +360,285 @@ def _fallback_last_price(symbol: str) -> Optional[float]:
     return None
 
 
-def _update_watch_symbols() -> list:
+def _fut_raw_to_ccxt_symbol(raw: str) -> Optional[str]:
     try:
-        symbols = executor_mod.list_open_position_symbols(force=True)
+        s = str(raw or "").strip().upper()
+        if not s.endswith("USDT") or len(s) <= 4:
+            return None
+        base = s[:-4]
+        if not base:
+            return None
+        return f"{base}/USDT:USDT"
+    except Exception:
+        return None
+
+
+def _request_futures_listen_key(exchange) -> Optional[str]:
+    try:
+        if hasattr(exchange, "fapiPrivatePostListenKey"):
+            resp = exchange.fapiPrivatePostListenKey({})
+        else:
+            resp = None
+        lk = (resp or {}).get("listenKey") if isinstance(resp, dict) else None
+        if lk:
+            return str(lk)
+    except Exception:
+        pass
+    if requests is None:
+        return None
+    try:
+        api_key = str(getattr(exchange, "apiKey", "") or "")
+        if not api_key:
+            return None
+        r = requests.post(
+            "https://fapi.binance.com/fapi/v1/listenKey",
+            headers={"X-MBX-APIKEY": api_key},
+            timeout=10,
+        )
+        if r.status_code >= 400:
+            return None
+        payload = r.json() if r.text else {}
+        lk = payload.get("listenKey") if isinstance(payload, dict) else None
+        return str(lk) if lk else None
+    except Exception:
+        return None
+
+
+def _keepalive_futures_listen_key(exchange) -> None:
+    while not _POS_WS["stop"].is_set():
+        _POS_WS["stop"].wait(timeout=max(30.0, MANAGE_POS_WS_KEEPALIVE_SEC))
+        if _POS_WS["stop"].is_set():
+            break
+        lk = str(_POS_WS.get("listen_key") or "")
+        if not lk:
+            continue
+        try:
+            if hasattr(exchange, "fapiPrivatePutListenKey"):
+                exchange.fapiPrivatePutListenKey({"listenKey": lk})
+            elif requests is not None:
+                api_key = str(getattr(exchange, "apiKey", "") or "")
+                if api_key:
+                    requests.put(
+                        "https://fapi.binance.com/fapi/v1/listenKey",
+                        headers={"X-MBX-APIKEY": api_key},
+                        params={"listenKey": lk},
+                        timeout=10,
+                    )
+        except Exception as e:
+            _POS_WS["last_error"] = f"keepalive:{e}"
+
+
+def _ws_pos_apply(changes: Dict[str, Dict[str, float]]) -> None:
+    now = time.time()
+    with _POS_WS["lock"]:
+        cur = _POS_WS.get("by_symbol") or {}
+        for sym, payload in (changes or {}).items():
+            if not sym or not isinstance(payload, dict):
+                continue
+            row = cur.get(sym) if isinstance(cur.get(sym), dict) else {"long": 0.0, "short": 0.0}
+            if "long" in payload:
+                row["long"] = max(0.0, float(payload.get("long") or 0.0))
+            if "short" in payload:
+                row["short"] = max(0.0, float(payload.get("short") or 0.0))
+            if row["long"] <= 0 and row["short"] <= 0:
+                cur.pop(sym, None)
+            else:
+                cur[sym] = row
+        _POS_WS["by_symbol"] = cur
+        _POS_WS["ts"] = now
+
+
+def _ws_pos_seed_from_rest() -> Dict[str, set]:
+    out = {"long": set(), "short": set()}
+    try:
+        pos = executor_mod.list_open_position_symbols(force=True)
+    except Exception:
+        return out
+    longs = set(pos.get("long") or set())
+    shorts = set(pos.get("short") or set())
+    changes: Dict[str, Dict[str, float]] = {}
+    for sym in longs | shorts:
+        long_amt = 0.0
+        short_amt = 0.0
+        try:
+            if sym in longs:
+                long_amt = float(executor_mod.get_long_position_amount(sym) or 0.0)
+            if sym in shorts:
+                short_amt = float(executor_mod.get_short_position_amount(sym) or 0.0)
+        except Exception:
+            pass
+        changes[sym] = {"long": max(0.0, long_amt), "short": max(0.0, short_amt)}
+    if changes:
+        _ws_pos_apply(changes)
+    return {"long": longs, "short": shorts}
+
+
+def _ws_pos_snapshot_symbols() -> Dict[str, set]:
+    with _POS_WS["lock"]:
+        by = dict(_POS_WS.get("by_symbol") or {})
+    longs = {s for s, v in by.items() if isinstance(v, dict) and float(v.get("long") or 0.0) > 0}
+    shorts = {s for s, v in by.items() if isinstance(v, dict) and float(v.get("short") or 0.0) > 0}
+    return {"long": longs, "short": shorts}
+
+
+def _ws_pos_amount(symbol: str, side: str) -> float:
+    key = "long" if str(side).upper() == "LONG" else "short"
+    with _POS_WS["lock"]:
+        row = (_POS_WS.get("by_symbol") or {}).get(symbol) or {}
+    try:
+        return max(0.0, float(row.get(key) or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _ws_pos_fresh(now_ts: Optional[float] = None) -> bool:
+    if not MANAGE_POS_WS_ENABLED:
+        return False
+    if websocket is None:
+        return False
+    now = time.time() if now_ts is None else float(now_ts)
+    ts = float(_POS_WS.get("ts") or 0.0)
+    return bool(_POS_WS.get("running")) and ts > 0 and (now - ts) <= MANAGE_POS_WS_STALE_SEC
+
+
+def _run_pos_ws(exchange) -> None:
+    if websocket is None:
+        return
+    backoff = 1.0
+    while not _POS_WS["stop"].is_set():
+        lk = _request_futures_listen_key(exchange)
+        if not lk:
+            _POS_WS["last_error"] = "listen_key_unavailable"
+            _POS_WS["stop"].wait(timeout=min(30.0, backoff))
+            backoff = min(30.0, backoff * 1.8)
+            continue
+        _POS_WS["listen_key"] = lk
+        url = f"wss://fstream.binance.com/ws/{lk}"
+        listen_expired = {"v": False}
+
+        def on_open(ws):
+            _POS_WS["running"] = True
+            _POS_WS["last_error"] = ""
+
+        def on_error(ws, err):
+            _POS_WS["last_error"] = str(err)
+
+        def on_close(ws, *args):
+            _POS_WS["running"] = False
+
+        def on_message(ws, message):
+            try:
+                payload = json.loads(message)
+            except Exception:
+                return
+            evt = str(payload.get("e") or "")
+            if evt == "listenKeyExpired":
+                listen_expired["v"] = True
+                return
+            if evt != "ACCOUNT_UPDATE":
+                return
+            acc = payload.get("a") if isinstance(payload.get("a"), dict) else {}
+            pos_arr = acc.get("P") if isinstance(acc.get("P"), list) else []
+            changes: Dict[str, Dict[str, float]] = {}
+            for p in pos_arr:
+                if not isinstance(p, dict):
+                    continue
+                sym = _fut_raw_to_ccxt_symbol(p.get("s"))
+                if not sym:
+                    continue
+                ps = str(p.get("ps") or "").upper()
+                try:
+                    pa = float(p.get("pa") or 0.0)
+                except Exception:
+                    pa = 0.0
+                row = changes.get(sym, {})
+                if ps == "LONG":
+                    row["long"] = max(0.0, pa)
+                elif ps == "SHORT":
+                    row["short"] = max(0.0, abs(pa))
+                else:  # BOTH(one-way)
+                    if pa >= 0:
+                        row["long"] = max(0.0, pa)
+                        row["short"] = 0.0
+                    else:
+                        row["long"] = 0.0
+                        row["short"] = max(0.0, abs(pa))
+                changes[sym] = row
+            if changes:
+                _ws_pos_apply(changes)
+
+        ws_app = websocket.WebSocketApp(
+            url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        t = threading.Thread(
+            target=ws_app.run_forever,
+            kwargs={"ping_interval": 15, "ping_timeout": 10},
+            daemon=True,
+        )
+        t.start()
+        while t.is_alive() and not _POS_WS["stop"].is_set():
+            _POS_WS["stop"].wait(timeout=1.0)
+        try:
+            ws_app.close()
+        except Exception:
+            pass
+        _POS_WS["running"] = False
+        _POS_WS["listen_key"] = ""
+        if _POS_WS["stop"].is_set():
+            break
+        if listen_expired["v"]:
+            backoff = 1.0
+            continue
+        _POS_WS["stop"].wait(timeout=backoff)
+        backoff = min(30.0, backoff * 1.5)
+
+
+def _start_pos_ws(exchange) -> bool:
+    if not MANAGE_POS_WS_ENABLED or websocket is None:
+        return False
+    if _POS_WS.get("thread") is not None:
+        return True
+    _POS_WS["stop"].clear()
+    _POS_WS["thread"] = threading.Thread(target=_run_pos_ws, args=(exchange,), daemon=True)
+    _POS_WS["thread"].start()
+    ka_thread = threading.Thread(target=_keepalive_futures_listen_key, args=(exchange,), daemon=True)
+    ka_thread.start()
+    return True
+
+
+def _position_symbols_snapshot(force_rest: bool = False) -> Dict[str, set]:
+    if (not force_rest) and _ws_pos_fresh():
+        snap = _ws_pos_snapshot_symbols()
+        if snap.get("long") or snap.get("short"):
+            return snap
+    return _ws_pos_seed_from_rest()
+
+
+def _position_amount(symbol: str, side: str, now_ts: float) -> float:
+    if _ws_pos_fresh(now_ts):
+        return _ws_pos_amount(symbol, side)
+    if str(side).upper() == "LONG":
+        return float(executor_mod.get_long_position_amount(symbol) or 0.0)
+    return float(executor_mod.get_short_position_amount(symbol) or 0.0)
+
+
+def _update_watch_symbols(force_rest: bool = False) -> tuple[list, Dict[str, set]]:
+    try:
+        symbols = _position_symbols_snapshot(force_rest=force_rest)
         watch = list((symbols.get("long") or set()) | (symbols.get("short") or set()))
     except Exception:
+        symbols = {"long": set(), "short": set()}
         watch = []
     if ws_manager and ws_manager.is_running():
         try:
             ws_manager.set_watch(watch, [tf.strip() for tf in MANAGE_WS_TFS.split(",") if tf.strip()])
         except Exception:
             pass
-    return watch
+    return watch, symbols
 
 
 def _format_symbol_list(symbols: list) -> str:
@@ -1408,6 +1698,12 @@ def main():
         ws_manager.start()
     else:
         print("[manage-ws] ws_manager unavailable")
+    pos_ws_on = _start_pos_ws(executor_mod.exchange)
+    if pos_ws_on:
+        _ws_pos_seed_from_rest()
+        print("[manage-ws] position user-data ws enabled")
+    else:
+        print("[manage-ws] position user-data ws disabled (fallback: REST)")
     # Startup sync: ensure state/db reflect current positions without alert spam.
     try:
         executor_mod.refresh_positions_cache(force=True)
@@ -1480,6 +1776,7 @@ def main():
     last_state_save_ts = 0.0
     last_meta_hydrate_ts = 0.0
     watch_syms = []
+    symbols = {"long": set(), "short": set()}
     first_watch = True
     last_amt = {}
     last_pos_log_ts = 0.0
@@ -1514,9 +1811,11 @@ def main():
                 pass
             last_cfg_save_ts = time.time()
         if (time.time() - last_watch_ts) >= 5.0:
-            new_watch_syms = _update_watch_symbols()
+            new_watch_syms, symbols = _update_watch_symbols(force_rest=not _ws_pos_fresh())
             try:
-                active_count = int(executor_mod.count_open_positions(force=True))
+                longs = set((symbols.get("long") or set()))
+                shorts = set((symbols.get("short") or set()))
+                active_count = int(len(longs) + len(shorts))
             except Exception:
                 active_count = len(new_watch_syms)
             state["_active_positions_total"] = int(active_count)
@@ -1542,13 +1841,13 @@ def main():
                     if missing:
                         print(f"[manage-ws] api_inpos_missing_in_state={len(missing)} {missing}")
                     else:
-                        longs = set((symbols.get("long") or set()))
-                        shorts = set((symbols.get("short") or set()))
                         both = longs & shorts
                         total = len(longs) + len(shorts)
+                        source = "WS" if _ws_pos_fresh(now_ts) else "REST"
                         print(
                             "[manage-ws] api_inpos_sync_ok "
-                            f"total={total} unique={len(api_set)} long={len(longs)} short={len(shorts)} both={len(both)}"
+                            f"src={source} total={total} unique={len(api_set)} "
+                            f"long={len(longs)} short={len(shorts)} both={len(both)}"
                         )
             except Exception:
                 pass
@@ -1575,7 +1874,7 @@ def main():
             now_ts = last_watch_ts
             if (now_ts - last_pos_log_ts) >= 30.0:
                 try:
-                    pos_syms = executor_mod.list_open_position_symbols(force=True)
+                    pos_syms = symbols if isinstance(symbols, dict) else _position_symbols_snapshot(force_rest=False)
                 except Exception:
                     pos_syms = {"long": set(), "short": set()}
                 longs = set(pos_syms.get("long") or set())
@@ -1583,9 +1882,10 @@ def main():
                 both = longs & shorts
                 total = len(longs) + len(shorts)
                 unique = len(longs | shorts)
+                source = "WS" if _ws_pos_fresh(now_ts) else "REST"
                 print(
                     f"[manage-ws] pos_summary total={total} unique={unique} "
-                    f"long={len(longs)} short={len(shorts)} both={len(both)}"
+                    f"long={len(longs)} short={len(shorts)} both={len(both)} src={source}"
                 )
                 last_pos_log_ts = now_ts
         if (time.time() - last_state_save_ts) >= 5.0:
@@ -1596,9 +1896,14 @@ def main():
                 pass
             last_state_save_ts = time.time()
         now_ts = time.time()
-        if (now_ts - last_sync_ts) >= 5.0:
+        rest_sync_sec = 5.0
+        if _ws_pos_fresh(now_ts):
+            rest_sync_sec = max(30.0, MANAGE_POS_WS_REST_SYNC_SEC)
+        if (now_ts - last_sync_ts) >= rest_sync_sec:
             try:
                 executor_mod.refresh_positions_cache(force=True)
+                if _ws_pos_fresh(now_ts):
+                    _ws_pos_seed_from_rest()
             except Exception:
                 pass
             last_sync_ts = now_ts
@@ -1610,8 +1915,8 @@ def main():
         for symbol in watch_syms:
             if not isinstance(symbol, str) or "/" not in symbol:
                 continue
-            long_amt = executor_mod.get_long_position_amount(symbol)
-            short_amt = executor_mod.get_short_position_amount(symbol)
+            long_amt = _position_amount(symbol, "LONG", now_ts)
+            short_amt = _position_amount(symbol, "SHORT", now_ts)
             st = state.get(symbol, {}) if isinstance(state, dict) else {}
             prev_long_amt = float(last_amt.get((symbol, "long"), 0.0) or 0.0)
             prev_short_amt = float(last_amt.get((symbol, "short"), 0.0) or 0.0)

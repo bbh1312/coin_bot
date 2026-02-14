@@ -253,6 +253,9 @@ def run_backtest() -> None:
     parser.add_argument("--reject-source", type=str, default="1h", choices=["1h", "15m"])
     parser.add_argument("--ema200-filter", action="store_true")
     parser.add_argument("--ema-filter-len", type=int, default=200)
+    parser.add_argument("--btc-filter-enabled", action="store_true")
+    parser.add_argument("--btc-filter-tf", type=str, default="1h", choices=["1h", "30m"])
+    parser.add_argument("--btc-filter-ema-len", type=int, default=200)
     parser.add_argument("--block-hours", type=str, default="")
     parser.add_argument("--disable-weak", action="store_true")
     parser.add_argument("--retest-bars", type=int, default=6)
@@ -515,6 +518,7 @@ def run_backtest() -> None:
         "reject_pass_1h": 0,
         "reject_pass_15m": 0,
         "ema200_pass": 0,
+        "btc_filter": 0,
         "entries_strong": 0,
         "entries_weak": 0,
         "wins_strong": 0,
@@ -599,6 +603,45 @@ def run_backtest() -> None:
     dow_stats: Dict[str, Dict[str, int]] = {}
     date_stats: Dict[str, Dict[str, float]] = {}
     end_ms_last = end_ms
+
+    btc_ts = np.array([])
+    btc_close: Optional[pd.Series] = None
+    btc_ema: Optional[pd.Series] = None
+    if bool(args.btc_filter_enabled):
+        rows_btc = _fetch_ohlcv_all(
+            exchange,
+            "BTC/USDT:USDT",
+            args.btc_filter_tf,
+            start_ms,
+            end_ms,
+            cache_only=args.cache_only,
+            use_common_warmup=use_common,
+            common_warmup_dir=common_dir,
+            common_only=args.common_only,
+        )
+        if not rows_btc:
+            rows_btc = _fetch_ohlcv_all(
+                exchange,
+                "BTC/USDT",
+                args.btc_filter_tf,
+                start_ms,
+                end_ms,
+                cache_only=args.cache_only,
+                use_common_warmup=use_common,
+                common_warmup_dir=common_dir,
+                common_only=args.common_only,
+            )
+        if rows_btc:
+            df_btc = pd.DataFrame(rows_btc, columns=["ts", "open", "high", "low", "close", "volume"])
+            if args.use_confirmed and not df_btc.empty:
+                tf_ms_btc = _tf_ms(args.btc_filter_tf)
+                last_ts_btc = int(df_btc.iloc[-1]["ts"])
+                if last_ts_btc and (end_ms - last_ts_btc) < tf_ms_btc:
+                    df_btc = df_btc.iloc[:-1]
+            if len(df_btc) > 0:
+                btc_ts = df_btc["ts"].values
+                btc_close = df_btc["close"].astype(float)
+                btc_ema = _ema(btc_close, max(1, int(args.btc_filter_ema_len)))
 
     def _record_entry_ts(entry_ts: int) -> None:
         dt_kst = datetime.fromtimestamp(entry_ts / 1000.0, tz=timezone.utc) + pd.Timedelta(hours=9)
@@ -774,6 +817,26 @@ def run_backtest() -> None:
                 idx_1h = int(np.searchsorted(ts_1h, ts, side="right") - 1)
             if idx_1h < 0:
                 continue
+
+            if args.btc_filter_enabled:
+                if btc_close is None or btc_ema is None or len(btc_ts) == 0:
+                    if args.log_gates:
+                        gate_counts["btc_filter"] += 1
+                    continue
+                if _use_decision_index():
+                    idx_btc = int(np.searchsorted(btc_ts, decision_ts - _tf_ms(args.btc_filter_tf), side="right") - 1)
+                else:
+                    idx_btc = int(np.searchsorted(btc_ts, ts, side="right") - 1)
+                if idx_btc < 0 or idx_btc >= len(btc_close):
+                    if args.log_gates:
+                        gate_counts["btc_filter"] += 1
+                    continue
+                btc_close_now = float(btc_close.iloc[idx_btc])
+                btc_ema_now = float(btc_ema.iloc[idx_btc]) if not np.isnan(btc_ema.iloc[idx_btc]) else btc_close_now
+                if not (btc_close_now < btc_ema_now):
+                    if args.log_gates:
+                        gate_counts["btc_filter"] += 1
+                    continue
 
 
             if args.rolling_zones and not zones_snapshot_in:
@@ -1659,6 +1722,7 @@ def run_backtest() -> None:
             f"skip_stale_ts={gate_counts['skip_stale_ts']} "
             f"boundary_block={gate_counts['boundary_block']} "
             f"ema200_pass={gate_counts['ema200_pass']} "
+            f"btc_filter={gate_counts['btc_filter']} "
             f"entries_strong={gate_counts['entries_strong']} "
             f"entries_weak={gate_counts['entries_weak']} "
             f"wins_strong={gate_counts['wins_strong']} "

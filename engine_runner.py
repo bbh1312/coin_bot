@@ -77,6 +77,7 @@ try:
     from engines.sr_pro_short_v1.engine import SrProShortV1Config
     from engines.sr_pro_short_v2.engine import SrProShortV2Config
     from engines.sr_pro_long_v1.engine import SrProLongV1Config
+    from engines.sr_pro_long_v2.engine import SrProLongV2Config
     from engines.tier_coordination import TierCoordinator, TierCoordConfig
     BullPullbackLongConfig = None
 except Exception as _import_err:
@@ -89,6 +90,7 @@ except Exception as _import_err:
     SrProShortV1Config = None
     SrProShortV2Config = None
     SrProLongV1Config = None
+    SrProLongV2Config = None
     build_sr_zones = None
     BullPullbackLongConfig = None
     AtlasRsFailShortEngine = None
@@ -630,6 +632,8 @@ def _realtime_only_required() -> bool:
     if SR_PRO_SHORT_V2_ENABLED:
         return True
     if SR_PRO_LONG_V1_ENABLED:
+        return True
+    if SR_PRO_LONG_V2_ENABLED:
         return True
     if BULL_PULLBACK_LONG_V1_ENABLED:
         return True
@@ -1193,6 +1197,7 @@ SR_PRO_SHORT_V1_ENABLED = os.getenv("SR_PRO_SHORT_V1_ENABLED", "0") == "1"
 SR_PRO_SHORT_BOUNDARY_GUARD_ENABLED = os.getenv("SR_PRO_SHORT_BOUNDARY_GUARD_ENABLED", "0") == "1"
 SR_PRO_SHORT_V2_ENABLED = os.getenv("SR_PRO_SHORT_V2_ENABLED", "0") == "1"
 SR_PRO_LONG_V1_ENABLED = os.getenv("SR_PRO_LONG_V1_ENABLED", "0") == "1"
+SR_PRO_LONG_V2_ENABLED = os.getenv("SR_PRO_LONG_V2_ENABLED", "0") == "1"
 SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED = os.getenv("SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED", "1") == "1"
 SRP_ST_REGIME_PULLBACK_V1_ENABLED = False
 ST_FLIP_V1_ENABLED = False
@@ -2380,6 +2385,13 @@ def _maybe_refresh_common_cycle_cache(state: dict, exchange, universe: list) -> 
 def _kst_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=9)
 
+def _is_even_kst_day(dt: Optional[datetime] = None) -> bool:
+    try:
+        cur = dt if isinstance(dt, datetime) else _kst_now()
+        return (int(cur.day) % 2) == 0
+    except Exception:
+        return False
+
 def _ts_to_kst_str(ts: float) -> str:
     try:
         dt = datetime.fromtimestamp(ts, tz=timezone.utc) + timedelta(hours=9)
@@ -2422,6 +2434,8 @@ def _maybe_daily_refresh_common_universe(state: dict, tickers: dict, symbols: li
         return False
     try:
         now_kst = _kst_now()
+        if not _is_even_kst_day(now_kst):
+            return False
         if now_kst.hour < COMMON_UNIVERSE_REFRESH_HOUR:
             return False
         today = now_kst.strftime("%Y-%m-%d")
@@ -3431,6 +3445,15 @@ def _append_sr_pro_long_v1_log(line: str) -> None:
         date_tag = time.strftime("%Y-%m-%d")
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         path = os.path.join("sr_pro_long_v1", f"sr_pro_long_v1-{date_tag}.log")
+        _append_log_lines(path, [f"{ts} {line}"])
+    except Exception:
+        pass
+
+def _append_sr_pro_long_v2_log(line: str) -> None:
+    try:
+        date_tag = time.strftime("%Y-%m-%d")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        path = os.path.join("sr_pro_long_v2", f"sr_pro_long_v2-{date_tag}.log")
         _append_log_lines(path, [f"{ts} {line}"])
     except Exception:
         pass
@@ -6772,6 +6795,8 @@ def _engine_label_from_reason(reason: Optional[str]) -> str:
         return "SR_PRO_SHORT_V2"
     if key in ("sr_pro_long_v1", "sr_pro_long"):
         return "SR_PRO_LONG_V1"
+    if key in ("sr_pro_long_v2", "sr_pro_long2"):
+        return "SR_PRO_LONG_V2"
     if key in ("vertical_exhaustion_trap_short", "vet_short", "tier_a_short"):
         return "VERTICAL_EXHAUSTION_TRAP_SHORT"
     if key in ("scout_only_exhaustion_short", "scout_exhaustion_short", "tier_b_short"):
@@ -6800,6 +6825,8 @@ def _reason_from_engine_label(engine_label: Optional[str], side: str) -> Optiona
         return "sr_pro_short_v2"
     if label == "SR_PRO_LONG_V1":
         return "sr_pro_long_v1"
+    if label == "SR_PRO_LONG_V2":
+        return "sr_pro_long_v2"
     if label == "VERTICAL_EXHAUSTION_TRAP_SHORT":
         return "vertical_exhaustion_trap_short"
     if label == "SCOUT_ONLY_EXHAUSTION_SHORT":
@@ -6831,6 +6858,7 @@ def _display_engine_label(label: Optional[str]) -> str:
         "SR_PRO_SHORT_V1": "SR프로숏v1",
         "SR_PRO_SHORT_V2": "SR프로숏v2",
         "SR_PRO_LONG_V1": "SR프로롱v1",
+        "SR_PRO_LONG_V2": "SR프로롱v2",
         "VERTICAL_EXHAUSTION_TRAP_SHORT": "수직소진트랩숏(A)",
         "SCOUT_ONLY_EXHAUSTION_SHORT": "정찰소진숏(B)",
     }
@@ -6855,6 +6883,8 @@ def _is_engine_enabled(engine: str) -> bool:
         return SR_PRO_SHORT_V2_ENABLED
     if key == "SR_PRO_LONG_V1":
         return SR_PRO_LONG_V1_ENABLED
+    if key == "SR_PRO_LONG_V2":
+        return SR_PRO_LONG_V2_ENABLED
     if key in ("MANUAL", "MANUAL_ADMIN", "관리자수동진입", "UNKNOWN", ""):
         return True
     return False
@@ -6866,6 +6896,7 @@ def _is_runtime_managed_engine(engine: Optional[str]) -> bool:
         "SR_PRO_SHORT_V1",
         "SR_PRO_SHORT_V2",
         "SR_PRO_LONG_V1",
+        "SR_PRO_LONG_V2",
         "SCOUT_ONLY_EXHAUSTION_SHORT",
         "MANUAL",
         "MANUAL_ADMIN",
@@ -9180,13 +9211,26 @@ def _run_sr_pro_long_v1_cycle(
     state,
     send_alert,
     cycle_id: Optional[int] = None,
+    engine_name: str = "SR_PRO_LONG_V1",
+    reason_name: str = "sr_pro_long_v1",
+    cfg_cls=None,
+    enabled: Optional[bool] = None,
+    state_key: str = "_sr_pro_long_v1_state",
+    log_fn=None,
+    cycle_tag: str = "SR_PRO_LONG",
 ):
     result = {"entries": 0}
-    if not SR_PRO_LONG_V1_ENABLED or not sr_universe or SrProLongV1Config is None:
+    if enabled is None:
+        enabled = SR_PRO_LONG_V1_ENABLED
+    if cfg_cls is None:
+        cfg_cls = SrProLongV1Config
+    if log_fn is None:
+        log_fn = _append_sr_pro_long_v1_log
+    if not enabled or not sr_universe or cfg_cls is None:
         return result
     if not LONG_LIVE_TRADING:
         return result
-    cfg = SrProLongV1Config()
+    cfg = cfg_cls()
     start_ts = time.time()
     checked = 0
     no_data = 0
@@ -9203,11 +9247,11 @@ def _run_sr_pro_long_v1_cycle(
         "skip_stale_ts": 0,
         "cooldown": 0,
     }
-    _append_sr_pro_long_v1_log(
-        f"SR_PRO_LONG_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}"
+    log_fn(
+        f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}"
     )
     try:
-        print(f"SR_PRO_LONG_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}")
+        print(f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}")
     except Exception:
         pass
 
@@ -9222,7 +9266,7 @@ def _run_sr_pro_long_v1_cycle(
     min_mtf_fetch = min_mtf + 1
     min_htf_fetch = min_htf + 1
 
-    sr_state = state.setdefault("_sr_pro_long_v1_state", {})
+    sr_state = state.setdefault(state_key, {})
     symbols = list(sr_universe or [])
 
     def _has_gap(df: pd.DataFrame, tf_ms: int, mult: float = 2.5) -> bool:
@@ -9344,13 +9388,13 @@ def _run_sr_pro_long_v1_cycle(
             try:
                 if _has_gap(df_3m, 3 * 60 * 1000):
                     df_3m = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
-                    _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=3m")
+                    log_fn(f"{cycle_tag}_GAP_REFRESH sym={symbol} tf=3m")
                 if _has_gap(df_15m, 15 * 60 * 1000):
                     df_15m = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
-                    _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=15m")
+                    log_fn(f"{cycle_tag}_GAP_REFRESH sym={symbol} tf=15m")
                 if _has_gap(df_1h, 60 * 60 * 1000):
                     df_1h = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
-                    _append_sr_pro_long_v1_log(f"SR_PRO_LONG_GAP_REFRESH sym={symbol} tf=1h")
+                    log_fn(f"{cycle_tag}_GAP_REFRESH sym={symbol} tf=1h")
             except Exception:
                 pass
 
@@ -9542,8 +9586,8 @@ def _run_sr_pro_long_v1_cycle(
                 if not (c3 >= nearest["mid"] or entry_px >= nearest["top"] - (atr_now * 0.2)):
                     if SR_PRO_LONG_DEBUG_NEAREST:
                         try:
-                            _append_sr_pro_long_v1_log(
-                                "SR_PRO_LONG_NEAREST_FAIL "
+                            log_fn(
+                                f"{cycle_tag}_NEAREST_FAIL "
                                 f"sym={symbol} ts={_iso_kst(now_ts_ms/1000) if now_ts_ms else 'NA'} "
                                 f"close_3m={c3:.6f} entry={entry_px:.6f} "
                                 f"zone_mid={float(nearest['mid']):.6f} zone_top={float(nearest['top']):.6f} zone_bot={float(nearest['bot']):.6f} "
@@ -9564,18 +9608,18 @@ def _run_sr_pro_long_v1_cycle(
                 usdt = _resolve_entry_usdt()
                 if usdt <= 0 or not _admin_is_active():
                     continue
-                if _exit_cooldown_blocked(state, symbol, "sr_pro_long_v1", "LONG"):
+                if _exit_cooldown_blocked(state, symbol, reason_name, "LONG"):
                     gate_stats["cooldown"] += 1
                     continue
-                _append_sr_pro_long_v1_log(
-                    f"SR_PRO_LONG_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={break_type}"
+                log_fn(
+                    f"{cycle_tag}_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={break_type}"
                 )
                 req_id = _enqueue_entry_request(
                     state,
                     symbol=symbol,
                     side="LONG",
-                    engine="SR_PRO_LONG_V1",
-                    reason="sr_pro_long_v1",
+                    engine=engine_name,
+                    reason=reason_name,
                     usdt=usdt,
                     live=LONG_LIVE_TRADING,
                     entry_price_hint=entry_px,
@@ -9593,8 +9637,8 @@ def _run_sr_pro_long_v1_cycle(
                 continue
         if sym_state.get("retest_active") and now_ts_ms > int(sym_state.get("retest_until", 0) or 0):
             sym_state["retest_active"] = False
-    _append_sr_pro_long_v1_log(
-        "SR_PRO_LONG_GATE_SUMMARY "
+    log_fn(
+        f"{cycle_tag}_GATE_SUMMARY "
         f"checked={checked} no_data={no_data} "
         f"zone_touch={gate_stats['zone_touch']} "
         f"hl_15m={gate_stats['hl_15m']} "
@@ -9611,7 +9655,7 @@ def _run_sr_pro_long_v1_cycle(
     )
     try:
         print(
-            "SR_PRO_LONG_GATE_SUMMARY "
+            f"{cycle_tag}_GATE_SUMMARY "
             f"checked={checked} no_data={no_data} "
             f"zone_touch={gate_stats['zone_touch']} "
             f"hl_15m={gate_stats['hl_15m']} "
@@ -9659,6 +9703,7 @@ def _run_sr_pro_short_v2_cycle(
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
         "ema200_pass": 0,
+        "btc_filter": 0,
         "ema7_dist": 0,
         "ltf_ema200_block": 0,
         "no_data_ltf": 0,
@@ -9718,6 +9763,31 @@ def _run_sr_pro_short_v2_cycle(
         if last_ts and (now_ms - last_ts) < tf_ms:
             return df.iloc[:-1]
         return df
+
+    btc_filter_tf = str(getattr(cfg, "btc_filter_tf", "1h") or "1h").lower()
+    if btc_filter_tf not in {"1h", "30m"}:
+        btc_filter_tf = "1h"
+    btc_sig = pd.DataFrame()
+    ts_btc = np.array([])
+    close_btc: Optional[pd.Series] = None
+    ema_btc: Optional[pd.Series] = None
+    if bool(getattr(cfg, "btc_filter_enabled", False)):
+        try:
+            if SR_PRO_USE_COMMON_CACHE:
+                _df = _load_common_warmup_ohlcv("BTC/USDT:USDT", btc_filter_tf, min_htf_fetch)
+                btc_raw = _df if _df is not None else pd.DataFrame()
+            else:
+                btc_raw = cycle_cache.get_df("BTC/USDT:USDT", btc_filter_tf, limit=min_htf_fetch)
+            btc_sig = _confirmed_df(btc_raw, btc_filter_tf)
+            if len(btc_sig) > 0:
+                ts_btc = btc_sig["ts"].values
+                close_btc = btc_sig["close"].astype(float)
+                ema_btc = ema(close_btc, max(1, int(getattr(cfg, "btc_filter_ema_len", 200))))
+        except Exception:
+            btc_sig = pd.DataFrame()
+            ts_btc = np.array([])
+            close_btc = None
+            ema_btc = None
 
     for symbol in symbols:
         checked += 1
@@ -9801,6 +9871,19 @@ def _run_sr_pro_short_v2_cycle(
         min_15m_hist = 2 if mtf_mode == "strict" else 0
         if idx_1h < 0 or idx_15m < min_15m_hist:
             continue
+        if bool(getattr(cfg, "btc_filter_enabled", False)):
+            if close_btc is None or ema_btc is None or len(ts_btc) == 0:
+                gate_stats["btc_filter"] += 1
+                continue
+            idx_btc = int(np.searchsorted(ts_btc, decision_ts - _tf_ms(btc_filter_tf), side="right") - 1)
+            if idx_btc < 0 or idx_btc >= len(close_btc):
+                gate_stats["btc_filter"] += 1
+                continue
+            btc_close_now = float(close_btc.iloc[idx_btc])
+            btc_ema_now = float(ema_btc.iloc[idx_btc]) if not np.isnan(ema_btc.iloc[idx_btc]) else btc_close_now
+            if not (btc_close_now < btc_ema_now):
+                gate_stats["btc_filter"] += 1
+                continue
 
         zones = build_sr_zones(df_1h_hist.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
         sym_state["zones"] = zones
@@ -9840,51 +9923,43 @@ def _run_sr_pro_short_v2_cycle(
                 continue
             gate_stats["ema200_pass"] += 1
 
-        h1_touch_px = h1_close if cfg.touch_use_close else h1_high
+        # 1h is direction-only; resistance touch gate is evaluated on 15m.
+        close15 = float(df_15m_sig.iloc[idx_15m]["close"])
+        open15 = float(df_15m_sig.iloc[idx_15m]["open"])
+        high15 = float(df_15m_sig.iloc[idx_15m]["high"])
+        low15 = float(df_15m_sig.iloc[idx_15m]["low"])
+        h15_touch_px = close15 if cfg.touch_use_close else high15
         touch_level = "mid" if cfg.touch_mode == "mid" else "bot"
-        for z in zones:
-            if not z.get("live", True):
-                z["_last_touch_ts"] = 0
-                continue
-            touched_now = (
-                z.get("side") == 1
-                and h1_high >= float(z.get("bot", 0.0))
-                and h1_low <= float(z.get("top", 0.0))
-                and h1_close <= float(z.get("top", 0.0))
-                and h1_touch_px >= float(z.get("mid") if touch_level == "mid" else z.get("bot", 0.0))
-            )
-            z["_last_touch_ts"] = h1_ts if touched_now else 0
         resist_candidates = [
             z for z in zones
             if z.get("live", True)
             and z.get("side") == 1
             and dvf_norm <= float(cfg.dvf_norm_max)
-            and h1_high >= float(z.get("bot", 0.0))
-            and h1_low <= float(z.get("top", 0.0))
-            and h1_close <= float(z.get("top", 0.0))
-            and z.get("_last_touch_ts") == h1_ts
+            and high15 >= float(z.get("bot", 0.0))
+            and low15 <= float(z.get("top", 0.0))
+            and close15 <= float(z.get("top", 0.0))
+            and h15_touch_px >= float(z.get("mid") if touch_level == "mid" else z.get("bot", 0.0))
         ]
         if not resist_candidates:
             sym_state["retest_active"] = False
             sym_state["retest_touched"] = False
-            gate_stats["zone_touch"] += 1
-            continue
-
-        close15 = float(df_15m_sig.iloc[idx_15m]["close"])
-        mtf_ema_len = max(1, int(getattr(cfg, "mtf_ema_len", 20)))
-        ema15_line = ema(df_15m_sig["close"].astype(float), mtf_ema_len)
-        ema15_now = float(ema15_line.iloc[idx_15m]) if not np.isnan(ema15_line.iloc[idx_15m]) else close15
-        if not (close15 < ema15_now):
             gate_stats["lh_15m"] += 1
             continue
+
         if mtf_mode == "strict":
-            h15_0 = float(df_15m_sig.iloc[idx_15m]["high"])
+            mtf_ema_len = max(1, int(getattr(cfg, "mtf_ema_len", 20)))
+            ema15_line = ema(df_15m_sig["close"].astype(float), mtf_ema_len)
+            ema15_now = float(ema15_line.iloc[idx_15m]) if not np.isnan(ema15_line.iloc[idx_15m]) else close15
+            if not (close15 < ema15_now):
+                gate_stats["lh_15m"] += 1
+                continue
+            h15_0 = high15
             h15_1 = float(df_15m_sig.iloc[idx_15m - 1]["high"])
             h15_2 = float(df_15m_sig.iloc[idx_15m - 2]["high"])
             if not (h15_0 < h15_1 or h15_1 < h15_2):
                 gate_stats["lh_15m"] += 1
                 continue
-            if not (close15 < float(df_15m_sig.iloc[idx_15m]["open"])):
+            if not (close15 < open15):
                 gate_stats["lh_15m"] += 1
                 continue
 
@@ -9915,7 +9990,8 @@ def _run_sr_pro_short_v2_cycle(
         ]
         low_min = min(low_prev)
         strong_break = c3 < low_min
-        weak_break = (l3 < low_min) and (c3 >= low_min) and (c3 < o3)
+        use_weak_break = bool(getattr(cfg, "use_weak_break", False))
+        weak_break = bool(use_weak_break) and (l3 < low_min) and (c3 >= low_min) and (c3 < o3)
         if not strong_break and not weak_break:
             gate_stats["break_3m"] += 1
             if sym_state.get("retest_active"):
@@ -9981,7 +10057,7 @@ def _run_sr_pro_short_v2_cycle(
                 if c3 < retest_level:
                     entry_reason = "pass_close"
                     gate_stats["retest_pass_close"] += 1
-                elif l3 < retest_level and c3 < o3 and upper_wick_ratio <= 0.40:
+                elif bool(getattr(cfg, "use_pass_low", False)) and l3 < retest_level and c3 < o3 and upper_wick_ratio <= 0.40:
                     entry_reason = "pass_low"
                     gate_stats["retest_pass_low"] += 1
                 if not entry_reason:
@@ -11341,6 +11417,9 @@ def _reconcile_long_trades(state: Dict[str, dict], ex, tickers: dict) -> None:
                 tp_pct_meta = meta.get("tp_pct")
                 if isinstance(tp_pct_meta, (int, float)):
                     tp_pct = float(tp_pct_meta)
+                sl_pct_meta = meta.get("sl_pct")
+                if isinstance(sl_pct_meta, (int, float)):
+                    sl_pct = float(sl_pct_meta)
             if isinstance(entry_price, (int, float)) and isinstance(exit_price, (int, float)) and entry_price > 0:
                 profit_unlev = (float(exit_price) - float(entry_price)) / float(entry_price) * 100.0
                 if isinstance(tp_price_meta, (int, float)) and exit_price >= float(tp_price_meta):
@@ -11555,6 +11634,9 @@ def _reconcile_short_trades(state: Dict[str, dict], tickers: dict) -> None:
                 tp_pct_meta = meta.get("tp_pct")
                 if isinstance(tp_pct_meta, (int, float)):
                     tp_pct = float(tp_pct_meta)
+                sl_pct_meta = meta.get("sl_pct")
+                if isinstance(sl_pct_meta, (int, float)):
+                    sl_pct = float(sl_pct_meta)
             if isinstance(entry_price, (int, float)) and isinstance(exit_price, (int, float)) and entry_price > 0:
                 profit_unlev = (float(entry_price) - float(exit_price)) / float(entry_price) * 100.0
                 if isinstance(tp_price_meta, (int, float)) and exit_price <= float(tp_price_meta):
@@ -12063,12 +12145,18 @@ def _detect_position_events(state: dict, send_telegram) -> None:
         elif prev_qty is not None and qty is not None:
             if isinstance(prev_qty, (int, float)) and isinstance(qty, (int, float)) and qty > prev_qty * 1.0001:
                 if not managed:
-                    _record_position_event(symbol, side, "DCA", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
-                    changed = True
-                    label = "DCA" if DCA_ENABLED else "ADD"
-                    send_telegram(
-                        f"➕ <b>{label}</b> {symbol} {side} adds mark={mark} entry={avg_entry} qty={qty}"
-                    )
+                    sr_ok, sr_reason = _dca_sr_zone_gate(symbol, side, now_ts=now)
+                    if sr_ok:
+                        _record_position_event(symbol, side, "DCA", "MANUAL", qty, avg_entry, mark, {"source": "pos_snapshot"})
+                        changed = True
+                        label = "DCA" if DCA_ENABLED else "ADD"
+                        send_telegram(
+                            f"➕ <b>{label}</b> {symbol} {side} adds mark={mark} entry={avg_entry} qty={qty}"
+                        )
+                    else:
+                        if _dca_sr_gate_should_log(st_side, side, now):
+                            _append_entry_gate_log("manual_dca", symbol, f"sr_gate_block {sr_reason}", side=side)
+                            state[symbol] = st_side
         elif prev_qty is not None and qty is None:
             source = managed_engine or ("AUTO" if managed else "MANUAL")
             cancel_stop_orders(symbol)
@@ -12210,10 +12298,20 @@ def _detect_manual_positions(state: dict, send_telegram) -> None:
                         if side_label == "SHORT" and isinstance(qty_seen, (int, float)):
                             qty_seen = abs(qty_seen)
                         if isinstance(qty_seen, (int, float)) and qty_seen > float(prev_qty_seen) * 1.0001:
+                            st_seen[f"manual_qty_{side_key}"] = qty_seen
+                            sr_ok, sr_reason = _dca_sr_zone_gate(sym, side_label, now_ts=time.time())
+                            if not sr_ok:
+                                if _dca_sr_gate_should_log(st_seen, side_label, time.time()):
+                                    _append_entry_gate_log("manual_dca", sym, f"sr_gate_block {sr_reason}", side=side_label)
+                                state[sym] = st_seen
+                                try:
+                                    save_state(state)
+                                except Exception:
+                                    pass
+                                continue
                             adds_key = f"manual_dca_adds_{side_key}"
                             adds_done = int(st_seen.get(adds_key, 0) or 0)
                             st_seen[adds_key] = adds_done + 1
-                            st_seen[f"manual_qty_{side_key}"] = qty_seen
                             state[sym] = st_seen
                             send_telegram(
                                 f"➕ <b>DCA</b> {sym} {side_label} adds {adds_done}->{adds_done+1} "
@@ -12492,7 +12590,9 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
         _sync_trade_log_from_db(state, symbol, side)
     except Exception:
         pass
-    if side == "LONG" and str(req.get("engine") or "").upper() == "SR_PRO_LONG_V1":
+    engine_upper = str(req.get("engine") or "").upper()
+    if side == "LONG" and engine_upper in ("SR_PRO_LONG_V1", "SR_PRO_LONG_V2"):
+        long_engine_tag = "sr_pro_long_v2" if engine_upper == "SR_PRO_LONG_V2" else "sr_pro_long_v1"
         sl_price_meta = meta.get("sl_price") if isinstance(meta, dict) else None
         try:
             st = state.get(symbol) if isinstance(state.get(symbol), dict) else {}
@@ -12504,7 +12604,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
             pass
         if not isinstance(sl_price_meta, (int, float)) or sl_price_meta <= 0:
             _append_entry_gate_log(
-                "sr_pro_long_v1",
+                long_engine_tag,
                 symbol,
                 f"sl_meta_missing entry={entry_base} meta={meta}",
                 side="LONG",
@@ -12519,7 +12619,7 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
                 res_sl = place_long_sl_px(symbol, float(sl_price_meta), qty=qty if isinstance(qty, (int, float)) else None)
                 if isinstance(res_sl, dict) and res_sl.get("status") != "ok":
                     _append_entry_gate_log(
-                        "sr_pro_long_v1",
+                        long_engine_tag,
                         symbol,
                         f"sl_place_failed status={res_sl.get('status')} reason={res_sl.get('reason')}",
                         side="LONG",
@@ -12550,14 +12650,14 @@ def _execute_manage_entry_request(state: dict, req: dict, send_telegram) -> tupl
                         except Exception:
                             pass
                     _append_entry_gate_log(
-                        "sr_pro_long_v1",
+                        long_engine_tag,
                         symbol,
                         f"sl_place_ok sl_price={sl_price_meta} sl_order_id={sl_order_id}",
                         side="LONG",
                     )
             except Exception as e:
                 _append_entry_gate_log(
-                    "sr_pro_long_v1",
+                    long_engine_tag,
                     symbol,
                     f"sl_place_failed err={e} sl_price={sl_price_meta}",
                     side="LONG",
@@ -13566,7 +13666,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
         open_tr = _get_open_trade(state, "LONG", sym)
         entry_ts = float(open_tr.get("entry_ts", 0.0) or 0.0) if open_tr else 0.0
         meta = open_tr.get("meta") if isinstance(open_tr, dict) else None
-        if isinstance(meta, dict) and str(meta.get("reason") or "").lower() == "sr_pro_long_v1":
+        if isinstance(meta, dict) and str(meta.get("reason") or "").lower() in ("sr_pro_long_v1", "sr_pro_long_v2"):
             fast_fail_level = meta.get("fast_fail_level")
             fast_fail_atr = meta.get("fast_fail_atr")
             mark_px = None
@@ -13640,7 +13740,8 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     _set_last_exit_state(st, "LONG", now, "fast_fail")
                     state[sym] = st
                 try:
-                    sr_state = state.setdefault("_sr_pro_long_v1_state", {})
+                    sr_state_key = "_sr_pro_long_v2_state" if str(meta.get("reason") or "").lower() == "sr_pro_long_v2" else "_sr_pro_long_v1_state"
+                    sr_state = state.setdefault(sr_state_key, {})
                     sym_state = sr_state.setdefault(sym, {})
                     sym_state["cooldown_until_long"] = (now * 1000.0) + (15 * 60 * 1000)
                     sym_state["last_fast_fail_ts"] = now
@@ -13650,11 +13751,12 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 except Exception:
                     pass
                 entry_px = open_tr.get("entry_price") if isinstance(open_tr, dict) else None
-                tp_sl_text = _fmt_tp_sl_pct(entry_px if isinstance(entry_px, (int, float)) else None, meta, "SR_PRO_LONG_V1", "LONG")
+                long_label = "SR_PRO_LONG_V2" if str(meta.get("reason") or "").lower() == "sr_pro_long_v2" else "SR_PRO_LONG_V1"
+                tp_sl_text = _fmt_tp_sl_pct(entry_px if isinstance(entry_px, (int, float)) else None, meta, long_label, "LONG")
                 send_telegram(
                     f"{EXIT_SL_ICON} <b>롱 청산</b>\n"
                     f"<b>{sym}</b>\n"
-                    f"엔진: {_display_engine_label('SR_PRO_LONG_V1')}\n"
+                    f"엔진: {_display_engine_label(long_label)}\n"
                     f"사유: FAST_FAIL\n"
                     f"TP/SL={tp_sl_text}\n"
                     f"체결가={avg_price} 수량={filled} 비용={cost}\n"
@@ -13663,7 +13765,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                 )
                 time.sleep(0.15)
                 continue
-        if isinstance(meta, dict) and str(meta.get("reason") or "").lower() == "sr_pro_long_v1":
+        if isinstance(meta, dict) and str(meta.get("reason") or "").lower() in ("sr_pro_long_v1", "sr_pro_long_v2"):
             if entry_ts and (now - entry_ts) < 120.0:
                 _append_entry_gate_log(
                     "auto_exit_long",
@@ -13687,7 +13789,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     (open_tr.get("meta") or {}).get("reason") if open_tr else None
                 )
                 # SR_PRO_LONG_V1: entry 직후 포지션 캐시 지연으로 잘못 청산되는 케이스 방지
-                if engine_label == "SR_PRO_LONG_V1":
+                if engine_label in ("SR_PRO_LONG_V1", "SR_PRO_LONG_V2"):
                     st = state.get(sym) if isinstance(state.get(sym), dict) else {}
                     pending_ts = st.get("_srp_long_sl_pending") if isinstance(st, dict) else None
                     pending_sl = st.get("_srp_long_sl_price") if isinstance(st, dict) else None
@@ -13799,7 +13901,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             continue
         profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
         # SR_PRO_LONG_V1: SL 주문 실패 시, SL 가격 도달 전에는 자동청산 금지
-        if engine_label == "SR_PRO_LONG_V1" and isinstance(open_tr, dict):
+        if engine_label in ("SR_PRO_LONG_V1", "SR_PRO_LONG_V2") and isinstance(open_tr, dict):
             meta = open_tr.get("meta") or {}
             sl_price_meta = None
             try:
@@ -13817,7 +13919,7 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                         side="LONG",
                     )
                     continue
-        if engine_label == "SR_PRO_LONG_V1" and entry_ts and (now - entry_ts) < 120.0:
+        if engine_label in ("SR_PRO_LONG_V1", "SR_PRO_LONG_V2") and entry_ts and (now - entry_ts) < 120.0:
             _append_entry_gate_log(
                 "auto_exit_long",
                 sym,
@@ -13845,9 +13947,11 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
             except Exception:
                 engine_v = ""
             is_srp_long_meta = (
-                reason_v == "sr_pro_long_v1"
+                reason_v in ("sr_pro_long_v1", "sr_pro_long_v2")
                 or engine_v == "SR_PRO_LONG_V1"
+                or engine_v == "SR_PRO_LONG_V2"
                 or engine_label == "SR_PRO_LONG_V1"
+                or engine_label == "SR_PRO_LONG_V2"
             )
             try:
                 sl_price_meta = float(meta.get("sl_price"))
@@ -14288,7 +14392,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
     global ADV_TREND_ENABLED, ADV_TREND_MIN_QV, ADV_TREND_UNIVERSE_TOP_N, ADV_TREND_RISK_PCT
     global ADV_TREND_MAX_NOTIONAL_MULT, ADV_TREND_MIN_STOP_ATR, ADV_TREND_ADX_MIN
     global ADV_TREND_MFI_LONG_MAX, ADV_TREND_MFI_SHORT_MIN
-    global ANTI_ALPHA_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED
+    global ANTI_ALPHA_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED
     global SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, DIV15M_LONG_ENABLED, DIV15M_SHORT_ENABLED
     global RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN
     global USDT_PER_TRADE, CHAT_ID_RUNTIME, MANAGE_WS_MODE, DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT
@@ -14355,6 +14459,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_sr_pro_short_v1_enabled",
         "_sr_pro_short_v2_enabled",
         "_sr_pro_long_v1_enabled",
+        "_sr_pro_long_v2_enabled",
         "_scout_only_exhaustion_short_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_loss_hedge_engine_enabled",
@@ -14362,6 +14467,7 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         "_sr_pro_short_v1_enabled",
         "_sr_pro_short_v2_enabled",
         "_sr_pro_long_v1_enabled",
+        "_sr_pro_long_v2_enabled",
         "_scout_only_exhaustion_short_enabled",
         "_srp_st_regime_pullback_v1_enabled",
         "_rsi_enabled",
@@ -14470,6 +14576,8 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         SR_PRO_SHORT_V2_ENABLED = bool(state.get("_sr_pro_short_v2_enabled"))
     if (not skip_keys or "_sr_pro_long_v1_enabled" not in skip_keys) and isinstance(state.get("_sr_pro_long_v1_enabled"), bool):
         SR_PRO_LONG_V1_ENABLED = bool(state.get("_sr_pro_long_v1_enabled"))
+    if (not skip_keys or "_sr_pro_long_v2_enabled" not in skip_keys) and isinstance(state.get("_sr_pro_long_v2_enabled"), bool):
+        SR_PRO_LONG_V2_ENABLED = bool(state.get("_sr_pro_long_v2_enabled"))
     if (not skip_keys or "_scout_only_exhaustion_short_enabled" not in skip_keys) and isinstance(state.get("_scout_only_exhaustion_short_enabled"), bool):
         SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED = bool(state.get("_scout_only_exhaustion_short_enabled"))
     if (not skip_keys or "_srp_st_regime_pullback_v1_enabled" not in skip_keys) and isinstance(state.get("_srp_st_regime_pullback_v1_enabled"), bool):
@@ -14745,6 +14853,7 @@ def _save_runtime_settings_only(state: dict) -> None:
         "_sr_pro_short_v1_enabled",
         "_sr_pro_short_v2_enabled",
         "_sr_pro_long_v1_enabled",
+        "_sr_pro_long_v2_enabled",
         "_dtfx_enabled",
         "_atlas_rs_fail_short_enabled",
         "_tg_offset",
@@ -14993,7 +15102,11 @@ def _append_entry_event(tr: dict) -> None:
 def _sync_short_positions_state(state: dict, symbols: list) -> None:
     now = time.time()
     for sym in symbols:
+        if not isinstance(sym, str) or "/" not in sym or sym.startswith("_"):
+            continue
         st = state.get(sym) or {}
+        if not isinstance(st, dict):
+            st = {}
         try:
             amt = get_short_position_amount(sym)
         except Exception:
@@ -15016,6 +15129,8 @@ def _sync_short_positions_state(state: dict, symbols: list) -> None:
 def _sync_positions_state(state: dict, symbols: list) -> None:
     now = time.time()
     for sym in symbols:
+        if not isinstance(sym, str) or "/" not in sym or sym.startswith("_"):
+            continue
         st = state.get(sym) or {}
         if not isinstance(st, dict):
             st = {}
@@ -15221,7 +15336,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
     현재 auto-exit 설정은 state["_auto_exit"]에 동기화한다.
     """
     global AUTO_EXIT_ENABLED, AUTO_EXIT_LONG_TP_PCT, AUTO_EXIT_LONG_SL_PCT, AUTO_EXIT_SHORT_TP_PCT, AUTO_EXIT_SHORT_SL_PCT
-    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
+    global LIVE_TRADING, LONG_LIVE_TRADING, MAX_OPEN_POSITIONS, SWAGGY_ATLAS_LAB_ENABLED, SWAGGY_NO_ATLAS_ENABLED, ADV_TREND_ENABLED, ANTI_ALPHA_V1_ENABLED, SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED, SRP_ST_REGIME_PULLBACK_V1_ENABLED, SWAGGY_NO_ATLAS_OVEREXT_ENTRY_MIN, SWAGGY_NO_ATLAS_OVEREXT_MIN_ENABLED, SWAGGY_D1_OVEREXT_ATR_MULT, SWAGGY_ATLAS_LAB_OFF_WINDOWS, SWAGGY_NO_ATLAS_OFF_WINDOWS, SATURDAY_TRADE_ENABLED, DTFX_ENABLED, ATLAS_RS_FAIL_SHORT_ENABLED, RSI_ENABLED, LOSS_HEDGE_ENGINE_ENABLED, LOSS_HEDGE_INTERVAL_MIN, REALTIME_ONLY_ENABLED
     global DCA_ENABLED, DCA_PCT, DCA_FIRST_PCT, DCA_SECOND_PCT, DCA_THIRD_PCT, USDT_PER_TRADE
     global EXIT_COOLDOWN_HOURS, EXIT_COOLDOWN_SEC, COOLDOWN_SEC
     global ENTRY_BLOCK_HOURS
@@ -15926,7 +16041,8 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"엔진요약: "
                             f"sr_pro={'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'} "
                             f"sr_pro_v2={'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'} "
-                            f"sr_pro_long={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
+                            f"sr_pro_long_v1={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
+                            f"sr_pro_long_v2={'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'} "
                             f"scout_only={'ON' if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED else 'OFF'} "
                             ""
                             "--------------\n"
@@ -15937,6 +16053,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
                             f"/sr_pro_short_v2(추가진입): {'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'}\n"
                             f"/sr_pro_long_v1(롱진입): {'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'}\n"
+                            f"/sr_pro_long_v2(롱진입): {'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'}\n"
                             f"/scout_only_exhaustion_short(정찰숏): {'ON' if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED else 'OFF'}\n"
                             "\n"
                             ""
@@ -15988,13 +16105,15 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         "--------------\n"
                         f"엔진요약: sr_pro={'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'} "
                         f"sr_pro_v2={'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'} "
-                        f"sr_pro_long={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
+                        f"sr_pro_long_v1={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
+                        f"sr_pro_long_v2={'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'} "
                         f"scout_only={'ON' if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED else 'OFF'} "
                         ""
                         "--------------\n"
                         f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
                         f"/sr_pro_short_v2(추가진입): {'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'}\n"
                         f"/sr_pro_long_v1(롱진입): {'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'}\n"
+                        f"/sr_pro_long_v2(롱진입): {'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'}\n"
                         f"/scout_only_exhaustion_short(정찰숏): {'ON' if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED else 'OFF'}\n"
                         "\n"
                         ""
@@ -16357,7 +16476,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     }:
                         ok = _reply(
                             "⛔ 삭제된 엔진 명령입니다.\n"
-                            "사용 가능: /sr_pro_short_v1, /sr_pro_short_v2, /sr_pro_long_v1, /scout_only_exhaustion_short"
+                            "사용 가능: /sr_pro_short_v1, /sr_pro_short_v2, /sr_pro_long_v1, /sr_pro_long_v2, /scout_only_exhaustion_short"
                         )
                         print(f"[telegram] deleted-engine cmd blocked: {cmd_norm} send={'ok' if ok else 'fail'}")
                         responded = True
@@ -16536,6 +16655,29 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] sr_pro_long_v1 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
+                        responded = True
+                if (cmd in ("/sr_pro_long_v2", "sr_pro_long_v2", "sr_pro_long2")) and not responded:
+                    parts = lower.split()
+                    arg = parts[1] if len(parts) >= 2 else "status"
+                    resp = None
+                    if arg in ("on", "1", "true", "enable", "enabled"):
+                        SR_PRO_LONG_V2_ENABLED = True
+                        state["_sr_pro_long_v2_enabled"] = True
+                        state_dirty = True
+                        resp = "✅ sr_pro_long_v2 ON"
+                    elif arg in ("off", "0", "false", "disable", "disabled"):
+                        SR_PRO_LONG_V2_ENABLED = False
+                        state["_sr_pro_long_v2_enabled"] = False
+                        state_dirty = True
+                        resp = "⛔ sr_pro_long_v2 OFF"
+                    else:
+                        resp = (
+                            f"ℹ️ sr_pro_long_v2 상태: {'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'}\n"
+                            "사용법: /sr_pro_long_v2 on|off|status"
+                        )
+                    if resp:
+                        ok = _reply(resp)
+                        print(f"[telegram] sr_pro_long_v2 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
                         responded = True
                 if (cmd in ("/scout_only_exhaustion_short", "scout_only_exhaustion_short", "scout_exhaustion_short", "tier_b_short")) and not responded:
                     parts = lower.split()
@@ -17207,6 +17349,7 @@ def save_state(state: Dict[str, dict]) -> None:
                 "_sr_pro_short_v1_enabled",
                 "_sr_pro_short_v2_enabled",
                 "_sr_pro_long_v1_enabled",
+                "_sr_pro_long_v2_enabled",
                 "_scout_only_exhaustion_short_enabled",
                 "_srp_st_regime_pullback_v1_enabled",
                 "_dtfx_enabled",
@@ -17277,6 +17420,7 @@ def save_state_to(state: Dict[str, dict], path: str) -> None:
                 "_sr_pro_short_v1_enabled",
                 "_sr_pro_short_v2_enabled",
                 "_sr_pro_long_v1_enabled",
+                "_sr_pro_long_v2_enabled",
                 "_scout_only_exhaustion_short_enabled",
                 "_runtime_cfg_ts",
             ]
@@ -17560,7 +17704,7 @@ def run():
     global GLOBAL_BACKOFF_UNTIL, _BACKOFF_SECS, RATE_LIMIT_LOG_TS, _LAST_ACCOUNT_REFRESH_TS
     global TOTAL_CYCLES, TOTAL_ELAPSED, TOTAL_REST_CALLS, TOTAL_429_COUNT
     global MANAGE_LOOP_ENABLED, MANAGE_WS_MODE
-    global SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED
+    global SR_PRO_SHORT_V1_ENABLED, SR_PRO_SHORT_V2_ENABLED, SR_PRO_LONG_V1_ENABLED, SR_PRO_LONG_V2_ENABLED, SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED
     global COMMON_WARMUP_DONE, COMMON_UNIVERSE_READY, COMMON_UNIVERSE, _COMMON_WARMUP_NOTIFY_TS_MEM
     _install_error_hooks()
     print("[시작] RSI 스캐너 초기화 중...")
@@ -17644,17 +17788,32 @@ def run():
         tickers = exchange.fetch_tickers()
         state["_tickers"] = tickers
         state["_tickers_ts"] = time.time()
-        COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
-        state["_common_universe"] = list(COMMON_UNIVERSE)
-        COMMON_UNIVERSE_READY = True
-        state["_common_universe_ready"] = True
-        print(f"[common-universe] ready size={len(COMMON_UNIVERSE)}")
-        if COMMON_UNIVERSE_LOG_PATH:
-            try:
-                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE size={len(COMMON_UNIVERSE)}"])
-                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
-            except Exception:
-                pass
+        if _is_even_kst_day():
+            COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
+            state["_common_universe"] = list(COMMON_UNIVERSE)
+            COMMON_UNIVERSE_READY = True
+            state["_common_universe_ready"] = True
+            print(f"[common-universe] ready size={len(COMMON_UNIVERSE)}")
+            if COMMON_UNIVERSE_LOG_PATH:
+                try:
+                    _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE size={len(COMMON_UNIVERSE)}"])
+                    _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
+                except Exception:
+                    pass
+        else:
+            prev_universe = state.get("_common_universe") if isinstance(state.get("_common_universe"), list) else []
+            COMMON_UNIVERSE = list(prev_universe or [])
+            if not COMMON_UNIVERSE:
+                # bootstrap once when state has no reusable universe
+                COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
+                state["_common_universe"] = list(COMMON_UNIVERSE)
+                state["_common_universe_ready"] = True
+                COMMON_UNIVERSE_READY = True
+                print(f"[common-universe] startup bootstrap on odd KST day size={len(COMMON_UNIVERSE)}")
+            else:
+                COMMON_UNIVERSE_READY = True
+                state["_common_universe_ready"] = True
+                print(f"[common-universe] startup refresh skipped (odd KST day), reuse size={len(COMMON_UNIVERSE)}")
     except Exception as e:
         COMMON_UNIVERSE = []
         COMMON_UNIVERSE_READY = False
@@ -17923,6 +18082,10 @@ def run():
         SR_PRO_LONG_V1_ENABLED = bool(state.get("_sr_pro_long_v1_enabled"))
     else:
         state["_sr_pro_long_v1_enabled"] = SR_PRO_LONG_V1_ENABLED
+    if isinstance(state.get("_sr_pro_long_v2_enabled"), bool):
+        SR_PRO_LONG_V2_ENABLED = bool(state.get("_sr_pro_long_v2_enabled"))
+    else:
+        state["_sr_pro_long_v2_enabled"] = SR_PRO_LONG_V2_ENABLED
     if isinstance(state.get("_scout_only_exhaustion_short_enabled"), bool):
         SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED = bool(state.get("_scout_only_exhaustion_short_enabled"))
     else:
@@ -17987,7 +18150,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /sr_pro_short_v1 on|off|status, /sr_pro_short_v2 on|off|status, /sr_pro_long_v1 on|off|status, /scout_only_exhaustion_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /sr_pro_short_v1 on|off|status, /sr_pro_short_v2 on|off|status, /sr_pro_long_v1 on|off|status, /sr_pro_long_v2 on|off|status, /scout_only_exhaustion_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
@@ -18256,30 +18419,52 @@ def run():
 
                     # daily common universe refresh (KST)
                     if _maybe_daily_refresh_common_universe(state, tickers, symbols):
-                        COMMON_UNIVERSE = list(state.get("_common_universe") or [])
+                        COMMON_UNIVERSE = (
+                            list(state.get("_common_universe") or [])
+                            if isinstance(state.get("_common_universe"), list)
+                            else []
+                        )
                         COMMON_UNIVERSE_READY = True
                         COMMON_WARMUP_DONE = False
                         _reset_common_warmup_state(state)
                         print(f"[common-universe] daily refresh done size={len(COMMON_UNIVERSE)}")
 
                     if not COMMON_UNIVERSE_READY or not isinstance(state.get("_common_universe"), list):
-                        COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
-                        state["_common_universe"] = list(COMMON_UNIVERSE)
-                        state["_common_universe_ready"] = True
-                        COMMON_UNIVERSE_READY = True
-                        print(f"[common-universe] refreshed size={len(COMMON_UNIVERSE)}")
-                        if COMMON_UNIVERSE_LOG_PATH and COMMON_UNIVERSE:
+                        if _is_even_kst_day():
+                            COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
+                            state["_common_universe"] = list(COMMON_UNIVERSE)
+                            state["_common_universe_ready"] = True
+                            COMMON_UNIVERSE_READY = True
+                            print(f"[common-universe] refreshed size={len(COMMON_UNIVERSE)}")
+                            if COMMON_UNIVERSE_LOG_PATH and COMMON_UNIVERSE:
+                                try:
+                                    _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE refresh size={len(COMMON_UNIVERSE)}"])
+                                    _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
+                                except Exception:
+                                    pass
                             try:
-                                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE refresh size={len(COMMON_UNIVERSE)}"])
-                                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
+                                os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
+                                with open(os.path.join("logs", "common_universe", "latest.txt"), "w", encoding="utf-8") as f:
+                                    f.write("\n".join(COMMON_UNIVERSE))
                             except Exception:
                                 pass
-                        try:
-                            os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
-                            with open(os.path.join("logs", "common_universe", "latest.txt"), "w", encoding="utf-8") as f:
-                                f.write("\n".join(COMMON_UNIVERSE))
-                        except Exception:
-                            pass
+                        else:
+                            prev_universe = state.get("_common_universe") if isinstance(state.get("_common_universe"), list) else []
+                            COMMON_UNIVERSE = list(prev_universe or [])
+                            if not COMMON_UNIVERSE:
+                                # bootstrap once when reusable universe is missing
+                                COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
+                                state["_common_universe"] = list(COMMON_UNIVERSE)
+                                COMMON_UNIVERSE_READY = True
+                                state["_common_universe_ready"] = True
+                                print(f"[common-universe] bootstrap on odd KST day size={len(COMMON_UNIVERSE)}")
+                            else:
+                                COMMON_UNIVERSE_READY = True
+                                state["_common_universe_ready"] = True
+                                print(f"[common-universe] refresh skipped (odd KST day), reuse size={len(COMMON_UNIVERSE)}")
+                    # protect against accidental state key pollution (must remain list of symbols)
+                    if not isinstance(state.get("_common_universe"), list):
+                        state["_common_universe"] = list(COMMON_UNIVERSE or [])
                     shared_universe = list(state.get("_common_universe") or [])
                     state["_universe"] = list(shared_universe)
                     state["_adv_trend_universe"] = list(shared_universe)
@@ -18310,6 +18495,8 @@ def run():
                     sr_pro_short_v2_universe_len = len(sr_pro_short_v2_universe)
                     sr_pro_long_universe = list(shared_universe)
                     sr_pro_long_universe_len = len(sr_pro_long_universe)
+                    sr_pro_long_v2_universe = list(shared_universe)
+                    sr_pro_long_v2_universe_len = len(sr_pro_long_v2_universe)
                     scout_only_exhaustion_short_universe = list(shared_universe)
                     scout_only_exhaustion_short_universe_len = len(scout_only_exhaustion_short_universe)
                     swaggy_cfg = SwaggyConfig() if SwaggyConfig else None
@@ -18511,6 +18698,7 @@ def run():
                     sr_pro_short_ran = bool(SR_PRO_SHORT_V1_ENABLED and sr_pro_short_universe and (not heavy_scan) and new_3m_bar)
                     sr_pro_short_v2_ran = bool(SR_PRO_SHORT_V2_ENABLED and sr_pro_short_v2_universe and (not heavy_scan) and new_3m_bar)
                     sr_pro_long_ran = bool(SR_PRO_LONG_V1_ENABLED and sr_pro_long_universe and (not heavy_scan) and new_3m_bar)
+                    sr_pro_long_v2_ran = bool(SR_PRO_LONG_V2_ENABLED and sr_pro_long_v2_universe and (not heavy_scan) and new_3m_bar)
                     scout_only_exhaustion_short_ran = bool(
                         SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED
                         and scout_only_exhaustion_short_universe
@@ -18840,10 +19028,12 @@ def run():
                     sr_pro_result = {}
                     sr_pro_short_v2_result = {}
                     sr_pro_long_result = {}
+                    sr_pro_long_v2_result = {}
                     scout_only_exhaustion_short_result = {}
                     sr_pro_thread = None
                     sr_pro_short_v2_thread = None
                     sr_pro_long_thread = None
+                    sr_pro_long_v2_thread = None
                     scout_only_exhaustion_short_thread = None
                     st_flip_result = {}
                     st_flip_thread = None
@@ -18977,6 +19167,25 @@ def run():
                             daemon=True,
                         )
                         sr_pro_long_thread.start()
+                    if SR_PRO_LONG_V2_ENABLED and new_3m_bar:
+                        sr_pro_long_v2_thread = threading.Thread(
+                            target=lambda: sr_pro_long_v2_result.update(
+                                _run_sr_pro_long_v1_cycle(
+                                    sr_pro_long_v2_universe,
+                                    state,
+                                    send_telegram,
+                                    engine_name="SR_PRO_LONG_V2",
+                                    reason_name="sr_pro_long_v2",
+                                    cfg_cls=SrProLongV2Config,
+                                    enabled=SR_PRO_LONG_V2_ENABLED,
+                                    state_key="_sr_pro_long_v2_state",
+                                    log_fn=_append_sr_pro_long_v2_log,
+                                    cycle_tag="SR_PRO_LONG_V2",
+                                )
+                            ),
+                            daemon=True,
+                        )
+                        sr_pro_long_v2_thread.start()
                     if SCOUT_ONLY_EXHAUSTION_SHORT_ENABLED and new_3m_bar:
                         scout_only_exhaustion_short_thread = threading.Thread(
                             target=lambda: scout_only_exhaustion_short_result.update(
@@ -19697,10 +19906,12 @@ def run():
                         f"union={universe_union_len}"
                     )
                     print(
-                        "[engines] sr_pro_long_v1=%s(%d) sr_pro_short_v1=%s(%d) sr_pro_short_v2=%s(%d) scout_only_exhaustion_short=%s(%d)"
+                        "[engines] sr_pro_long_v1=%s(%d) sr_pro_long_v2=%s(%d) sr_pro_short_v1=%s(%d) sr_pro_short_v2=%s(%d) scout_only_exhaustion_short=%s(%d)"
                         % (
                             "ON" if sr_pro_long_ran else "OFF",
                             sr_pro_long_universe_len,
+                            "ON" if sr_pro_long_v2_ran else "OFF",
+                            sr_pro_long_v2_universe_len,
                             "ON" if sr_pro_short_ran else "OFF",
                             sr_pro_short_universe_len,
                             "ON" if sr_pro_short_v2_ran else "OFF",
