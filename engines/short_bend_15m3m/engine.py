@@ -12,7 +12,7 @@ class ShortBend15m3mConfig:
     lookback_15m: int = 120
 
     # 롤링 30봉 상승률(%)
-    rise_min_pct: float = 25.0
+    rise_min_pct: float = 18.0
     # 고점 상승 비율(최근 lookback-1 구간 중 high[i] > high[i-1] 비율)
     hh_ratio_min: float = 0.55
     # 15m 고점권 판별: 롤링 구간 상단 몇 % 영역에 위치해야 하는지
@@ -33,7 +33,7 @@ class ShortBend15m3mConfig:
     # 3m 확인
     armed_bars_3m: int = 4
     ltf_ema_len: int = 20
-    swing_lookback_3m: int = 6
+    swing_lookback_3m: int = 10
     require_vol_confirm: bool = True
     vol_mult_min: float = 1.2
     # 3m 주도 진입: 신호 후 역모멘텀(반등) 캔들 출현까지 대기 후 숏 진입
