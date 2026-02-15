@@ -43,6 +43,18 @@
 ## 6-1) 관리모드(관리 큐) 연결
 - `engine_runner.py`의 `_process_manage_queue()` 내 `allowed_engines`에 엔진 라벨 추가
 - 관리모드에서 `engine_removed`로 스킵되면 이 목록 누락이 원인
+- 추가 절차(필수):
+  - 엔진 라벨은 대문자 기준으로 맞춰 추가 (예: `SCOUT_ONLY_EXHAUSTION_SHORT`)
+  - 신규 엔진 연결/라벨 변경 시 `allowed_engines` 동시 수정
+  - 수정 후 프로세스 재기동 (미재기동 시 기존 allowlist로 계속 동작)
+- 현재 기준 허용 라벨(2026-02-15):
+  - `SR_PRO_SHORT_V1`
+  - `SR_PRO_SHORT_V2`
+  - `SR_PRO_LONG_V1`
+  - `SR_PRO_LONG_V2`
+  - `SCOUT_ONLY_EXHAUSTION_SHORT`
+  - `MANUAL`
+  - `UNKNOWN`
 
 ## 7) 엔진 라벨 매핑
 - `_engine_label_from_reason`

@@ -1530,6 +1530,12 @@ def _exclude_common_symbols(universe: list) -> list:
         deduped.append(sym)
     return deduped
 SR_PRO_LONG_DEBUG_NEAREST = os.getenv("SR_PRO_LONG_DEBUG_NEAREST", "0") in ("1", "true", "on", "yes")
+SR_PRO_LONG_DEBUG_SYMBOLS = {
+    s.strip().upper()
+    for s in os.getenv("SR_PRO_LONG_DEBUG_SYMBOLS", "").split(",")
+    if s.strip()
+}
+SR_PRO_LONG_REPLAY_MAX_BARS = max(1, int(os.getenv("SR_PRO_LONG_REPLAY_MAX_BARS", "6") or 6))
 
 def _common_warmup_cache_dir() -> str:
     base = COMMON_WARMUP_CACHE_DIR or os.path.join("logs", "common_warmup", "ohlcv")
@@ -8575,6 +8581,10 @@ def _run_sr_pro_short_v1_cycle(
                 gate_stats["no_data_mtf"] += 1
             if df_1h.empty:
                 gate_stats["no_data_htf"] += 1
+            _dbg(
+                symbol,
+                f"stage=no_data_raw ltf_empty={int(df_3m.empty)} mtf_empty={int(df_15m.empty)} htf_empty={int(df_1h.empty)}",
+            )
             continue
 
         if not SR_PRO_USE_COMMON_CACHE:
@@ -8619,6 +8629,10 @@ def _run_sr_pro_short_v1_cycle(
                 gate_stats["no_data_mtf"] += 1
             if len(df_1h_hist) < min_htf:
                 gate_stats["no_data_htf"] += 1
+            _dbg(
+                symbol,
+                f"stage=no_data_sig ltf_len={len(df_3m_sig)} mtf_len={len(df_15m_sig)} htf_len={len(df_1h_hist)}",
+            )
             continue
 
         sym_state = sr_state.setdefault(symbol, {})
@@ -9331,6 +9345,14 @@ def _run_sr_pro_long_v1_cycle(
     sr_state = state.setdefault(state_key, {})
     symbols = list(sr_universe or [])
 
+    def _dbg(symbol: str, msg: str) -> None:
+        try:
+            if str(symbol or "").upper() not in SR_PRO_LONG_DEBUG_SYMBOLS:
+                return
+            log_fn(f"{cycle_tag}_DBG sym={symbol} {msg}")
+        except Exception:
+            pass
+
     def _has_gap(df: pd.DataFrame, tf_ms: int, mult: float = 2.5) -> bool:
         try:
             if df is None or df.empty or len(df) < 3:
@@ -9471,234 +9493,289 @@ def _run_sr_pro_long_v1_cycle(
             continue
 
         sym_state = sr_state.setdefault(symbol, {})
-        # stale check should use latest confirmed 3m candle ts (not raw in-progress candle)
+        ltf_ms = _tf_ms(tf_ltf)
         latest_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
-        if sym_state.get("last_eval_ts") == latest_ts_ms:
+        last_eval_ts = _coerce_state_int(sym_state.get("last_eval_ts", 0))
+        if last_eval_ts == latest_ts_ms:
             gate_stats["skip_stale_ts"] += 1
-            continue
-        sym_state["last_eval_ts"] = latest_ts_ms
-        cd_until = sym_state.get("cooldown_until_long")
-        if isinstance(cd_until, (int, float)) and latest_ts_ms < int(cd_until):
-            gate_stats["cooldown"] += 1
+            _dbg(symbol, f"stage=stale last_eval_ts={last_eval_ts} latest_ts={latest_ts_ms}")
             continue
 
+        ts_3m = df_3m_sig["ts"].astype(int).values
         ts_1h = df_1h_hist["ts"].values
         ts_15m = df_15m_sig["ts"].values
-        decision_ts = latest_ts_ms + _tf_ms(tf_ltf)
-        idx_1h = int(np.searchsorted(ts_1h, decision_ts - _tf_ms(tf_htf), side="right") - 1)
-        idx_15m = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(tf_mtf), side="right") - 1)
         mtf_mode = str(getattr(cfg, "mtf_mode", "ema_only") or "ema_only").lower()
         min_15m_hist = 2 if mtf_mode == "strict" else 0
-        if idx_1h < 0 or idx_15m < min_15m_hist:
-            continue
 
-        last_1h_hist_ts = int(df_1h_hist.iloc[idx_1h]["ts"])
-        # Rebuild 1h zones every 3m cycle to keep live behavior aligned with backtest replay.
-        zones = build_sr_zones(df_1h_hist.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
-        sym_state["zones"] = zones
-        sym_state["zones_ts"] = last_1h_hist_ts
+        eval_targets = []
+        if last_eval_ts <= 0:
+            eval_targets = [latest_ts_ms]
+        else:
+            missed = int((latest_ts_ms - last_eval_ts) // ltf_ms)
+            if missed <= 0:
+                gate_stats["skip_stale_ts"] += 1
+                _dbg(symbol, f"stage=stale last_eval_ts={last_eval_ts} latest_ts={latest_ts_ms}")
+                continue
+            replay_bars = min(max(1, missed), SR_PRO_LONG_REPLAY_MAX_BARS)
+            start_ts = latest_ts_ms - ((replay_bars - 1) * ltf_ms)
+            eval_targets = [start_ts + (i * ltf_ms) for i in range(replay_bars)]
+            if missed > replay_bars:
+                _dbg(symbol, f"stage=replay_capped missed={missed} replay={replay_bars} latest_ts={latest_ts_ms}")
 
-        h1 = df_1h_hist.iloc[idx_1h]
-        h1_ts = int(h1["ts"]) if "ts" in h1 else 0
-        h1_high = float(h1["high"])
-        h1_low = float(h1["low"])
-        h1_close = float(h1["close"])
+        entered = False
+        for eval_ts in eval_targets:
+            idx_3m = int(np.searchsorted(ts_3m, eval_ts, side="right") - 1)
+            if idx_3m < 0:
+                continue
+            latest_ts_ms = int(ts_3m[idx_3m])
+            if latest_ts_ms <= last_eval_ts:
+                continue
+            df_3m_eval = df_3m_sig.iloc[: idx_3m + 1]
+            if len(df_3m_eval) < 4:
+                continue
 
-        close_1h = df_1h_hist["close"].astype(float)
-        open_1h = df_1h_hist["open"].astype(float)
-        vol_1h = df_1h_hist["volume"].astype(float)
-        dv = np.where(close_1h > open_1h, vol_1h, np.where(close_1h < open_1h, -vol_1h, 0.0))
-        dv = pd.Series(dv, index=df_1h_hist.index)
-        dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
-        vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
-        dvf_norm = float(dvf.iloc[idx_1h]) / float(vol_ema.iloc[idx_1h]) if float(vol_ema.iloc[idx_1h]) > 0 else 0.0
+            sym_state["last_eval_ts"] = latest_ts_ms
+            cd_until = sym_state.get("cooldown_until_long")
+            if isinstance(cd_until, (int, float)) and latest_ts_ms < int(cd_until):
+                gate_stats["cooldown"] += 1
+                _dbg(symbol, f"stage=cooldown latest_ts={latest_ts_ms} cd_until={int(cd_until)}")
+                continue
 
-        # invalidate zones on confirmed 1h close (match backtest behavior)
-        try:
+            decision_ts = latest_ts_ms + ltf_ms
+            idx_1h = int(np.searchsorted(ts_1h, decision_ts - _tf_ms(tf_htf), side="right") - 1)
+            idx_15m = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(tf_mtf), side="right") - 1)
+            if idx_1h < 0 or idx_15m < min_15m_hist:
+                _dbg(symbol, f"stage=index idx_1h={idx_1h} idx_15m={idx_15m} min_15m_hist={min_15m_hist}")
+                continue
+
+            last_1h_hist_ts = int(df_1h_hist.iloc[idx_1h]["ts"])
+            # Rebuild 1h zones every 3m cycle to keep live behavior aligned with backtest replay.
+            zones = build_sr_zones(df_1h_hist.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
+            sym_state["zones"] = zones
+            sym_state["zones_ts"] = last_1h_hist_ts
+
+            h1 = df_1h_hist.iloc[idx_1h]
+            h1_ts = int(h1["ts"]) if "ts" in h1 else 0
+            h1_high = float(h1["high"])
+            h1_low = float(h1["low"])
+            h1_close = float(h1["close"])
+
+            close_1h = df_1h_hist["close"].astype(float)
+            open_1h = df_1h_hist["open"].astype(float)
+            vol_1h = df_1h_hist["volume"].astype(float)
+            dv = np.where(close_1h > open_1h, vol_1h, np.where(close_1h < open_1h, -vol_1h, 0.0))
+            dv = pd.Series(dv, index=df_1h_hist.index)
+            dvf = dv.ewm(span=cfg.delta_len, adjust=False).mean()
+            vol_ema = vol_1h.ewm(span=cfg.delta_len, adjust=False).mean()
+            dvf_norm = float(dvf.iloc[idx_1h]) / float(vol_ema.iloc[idx_1h]) if float(vol_ema.iloc[idx_1h]) > 0 else 0.0
+
+            # invalidate zones on confirmed 1h close (match backtest behavior)
+            try:
+                for z in zones:
+                    if "live" not in z:
+                        z["live"] = True
+                    if not z.get("live"):
+                        continue
+                    if z.get("side") == 1 and h1_close > float(z.get("top", 0)):
+                        z["live"] = False
+                    elif z.get("side") == -1 and h1_close < float(z.get("bot", 0)):
+                        z["live"] = False
+            except Exception:
+                pass
+
+            touch_level = "mid" if cfg.touch_mode == "mid" else "top"
+            h1_touch_px = h1_close if cfg.touch_use_close else h1_low
+            if cfg.ema200_filter:
+                ema_len = max(1, int(getattr(cfg, "ema_filter_len", 200)))
+                ema_line = ema(close_1h, ema_len)
+                ema_now = float(ema_line.iloc[idx_1h])
+                if h1_close <= ema_now:
+                    gate_stats["zone_touch"] += 1
+                    _dbg(symbol, f"stage=ema_filter h1_close={h1_close:.6f} ema={ema_now:.6f}")
+                    continue
+            # Only accept zones touched by the latest confirmed 1h bar
             for z in zones:
-                if "live" not in z:
-                    z["live"] = True
-                if not z.get("live"):
+                if not z.get("live", True):
+                    z["_last_touch_ts"] = 0
                     continue
-                if z.get("side") == 1 and h1_close > float(z.get("top", 0)):
-                    z["live"] = False
-                elif z.get("side") == -1 and h1_close < float(z.get("bot", 0)):
-                    z["live"] = False
-        except Exception:
-            pass
-
-        touch_level = "mid" if cfg.touch_mode == "mid" else "top"
-        h1_touch_px = h1_close if cfg.touch_use_close else h1_low
-        if cfg.ema200_filter:
-            ema_len = max(1, int(getattr(cfg, "ema_filter_len", 200)))
-            ema_line = ema(close_1h, ema_len)
-            ema_now = float(ema_line.iloc[idx_1h])
-            if h1_close <= ema_now:
+                touched_now = (
+                    z.get("side") == -1
+                    and h1_touch_px <= (z.get("mid") if touch_level == "mid" else z.get("top"))
+                    and h1_high >= z.get("bot")
+                )
+                z["_last_touch_ts"] = h1_ts if touched_now else 0
+            support_candidates = [
+                z for z in zones
+                if z.get("live", True)
+                and z["side"] == -1
+                and dvf_norm >= float(cfg.dvf_norm_min)
+                and h1_touch_px <= (z["mid"] if touch_level == "mid" else z["top"])
+                and h1_high >= z["bot"]
+                and z.get("_last_touch_ts") == h1_ts
+            ]
+            if not support_candidates:
                 gate_stats["zone_touch"] += 1
+                _dbg(
+                    symbol,
+                    f"stage=zone support_candidates=0 dvf_norm={dvf_norm:.6f} h1_touch_px={h1_touch_px:.6f} h1_high={h1_high:.6f}",
+                )
                 continue
-        # Only accept zones touched by the latest confirmed 1h bar
-        for z in zones:
-            if not z.get("live", True):
-                z["_last_touch_ts"] = 0
+
+            l15_0 = float(df_15m_sig.iloc[idx_15m]["low"])
+            l15_1 = float(df_15m_sig.iloc[idx_15m - 1]["low"])
+            l15_2 = float(df_15m_sig.iloc[idx_15m - 2]["low"])
+            if not (l15_0 > l15_1 or l15_1 > l15_2):
+                gate_stats["hl_15m"] += 1
+                _dbg(symbol, f"stage=hl_15m lows={l15_2:.6f},{l15_1:.6f},{l15_0:.6f}")
                 continue
-            touched_now = (
-                z.get("side") == -1
-                and h1_touch_px <= (z.get("mid") if touch_level == "mid" else z.get("top"))
-                and h1_high >= z.get("bot")
-            )
-            z["_last_touch_ts"] = h1_ts if touched_now else 0
-        support_candidates = [
-            z for z in zones
-            if z.get("live", True)
-            and z["side"] == -1
-            and dvf_norm >= float(cfg.dvf_norm_min)
-            and h1_touch_px <= (z["mid"] if touch_level == "mid" else z["top"])
-            and h1_high >= z["bot"]
-            and z.get("_last_touch_ts") == h1_ts
-        ]
-        if not support_candidates:
-            gate_stats["zone_touch"] += 1
-            continue
+            if not (float(df_15m_sig.iloc[idx_15m]["close"]) > float(df_15m_sig.iloc[idx_15m]["open"])):
+                gate_stats["hl_15m"] += 1
+                _dbg(
+                    symbol,
+                    f"stage=hl_15m close_open_fail c={float(df_15m_sig.iloc[idx_15m]['close']):.6f} o={float(df_15m_sig.iloc[idx_15m]['open']):.6f}",
+                )
+                continue
 
-        l15_0 = float(df_15m_sig.iloc[idx_15m]["low"])
-        l15_1 = float(df_15m_sig.iloc[idx_15m - 1]["low"])
-        l15_2 = float(df_15m_sig.iloc[idx_15m - 2]["low"])
-        if not (l15_0 > l15_1 or l15_1 > l15_2):
-            gate_stats["hl_15m"] += 1
-            continue
-        if not (float(df_15m_sig.iloc[idx_15m]["close"]) > float(df_15m_sig.iloc[idx_15m]["open"])):
-            gate_stats["hl_15m"] += 1
-            continue
+            c3 = float(df_3m_eval.iloc[-1]["close"])
+            o3 = float(df_3m_eval.iloc[-1]["open"])
+            h3 = float(df_3m_eval.iloc[-1]["high"])
+            l3 = float(df_3m_eval.iloc[-1]["low"])
+            high_prev = [
+                float(df_3m_eval.iloc[-2]["high"]),
+                float(df_3m_eval.iloc[-3]["high"]),
+                float(df_3m_eval.iloc[-4]["high"]),
+            ]
+            high_max = max(high_prev)
+            strong_break = c3 > high_max
+            weak_break = (h3 > high_max) and (c3 <= high_max) and (c3 > o3)
+            if not strong_break and not weak_break:
+                gate_stats["break_3m"] += 1
+                _dbg(
+                    symbol,
+                    f"stage=break_3m strong=0 weak=0 c3={c3:.6f} o3={o3:.6f} h3={h3:.6f} high_max={high_max:.6f}",
+                )
+                continue
 
-        if len(df_3m_sig) < 4:
-            gate_stats["break_3m"] += 1
-            continue
-        c3 = float(df_3m_sig.iloc[-1]["close"])
-        o3 = float(df_3m_sig.iloc[-1]["open"])
-        h3 = float(df_3m_sig.iloc[-1]["high"])
-        l3 = float(df_3m_sig.iloc[-1]["low"])
-        high_prev = [
-            float(df_3m_sig.iloc[-2]["high"]),
-            float(df_3m_sig.iloc[-3]["high"]),
-            float(df_3m_sig.iloc[-4]["high"]),
-        ]
-        high_max = max(high_prev)
-        strong_break = c3 > high_max
-        weak_break = (h3 > high_max) and (c3 <= high_max) and (c3 > o3)
-        if not strong_break and not weak_break:
-            gate_stats["break_3m"] += 1
-            continue
+            retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
+            break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
+            now_ts_ms = latest_ts_ms
 
-        retest_active = bool(sym_state.get("retest_active"))
-        retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
-        retest_until = int(sym_state.get("retest_until", 0) or 0)
-        break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
-        now_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
+            retest_bars = int(cfg.retest_bars)
+            if cfg.retest_dyn:
+                atr_3m = atr(df_3m_eval, 14)
+                atr_15m = atr(df_15m_sig, 14)
+                atr3 = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
+                atr15 = float(atr_15m.iloc[idx_15m]) if not np.isnan(atr_15m.iloc[idx_15m]) else 0.0
+                if atr15 > 0 and (atr3 / atr15) < float(cfg.retest_dyn_th):
+                    retest_bars = max(retest_bars, int(cfg.retest_dyn_bars))
 
-        retest_bars = int(cfg.retest_bars)
-        if cfg.retest_dyn:
-            atr_3m = atr(df_3m_sig, 14)
-            atr_15m = atr(df_15m_sig, 14)
-            atr3 = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
-            atr15 = float(atr_15m.iloc[idx_15m]) if not np.isnan(atr_15m.iloc[idx_15m]) else 0.0
-            if atr15 > 0 and (atr3 / atr15) < float(cfg.retest_dyn_th):
-                retest_bars = max(retest_bars, int(cfg.retest_dyn_bars))
+            if strong_break or weak_break:
+                retest_level = high_max
+                sym_state["retest_level"] = retest_level
+                sym_state["retest_until"] = now_ts_ms + int(retest_bars * 3 * 60 * 1000)
+                sym_state["retest_active"] = True
+                sym_state["break_type"] = "strong" if strong_break else "weak"
+                gate_stats["retest_seen"] += 1
 
-        if strong_break or weak_break:
-            retest_level = high_max
-            retest_until = now_ts_ms + int(retest_bars * 3 * 60 * 1000)
-            sym_state["retest_level"] = retest_level
-            sym_state["retest_until"] = retest_until
-            sym_state["retest_active"] = True
-            sym_state["break_type"] = "strong" if strong_break else "weak"
-            gate_stats["retest_seen"] += 1
+            if sym_state.get("retest_active") and now_ts_ms <= int(sym_state.get("retest_until", 0) or 0):
+                atr_3m = atr(df_3m_eval, 14)
+                atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
+                rng = float(df_3m_eval.iloc[-1]["high"]) - float(df_3m_eval.iloc[-1]["low"])
+                lower_wick = min(float(df_3m_eval.iloc[-1]["open"]), float(df_3m_eval.iloc[-1]["close"])) - float(df_3m_eval.iloc[-1]["low"])
+                lower_wick_ratio = (lower_wick / rng) if rng > 0 else 0.0
+                if l3 <= retest_level + (atr_now * float(cfg.retest_atr_mult)):
+                    entry_ok = False
+                    if c3 > retest_level:
+                        entry_ok = True
+                        gate_stats["entry_by_pass_close"] += 1
+                    elif h3 > retest_level and c3 > o3 and lower_wick_ratio <= 0.40:
+                        entry_ok = True
+                        gate_stats["entry_by_pass_high"] += 1
+                    elif (not strong_break) and (l3 > retest_level - (atr_now * float(cfg.shallow_atr_mult))) and (c3 > o3) and dvf_norm >= float(cfg.shallow_dvf_min) and lower_wick_ratio <= float(cfg.shallow_wick_max):
+                        entry_ok = True
+                        gate_stats["entry_by_pass_high"] += 1
+                    if not entry_ok:
+                        _dbg(
+                            symbol,
+                            f"stage=retest pattern_fail strong={int(strong_break)} weak={int(weak_break)} c3={c3:.6f} o3={o3:.6f} h3={h3:.6f} l3={l3:.6f} level={retest_level:.6f}",
+                        )
+                        continue
 
-        if sym_state.get("retest_active") and now_ts_ms <= int(sym_state.get("retest_until", 0) or 0):
-            atr_3m = atr(df_3m_sig, 14)
-            atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
-            rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
-            lower_wick = min(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"])) - float(df_3m_sig.iloc[-1]["low"])
-            lower_wick_ratio = (lower_wick / rng) if rng > 0 else 0.0
-            if l3 <= retest_level + (atr_now * float(cfg.retest_atr_mult)):
-                entry_ok = False
-                if c3 > retest_level:
-                    entry_ok = True
-                    gate_stats["entry_by_pass_close"] += 1
-                elif h3 > retest_level and c3 > o3 and lower_wick_ratio <= 0.40:
-                    entry_ok = True
-                    gate_stats["entry_by_pass_high"] += 1
-                elif (not strong_break) and (l3 > retest_level - (atr_now * float(cfg.shallow_atr_mult))) and (c3 > o3) and dvf_norm >= float(cfg.shallow_dvf_min) and lower_wick_ratio <= float(cfg.shallow_wick_max):
-                    entry_ok = True
-                    gate_stats["entry_by_pass_high"] += 1
-                if not entry_ok:
-                    continue
-
-                ema_entry = None
-                try:
-                    ema_entry = float(ema(df_3m_sig["close"], int(cfg.entry_ema_len)).iloc[-1])
-                except Exception:
                     ema_entry = None
-                entry_target = None
-                if isinstance(ema_entry, (int, float)) and atr_now > 0:
-                    entry_target = float(ema_entry) - (atr_now * float(cfg.entry_atr_offset))
-                if entry_target is None or l3 > entry_target:
-                    continue
-                entry_px = float(entry_target)
-                nearest = min(support_candidates, key=lambda z: abs(z["mid"] - entry_px))
-                if not (c3 >= nearest["mid"] or entry_px >= nearest["top"] - (atr_now * 0.2)):
-                    if SR_PRO_LONG_DEBUG_NEAREST:
-                        try:
-                            log_fn(
-                                f"{cycle_tag}_NEAREST_FAIL "
-                                f"sym={symbol} ts={_iso_kst(now_ts_ms/1000) if now_ts_ms else 'NA'} "
-                                f"close_3m={c3:.6f} entry={entry_px:.6f} "
-                                f"zone_mid={float(nearest['mid']):.6f} zone_top={float(nearest['top']):.6f} zone_bot={float(nearest['bot']):.6f} "
-                                f"atr3={atr_now:.6f} cond_rhs={(float(nearest['top']) - (atr_now * 0.2)):.6f}"
-                            )
-                        except Exception:
-                            pass
-                    sym_state["retest_active"] = True
-                    continue
-                sl_raw = nearest["bot"] - (atr_now * float(cfg.sl_atr_mult))
-                sl_price = min(sl_raw, entry_px - (atr_now * 1.0))
-                tp_atr = cfg.tp_atr_mult_weak if break_type == "weak" else cfg.tp_atr_mult
-                if tp_atr and tp_atr > 0:
-                    tp_price = entry_px + (atr_now * float(tp_atr))
-                else:
-                    tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
+                    try:
+                        ema_entry = float(ema(df_3m_eval["close"], int(cfg.entry_ema_len)).iloc[-1])
+                    except Exception:
+                        ema_entry = None
+                    entry_target = None
+                    if isinstance(ema_entry, (int, float)) and atr_now > 0:
+                        entry_target = float(ema_entry) - (atr_now * float(cfg.entry_atr_offset))
+                    if entry_target is None or l3 > entry_target:
+                        _dbg(
+                            symbol,
+                            f"stage=entry_target low={l3:.6f} target={entry_target if entry_target is not None else 'None'} ema={ema_entry if ema_entry is not None else 'None'} atr3={atr_now:.6f}",
+                        )
+                        continue
+                    entry_px = float(entry_target)
+                    nearest = min(support_candidates, key=lambda z: abs(z["mid"] - entry_px))
+                    if not (c3 >= nearest["mid"] or entry_px >= nearest["top"] - (atr_now * 0.2)):
+                        if SR_PRO_LONG_DEBUG_NEAREST:
+                            try:
+                                log_fn(
+                                    f"{cycle_tag}_NEAREST_FAIL "
+                                    f"sym={symbol} ts={_iso_kst(now_ts_ms/1000) if now_ts_ms else 'NA'} "
+                                    f"close_3m={c3:.6f} entry={entry_px:.6f} "
+                                    f"zone_mid={float(nearest['mid']):.6f} zone_top={float(nearest['top']):.6f} zone_bot={float(nearest['bot']):.6f} "
+                                    f"atr3={atr_now:.6f} cond_rhs={(float(nearest['top']) - (atr_now * 0.2)):.6f}"
+                                )
+                            except Exception:
+                                pass
+                        sym_state["retest_active"] = True
+                        continue
+                    sl_raw = nearest["bot"] - (atr_now * float(cfg.sl_atr_mult))
+                    sl_price = min(sl_raw, entry_px - (atr_now * 1.0))
+                    tp_atr = cfg.tp_atr_mult_weak if break_type == "weak" else cfg.tp_atr_mult
+                    if tp_atr and tp_atr > 0:
+                        tp_price = entry_px + (atr_now * float(tp_atr))
+                    else:
+                        tp_price = entry_px * (cfg.tp_mult if break_type == "strong" else cfg.tp_mult_weak)
 
-                usdt = _resolve_entry_usdt()
-                if usdt <= 0 or not _admin_is_active():
-                    continue
-                if _exit_cooldown_blocked(state, symbol, reason_name, "LONG"):
-                    gate_stats["cooldown"] += 1
-                    continue
-                log_fn(
-                    f"{cycle_tag}_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={break_type}"
-                )
-                req_id = _enqueue_entry_request(
-                    state,
-                    symbol=symbol,
-                    side="LONG",
-                    engine=engine_name,
-                    reason=reason_name,
-                    usdt=usdt,
-                    live=LONG_LIVE_TRADING,
-                    entry_price_hint=entry_px,
-                    meta={
-                        "sl_price": float(sl_price),
-                        "tp_price": float(tp_price),
-                        "sl_pct": ((entry_px - float(sl_price)) / entry_px * 100.0) if entry_px > 0 else None,
-                        "tp_pct": ((float(tp_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
-                        "track": break_type,
-                    },
-                )
-                if req_id:
-                    result["entries"] += 1
+                    usdt = _resolve_entry_usdt()
+                    if usdt <= 0 or not _admin_is_active():
+                        _dbg(symbol, f"stage=usdt_or_admin usdt={usdt} admin={int(_admin_is_active())}")
+                        continue
+                    if _exit_cooldown_blocked(state, symbol, reason_name, "LONG"):
+                        gate_stats["cooldown"] += 1
+                        _dbg(symbol, "stage=exit_cooldown_blocked")
+                        continue
+                    log_fn(
+                        f"{cycle_tag}_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={break_type}"
+                    )
+                    req_id = _enqueue_entry_request(
+                        state,
+                        symbol=symbol,
+                        side="LONG",
+                        engine=engine_name,
+                        reason=reason_name,
+                        usdt=usdt,
+                        live=LONG_LIVE_TRADING,
+                        entry_price_hint=entry_px,
+                        meta={
+                            "sl_price": float(sl_price),
+                            "tp_price": float(tp_price),
+                            "sl_pct": ((entry_px - float(sl_price)) / entry_px * 100.0) if entry_px > 0 else None,
+                            "tp_pct": ((float(tp_price) - entry_px) / entry_px * 100.0) if entry_px > 0 else None,
+                            "track": break_type,
+                        },
+                    )
+                    if req_id:
+                        result["entries"] += 1
+                    sym_state["retest_active"] = False
+                    entered = True
+                    break
+            if sym_state.get("retest_active") and now_ts_ms > int(sym_state.get("retest_until", 0) or 0):
                 sym_state["retest_active"] = False
-                continue
-        if sym_state.get("retest_active") and now_ts_ms > int(sym_state.get("retest_until", 0) or 0):
-            sym_state["retest_active"] = False
+        if entered:
+            continue
     log_fn(
         f"{cycle_tag}_GATE_SUMMARY "
         f"checked={checked} no_data={no_data} "
@@ -11810,6 +11887,8 @@ def _process_manage_queue(state: dict, send_telegram) -> None:
             "SR_PRO_SHORT_V1",
             "SR_PRO_SHORT_V2",
             "SR_PRO_LONG_V1",
+            "SR_PRO_LONG_V2",
+            "SCOUT_ONLY_EXHAUSTION_SHORT",
             "MANUAL",
             "UNKNOWN",
         }
@@ -18477,10 +18556,21 @@ def run():
                     new_1m_bar = bool(last_1m_open and last_1m_open != prev_1m_open)
                     new_3m_bar = bool(last_3m_open and last_3m_open != prev_3m_open)
                     new_15m_bar = bool(last_15m_open and last_15m_open != prev_15m_open)
+                    missed_3m_bars = 0
+                    if prev_3m_open and last_3m_open and last_3m_open > prev_3m_open:
+                        missed_3m_bars = max(0, int((last_3m_open - prev_3m_open) // three_min_ms) - 1)
                     if new_1m_bar:
                         state["_last_rt_1m_open"] = last_1m_open
                     if new_3m_bar:
                         state["_last_rt_3m_open"] = last_3m_open
+                        if missed_3m_bars > 0:
+                            try:
+                                print(
+                                    f"[CYCLE][WARN] missed_3m_bars={missed_3m_bars} "
+                                    f"prev={_ts_to_kst_str(prev_3m_open/1000)} last={_ts_to_kst_str(last_3m_open/1000)}"
+                                )
+                            except Exception:
+                                pass
                     if new_15m_bar:
                         state["_last_rt_15m_open"] = last_15m_open
                     try:
