@@ -26,7 +26,7 @@ class ShortBend15m3mConfig:
     # 15m 꺾임 조건
     bend_need_close_down: bool = True
     htf_require_vol_confirm: bool = True
-    htf_vol_mult_min: float = 1.2
+    htf_vol_mult_min: float = 1.0
     htf_vol_spike_lookback: int = 10
     htf_vol_spike_mult: float = 1.00
 

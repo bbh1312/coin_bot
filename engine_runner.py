@@ -1473,6 +1473,7 @@ COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "fals
 COMMON_WARMUP_WS = os.getenv("COMMON_WARMUP_WS", "0") in ("1", "true", "on", "yes")
 COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
 COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "12"))
+COMMON_UNIVERSE_REFRESH_MINUTE = max(0, min(59, int(os.getenv("COMMON_UNIVERSE_REFRESH_MINUTE", "0"))))
 COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "50"))
 COMMON_WARMUP_NOTIFY_COOLDOWN_SEC = int(os.getenv("COMMON_WARMUP_NOTIFY_COOLDOWN_SEC", "3600"))
 _COMMON_WARMUP_NOTIFY_TS_MEM = 0.0
@@ -2054,7 +2055,8 @@ def _build_common_universe(tickers: dict, symbols: list) -> list:
         if excluded_bases:
             pct_all_map = {s: v for s, v in pct_all_map.items() if _symbol_base(s) not in excluded_bases}
             qv_all_map = {s: v for s, v in qv_all_map.items() if _symbol_base(s) not in excluded_bases}
-        shared_universe = [s for s, _ in sorted(pct_all_map.items(), key=lambda x: abs(x[1]), reverse=True)]
+        shared_universe = [s for s, v in pct_all_map.items() if float(v) > 0.0]
+        shared_universe = [s for s, _ in sorted(((s, pct_all_map[s]) for s in shared_universe), key=lambda x: x[1], reverse=True)]
         shared_universe = [s for s in shared_universe if qv_all_map.get(s, 0) >= shared_min_qv]
         shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
         if shared_top_n:
@@ -2449,7 +2451,9 @@ def _maybe_daily_refresh_common_universe(state: dict, tickers: dict, symbols: li
         now_kst = _kst_now()
         if not _is_even_kst_day(now_kst):
             return False
-        if now_kst.hour < COMMON_UNIVERSE_REFRESH_HOUR:
+        now_minute_of_day = int(now_kst.hour) * 60 + int(now_kst.minute)
+        refresh_minute_of_day = int(COMMON_UNIVERSE_REFRESH_HOUR) * 60 + int(COMMON_UNIVERSE_REFRESH_MINUTE)
+        if now_minute_of_day < refresh_minute_of_day:
             return False
         today = now_kst.strftime("%Y-%m-%d")
         if state.get("_common_universe_refresh_date") == today:

@@ -12,7 +12,7 @@ class ScoutOnlyExhaustionShortConfig:
     pump_rise_3bars_min: float = 0.06
     pump_rise_1bar_min: float = 0.02
     pump_mfi_min: float = 99.0
-    pump_vol_mult_min: float = 3.0
+    pump_vol_mult_min: float = 2.8
     pump_bb_excess_mult: float = 0.60
     pump_optional_min_score: int = 1
     pump_use_score_mode: bool = True
