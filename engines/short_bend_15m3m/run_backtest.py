@@ -99,7 +99,17 @@ def _minute_str(ts_ms: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
-def _fmt_summary_line(symbol: Optional[str], stats: Dict[str, float], base_usdt: float) -> str:
+def _dow_label(dt: datetime) -> str:
+    return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][dt.weekday()]
+
+
+def _fmt_summary_line(
+    symbol: Optional[str],
+    stats: Dict[str, float],
+    base_usdt: float,
+    last_day_exits: int,
+    entry_syms: int,
+) -> str:
     trades = int(stats.get("trades", 0))
     wins = int(stats.get("wins", 0))
     losses = int(stats.get("losses", 0))
@@ -116,9 +126,10 @@ def _fmt_summary_line(symbol: Optional[str], stats: Dict[str, float], base_usdt:
         f"[BACKTEST] {tag} entries={entries} exits={exits} trades={trades} "
         f"wins={wins} losses={losses} winrate={winrate:.2f}% "
         f"tp={tp} sl={sl} avg_mfe={avg_mfe:.4f} avg_mae={avg_mae:.4f} avg_hold={avg_hold:.1f} "
+        f"last_day_exits={last_day_exits} "
         f"base_usdt={base_usdt:.2f} tp_sum={stats.get('tp_sum', 0.0):.3f} "
         f"sl_sum={stats.get('sl_sum', 0.0):.3f} net_sum={stats.get('net_sum', 0.0):.3f} "
-        f"net_sum_usdt={stats.get('net_sum_usdt', 0.0):.3f}"
+        f"net_sum_usdt={stats.get('net_sum_usdt', 0.0):.3f} entry_syms={entry_syms}"
     )
 
 
@@ -210,6 +221,11 @@ def run_backtest() -> None:
     stats = _new_stats()
     per_symbol: Dict[str, Dict[str, float]] = {}
     exit_logs: List[dict] = []
+    open_logs: List[dict] = []
+    entry_symbols: set[str] = set()
+    hour_stats: Dict[int, Dict[str, int]] = {}
+    dow_stats: Dict[str, Dict[str, int]] = {}
+    date_stats: Dict[str, Dict[str, float]] = {}
 
     for sym in universe:
         rows15 = _fetch_ohlcv_all(
@@ -393,6 +409,17 @@ def run_backtest() -> None:
             stats["entries"] += 1
             sym_stats["entries"] += 1
             gates["entry_hit"] += 1
+            entry_symbols.add(sym)
+            dt_kst = datetime.fromtimestamp(entry_ts / 1000.0, tz=timezone.utc) + timedelta(hours=9)
+            hour_bucket = dt_kst.hour
+            dow_bucket = _dow_label(dt_kst)
+            day_bucket = dt_kst.strftime("%Y-%m-%d")
+            hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
+            dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
+            date_stats.setdefault(day_bucket, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0})
+            hour_stats[hour_bucket]["entries"] += 1
+            dow_stats[dow_bucket]["entries"] += 1
+            date_stats[day_bucket]["entries"] += 1
 
             exited = False
             for k in range(entry_i, len(d3)):
@@ -452,6 +479,7 @@ def run_backtest() -> None:
                         "reason": reason,
                         "tp_pct": abs(tp - entry_px) / max(entry_px, 1e-12) * 100.0,
                         "sl_pct": abs(sl - entry_px) / max(entry_px, 1e-12) * 100.0,
+                        "pnl_pct": pnl,
                     }
                 )
                 next_eligible_ts = ts3
@@ -461,31 +489,147 @@ def run_backtest() -> None:
             if not exited:
                 open_left = True
                 gates["open_left"] += 1
+                last_px = float(d3.iloc[-1]["close"]) if len(d3) > 0 else entry_px
+                last_ts = int(d3.iloc[-1]["ts"]) if len(d3) > 0 else entry_ts
+                unrealized = (entry_px - last_px) / max(entry_px, 1e-12) * 100.0
+                open_logs.append(
+                    {
+                        "sym": sym,
+                        "mode": "short_bend_15m3m",
+                        "side": "SHORT",
+                        "entry_ts": entry_ts,
+                        "entry_px": entry_px,
+                        "last_px": last_px,
+                        "last_ts": last_ts,
+                        "unrealized_pct": unrealized,
+                    }
+                )
                 break
 
         if open_left:
             continue
 
+    for ex in exit_logs:
+        dt_kst = datetime.fromtimestamp(ex["entry_ts"] / 1000.0, tz=timezone.utc) + timedelta(hours=9)
+        hour_bucket = dt_kst.hour
+        dow_bucket = _dow_label(dt_kst)
+        day_bucket = dt_kst.strftime("%Y-%m-%d")
+        hour_stats.setdefault(hour_bucket, {"entries": 0, "tp": 0, "sl": 0})
+        dow_stats.setdefault(dow_bucket, {"entries": 0, "tp": 0, "sl": 0})
+        date_stats.setdefault(day_bucket, {"entries": 0, "tp": 0, "sl": 0, "net_sum": 0.0, "net_sum_usdt": 0.0})
+        date_stats[day_bucket]["net_sum"] += float(ex.get("pnl_pct", 0.0))
+        date_stats[day_bucket]["net_sum_usdt"] += float(ex.get("pnl_pct", 0.0)) * float(args.base_usdt)
+        if ex["reason"] == "TP":
+            hour_stats[hour_bucket]["tp"] += 1
+            dow_stats[dow_bucket]["tp"] += 1
+            date_stats[day_bucket]["tp"] += 1
+        elif ex["reason"] == "SL":
+            hour_stats[hour_bucket]["sl"] += 1
+            dow_stats[dow_bucket]["sl"] += 1
+            date_stats[day_bucket]["sl"] += 1
+
+    last_day_threshold = end_ms - (24 * 60 * 60 * 1000)
+
     for sym, sym_stats in sorted(per_symbol.items(), key=lambda x: float(x[1].get("net_sum_usdt", 0.0)), reverse=True):
         if not (sym_stats.get("entries", 0) or sym_stats.get("trades", 0)):
             continue
-        print(_fmt_summary_line(sym, sym_stats, float(args.base_usdt)))
-        sym_exits = [ex for ex in exit_logs if ex["sym"] == sym]
-        sym_exits.sort(key=lambda x: x["entry_ts"], reverse=True)
-        for item in sym_exits:
-            result = "WIN" if item.get("reason") == "TP" else "LOSS"
-            print(
-                "[BACKTEST][EXIT] "
-                f"sym={item['sym']} mode={item['mode']} side={item['side']} "
-                f"entry_dt={_minute_str(item['entry_ts'])} exit_dt={_minute_str(item['exit_ts'])} "
-                f"entry_px={item['entry_px']:.6f} exit_px={item['exit_px']:.6f} "
-                f"reason={item['reason']} result={result} "
-                f"tp_pct={float(item.get('tp_pct', 0.0)):.2f} sl_pct={float(item.get('sl_pct', 0.0)):.2f}"
+        sym_last_day_exits = sum(1 for ex in exit_logs if ex["sym"] == sym and ex["exit_ts"] >= last_day_threshold)
+        print(
+            _fmt_summary_line(
+                sym,
+                sym_stats,
+                float(args.base_usdt),
+                sym_last_day_exits,
+                1 if sym_stats.get("entries", 0) > 0 else 0,
             )
+        )
+        sym_items: List[dict] = []
+        sym_items.extend([ex for ex in exit_logs if ex["sym"] == sym])
+        sym_items.extend([op for op in open_logs if op["sym"] == sym])
+        sym_items.sort(key=lambda x: x["entry_ts"], reverse=True)
+        for item in sym_items:
+            if "exit_ts" in item:
+                result = "WIN" if item.get("reason") == "TP" else "LOSS" if item.get("reason") == "SL" else "OTHER"
+                print(
+                    "[BACKTEST][EXIT] "
+                    f"sym={item['sym']} mode={item['mode']} side={item['side']} "
+                    f"entry_dt={_minute_str(item['entry_ts'])} exit_dt={_minute_str(item['exit_ts'])} "
+                    f"entry_px={item['entry_px']:.6f} exit_px={item['exit_px']:.6f} "
+                    f"reason={item['reason']} result={result} "
+                    f"tp_pct={float(item.get('tp_pct', 0.0)):.2f} sl_pct={float(item.get('sl_pct', 0.0)):.2f}"
+                )
+            else:
+                print(
+                    "[BACKTEST][OPEN] "
+                    f"sym={item['sym']} mode={item['mode']} side={item['side']} "
+                    f"entry_dt={_minute_str(item['entry_ts'])} exit_dt= "
+                    f"entry_px={item['entry_px']:.6f} last_px={item['last_px']:.6f} "
+                    f"last_dt={_minute_str(item['last_ts'])} unrealized_pct={item['unrealized_pct']:.2f}%"
+                )
 
-    print(_fmt_summary_line(None, stats, float(args.base_usdt)))
+    total_last_day_exits = sum(1 for ex in exit_logs if ex["exit_ts"] >= last_day_threshold)
+    print(
+        _fmt_summary_line(
+            None,
+            stats,
+            float(args.base_usdt),
+            total_last_day_exits,
+            len(entry_symbols),
+        )
+    )
     if args.log_gates:
         print(f"[BACKTEST] GATES {gates}")
+
+    print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")
+    for hour in range(24):
+        bucket = hour_stats.get(hour, {"entries": 0, "tp": 0, "sl": 0})
+        entries = bucket["entries"]
+        sl_cnt = bucket["sl"]
+        sl_rate = (sl_cnt / entries * 100.0) if entries > 0 else 0.0
+        print(f"[BACKTEST] HOUR {hour:02d} entries={entries} tp={bucket['tp']} sl={sl_cnt} sl_rate={sl_rate:.2f}%")
+
+    print("[BACKTEST] BY_DOW(KST) dow entries tp sl sl_rate")
+    for dow in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
+        bucket = dow_stats.get(dow, {"entries": 0, "tp": 0, "sl": 0})
+        entries = bucket["entries"]
+        sl_cnt = bucket["sl"]
+        sl_rate = (sl_cnt / entries * 100.0) if entries > 0 else 0.0
+        print(f"[BACKTEST] DOW {dow} entries={entries} tp={bucket['tp']} sl={sl_cnt} sl_rate={sl_rate:.2f}%")
+
+    if date_stats:
+        print("[BACKTEST] BY_DATE(KST) date entries tp sl sl_rate winrate net_sum net_sum_usdt")
+        total_entries = 0
+        total_tp = 0
+        total_sl = 0
+        total_net_sum = 0.0
+        total_net_sum_usdt = 0.0
+        for day_key in sorted(date_stats.keys()):
+            bucket = date_stats[day_key]
+            entries = int(bucket.get("entries", 0))
+            tp_cnt = int(bucket.get("tp", 0))
+            sl_cnt = int(bucket.get("sl", 0))
+            trades = tp_cnt + sl_cnt
+            sl_rate = (sl_cnt / entries * 100.0) if entries > 0 else 0.0
+            winrate = (tp_cnt / trades * 100.0) if trades > 0 else 0.0
+            net_sum = float(bucket.get("net_sum", 0.0))
+            net_sum_usdt = float(bucket.get("net_sum_usdt", 0.0))
+            total_entries += entries
+            total_tp += tp_cnt
+            total_sl += sl_cnt
+            total_net_sum += net_sum
+            total_net_sum_usdt += net_sum_usdt
+            print(
+                f"[BACKTEST] DATE {day_key} entries={entries} tp={tp_cnt} sl={sl_cnt} "
+                f"sl_rate={sl_rate:.2f}% winrate={winrate:.2f}% net_sum={net_sum:.3f} net_sum_usdt={net_sum_usdt:.3f}"
+            )
+        total_trades = total_tp + total_sl
+        total_sl_rate = (total_sl / total_entries * 100.0) if total_entries > 0 else 0.0
+        total_winrate = (total_tp / total_trades * 100.0) if total_trades > 0 else 0.0
+        print(
+            f"[BACKTEST] DATE TOTAL entries={total_entries} tp={total_tp} sl={total_sl} "
+            f"sl_rate={total_sl_rate:.2f}% winrate={total_winrate:.2f}% "
+            f"net_sum={total_net_sum:.3f} net_sum_usdt={total_net_sum_usdt:.3f}"
+        )
 
 
 if __name__ == "__main__":

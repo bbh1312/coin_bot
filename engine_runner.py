@@ -75,7 +75,7 @@ try:
     from engines.sr_pro_common import build_sr_zones
     from engines.scout_only_exhaustion_short.engine import ScoutOnlyExhaustionShortConfig
     from engines.sr_pro_short_v1.engine import SrProShortV1Config
-    from engines.sr_pro_short_v2.engine import SrProShortV2Config
+    SrProShortV2Config = None
     from engines.sr_pro_long_v1.engine import SrProLongV1Config
     from engines.sr_pro_long_v2.engine import SrProLongV2Config
     from engines.short_bend_15m3m.engine import ShortBend15m3mConfig
@@ -1199,7 +1199,8 @@ ANTI_ALPHA_V1_ENABLED = False
 NOISE_REVERSE_V1_ENABLED = False
 SR_PRO_SHORT_V1_ENABLED = os.getenv("SR_PRO_SHORT_V1_ENABLED", "0") == "1"
 SR_PRO_SHORT_BOUNDARY_GUARD_ENABLED = os.getenv("SR_PRO_SHORT_BOUNDARY_GUARD_ENABLED", "0") == "1"
-SR_PRO_SHORT_V2_ENABLED = os.getenv("SR_PRO_SHORT_V2_ENABLED", "0") == "1"
+# Removed: SR Pro Short V2
+SR_PRO_SHORT_V2_ENABLED = False
 SHORT_BEND_15M3M_ENABLED = os.getenv("SHORT_BEND_15M3M_ENABLED", "0") == "1"
 SR_PRO_LONG_V1_ENABLED = os.getenv("SR_PRO_LONG_V1_ENABLED", "0") == "1"
 SR_PRO_LONG_V2_ENABLED = os.getenv("SR_PRO_LONG_V2_ENABLED", "0") == "1"
@@ -15091,8 +15092,9 @@ def _reload_runtime_settings_from_disk(state: dict, state_path: Optional[str] = 
         ANTI_ALPHA_V1_ENABLED = bool(state.get("_anti_alpha_v1_enabled"))
     if (not skip_keys or "_sr_pro_short_v1_enabled" not in skip_keys) and isinstance(state.get("_sr_pro_short_v1_enabled"), bool):
         SR_PRO_SHORT_V1_ENABLED = bool(state.get("_sr_pro_short_v1_enabled"))
-    if (not skip_keys or "_sr_pro_short_v2_enabled" not in skip_keys) and isinstance(state.get("_sr_pro_short_v2_enabled"), bool):
-        SR_PRO_SHORT_V2_ENABLED = bool(state.get("_sr_pro_short_v2_enabled"))
+    if not skip_keys or "_sr_pro_short_v2_enabled" not in skip_keys:
+        SR_PRO_SHORT_V2_ENABLED = False
+        state["_sr_pro_short_v2_enabled"] = False
     if (not skip_keys or "_short_bend_15m3m_enabled" not in skip_keys) and isinstance(state.get("_short_bend_15m3m_enabled"), bool):
         SHORT_BEND_15M3M_ENABLED = bool(state.get("_short_bend_15m3m_enabled"))
     if (not skip_keys or "_sr_pro_long_v1_enabled" not in skip_keys) and isinstance(state.get("_sr_pro_long_v1_enabled"), bool):
@@ -16562,7 +16564,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             "--------------\n"
                             f"엔진요약: "
                             f"sr_pro={'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'} "
-                            f"sr_pro_v2={'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'} "
                             f"short_bend={'ON' if SHORT_BEND_15M3M_ENABLED else 'OFF'} "
                             f"sr_pro_long_v1={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
                             f"sr_pro_long_v2={'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'} "
@@ -16574,7 +16575,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                             f"max_fetch={COMMON_WARMUP_MAX_FETCH}\n"
                             "--------------\n"
                             f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
-                            f"/sr_pro_short_v2(추가진입): {'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'}\n"
                             f"/short_bend_15m3m(숏밴드): {'ON' if SHORT_BEND_15M3M_ENABLED else 'OFF'}\n"
                             f"/sr_pro_long_v1(롱진입): {'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'}\n"
                             f"/sr_pro_long_v2(롱진입): {'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'}\n"
@@ -16628,7 +16628,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         f"/engine_exit: {_format_engine_exit_overrides()}\n"
                         "--------------\n"
                         f"엔진요약: sr_pro={'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'} "
-                        f"sr_pro_v2={'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'} "
                         f"short_bend={'ON' if SHORT_BEND_15M3M_ENABLED else 'OFF'} "
                         f"sr_pro_long_v1={'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'} "
                         f"sr_pro_long_v2={'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'} "
@@ -16636,7 +16635,6 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                         ""
                         "--------------\n"
                         f"/sr_pro_short_v1(추가진입): {'ON' if SR_PRO_SHORT_V1_ENABLED else 'OFF'}\n"
-                        f"/sr_pro_short_v2(추가진입): {'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'}\n"
                         f"/short_bend_15m3m(숏밴드): {'ON' if SHORT_BEND_15M3M_ENABLED else 'OFF'}\n"
                         f"/sr_pro_long_v1(롱진입): {'ON' if SR_PRO_LONG_V1_ENABLED else 'OFF'}\n"
                         f"/sr_pro_long_v2(롱진입): {'ON' if SR_PRO_LONG_V2_ENABLED else 'OFF'}\n"
@@ -17002,7 +17000,7 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                     }:
                         ok = _reply(
                             "⛔ 삭제된 엔진 명령입니다.\n"
-                            "사용 가능: /sr_pro_short_v1, /sr_pro_short_v2, /short_bend_15m3m, /sr_pro_long_v1, /sr_pro_long_v2, /scout_only_exhaustion_short"
+                            "사용 가능: /sr_pro_short_v1, /short_bend_15m3m, /sr_pro_long_v1, /sr_pro_long_v2, /scout_only_exhaustion_short"
                         )
                         print(f"[telegram] deleted-engine cmd blocked: {cmd_norm} send={'ok' if ok else 'fail'}")
                         responded = True
@@ -17139,22 +17137,10 @@ def handle_telegram_commands(state: Dict[str, dict]) -> None:
                 if (cmd in ("/sr_pro_short_v2", "sr_pro_short_v2", "sr_pro_short2")) and not responded:
                     parts = lower.split()
                     arg = parts[1] if len(parts) >= 2 else "status"
-                    resp = None
-                    if arg in ("on", "1", "true", "enable", "enabled"):
-                        SR_PRO_SHORT_V2_ENABLED = True
-                        state["_sr_pro_short_v2_enabled"] = True
-                        state_dirty = True
-                        resp = "✅ sr_pro_short_v2 ON"
-                    elif arg in ("off", "0", "false", "disable", "disabled"):
-                        SR_PRO_SHORT_V2_ENABLED = False
-                        state["_sr_pro_short_v2_enabled"] = False
-                        state_dirty = True
-                        resp = "⛔ sr_pro_short_v2 OFF"
-                    else:
-                        resp = (
-                            f"ℹ️ sr_pro_short_v2 상태: {'ON' if SR_PRO_SHORT_V2_ENABLED else 'OFF'}\n"
-                            "사용법: /sr_pro_short_v2 on|off|status"
-                        )
+                    SR_PRO_SHORT_V2_ENABLED = False
+                    state["_sr_pro_short_v2_enabled"] = False
+                    state_dirty = True
+                    resp = "⛔ sr_pro_short_v2 삭제됨 (사용 불가)"
                     if resp:
                         ok = _reply(resp)
                         print(f"[telegram] sr_pro_short_v2 cmd 처리 ({arg}) send={'ok' if ok else 'fail'}")
@@ -18670,10 +18656,8 @@ def run():
         SR_PRO_SHORT_V1_ENABLED = bool(state.get("_sr_pro_short_v1_enabled"))
     else:
         state["_sr_pro_short_v1_enabled"] = SR_PRO_SHORT_V1_ENABLED
-    if isinstance(state.get("_sr_pro_short_v2_enabled"), bool):
-        SR_PRO_SHORT_V2_ENABLED = bool(state.get("_sr_pro_short_v2_enabled"))
-    else:
-        state["_sr_pro_short_v2_enabled"] = SR_PRO_SHORT_V2_ENABLED
+    SR_PRO_SHORT_V2_ENABLED = False
+    state["_sr_pro_short_v2_enabled"] = False
     if isinstance(state.get("_short_bend_15m3m_enabled"), bool):
         SHORT_BEND_15M3M_ENABLED = bool(state.get("_short_bend_15m3m_enabled"))
     else:
@@ -18750,7 +18734,7 @@ def run():
         "✅ RSI 스캐너 시작\n"
         f"auto-exit: {'ON' if AUTO_EXIT_ENABLED else 'OFF'}\n"
         f"live-trading: {'ON' if LIVE_TRADING else 'OFF'}\n"
-        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /sr_pro_short_v1 on|off|status, /sr_pro_short_v2 on|off|status, /short_bend_15m3m on|off|status, /sr_pro_long_v1 on|off|status, /sr_pro_long_v2 on|off|status, /scout_only_exhaustion_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
+        "명령: /auto_exit on|off|status, /sat_trade on|off|status, /realtime_only on|off|status, /l_exit_tp n, /l_exit_sl n, /s_exit_tp n, /s_exit_sl n, /engine_exit ENGINE SIDE tp sl, /live on|off|status, /long_live on|off|status, /entry_usdt pct, /entry_block_hours 2,3,4,7,9, /dca on|off|status, /dca_pct n, /dca1 n, /dca2 n, /dca3 n, /exit_cd_h n, /sr_pro_short_v1 on|off|status, /short_bend_15m3m on|off|status, /sr_pro_long_v1 on|off|status, /sr_pro_long_v2 on|off|status, /scout_only_exhaustion_short on|off|status, /user_active on|off|status [name], /max_pos n, /report today|yesterday, /status, /accounts, /reload_accounts"
     )
     if ADMIN_ACCOUNT_CONTEXT:
         with (ADMIN_ACCOUNT_CONTEXT.executor.activate() if ADMIN_ACCOUNT_CONTEXT else nullcontext()):
