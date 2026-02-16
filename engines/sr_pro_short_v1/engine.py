@@ -29,7 +29,7 @@ class SrProShortV1Config:
     ema200_filter: bool = True
     ema_filter_len: int = 200
     total_window_days: int = 14
-    rolling_zones: bool = True
+    rolling_zones: bool = False
     retest_bars: int = 6
     retest_atr_mult: float = 0.6
     retest_above_atr_mult: float = 0.25

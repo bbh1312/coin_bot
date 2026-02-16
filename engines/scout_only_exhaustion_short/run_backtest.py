@@ -198,6 +198,8 @@ def run_backtest() -> None:
     parser.add_argument("--scout-tp-dynamic-step", type=float, default=cfg.scout_tp_dynamic_step)
     parser.add_argument("--scout-tp-dynamic-max", type=float, default=cfg.scout_tp_dynamic_max)
     parser.add_argument("--scout-loss-cap-pct", type=float, default=cfg.scout_loss_cap_pct)
+    parser.add_argument("--sl-first", action="store_true", default=True)
+    parser.add_argument("--no-sl-first", action="store_false", dest="sl_first")
 
     parser.add_argument("--entry-usdt", type=float, default=20.0)
     parser.add_argument("--fee-bps", type=float, default=8.0)
@@ -350,22 +352,26 @@ def run_backtest() -> None:
                     continue
 
             if pos is not None:
-                hit_tp = l <= float(pos["tp"])
-                pnl_now = ((float(pos["avg_entry"]) - c) / max(float(pos["avg_entry"]), 1e-12)) * 100.0
-                hit_loss_cap = pnl_now <= (-abs(float(args.scout_loss_cap_pct)) * 100.0)
+                tp_px = float(pos["tp"])
+                loss_cap_px = float(pos["avg_entry"]) * (1.0 + abs(float(args.scout_loss_cap_pct)))
+                hit_tp = l <= tp_px
+                hit_loss_cap = h >= loss_cap_px
 
                 if not (hit_tp or hit_loss_cap):
                     continue
-                loss_cap_px = float(pos["avg_entry"]) * (1.0 + abs(float(args.scout_loss_cap_pct)))
-                if hit_tp:
-                    exit_px = float(pos["tp"])
-                    gate["exit_tp"] += 1
-                    exit_reason = "tp"
+                if hit_tp and hit_loss_cap:
+                    pick_sl = bool(args.sl_first)
                 else:
-                    exit_px = c
+                    pick_sl = bool(hit_loss_cap)
+
+                if pick_sl:
+                    exit_px = float(loss_cap_px)
                     gate["exit_loss_cap"] += 1
                     exit_reason = "loss_cap"
-                    exit_px = min(float(exit_px), float(loss_cap_px))
+                else:
+                    exit_px = float(tp_px)
+                    gate["exit_tp"] += 1
+                    exit_reason = "tp"
 
                 slip_rate = max(float(args.slip_pct), 0.0)
                 apply_slip = True

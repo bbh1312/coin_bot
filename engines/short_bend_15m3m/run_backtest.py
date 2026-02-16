@@ -338,8 +338,11 @@ def run_backtest() -> None:
                     continue
 
             gates["armed"] += 1
-            arm_end_ts = ts15 + int(args.armed_bars_3m) * 3 * 60 * 1000
-            c3 = d3[(d3["ts"] > ts15) & (d3["ts"] <= arm_end_ts)]
+            tf15_ms = 15 * 60 * 1000
+            tf3_ms = 3 * 60 * 1000
+            arm_start_ts = ts15 + (tf15_ms if bool(args.use_confirmed) else 0)
+            arm_end_ts = arm_start_ts + int(args.armed_bars_3m) * tf3_ms
+            c3 = d3[(d3["ts"] > arm_start_ts) & (d3["ts"] <= arm_end_ts)]
             if c3.empty:
                 gates["confirm_fail"] += 1
                 continue

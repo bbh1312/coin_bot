@@ -1475,6 +1475,8 @@ COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "
 COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "12"))
 COMMON_UNIVERSE_REFRESH_MINUTE = max(0, min(59, int(os.getenv("COMMON_UNIVERSE_REFRESH_MINUTE", "0"))))
 COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "50"))
+COMMON_UNIVERSE_POS_TOP_N = int(os.getenv("COMMON_UNIVERSE_POS_TOP_N", "35"))
+COMMON_UNIVERSE_ABS_TOP_N = int(os.getenv("COMMON_UNIVERSE_ABS_TOP_N", "15"))
 COMMON_WARMUP_NOTIFY_COOLDOWN_SEC = int(os.getenv("COMMON_WARMUP_NOTIFY_COOLDOWN_SEC", "3600"))
 _COMMON_WARMUP_NOTIFY_TS_MEM = 0.0
 COMMON_UNIVERSE_MAX_N = int(os.getenv("COMMON_UNIVERSE_MAX_N", "40"))
@@ -1522,6 +1524,11 @@ NOISE_REVERSE_FILE_CACHE_MISS: dict = {}
 NOISE_REVERSE_FILE_CACHE_FAIL: dict = {}
 NOISE_REVERSE_SOURCE_LOGGED: dict = {}
 SR_PRO_USE_COMMON_CACHE = os.getenv("SR_PRO_USE_COMMON_CACHE", "1") not in ("0", "false", "off", "no")
+SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST = os.getenv("SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST", "1") not in ("0", "false", "off", "no")
+SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR = os.getenv("SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR", os.path.join("logs", "common_universe")).strip()
+SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N = int(os.getenv("SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N", str(COMMON_UNIVERSE_TOP_N or 50)))
+SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST = os.getenv("SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST", "1") not in ("0", "false", "off", "no")
+SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N = int(os.getenv("SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N", str(COMMON_UNIVERSE_TOP_N or 50)))
 
 
 def _exclude_common_symbols(universe: list) -> list:
@@ -2031,6 +2038,8 @@ def _build_common_universe(tickers: dict, symbols: list) -> list:
             symbols=symbols,
             min_quote_volume_usdt=shared_min_qv,
             top_n=shared_top_n,
+            pos_top_n=COMMON_UNIVERSE_POS_TOP_N,
+            abs_top_n=COMMON_UNIVERSE_ABS_TOP_N,
             anchors=anchors,
             excluded_bases=excluded_bases,
         )
@@ -2055,11 +2064,33 @@ def _build_common_universe(tickers: dict, symbols: list) -> list:
         if excluded_bases:
             pct_all_map = {s: v for s, v in pct_all_map.items() if _symbol_base(s) not in excluded_bases}
             qv_all_map = {s: v for s, v in qv_all_map.items() if _symbol_base(s) not in excluded_bases}
-        shared_universe = [s for s, v in pct_all_map.items() if float(v) > 0.0]
-        shared_universe = [s for s, _ in sorted(((s, pct_all_map[s]) for s in shared_universe), key=lambda x: x[1], reverse=True)]
-        shared_universe = [s for s in shared_universe if qv_all_map.get(s, 0) >= shared_min_qv]
-        shared_universe = [s for s in anchors] + [s for s in shared_universe if s not in anchors]
-        if shared_top_n:
+        pos_candidates = [s for s, v in pct_all_map.items() if float(v) > 0.0]
+        pos_candidates = [s for s, _ in sorted(((s, pct_all_map[s]) for s in pos_candidates), key=lambda x: x[1], reverse=True)]
+        abs_candidates = [s for s, _ in sorted(((s, abs(v)) for s, v in pct_all_map.items()), key=lambda x: x[1], reverse=True)]
+        pos_candidates = [s for s in pos_candidates if qv_all_map.get(s, 0) >= shared_min_qv]
+        abs_candidates = [s for s in abs_candidates if qv_all_map.get(s, 0) >= shared_min_qv]
+        shared_universe = []
+        for s in pos_candidates:
+            if s in shared_universe:
+                continue
+            shared_universe.append(s)
+            if len(shared_universe) >= COMMON_UNIVERSE_POS_TOP_N:
+                break
+        target_non_anchor = COMMON_UNIVERSE_POS_TOP_N + COMMON_UNIVERSE_ABS_TOP_N
+        for s in abs_candidates:
+            if s in shared_universe:
+                continue
+            shared_universe.append(s)
+            if len(shared_universe) >= target_non_anchor:
+                break
+        # Fallback fill: if positive+abs buckets are insufficient, append anchors.
+        for s in anchors:
+            if s in shared_universe:
+                continue
+            shared_universe.append(s)
+            if shared_top_n and len(shared_universe) >= shared_top_n:
+                break
+        if shared_top_n and len(shared_universe) > shared_top_n:
             shared_universe = shared_universe[:shared_top_n]
     if COMMON_UNIVERSE_MAX_N and len(shared_universe) > COMMON_UNIVERSE_MAX_N:
         shared_universe = shared_universe[:COMMON_UNIVERSE_MAX_N]
@@ -2406,6 +2437,73 @@ def _is_even_kst_day(dt: Optional[datetime] = None) -> bool:
         return (int(cur.day) % 2) == 0
     except Exception:
         return False
+
+
+def _latest_even_day_0030_kst_anchor(now_kst: Optional[datetime] = None) -> datetime:
+    cur = now_kst if isinstance(now_kst, datetime) else _kst_now()
+    anchor = cur.replace(hour=0, minute=30, second=0, microsecond=0)
+    if cur < anchor:
+        anchor = anchor - timedelta(days=1)
+    while (int(anchor.day) % 2) != 0:
+        anchor = anchor - timedelta(days=1)
+    return anchor
+
+
+def _latest_even_day_0030_kst_anchor_ms(now_ts: Optional[float] = None) -> int:
+    try:
+        if now_ts is not None:
+            cur = datetime.fromtimestamp(float(now_ts), tz=timezone.utc) + timedelta(hours=9)
+        else:
+            cur = _kst_now()
+        anchor_kst = _latest_even_day_0030_kst_anchor(cur)
+        return int((anchor_kst - timedelta(hours=9)).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _load_common_universe_snapshot_for_anchor(anchor_ms: int, top_n: int) -> tuple[list, str]:
+    log_dir = SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR
+    if (not log_dir) or (not os.path.isdir(log_dir)):
+        return [], ""
+    candidates: list[tuple[float, str]] = []
+    try:
+        for name in os.listdir(log_dir):
+            if not (name.startswith("common_universe_") and name.endswith(".log")):
+                continue
+            full = os.path.join(log_dir, name)
+            try:
+                mtime = float(os.path.getmtime(full))
+            except Exception:
+                continue
+            candidates.append((mtime, full))
+    except Exception:
+        return [], ""
+    if not candidates:
+        return [], ""
+    anchor_sec = float(anchor_ms) / 1000.0 if anchor_ms else 0.0
+    chosen = ""
+    if anchor_sec > 0:
+        before = [c for c in candidates if c[0] <= anchor_sec]
+        if before:
+            before.sort(key=lambda x: x[0], reverse=True)
+            chosen = before[0][1]
+    if not chosen:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        chosen = candidates[0][1]
+    universe: list = []
+    try:
+        with open(chosen, "r", encoding="utf-8") as f:
+            for line in f:
+                sym = str(line).strip()
+                if not sym or sym.startswith("COMMON_UNIVERSE"):
+                    continue
+                universe.append(sym)
+    except Exception:
+        return [], chosen
+    universe = _exclude_common_symbols(universe)
+    if top_n and top_n > 0:
+        universe = universe[: int(top_n)]
+    return universe, chosen
 
 def _ts_to_kst_str(ts: float) -> str:
     try:
@@ -8492,11 +8590,28 @@ def _run_sr_pro_short_v1_cycle(
         "boundary_block": 0,
         "pct_non_negative": 0,
     }
+    fixed_anchor_ms = _latest_even_day_0030_kst_anchor_ms()
+    fixed_anchor_kst = _ts_to_kst_str(float(fixed_anchor_ms) / 1000.0) if fixed_anchor_ms else "unknown"
+    fixed_universe_file = ""
+    effective_universe = list(sr_universe or [])
+    if SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST:
+        u_fix, u_file = _load_common_universe_snapshot_for_anchor(
+            anchor_ms=fixed_anchor_ms,
+            top_n=SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N,
+        )
+        if u_fix:
+            effective_universe = list(u_fix)
+            fixed_universe_file = u_file
     _append_sr_pro_short_v1_log(
-        f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}"
+        f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
+        f"fixed_anchor={int(SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST)} anchor_kst={fixed_anchor_kst} "
+        f"universe_file={fixed_universe_file or '-'}"
     )
     try:
-        print(f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}")
+        print(
+            f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
+            f"fixed_anchor={int(SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST)} anchor_kst={fixed_anchor_kst}"
+        )
     except Exception:
         pass
 
@@ -8512,7 +8627,7 @@ def _run_sr_pro_short_v1_cycle(
     min_htf_fetch = min_htf + 1
 
     sr_state = state.setdefault("_sr_pro_short_v1_state", {})
-    symbols = list(sr_universe or [])
+    symbols = list(effective_universe or [])
     tickers = state.get("_tickers") if isinstance(state.get("_tickers"), dict) else {}
     def _has_gap(df: pd.DataFrame, tf_ms: int, mult: float = 2.5) -> bool:
         try:
@@ -8566,15 +8681,6 @@ def _run_sr_pro_short_v1_cycle(
         if symbol in {"BTC/USDT:USDT", "BTC/USDT"}:
             continue
         checked += 1
-        try:
-            t = tickers.get(symbol) if isinstance(tickers, dict) else None
-            pct = float((t or {}).get("percentage")) if t and (t.get("percentage") is not None) else None
-        except Exception:
-            pct = None
-        # v1 short filter: only evaluate symbols with negative percentage.
-        if pct is None or pct >= 0.0:
-            gate_stats["pct_non_negative"] += 1
-            continue
         if _entry_blocked_now(ENTRY_BLOCK_HOURS):
             gate_stats["time_block"] += 1
             continue
@@ -8681,12 +8787,27 @@ def _run_sr_pro_short_v1_cycle(
         if idx_1h < 0 or idx_15m < min_15m_hist:
             continue
 
-        # refresh zones using 1h history up to decision index
-        last_1h_hist_ts = int(df_1h_hist.iloc[idx_1h]["ts"])
-        # Rebuild 1h zones every cycle to avoid state drift and improve backtest parity.
-        zones = build_sr_zones(df_1h_hist.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
-        sym_state["zones"] = zones
-        sym_state["zones_ts"] = last_1h_hist_ts
+        # zones: fixed-anchor mode keeps static zone snapshot per symbol/anchor.
+        if SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST and fixed_anchor_ms > 0:
+            zone_anchor_ms_prev = int(sym_state.get("zones_anchor_ms") or 0)
+            zones_cached = sym_state.get("zones") if isinstance(sym_state.get("zones"), list) else None
+            if (zones_cached is None) or (zone_anchor_ms_prev != int(fixed_anchor_ms)):
+                zone_end_idx = int(np.searchsorted(ts_1h, fixed_anchor_ms, side="right"))
+                if zone_end_idx <= 0:
+                    continue
+                zones = build_sr_zones(df_1h_hist.iloc[:zone_end_idx], cfg, window_bars=window_bars_1h)
+                sym_state["zones"] = zones
+                sym_state["zones_anchor_ms"] = int(fixed_anchor_ms)
+                sym_state["zones_ts"] = int(df_1h_hist.iloc[zone_end_idx - 1]["ts"])
+            else:
+                zones = zones_cached
+        else:
+            # refresh zones using 1h history up to decision index
+            last_1h_hist_ts = int(df_1h_hist.iloc[idx_1h]["ts"])
+            # Rebuild 1h zones every cycle to avoid state drift and improve backtest parity.
+            zones = build_sr_zones(df_1h_hist.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
+            sym_state["zones"] = zones
+            sym_state["zones_ts"] = last_1h_hist_ts
 
         # current 1h bar by decision_ts mapping (match backtest)
         h1 = df_1h_hist.iloc[idx_1h]
@@ -9331,6 +9452,7 @@ def _run_sr_pro_long_v1_cycle(
     if not LONG_LIVE_TRADING:
         return result
     cfg = cfg_cls()
+    apply_fixed_anchor = (str(engine_name or "").upper() == "SR_PRO_LONG_V2") and bool(SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST)
     start_ts = time.time()
     checked = 0
     no_data = 0
@@ -9347,11 +9469,28 @@ def _run_sr_pro_long_v1_cycle(
         "skip_stale_ts": 0,
         "cooldown": 0,
     }
+    fixed_anchor_ms = _latest_even_day_0030_kst_anchor_ms() if apply_fixed_anchor else 0
+    fixed_anchor_kst = _ts_to_kst_str(float(fixed_anchor_ms) / 1000.0) if fixed_anchor_ms else "NA"
+    fixed_universe_file = ""
+    effective_universe = list(sr_universe or [])
+    if apply_fixed_anchor:
+        u_fix, u_file = _load_common_universe_snapshot_for_anchor(
+            anchor_ms=fixed_anchor_ms,
+            top_n=SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N,
+        )
+        if u_fix:
+            effective_universe = list(u_fix)
+            fixed_universe_file = u_file
     log_fn(
-        f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}"
+        f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
+        f"fixed_anchor={int(apply_fixed_anchor)} anchor_kst={fixed_anchor_kst} "
+        f"universe_file={fixed_universe_file or '-'}"
     )
     try:
-        print(f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(sr_universe)}")
+        print(
+            f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
+            f"fixed_anchor={int(apply_fixed_anchor)} anchor_kst={fixed_anchor_kst}"
+        )
     except Exception:
         pass
 
@@ -9367,7 +9506,7 @@ def _run_sr_pro_long_v1_cycle(
     min_htf_fetch = min_htf + 1
 
     sr_state = state.setdefault(state_key, {})
-    symbols = list(sr_universe or [])
+    symbols = list(effective_universe or [])
 
     def _dbg(symbol: str, msg: str) -> None:
         try:
@@ -9572,11 +9711,25 @@ def _run_sr_pro_long_v1_cycle(
                 _dbg(symbol, f"stage=index idx_1h={idx_1h} idx_15m={idx_15m} min_15m_hist={min_15m_hist}")
                 continue
 
-            last_1h_hist_ts = int(df_1h_hist.iloc[idx_1h]["ts"])
-            # Rebuild 1h zones every 3m cycle to keep live behavior aligned with backtest replay.
-            zones = build_sr_zones(df_1h_hist.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
-            sym_state["zones"] = zones
-            sym_state["zones_ts"] = last_1h_hist_ts
+            if apply_fixed_anchor and fixed_anchor_ms > 0:
+                zone_anchor_ms_prev = int(sym_state.get("zones_anchor_ms") or 0)
+                zones_cached = sym_state.get("zones") if isinstance(sym_state.get("zones"), list) else None
+                if (zones_cached is None) or (zone_anchor_ms_prev != int(fixed_anchor_ms)):
+                    zone_end_idx = int(np.searchsorted(ts_1h, fixed_anchor_ms, side="right"))
+                    if zone_end_idx <= 0:
+                        continue
+                    zones = build_sr_zones(df_1h_hist.iloc[:zone_end_idx], cfg, window_bars=window_bars_1h)
+                    sym_state["zones"] = zones
+                    sym_state["zones_anchor_ms"] = int(fixed_anchor_ms)
+                    sym_state["zones_ts"] = int(df_1h_hist.iloc[zone_end_idx - 1]["ts"])
+                else:
+                    zones = zones_cached
+            else:
+                last_1h_hist_ts = int(df_1h_hist.iloc[idx_1h]["ts"])
+                # Rebuild 1h zones every 3m cycle to keep live behavior aligned with backtest replay.
+                zones = build_sr_zones(df_1h_hist.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
+                sym_state["zones"] = zones
+                sym_state["zones_ts"] = last_1h_hist_ts
 
             h1 = df_1h_hist.iloc[idx_1h]
             h1_ts = int(h1["ts"]) if "ts" in h1 else 0
@@ -10475,33 +10628,34 @@ def _run_short_bend_15m3m_cycle(
                                             vol_ok = False
                                             gate_stats["htf_vol_spike_fail"] += 1
                                     if vol_ok:
-                                        arm_end_ts = ts15 + (int(cfg.armed_bars_3m) * _tf_ms(tf_ltf))
+                                        # Confirmed mode: start 3m confirmation only after the 15m bend bar is fully closed.
+                                        arm_start_ts = ts15 + (_tf_ms(tf_htf) if bool(cfg.use_confirmed) else 0)
+                                        arm_end_ts = arm_start_ts + (int(cfg.armed_bars_3m) * _tf_ms(tf_ltf))
                                         sym_state["armed_active"] = True
                                         sym_state["armed_ts15"] = ts15
+                                        sym_state["arm_start_ts"] = int(arm_start_ts)
                                         sym_state["arm_end_ts"] = int(arm_end_ts)
                                         sym_state["bend_high"] = now_high
-                                        sym_state["last_scan_ts"] = ts15
+                                        sym_state["last_scan_ts"] = int(arm_start_ts)
                                         gate_stats["armed_new"] += 1
                                         _append_short_bend_15m3m_log(
-                                            f"SHORT_BEND_15M3M_ARMED sym={symbol} ts15={ts15} arm_end={int(arm_end_ts)} bend_high={now_high:.6g}"
+                                            f"SHORT_BEND_15M3M_ARMED sym={symbol} ts15={ts15} arm_start={int(arm_start_ts)} arm_end={int(arm_end_ts)} bend_high={now_high:.6g}"
                                         )
 
         if not bool(sym_state.get("armed_active")):
             continue
         arm_end_ts = int(sym_state.get("arm_end_ts") or 0)
         armed_ts15 = int(sym_state.get("armed_ts15") or 0)
-        if latest_3m_ts > arm_end_ts:
-            sym_state["armed_active"] = False
-            gate_stats["arm_expire"] += 1
-            continue
-
-        last_scan_ts = int(sym_state.get("last_scan_ts") or armed_ts15)
-        c3 = df_3m_sig[(df_3m_sig["ts"] > armed_ts15) & (df_3m_sig["ts"] <= arm_end_ts)].copy()
+        arm_start_ts = int(sym_state.get("arm_start_ts") or armed_ts15)
+        last_scan_ts = int(sym_state.get("last_scan_ts") or arm_start_ts)
+        c3_all = df_3m_sig[(df_3m_sig["ts"] > arm_start_ts) & (df_3m_sig["ts"] <= arm_end_ts)].copy()
+        c3 = c3_all[c3_all["ts"] > last_scan_ts]
         if c3.empty:
-            gate_stats["confirm_fail"] += 1
-            continue
-        c3 = c3[c3["ts"] > last_scan_ts]
-        if c3.empty:
+            # 데이터 지연으로 arm 윈도우 봉이 늦게 도착할 수 있으므로,
+            # 신규 봉이 없을 때만 만료 처리한다.
+            if latest_3m_ts > arm_end_ts:
+                sym_state["armed_active"] = False
+                gate_stats["arm_expire"] += 1
             continue
 
         entry_ref_idx = None
@@ -10521,6 +10675,9 @@ def _run_short_bend_15m3m_cycle(
         sym_state["last_scan_ts"] = int(c3["ts"].max())
         if entry_ref_idx is None:
             gate_stats["confirm_fail"] += 1
+            if latest_3m_ts > arm_end_ts:
+                sym_state["armed_active"] = False
+                gate_stats["arm_expire"] += 1
             continue
 
         if bool(cfg.ltf_wait_counter_momo):
@@ -19760,17 +19917,14 @@ def run():
                         )
                         sr_pro_short_v2_thread.start()
                     if SHORT_BEND_15M3M_ENABLED and new_3m_bar:
-                        short_bend_15m3m_thread = threading.Thread(
-                            target=lambda: short_bend_15m3m_result.update(
-                                _run_short_bend_15m3m_cycle(
-                                    short_bend_15m3m_universe,
-                                    state,
-                                    send_telegram,
-                                )
-                            ),
-                            daemon=True,
+                        # Priority execution: run short_bend first, then scout_only_exhaustion_short.
+                        short_bend_15m3m_result.update(
+                            _run_short_bend_15m3m_cycle(
+                                short_bend_15m3m_universe,
+                                state,
+                                send_telegram,
+                            )
                         )
-                        short_bend_15m3m_thread.start()
                     if SR_PRO_LONG_V1_ENABLED and new_3m_bar:
                         sr_pro_long_thread = threading.Thread(
                             target=lambda: sr_pro_long_result.update(
