@@ -49,14 +49,14 @@ class SrProShortV1Config:
     ema60_15m_len: int = 60
     ema120_15m_len: int = 120
     ema_slope_min: float = 0.001
-    sl_buffer: float = 0.01
+    sl_buffer: float = 0.009
     sl_atr_mult: float = 0.4
     sl_cap_pct: float = 0.02
     sl_cap_atr_mult: float = 0.6
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 0.99
-    tp_mult_weak: float = 0.99
+    tp_mult: float = 0.992
+    tp_mult_weak: float = 0.992
     dvf_confirm_bars: int = 1
 
 

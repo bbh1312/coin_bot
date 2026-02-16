@@ -19,7 +19,7 @@ class SrProLongV2Config:
     max_zones_per_side: int = 8
     touch_mode: str = "top"
     touch_use_close: bool = False
-    dvf_norm_min: float = 0.15
+    dvf_norm_min: float = 0.12
     require_reject_close: bool = False
     reject_mode: str = "top"
     reject_source: str = "1h"
@@ -39,11 +39,11 @@ class SrProLongV2Config:
     shallow_dvf_min: float = 0.0
     entry_ema_len: int = 7
     entry_atr_offset: float = 0.15
-    sl_buffer: float = 0.01
+    sl_buffer: float = 0.009
     sl_atr_mult: float = 0.10
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 1.015
+    tp_mult: float = 1.012
     tp_mult_weak: float = 1.02
 
 

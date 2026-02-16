@@ -16,7 +16,7 @@ class ShortBend15m3mConfig:
     # 고점 상승 비율(최근 lookback-1 구간 중 high[i] > high[i-1] 비율)
     hh_ratio_min: float = 0.55
     # 15m 고점권 판별: 롤링 구간 상단 몇 % 영역에 위치해야 하는지
-    htf_top_zone_ratio: float = 0.45
+    htf_top_zone_ratio: float = 0.30
 
     # 정배열
     ema_fast_len: int = 20
@@ -29,6 +29,10 @@ class ShortBend15m3mConfig:
     htf_vol_mult_min: float = 1.2
     htf_vol_spike_lookback: int = 10
     htf_vol_spike_mult: float = 1.00
+    bend_atr_len: int = 14
+    bend_min_drop_atr: float = 0.30
+    bend_min_body_ratio: float = 0.50
+    bend_require_prev_low_break: bool = True
 
     # 3m 확인
     armed_bars_3m: int = 4
@@ -36,6 +40,10 @@ class ShortBend15m3mConfig:
     swing_lookback_3m: int = 10
     require_vol_confirm: bool = True
     vol_mult_min: float = 1.1
+    ltf_two_step_confirm: bool = True
+    ltf_retest_enable: bool = False
+    ltf_retest_bars: int = 3
+    ltf_retest_tol_atr_mult: float = 0.20
     # 3m 주도 진입: 신호 후 역모멘텀(반등) 캔들 출현까지 대기 후 숏 진입
     ltf_wait_counter_momo: bool = False
     ltf_counter_momo_bars: int = 2
@@ -43,6 +51,7 @@ class ShortBend15m3mConfig:
     # 리스크
     sl_min_pct: float = 0.006
     sl_max_pct: float = 0.040
+    sl_floor_atr_mult: float = 0.80
     tp_min_pct: float = 0.004
     tp_max_pct: float = 0.050
     rr_min: float = 1.5

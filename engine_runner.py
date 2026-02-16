@@ -10497,11 +10497,14 @@ def _run_short_bend_15m3m_cycle(
         "hh_fail": 0,
         "top_zone_fail": 0,
         "bend_fail": 0,
+        "bend_strength_fail": 0,
         "htf_vol_fail": 0,
         "htf_vol_spike_fail": 0,
         "armed_new": 0,
         "arm_expire": 0,
         "confirm_fail": 0,
+        "retest_fail": 0,
+        "two_step_fail": 0,
         "counter_momo_fail": 0,
         "entry_hit": 0,
         "skip_stale_ts": 0,
@@ -10564,9 +10567,11 @@ def _run_short_bend_15m3m_cycle(
         df_15m_sig["ema_fast"] = ema(df_15m_sig["close"].astype(float), max(1, int(cfg.ema_fast_len)))
         df_15m_sig["ema_mid"] = ema(df_15m_sig["close"].astype(float), max(1, int(cfg.ema_mid_len)))
         df_15m_sig["ema_slow"] = ema(df_15m_sig["close"].astype(float), max(1, int(cfg.ema_slow_len)))
+        df_15m_sig["atr"] = atr(df_15m_sig, max(1, int(getattr(cfg, "bend_atr_len", 14)))).fillna(0.0)
         df_15m_sig["vol_sma20"] = df_15m_sig["volume"].astype(float).rolling(20, min_periods=1).mean()
         df_3m_sig["ema_ltf"] = ema(df_3m_sig["close"].astype(float), max(1, int(cfg.ltf_ema_len)))
         df_3m_sig["vol_sma20"] = df_3m_sig["volume"].astype(float).rolling(20, min_periods=1).mean()
+        df_3m_sig["atr"] = atr(df_3m_sig, 14).fillna(0.0)
         df_3m_sig["swing_low_prev"] = (
             df_3m_sig["low"].astype(float).rolling(max(2, int(cfg.swing_lookback_3m)), min_periods=2).min().shift(1)
         )
@@ -10608,9 +10613,23 @@ def _run_short_bend_15m3m_cycle(
                                 gate_stats["top_zone_fail"] += 1
                             else:
                                 prev_high = float(df_15m_sig.iloc[i - 1]["high"])
+                                prev_low = float(df_15m_sig.iloc[i - 1]["low"])
                                 now_high = float(df_15m_sig.iloc[i]["high"])
+                                now_low = float(df_15m_sig.iloc[i]["low"])
+                                now_open = float(df_15m_sig.iloc[i]["open"])
                                 now_close = float(df_15m_sig.iloc[i]["close"])
+                                atr15 = max(float(df_15m_sig.iloc[i]["atr"]), 1e-12)
+                                body_ratio = abs(now_close - now_open) / max(now_high - now_low, 1e-12)
+                                drop_atr = (prev_close - now_close) / atr15
                                 bend_ok = (now_high < prev_high) and (now_close < prev_close)
+                                if bend_ok and bool(getattr(cfg, "bend_require_prev_low_break", True)):
+                                    bend_ok = now_close < prev_low
+                                if bend_ok and (
+                                    drop_atr < float(getattr(cfg, "bend_min_drop_atr", 0.0))
+                                    or body_ratio < float(getattr(cfg, "bend_min_body_ratio", 0.0))
+                                ):
+                                    gate_stats["bend_strength_fail"] += 1
+                                    bend_ok = False
                                 if not bend_ok:
                                     gate_stats["bend_fail"] += 1
                                 else:
@@ -10669,16 +10688,54 @@ def _run_short_bend_15m3m_cycle(
             vol_ok = True
             if bool(cfg.require_vol_confirm):
                 vol_ok = float(df_3m_sig.at[j, "volume"]) >= float(df_3m_sig.at[j, "vol_sma20"]) * float(cfg.vol_mult_min)
-            if (c < ema_ltf) and (c < sw_low) and vol_ok:
+            break_cond = (c < ema_ltf) and (c < sw_low) and vol_ok
+            if not break_cond:
+                continue
+            if not bool(getattr(cfg, "ltf_retest_enable", False)):
                 entry_ref_idx = int(j)
+                break
+            atr3 = max(float(df_3m_sig.at[j, "atr"]), 1e-12)
+            tol = atr3 * float(getattr(cfg, "ltf_retest_tol_atr_mult", 0.0))
+            end_j = min(int(j) + max(int(getattr(cfg, "ltf_retest_bars", 1)), 1), len(df_3m_sig) - 2)
+            retest_ok = False
+            for j2 in range(int(j) + 1, end_j + 1):
+                h2 = float(df_3m_sig.iloc[j2]["high"])
+                c2 = float(df_3m_sig.iloc[j2]["close"])
+                ema2 = float(df_3m_sig.iloc[j2]["ema_ltf"])
+                touched = h2 >= (sw_low - tol)
+                retest_fail = touched and (c2 < sw_low) and (c2 < ema2)
+                if retest_fail:
+                    entry_ref_idx = int(j2)
+                    retest_ok = True
+                    break
+            if retest_ok:
                 break
         sym_state["last_scan_ts"] = int(c3["ts"].max())
         if entry_ref_idx is None:
+            if bool(getattr(cfg, "ltf_retest_enable", False)):
+                gate_stats["retest_fail"] += 1
             gate_stats["confirm_fail"] += 1
             if latest_3m_ts > arm_end_ts:
                 sym_state["armed_active"] = False
                 gate_stats["arm_expire"] += 1
             continue
+
+        if bool(getattr(cfg, "ltf_two_step_confirm", False)):
+            jn = int(entry_ref_idx) + 1
+            if jn >= len(df_3m_sig):
+                gate_stats["two_step_fail"] += 1
+                gate_stats["confirm_fail"] += 1
+                continue
+            c_sig = float(df_3m_sig.iloc[int(entry_ref_idx)]["close"])
+            h_sig = float(df_3m_sig.iloc[int(entry_ref_idx)]["high"])
+            c_n = float(df_3m_sig.iloc[jn]["close"])
+            h_n = float(df_3m_sig.iloc[jn]["high"])
+            step_ok = (c_n < c_sig) or (h_n < h_sig)
+            if not step_ok:
+                gate_stats["two_step_fail"] += 1
+                gate_stats["confirm_fail"] += 1
+                continue
+            entry_ref_idx = int(jn)
 
         if bool(cfg.ltf_wait_counter_momo):
             counter_idx = None
@@ -10709,7 +10766,9 @@ def _run_short_bend_15m3m_cycle(
         bend_high = float(sym_state.get("bend_high") or float(df_15m_sig.iloc[i]["high"]))
         sl_by_bend = bend_high * (1.0 + float(cfg.bend_sl_buffer_pct))
         sl_by_floor = entry_px * (1.0 + float(cfg.sl_min_pct))
-        sl_price = max(sl_by_bend, sl_by_floor)
+        atr3_entry = max(float(df_3m_sig.iloc[entry_i]["atr"]), 1e-12)
+        sl_by_atr = entry_px + (atr3_entry * max(float(getattr(cfg, "sl_floor_atr_mult", 0.0)), 0.0))
+        sl_price = max(sl_by_bend, sl_by_floor, sl_by_atr)
         risk = max(sl_price - entry_px, entry_px * 0.001)
         tp_rr = entry_px - risk * float(cfg.rr_min)
         tp_floor = entry_px * (1.0 - float(cfg.tp_min_pct))

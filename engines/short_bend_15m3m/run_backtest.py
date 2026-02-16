@@ -75,6 +75,18 @@ def _ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=max(int(length), 1), adjust=False).mean()
 
 
+def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / max(int(length), 1), adjust=False).mean()
+
+
 def _new_stats() -> Dict[str, float]:
     return {
         "entries": 0,
@@ -157,17 +169,29 @@ def run_backtest() -> None:
     parser.add_argument("--htf-vol-mult-min", type=float, default=cfg.htf_vol_mult_min)
     parser.add_argument("--htf-vol-spike-lookback", type=int, default=cfg.htf_vol_spike_lookback)
     parser.add_argument("--htf-vol-spike-mult", type=float, default=cfg.htf_vol_spike_mult)
+    parser.add_argument("--bend-atr-len", type=int, default=cfg.bend_atr_len)
+    parser.add_argument("--bend-min-drop-atr", type=float, default=cfg.bend_min_drop_atr)
+    parser.add_argument("--bend-min-body-ratio", type=float, default=cfg.bend_min_body_ratio)
+    parser.add_argument("--bend-require-prev-low-break", action="store_true", default=cfg.bend_require_prev_low_break)
+    parser.add_argument("--no-bend-require-prev-low-break", action="store_false", dest="bend_require_prev_low_break")
     parser.add_argument("--armed-bars-3m", type=int, default=cfg.armed_bars_3m)
     parser.add_argument("--ltf-ema-len", type=int, default=cfg.ltf_ema_len)
     parser.add_argument("--swing-lookback-3m", type=int, default=cfg.swing_lookback_3m)
     parser.add_argument("--require-vol-confirm", action="store_true", default=cfg.require_vol_confirm)
     parser.add_argument("--vol-mult-min", type=float, default=cfg.vol_mult_min)
+    parser.add_argument("--ltf-two-step-confirm", action="store_true", default=cfg.ltf_two_step_confirm)
+    parser.add_argument("--no-ltf-two-step-confirm", action="store_false", dest="ltf_two_step_confirm")
+    parser.add_argument("--ltf-retest-enable", action="store_true", default=cfg.ltf_retest_enable)
+    parser.add_argument("--no-ltf-retest-enable", action="store_false", dest="ltf_retest_enable")
+    parser.add_argument("--ltf-retest-bars", type=int, default=cfg.ltf_retest_bars)
+    parser.add_argument("--ltf-retest-tol-atr-mult", type=float, default=cfg.ltf_retest_tol_atr_mult)
     parser.add_argument("--ltf-wait-counter-momo", action="store_true", default=cfg.ltf_wait_counter_momo)
     parser.add_argument("--no-ltf-wait-counter-momo", action="store_false", dest="ltf_wait_counter_momo")
     parser.add_argument("--ltf-counter-momo-bars", type=int, default=cfg.ltf_counter_momo_bars)
 
     parser.add_argument("--sl-min-pct", type=float, default=cfg.sl_min_pct)
     parser.add_argument("--sl-max-pct", type=float, default=cfg.sl_max_pct)
+    parser.add_argument("--sl-floor-atr-mult", type=float, default=cfg.sl_floor_atr_mult)
     parser.add_argument("--tp-min-pct", type=float, default=cfg.tp_min_pct)
     parser.add_argument("--tp-max-pct", type=float, default=cfg.tp_max_pct)
     parser.add_argument("--rr-min", type=float, default=cfg.rr_min)
@@ -208,8 +232,11 @@ def run_backtest() -> None:
         "htf_vol_fail": 0,
         "htf_vol_spike_fail": 0,
         "bend_fail": 0,
+        "bend_strength_fail": 0,
         "armed": 0,
         "confirm_fail": 0,
+        "retest_fail": 0,
+        "two_step_fail": 0,
         "counter_momo_fail": 0,
         "counter_momo_hit": 0,
         "entry_hit": 0,
@@ -269,10 +296,12 @@ def run_backtest() -> None:
         d15["ema_mid"] = _ema(d15["close"].astype(float), int(args.ema_mid_len))
         d15["ema_slow"] = _ema(d15["close"].astype(float), int(args.ema_slow_len))
         d15["vol_sma20"] = d15["volume"].astype(float).rolling(20, min_periods=1).mean()
+        d15["atr"] = _atr(d15, int(args.bend_atr_len)).fillna(0.0)
 
         d3["ema_ltf"] = _ema(d3["close"].astype(float), int(args.ltf_ema_len))
         d3["vol_sma20"] = d3["volume"].astype(float).rolling(20, min_periods=1).mean()
         d3["swing_low_prev"] = d3["low"].astype(float).rolling(int(args.swing_lookback_3m), min_periods=2).min().shift(1)
+        d3["atr"] = _atr(d3, 14).fillna(0.0)
 
         sym_stats = per_symbol.setdefault(sym, _new_stats())
         next_eligible_ts = eval_start_ms
@@ -317,10 +346,21 @@ def run_backtest() -> None:
                 continue
 
             prev_high = float(d15.at[i - 1, "high"])
+            prev_low = float(d15.at[i - 1, "low"])
             prev_close = float(d15.at[i - 1, "close"])
+            now_open = float(d15.at[i, "open"])
             now_high = float(d15.at[i, "high"])
+            now_low = float(d15.at[i, "low"])
             now_close = float(d15.at[i, "close"])
+            atr15 = max(float(d15.at[i, "atr"]), 1e-12)
+            body_ratio = abs(now_close - now_open) / max(now_high - now_low, 1e-12)
+            drop_atr = (prev_close - now_close) / atr15
             bend = now_high < prev_high and (now_close < prev_close)
+            if bend and bool(args.bend_require_prev_low_break):
+                bend = now_close < prev_low
+            if bend and (drop_atr < float(args.bend_min_drop_atr) or body_ratio < float(args.bend_min_body_ratio)):
+                gates["bend_strength_fail"] += 1
+                bend = False
             if not bend:
                 gates["bend_fail"] += 1
                 continue
@@ -347,7 +387,7 @@ def run_backtest() -> None:
                 gates["confirm_fail"] += 1
                 continue
 
-            entry_j = -1
+            entry_ref_j = -1
             for j in c3.index:
                 c = float(d3.at[j, "close"])
                 ema_ltf = float(d3.at[j, "ema_ltf"])
@@ -358,20 +398,58 @@ def run_backtest() -> None:
                 vol_ok = True
                 if bool(args.require_vol_confirm):
                     vol_ok = float(d3.at[j, "volume"]) >= float(d3.at[j, "vol_sma20"]) * float(args.vol_mult_min)
-                if (c < ema_ltf) and (c < sw_low) and vol_ok:
-                    entry_j = int(j)
+                break_cond = (c < ema_ltf) and (c < sw_low) and vol_ok
+                if not break_cond:
+                    continue
+
+                if not bool(args.ltf_retest_enable):
+                    entry_ref_j = int(j)
                     break
 
-            if entry_j < 0:
+                retest_ok = False
+                atr3 = max(float(d3.at[j, "atr"]), 1e-12)
+                tol = atr3 * float(args.ltf_retest_tol_atr_mult)
+                end_j = min(int(j) + max(int(args.ltf_retest_bars), 1), len(d3) - 2)
+                for j2 in range(int(j) + 1, end_j + 1):
+                    h2 = float(d3.at[j2, "high"])
+                    c2 = float(d3.at[j2, "close"])
+                    ema2 = float(d3.at[j2, "ema_ltf"])
+                    touched = h2 >= (sw_low - tol)
+                    retest_fail = touched and (c2 < sw_low) and (c2 < ema2)
+                    if retest_fail:
+                        entry_ref_j = int(j2)
+                        retest_ok = True
+                        break
+                if retest_ok:
+                    break
+
+            if entry_ref_j < 0:
+                if bool(args.ltf_retest_enable):
+                    gates["retest_fail"] += 1
                 gates["confirm_fail"] += 1
                 continue
 
-            entry_ref_j = entry_j
+            if bool(args.ltf_two_step_confirm):
+                jn = entry_ref_j + 1
+                if jn >= len(d3):
+                    gates["two_step_fail"] += 1
+                    gates["confirm_fail"] += 1
+                    continue
+                c_sig = float(d3.at[entry_ref_j, "close"])
+                h_sig = float(d3.at[entry_ref_j, "high"])
+                c_n = float(d3.at[jn, "close"])
+                h_n = float(d3.at[jn, "high"])
+                step_ok = (c_n < c_sig) or (h_n < h_sig)
+                if not step_ok:
+                    gates["two_step_fail"] += 1
+                    gates["confirm_fail"] += 1
+                    continue
+                entry_ref_j = int(jn)
             if bool(args.ltf_wait_counter_momo):
                 max_wait = max(int(args.ltf_counter_momo_bars), 1)
-                end_wait_j = min(entry_j + max_wait, len(d3) - 2)
+                end_wait_j = min(entry_ref_j + max_wait, len(d3) - 2)
                 counter_j = -1
-                for j2 in range(entry_j, end_wait_j + 1):
+                for j2 in range(entry_ref_j, end_wait_j + 1):
                     c2 = float(d3.at[j2, "close"])
                     o2 = float(d3.at[j2, "open"])
                     ema2 = float(d3.at[j2, "ema_ltf"])
@@ -396,7 +474,9 @@ def run_backtest() -> None:
             bend_high = float(now_high)
             sl_by_bend = bend_high * (1.0 + float(args.bend_sl_buffer_pct))
             sl_by_floor = entry_px * (1.0 + float(args.sl_min_pct))
-            sl = max(sl_by_bend, sl_by_floor)
+            atr3_entry = max(float(d3.at[entry_i, "atr"]), 1e-12)
+            sl_by_atr = entry_px + (atr3_entry * max(float(args.sl_floor_atr_mult), 0.0))
+            sl = max(sl_by_bend, sl_by_floor, sl_by_atr)
             risk = max(sl - entry_px, entry_px * 0.001)
             tp_rr = entry_px - risk * float(args.rr_min)
             tp_floor = entry_px * (1.0 - float(args.tp_min_pct))
