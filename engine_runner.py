@@ -1515,6 +1515,13 @@ COMMON_CYCLE_REFRESH_TFS = tuple(
     for tf in os.getenv("COMMON_CYCLE_REFRESH_TFS", "3m,15m,1h").split(",")
     if tf.strip()
 )
+# Run common cache maintenance off the main trading path to avoid missing LTF cycles.
+COMMON_MAINT_ASYNC_ENABLED = os.getenv("COMMON_MAINT_ASYNC_ENABLED", "1") not in ("0", "false", "off", "no")
+COMMON_MAINT_MIN_START_INTERVAL_SEC = float(os.getenv("COMMON_MAINT_MIN_START_INTERVAL_SEC", "15"))
+COMMON_MAINT_GAP_REPAIR_MAX_FETCH_RT = int(os.getenv("COMMON_MAINT_GAP_REPAIR_MAX_FETCH_RT", "8"))
+COMMON_MAINT_CYCLE_REFRESH_MAX_FETCH_RT = int(os.getenv("COMMON_MAINT_CYCLE_REFRESH_MAX_FETCH_RT", "2"))
+_COMMON_MAINT_THREAD = None
+_COMMON_MAINT_LOCK = threading.Lock()
 LIVE_OHLCV_SNAPSHOT_ENABLED = os.getenv("LIVE_OHLCV_SNAPSHOT_ENABLED", "1") not in ("0", "false", "off", "no")
 LIVE_OHLCV_SNAPSHOT_DIR = os.getenv("LIVE_OHLCV_SNAPSHOT_DIR", "").strip()
 NOISE_REVERSE_USE_COMMON_CACHE = os.getenv("NOISE_REVERSE_USE_COMMON_CACHE", "0") == "1"
@@ -1526,7 +1533,7 @@ NOISE_REVERSE_SOURCE_LOGGED: dict = {}
 SR_PRO_USE_COMMON_CACHE = os.getenv("SR_PRO_USE_COMMON_CACHE", "1") not in ("0", "false", "off", "no")
 SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST = os.getenv("SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST", "1") not in ("0", "false", "off", "no")
 SR_PRO_SHORT_V1_FIXED_ANCHOR_CADENCE_DAYS = max(1, int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_CADENCE_DAYS", "1") or 1))
-SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR = max(0, min(23, int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR", "0") or 0)))
+SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR = max(0, min(23, int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
 SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE = max(0, min(59, int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
 SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR = os.getenv("SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR", os.path.join("logs", "common_universe")).strip()
 SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N = int(os.getenv("SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N", str(COMMON_UNIVERSE_TOP_N or 50)))
@@ -2282,7 +2289,13 @@ def _warmup_common_cache(state: dict, exchange, universe: list) -> bool:
                 pass
     return done_all
 
-def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list, force_full: bool = False) -> None:
+def _maybe_repair_common_warmup_gaps(
+    state: dict,
+    exchange,
+    universe: list,
+    force_full: bool = False,
+    max_fetch_override: Optional[int] = None,
+) -> None:
     if not COMMON_GAP_REPAIR_ENABLED:
         return
     if not universe:
@@ -2302,6 +2315,8 @@ def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list, forc
     candidates = 0
     repaired = 0
     max_fetch = 0 if force_full else COMMON_GAP_REPAIR_MAX_FETCH
+    if (not force_full) and isinstance(max_fetch_override, int) and max_fetch_override >= 0:
+        max_fetch = int(max_fetch_override)
     tf_ms_map = {
         "1m": 60 * 1000,
         "3m": 3 * 60 * 1000,
@@ -2361,7 +2376,12 @@ def _maybe_repair_common_warmup_gaps(state: dict, exchange, universe: list, forc
     if repaired:
         print(f"[common-gap] repaired {repaired}/{candidates} checked={checked}")
 
-def _maybe_refresh_common_cycle_cache(state: dict, exchange, universe: list) -> None:
+def _maybe_refresh_common_cycle_cache(
+    state: dict,
+    exchange,
+    universe: list,
+    max_fetch_override: Optional[int] = None,
+) -> None:
     if not COMMON_CYCLE_REFRESH_ENABLED:
         return
     if not universe:
@@ -2392,7 +2412,10 @@ def _maybe_refresh_common_cycle_cache(state: dict, exchange, universe: list) -> 
     for sym in universe:
         for tf in COMMON_CYCLE_REFRESH_TFS:
             checked += 1
-            if refreshed >= COMMON_CYCLE_REFRESH_MAX_FETCH:
+            cap = COMMON_CYCLE_REFRESH_MAX_FETCH
+            if isinstance(max_fetch_override, int) and max_fetch_override >= 0:
+                cap = int(max_fetch_override)
+            if refreshed >= cap:
                 break
             try:
                 df = cycle_cache.get_df(sym, tf, limit=120)
@@ -2429,10 +2452,75 @@ def _maybe_refresh_common_cycle_cache(state: dict, exchange, universe: list) -> 
                         COMMON_WARMUP_LOG_PATH,
                         [f"CYCLE_REFRESH_FAIL sym={sym} tf={tf} err={e}"],
                     )
-        if refreshed >= COMMON_CYCLE_REFRESH_MAX_FETCH:
+        cap = COMMON_CYCLE_REFRESH_MAX_FETCH
+        if isinstance(max_fetch_override, int) and max_fetch_override >= 0:
+            cap = int(max_fetch_override)
+        if refreshed >= cap:
             break
     if refreshed:
         print(f"[common-cycle] refreshed {refreshed} checked={checked}")
+
+
+def _run_common_maintenance_async(state: dict, exchange, universe: list) -> None:
+    if not COMMON_MAINT_ASYNC_ENABLED:
+        return
+    if not universe:
+        return
+    now = time.time()
+    try:
+        last_try = _coerce_state_float(state.get("_common_maint_last_try_ts", 0.0))
+    except Exception:
+        last_try = 0.0
+    if COMMON_MAINT_MIN_START_INTERVAL_SEC > 0 and (now - last_try) < COMMON_MAINT_MIN_START_INTERVAL_SEC:
+        return
+    state["_common_maint_last_try_ts"] = now
+
+    def _worker() -> None:
+        try:
+            state["_common_gap_repair_inflight"] = True
+            state["_common_maint_inflight"] = True
+            state["_common_maint_started_ts"] = time.time()
+
+            if state.get("_common_gap_repair_force"):
+                state["_common_gap_repair_ts"] = 0.0
+                _maybe_repair_common_warmup_gaps(state, exchange, universe, force_full=True)
+                state["_common_gap_repair_force"] = False
+                state["_common_gap_repair_once"] = True
+            else:
+                if not state.get("_common_gap_repair_once"):
+                    state["_common_gap_repair_ts"] = 0.0
+                    _maybe_repair_common_warmup_gaps(
+                        state,
+                        exchange,
+                        universe,
+                        max_fetch_override=COMMON_MAINT_GAP_REPAIR_MAX_FETCH_RT,
+                    )
+                    state["_common_gap_repair_once"] = True
+                _maybe_repair_common_warmup_gaps(
+                    state,
+                    exchange,
+                    universe,
+                    max_fetch_override=COMMON_MAINT_GAP_REPAIR_MAX_FETCH_RT,
+                )
+            _maybe_refresh_common_cycle_cache(
+                state,
+                exchange,
+                universe,
+                max_fetch_override=COMMON_MAINT_CYCLE_REFRESH_MAX_FETCH_RT,
+            )
+        except Exception as e:
+            print(f"[common-maint] worker error: {e}")
+        finally:
+            state["_common_gap_repair_inflight"] = False
+            state["_common_maint_inflight"] = False
+            state["_common_maint_done_ts"] = time.time()
+
+    global _COMMON_MAINT_THREAD
+    with _COMMON_MAINT_LOCK:
+        if _COMMON_MAINT_THREAD is not None and _COMMON_MAINT_THREAD.is_alive():
+            return
+        _COMMON_MAINT_THREAD = threading.Thread(target=_worker, daemon=True, name="common-maint")
+        _COMMON_MAINT_THREAD.start()
 
 def _kst_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=9)
@@ -2593,8 +2681,6 @@ def _maybe_daily_refresh_common_universe(state: dict, tickers: dict, symbols: li
         return False
     try:
         now_kst = _kst_now()
-        if not _is_even_kst_day(now_kst):
-            return False
         now_minute_of_day = int(now_kst.hour) * 60 + int(now_kst.minute)
         refresh_minute_of_day = int(COMMON_UNIVERSE_REFRESH_HOUR) * 60 + int(COMMON_UNIVERSE_REFRESH_MINUTE)
         if now_minute_of_day < refresh_minute_of_day:
@@ -9222,6 +9308,7 @@ def _run_sr_pro_short_v1_cycle(
                 sl_price = min(sl_price, entry_px * (1.0 + cap_pct))
                 tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
+                req_id = None
                 if usdt > 0 and _admin_is_active():
                     _append_sr_pro_short_v1_log(
                         f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track=dvf_accel"
@@ -9268,6 +9355,7 @@ def _run_sr_pro_short_v1_cycle(
                 sl_price = min(sl_price, entry_px * (1.0 + cap_pct))
                 tp_price = entry_px * float(cfg.tp_mult)
                 usdt = _resolve_entry_usdt()
+                req_id = None
                 if usdt > 0 and _admin_is_active():
                     _append_sr_pro_short_v1_log(
                         f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track=dvf_slope"
@@ -18646,32 +18734,25 @@ def run():
         tickers = exchange.fetch_tickers()
         state["_tickers"] = tickers
         state["_tickers_ts"] = time.time()
-        if _is_even_kst_day():
+        prev_universe = state.get("_common_universe") if isinstance(state.get("_common_universe"), list) else []
+        COMMON_UNIVERSE = list(prev_universe or [])
+        if not COMMON_UNIVERSE:
+            # bootstrap once when state has no reusable universe
             COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
             state["_common_universe"] = list(COMMON_UNIVERSE)
-            COMMON_UNIVERSE_READY = True
             state["_common_universe_ready"] = True
-            print(f"[common-universe] ready size={len(COMMON_UNIVERSE)}")
+            COMMON_UNIVERSE_READY = True
+            print(f"[common-universe] startup bootstrap size={len(COMMON_UNIVERSE)}")
             if COMMON_UNIVERSE_LOG_PATH:
                 try:
-                    _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE size={len(COMMON_UNIVERSE)}"])
+                    _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE startup size={len(COMMON_UNIVERSE)}"])
                     _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
                 except Exception:
                     pass
         else:
-            prev_universe = state.get("_common_universe") if isinstance(state.get("_common_universe"), list) else []
-            COMMON_UNIVERSE = list(prev_universe or [])
-            if not COMMON_UNIVERSE:
-                # bootstrap once when state has no reusable universe
-                COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
-                state["_common_universe"] = list(COMMON_UNIVERSE)
-                state["_common_universe_ready"] = True
-                COMMON_UNIVERSE_READY = True
-                print(f"[common-universe] startup bootstrap on odd KST day size={len(COMMON_UNIVERSE)}")
-            else:
-                COMMON_UNIVERSE_READY = True
-                state["_common_universe_ready"] = True
-                print(f"[common-universe] startup refresh skipped (odd KST day), reuse size={len(COMMON_UNIVERSE)}")
+            COMMON_UNIVERSE_READY = True
+            state["_common_universe_ready"] = True
+            print(f"[common-universe] startup reuse size={len(COMMON_UNIVERSE)}")
         # Keep file-based consumers (backtest/tools) aligned with runtime universe on startup.
         if COMMON_UNIVERSE:
             try:
@@ -19309,38 +19390,23 @@ def run():
                         print(f"[common-universe] daily refresh done size={len(COMMON_UNIVERSE)}")
 
                     if not COMMON_UNIVERSE_READY or not isinstance(state.get("_common_universe"), list):
-                        if _is_even_kst_day():
-                            COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
-                            state["_common_universe"] = list(COMMON_UNIVERSE)
-                            state["_common_universe_ready"] = True
-                            COMMON_UNIVERSE_READY = True
-                            print(f"[common-universe] refreshed size={len(COMMON_UNIVERSE)}")
-                            if COMMON_UNIVERSE_LOG_PATH and COMMON_UNIVERSE:
-                                try:
-                                    _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE refresh size={len(COMMON_UNIVERSE)}"])
-                                    _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
-                                except Exception:
-                                    pass
+                        COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
+                        state["_common_universe"] = list(COMMON_UNIVERSE)
+                        state["_common_universe_ready"] = True
+                        COMMON_UNIVERSE_READY = True
+                        print(f"[common-universe] refreshed size={len(COMMON_UNIVERSE)}")
+                        if COMMON_UNIVERSE_LOG_PATH and COMMON_UNIVERSE:
                             try:
-                                os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
-                                with open(os.path.join("logs", "common_universe", "latest.txt"), "w", encoding="utf-8") as f:
-                                    f.write("\n".join(COMMON_UNIVERSE))
+                                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE refresh size={len(COMMON_UNIVERSE)}"])
+                                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
                             except Exception:
                                 pass
-                        else:
-                            prev_universe = state.get("_common_universe") if isinstance(state.get("_common_universe"), list) else []
-                            COMMON_UNIVERSE = list(prev_universe or [])
-                            if not COMMON_UNIVERSE:
-                                # bootstrap once when reusable universe is missing
-                                COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
-                                state["_common_universe"] = list(COMMON_UNIVERSE)
-                                COMMON_UNIVERSE_READY = True
-                                state["_common_universe_ready"] = True
-                                print(f"[common-universe] bootstrap on odd KST day size={len(COMMON_UNIVERSE)}")
-                            else:
-                                COMMON_UNIVERSE_READY = True
-                                state["_common_universe_ready"] = True
-                                print(f"[common-universe] refresh skipped (odd KST day), reuse size={len(COMMON_UNIVERSE)}")
+                        try:
+                            os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
+                            with open(os.path.join("logs", "common_universe", "latest.txt"), "w", encoding="utf-8") as f:
+                                f.write("\n".join(COMMON_UNIVERSE))
+                        except Exception:
+                            pass
                     # protect against accidental state key pollution (must remain list of symbols)
                     if not isinstance(state.get("_common_universe"), list):
                         state["_common_universe"] = list(COMMON_UNIVERSE or [])
@@ -19499,28 +19565,12 @@ def run():
                             _COMMON_WARMUP_NOTIFY_TS_MEM = now_ts
                             save_state(state)
 
-                    # periodic gap repair for common warmup cache (non-blocking)
+                    # periodic common cache maintenance is async to protect realtime entry loops.
                     try:
-                        if state.get("_common_gap_repair_force"):
-                            state["_common_gap_repair_ts"] = 0.0
-                            state["_common_gap_repair_inflight"] = True
-                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe, force_full=True)
-                            state["_common_gap_repair_force"] = False
-                            state["_common_gap_repair_once"] = True
-                            state["_common_gap_repair_inflight"] = False
-                        else:
-                            if not state.get("_common_gap_repair_once"):
-                                state["_common_gap_repair_ts"] = 0.0
-                                _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
-                                state["_common_gap_repair_once"] = True
-                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe)
+                        _run_common_maintenance_async(state, exchange, shared_universe)
                     except Exception:
                         state["_common_gap_repair_inflight"] = False
-                        pass
-                    # periodic cycle cache refresh for stale/gapped TFS (non-blocking)
-                    try:
-                        _maybe_refresh_common_cycle_cache(state, exchange, shared_universe)
-                    except Exception:
+                        state["_common_maint_inflight"] = False
                         pass
 
                     if heavy_scan:

@@ -19,7 +19,7 @@ class SrProLongV2Config:
     max_zones_per_side: int = 8
     touch_mode: str = "top"
     touch_use_close: bool = False
-    dvf_norm_min: float = 0.12
+    dvf_norm_min: float = 0.14
     require_reject_close: bool = False
     reject_mode: str = "top"
     reject_source: str = "1h"
