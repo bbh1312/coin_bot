@@ -210,7 +210,9 @@ def _minute_str(ts_ms: int) -> str:
 def _latest_even_day_0030_kst_anchor_ms(now_ms: int) -> int:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
-    anchor_kst = now_kst.replace(hour=0, minute=30, second=0, microsecond=0)
+    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_HOUR", "0") or 0)))
+    anchor_minute = max(0, min(59, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
+    anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
     if now_kst < anchor_kst:
         anchor_kst -= timedelta(days=1)
     while (anchor_kst.day % 2) != 0:
@@ -225,6 +227,32 @@ def _even_day_anchor_series_ms(eval_start_ms: int, end_ms: int) -> List[int]:
     out: List[int] = []
     cur = first
     step = 2 * 24 * 60 * 60 * 1000
+    while cur < end_ms:
+        out.append(int(cur))
+        cur += step
+    if not out:
+        out.append(int(first))
+    return sorted(set(out))
+
+
+def _latest_daily_0030_kst_anchor_ms(now_ms: int) -> int:
+    kst = timezone(timedelta(hours=9))
+    now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
+    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_HOUR", "0") or 0)))
+    anchor_minute = max(0, min(59, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
+    anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
+    if now_kst < anchor_kst:
+        anchor_kst -= timedelta(days=1)
+    return int(anchor_kst.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def _daily_anchor_series_ms(eval_start_ms: int, end_ms: int) -> List[int]:
+    if end_ms <= 0:
+        return []
+    first = _latest_daily_0030_kst_anchor_ms(eval_start_ms)
+    out: List[int] = []
+    cur = first
+    step = 24 * 60 * 60 * 1000
     while cur < end_ms:
         out.append(int(cur))
         cur += step
@@ -287,8 +315,13 @@ def _build_fixed_anchor_replay_schedule(
     eval_start_ms: int,
     end_ms: int,
     top_n: int,
+    cadence: str = "even",
 ) -> List[dict]:
-    anchors = _even_day_anchor_series_ms(eval_start_ms, end_ms)
+    cadence_key = str(cadence or "even").lower()
+    if cadence_key == "daily":
+        anchors = _daily_anchor_series_ms(eval_start_ms, end_ms)
+    else:
+        anchors = _even_day_anchor_series_ms(eval_start_ms, end_ms)
     if not anchors:
         return []
     sched: List[dict] = []
@@ -406,18 +439,27 @@ def run_backtest() -> None:
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
-    parser.add_argument("--total-window-days", type=int, default=14)
+    parser.add_argument(
+        "--total-window-days",
+        type=int,
+        default=int(os.getenv("SR_PRO_LONG_V2_BT_TOTAL_WINDOW_DAYS", "14") or 14),
+    )
     parser.add_argument("--rolling-zones", action="store_true", default=True)
     parser.add_argument("--no-rolling-zones", action="store_false", dest="rolling_zones")
     parser.add_argument(
         "--fixed-even-day-0030-kst",
         action="store_true",
-        help="Fix universe/zones to latest even-day 00:30 KST snapshot (backtest only).",
+        help="Fix universe/zones to latest even-day configured KST anchor snapshot (default 00:00).",
     )
     parser.add_argument(
         "--fixed-even-day-0030-kst-replay",
         action="store_true",
-        help="Replay mode: refresh anchor/universe every even-day 00:30 KST within eval window.",
+        help="Replay mode: refresh anchor/universe every even-day configured KST anchor within eval window.",
+    )
+    parser.add_argument(
+        "--fixed-daily-0030-kst-replay",
+        action="store_true",
+        help="Replay mode: refresh anchor/universe every day configured KST anchor within eval window.",
     )
     parser.add_argument("--zones-snapshot-in", type=str, default="")
     parser.add_argument("--zones-snapshot-out", type=str, default="")
@@ -428,6 +470,20 @@ def run_backtest() -> None:
     parser.add_argument("--debug-symbol", type=str, default="")
     parser.add_argument("--block-hours", type=str, default="")
     args = parser.parse_args()
+    bt_fixed_default = os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR", "1").strip().lower() not in ("0", "false", "off", "no")
+    bt_replay_cadence = os.getenv("SR_PRO_LONG_V2_BT_FIXED_REPLAY_CADENCE", "daily").strip().lower()
+    if (
+        bt_fixed_default
+        and args.universe in ("common", "common_universe")
+        and not args.fixed_even_day_0030_kst
+        and not args.fixed_even_day_0030_kst_replay
+        and not args.fixed_daily_0030_kst_replay
+    ):
+        args.fixed_even_day_0030_kst = True
+        if bt_replay_cadence == "even":
+            args.fixed_even_day_0030_kst_replay = True
+        else:
+            args.fixed_daily_0030_kst_replay = True
 
     def _tf_ms(tf: str) -> int:
         try:
@@ -461,9 +517,14 @@ def run_backtest() -> None:
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     anchor_ms = 0
     if args.fixed_even_day_0030_kst:
-        anchor_ms = _latest_even_day_0030_kst_anchor_ms(end_ms)
+        if args.fixed_daily_0030_kst_replay and not args.fixed_even_day_0030_kst_replay:
+            anchor_ms = _latest_daily_0030_kst_anchor_ms(end_ms)
+            anchor_mode = "daily_config_kst"
+        else:
+            anchor_ms = _latest_even_day_0030_kst_anchor_ms(end_ms)
+            anchor_mode = "even_day_config_kst"
         print(
-            f"[BACKTEST] fixed_anchor_mode=even_day_0030_kst "
+            f"[BACKTEST] fixed_anchor_mode={anchor_mode} "
             f"anchor_kst={_ts_kst(anchor_ms)} anchor_utc={datetime.fromtimestamp(anchor_ms/1000.0, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}"
         )
     min_bars = {cfg.tf_ltf: 120, cfg.tf_mtf: 120, cfg.tf_htf: 120}
@@ -502,13 +563,15 @@ def run_backtest() -> None:
     universe: List[str] = []
     if (
         args.fixed_even_day_0030_kst
-        and args.fixed_even_day_0030_kst_replay
+        and (args.fixed_even_day_0030_kst_replay or args.fixed_daily_0030_kst_replay)
         and args.universe in ("common", "common_universe")
     ):
+        cadence = "daily" if args.fixed_daily_0030_kst_replay else "even"
         replay_schedule = _build_fixed_anchor_replay_schedule(
             eval_start_ms=eval_start_ms,
             end_ms=end_ms,
             top_n=args.top_n,
+            cadence=cadence,
         )
         union_syms: List[str] = []
         seen_syms = set()
@@ -520,7 +583,7 @@ def run_backtest() -> None:
                 union_syms.append(s)
         universe = union_syms
         print(
-            f"[BACKTEST] fixed_replay_schedule segments={len(replay_schedule)} "
+            f"[BACKTEST] fixed_replay_schedule cadence={cadence} segments={len(replay_schedule)} "
             f"union_symbols={len(universe)}"
         )
         for seg in replay_schedule:

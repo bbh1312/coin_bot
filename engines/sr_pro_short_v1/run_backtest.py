@@ -150,24 +150,54 @@ def _minute_str(ts_ms: int) -> str:
     return _ts_kst(ts_ms)
 
 
-def _latest_even_day_0030_kst_anchor_ms(now_ms: int) -> int:
+def _latest_kst_anchor_ms(
+    now_ms: int,
+    cadence_days: int = 2,
+    anchor_hour: int = 0,
+    anchor_minute: int = 30,
+) -> int:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
-    anchor_kst = now_kst.replace(hour=0, minute=30, second=0, microsecond=0)
+    cadence_days = max(1, int(cadence_days))
+    anchor_hour = max(0, min(23, int(anchor_hour)))
+    anchor_minute = max(0, min(59, int(anchor_minute)))
+    anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
     if now_kst < anchor_kst:
         anchor_kst -= timedelta(days=1)
-    while (anchor_kst.day % 2) != 0:
+    while ((anchor_kst.day - 1) % cadence_days) != 0:
         anchor_kst -= timedelta(days=1)
     return int(anchor_kst.astimezone(timezone.utc).timestamp() * 1000)
 
 
 def _even_day_anchor_series_ms(eval_start_ms: int, end_ms: int) -> List[int]:
+    return _anchor_series_ms(
+        eval_start_ms=eval_start_ms,
+        end_ms=end_ms,
+        cadence_days=2,
+        anchor_hour=0,
+        anchor_minute=30,
+    )
+
+
+def _anchor_series_ms(
+    eval_start_ms: int,
+    end_ms: int,
+    cadence_days: int = 2,
+    anchor_hour: int = 0,
+    anchor_minute: int = 30,
+) -> List[int]:
     if end_ms <= 0:
         return []
-    first = _latest_even_day_0030_kst_anchor_ms(eval_start_ms)
+    cadence_days = max(1, int(cadence_days))
+    first = _latest_kst_anchor_ms(
+        now_ms=eval_start_ms,
+        cadence_days=cadence_days,
+        anchor_hour=anchor_hour,
+        anchor_minute=anchor_minute,
+    )
     out: List[int] = []
     cur = first
-    step = 2 * 24 * 60 * 60 * 1000
+    step = cadence_days * 24 * 60 * 60 * 1000
     while cur < end_ms:
         out.append(int(cur))
         cur += step
@@ -230,8 +260,17 @@ def _build_fixed_anchor_replay_schedule(
     eval_start_ms: int,
     end_ms: int,
     top_n: int,
+    cadence_days: int = 2,
+    anchor_hour: int = 0,
+    anchor_minute: int = 30,
 ) -> List[dict]:
-    anchors = _even_day_anchor_series_ms(eval_start_ms, end_ms)
+    anchors = _anchor_series_ms(
+        eval_start_ms=eval_start_ms,
+        end_ms=end_ms,
+        cadence_days=cadence_days,
+        anchor_hour=anchor_hour,
+        anchor_minute=anchor_minute,
+    )
     if not anchors:
         return []
     sched: List[dict] = []
@@ -420,6 +459,9 @@ def run_backtest() -> None:
         help="Disable replay mode and use a single fixed anchor for full eval window.",
     )
     parser.set_defaults(fixed_even_day_0030_kst_replay=True)
+    parser.add_argument("--fixed-anchor-cadence-days", type=int, default=1)
+    parser.add_argument("--fixed-kst-anchor-hour", type=int, default=0)
+    parser.add_argument("--fixed-kst-anchor-minute", type=int, default=0)
     parser.add_argument("--zones-snapshot-in", type=str, default="")
     parser.add_argument("--zones-snapshot-out", type=str, default="")
     parser.add_argument("--verbose", action="store_true")
@@ -494,9 +536,15 @@ def run_backtest() -> None:
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     anchor_ms = 0
     if args.fixed_even_day_0030_kst:
-        anchor_ms = _latest_even_day_0030_kst_anchor_ms(end_ms)
+        anchor_ms = _latest_kst_anchor_ms(
+            now_ms=end_ms,
+            cadence_days=args.fixed_anchor_cadence_days,
+            anchor_hour=args.fixed_kst_anchor_hour,
+            anchor_minute=args.fixed_kst_anchor_minute,
+        )
         print(
-            f"[BACKTEST] fixed_anchor_mode=even_day_0030_kst "
+            f"[BACKTEST] fixed_anchor_mode=kst_{int(args.fixed_anchor_cadence_days)}d_"
+            f"{int(args.fixed_kst_anchor_hour):02d}{int(args.fixed_kst_anchor_minute):02d} "
             f"anchor_kst={_ts_kst(anchor_ms)} anchor_utc={datetime.fromtimestamp(anchor_ms/1000.0, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}"
         )
     min_bars = {
@@ -546,6 +594,9 @@ def run_backtest() -> None:
             eval_start_ms=eval_start_ms,
             end_ms=end_ms,
             top_n=args.top_n,
+            cadence_days=args.fixed_anchor_cadence_days,
+            anchor_hour=args.fixed_kst_anchor_hour,
+            anchor_minute=args.fixed_kst_anchor_minute,
         )
         union_syms: List[str] = []
         seen_syms = set()

@@ -1525,9 +1525,15 @@ NOISE_REVERSE_FILE_CACHE_FAIL: dict = {}
 NOISE_REVERSE_SOURCE_LOGGED: dict = {}
 SR_PRO_USE_COMMON_CACHE = os.getenv("SR_PRO_USE_COMMON_CACHE", "1") not in ("0", "false", "off", "no")
 SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST = os.getenv("SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST", "1") not in ("0", "false", "off", "no")
+SR_PRO_SHORT_V1_FIXED_ANCHOR_CADENCE_DAYS = max(1, int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_CADENCE_DAYS", "1") or 1))
+SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR = max(0, min(23, int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR", "0") or 0)))
+SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE = max(0, min(59, int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
 SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR = os.getenv("SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR", os.path.join("logs", "common_universe")).strip()
 SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N = int(os.getenv("SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N", str(COMMON_UNIVERSE_TOP_N or 50)))
 SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST = os.getenv("SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST", "1") not in ("0", "false", "off", "no")
+SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS = max(1, int(os.getenv("SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS", "1") or 1))
+SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR", "0") or 0)))
+SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE = max(0, min(59, int(os.getenv("SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
 SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N = int(os.getenv("SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N", str(COMMON_UNIVERSE_TOP_N or 50)))
 
 
@@ -2449,6 +2455,24 @@ def _latest_even_day_0030_kst_anchor(now_kst: Optional[datetime] = None) -> date
     return anchor
 
 
+def _latest_kst_anchor(
+    now_kst: Optional[datetime] = None,
+    cadence_days: int = 2,
+    anchor_hour: int = 0,
+    anchor_minute: int = 30,
+) -> datetime:
+    cur = now_kst if isinstance(now_kst, datetime) else _kst_now()
+    cadence_days = max(1, int(cadence_days))
+    anchor_hour = max(0, min(23, int(anchor_hour)))
+    anchor_minute = max(0, min(59, int(anchor_minute)))
+    anchor = cur.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
+    if cur < anchor:
+        anchor = anchor - timedelta(days=1)
+    while ((int(anchor.day) - 1) % cadence_days) != 0:
+        anchor = anchor - timedelta(days=1)
+    return anchor
+
+
 def _latest_even_day_0030_kst_anchor_ms(now_ts: Optional[float] = None) -> int:
     try:
         if now_ts is not None:
@@ -2456,6 +2480,28 @@ def _latest_even_day_0030_kst_anchor_ms(now_ts: Optional[float] = None) -> int:
         else:
             cur = _kst_now()
         anchor_kst = _latest_even_day_0030_kst_anchor(cur)
+        return int((anchor_kst - timedelta(hours=9)).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _latest_kst_anchor_ms(
+    now_ts: Optional[float] = None,
+    cadence_days: int = 2,
+    anchor_hour: int = 0,
+    anchor_minute: int = 30,
+) -> int:
+    try:
+        if now_ts is not None:
+            cur = datetime.fromtimestamp(float(now_ts), tz=timezone.utc) + timedelta(hours=9)
+        else:
+            cur = _kst_now()
+        anchor_kst = _latest_kst_anchor(
+            now_kst=cur,
+            cadence_days=cadence_days,
+            anchor_hour=anchor_hour,
+            anchor_minute=anchor_minute,
+        )
         return int((anchor_kst - timedelta(hours=9)).timestamp() * 1000)
     except Exception:
         return 0
@@ -8590,7 +8636,11 @@ def _run_sr_pro_short_v1_cycle(
         "boundary_block": 0,
         "pct_non_negative": 0,
     }
-    fixed_anchor_ms = _latest_even_day_0030_kst_anchor_ms()
+    fixed_anchor_ms = _latest_kst_anchor_ms(
+        cadence_days=SR_PRO_SHORT_V1_FIXED_ANCHOR_CADENCE_DAYS,
+        anchor_hour=SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR,
+        anchor_minute=SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE,
+    )
     fixed_anchor_kst = _ts_to_kst_str(float(fixed_anchor_ms) / 1000.0) if fixed_anchor_ms else "unknown"
     fixed_universe_file = ""
     effective_universe = list(sr_universe or [])
@@ -8605,12 +8655,14 @@ def _run_sr_pro_short_v1_cycle(
     _append_sr_pro_short_v1_log(
         f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
         f"fixed_anchor={int(SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST)} anchor_kst={fixed_anchor_kst} "
+        f"anchor_rule={SR_PRO_SHORT_V1_FIXED_ANCHOR_CADENCE_DAYS}d_{SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR:02d}:{SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE:02d} "
         f"universe_file={fixed_universe_file or '-'}"
     )
     try:
         print(
             f"SR_PRO_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
-            f"fixed_anchor={int(SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST)} anchor_kst={fixed_anchor_kst}"
+            f"fixed_anchor={int(SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST)} anchor_kst={fixed_anchor_kst} "
+            f"anchor_rule={SR_PRO_SHORT_V1_FIXED_ANCHOR_CADENCE_DAYS}d_{SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR:02d}:{SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE:02d}"
         )
     except Exception:
         pass
@@ -9469,7 +9521,15 @@ def _run_sr_pro_long_v1_cycle(
         "skip_stale_ts": 0,
         "cooldown": 0,
     }
-    fixed_anchor_ms = _latest_even_day_0030_kst_anchor_ms() if apply_fixed_anchor else 0
+    fixed_anchor_ms = (
+        _latest_kst_anchor_ms(
+            cadence_days=SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS,
+            anchor_hour=SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR,
+            anchor_minute=SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE,
+        )
+        if apply_fixed_anchor
+        else 0
+    )
     fixed_anchor_kst = _ts_to_kst_str(float(fixed_anchor_ms) / 1000.0) if fixed_anchor_ms else "NA"
     fixed_universe_file = ""
     effective_universe = list(sr_universe or [])
@@ -9484,12 +9544,16 @@ def _run_sr_pro_long_v1_cycle(
     log_fn(
         f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
         f"fixed_anchor={int(apply_fixed_anchor)} anchor_kst={fixed_anchor_kst} "
+        f"anchor_cadence_days={SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS} "
+        f"anchor_hm={SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR:02d}:{SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE:02d} "
         f"universe_file={fixed_universe_file or '-'}"
     )
     try:
         print(
             f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
-            f"fixed_anchor={int(apply_fixed_anchor)} anchor_kst={fixed_anchor_kst}"
+            f"fixed_anchor={int(apply_fixed_anchor)} anchor_kst={fixed_anchor_kst} "
+            f"anchor_cadence_days={SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS} "
+            f"anchor_hm={SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR:02d}:{SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE:02d}"
         )
     except Exception:
         pass
