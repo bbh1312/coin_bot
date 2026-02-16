@@ -161,6 +161,26 @@ def run_backtest() -> None:
     parser.add_argument("--rise-min-pct", type=float, default=cfg.rise_min_pct)
     parser.add_argument("--hh-ratio-min", type=float, default=cfg.hh_ratio_min)
     parser.add_argument("--htf-top-zone-ratio", type=float, default=cfg.htf_top_zone_ratio)
+    parser.add_argument("--htf-resistance-require", action="store_true", default=cfg.htf_resistance_require)
+    parser.add_argument("--no-htf-resistance-require", action="store_false", dest="htf_resistance_require")
+    parser.add_argument("--htf-resistance-touch-tol-pct", type=float, default=cfg.htf_resistance_touch_tol_pct)
+    parser.add_argument("--htf-resistance-reject-min-pct", type=float, default=cfg.htf_resistance_reject_min_pct)
+    parser.add_argument("--htf-dev-min-pct", type=float, default=cfg.htf_dev_min_pct)
+    parser.add_argument("--use-1h-regime", action="store_true", default=cfg.use_1h_regime)
+    parser.add_argument("--no-use-1h-regime", action="store_false", dest="use_1h_regime")
+    parser.add_argument("--lookback-1h", type=int, default=cfg.lookback_1h)
+    parser.add_argument("--h1-use-rise-filter", action="store_true", default=cfg.h1_use_rise_filter)
+    parser.add_argument("--no-h1-use-rise-filter", action="store_false", dest="h1_use_rise_filter")
+    parser.add_argument("--h1-rise-min-pct", type=float, default=cfg.h1_rise_min_pct)
+    parser.add_argument("--h1-top-zone-ratio", type=float, default=cfg.h1_top_zone_ratio)
+    parser.add_argument("--h1-resistance-touch-tol-pct", type=float, default=cfg.h1_resistance_touch_tol_pct)
+    parser.add_argument("--h1-resistance-reject-min-pct", type=float, default=cfg.h1_resistance_reject_min_pct)
+    parser.add_argument("--h1-use-dev-filter", action="store_true", default=cfg.h1_use_dev_filter)
+    parser.add_argument("--no-h1-use-dev-filter", action="store_false", dest="h1_use_dev_filter")
+    parser.add_argument("--h1-dev-min-pct", type=float, default=cfg.h1_dev_min_pct)
+    parser.add_argument("--h1-bend-require", action="store_true", default=cfg.h1_bend_require)
+    parser.add_argument("--no-h1-bend-require", action="store_false", dest="h1_bend_require")
+    parser.add_argument("--h1-ema-len", type=int, default=cfg.h1_ema_len)
     parser.add_argument("--ema-fast-len", type=int, default=cfg.ema_fast_len)
     parser.add_argument("--ema-mid-len", type=int, default=cfg.ema_mid_len)
     parser.add_argument("--ema-slow-len", type=int, default=cfg.ema_slow_len)
@@ -174,6 +194,22 @@ def run_backtest() -> None:
     parser.add_argument("--bend-min-body-ratio", type=float, default=cfg.bend_min_body_ratio)
     parser.add_argument("--bend-require-prev-low-break", action="store_true", default=cfg.bend_require_prev_low_break)
     parser.add_argument("--no-bend-require-prev-low-break", action="store_false", dest="bend_require_prev_low_break")
+    parser.add_argument("--bend-two-step-enable", action="store_true", default=cfg.bend_two_step_enable)
+    parser.add_argument("--no-bend-two-step-enable", action="store_false", dest="bend_two_step_enable")
+    parser.add_argument("--bend-use-upper-wick-filter", action="store_true", default=cfg.bend_use_upper_wick_filter)
+    parser.add_argument("--no-bend-use-upper-wick-filter", action="store_false", dest="bend_use_upper_wick_filter")
+    parser.add_argument("--bend-min-upper-wick-ratio", type=float, default=cfg.bend_min_upper_wick_ratio)
+    parser.add_argument(
+        "--bend-use-close-location-filter",
+        action="store_true",
+        default=cfg.bend_use_close_location_filter,
+    )
+    parser.add_argument(
+        "--no-bend-use-close-location-filter",
+        action="store_false",
+        dest="bend_use_close_location_filter",
+    )
+    parser.add_argument("--bend-max-close-pos-ratio", type=float, default=cfg.bend_max_close_pos_ratio)
     parser.add_argument("--armed-bars-3m", type=int, default=cfg.armed_bars_3m)
     parser.add_argument("--ltf-ema-len", type=int, default=cfg.ltf_ema_len)
     parser.add_argument("--swing-lookback-3m", type=int, default=cfg.swing_lookback_3m)
@@ -184,14 +220,53 @@ def run_backtest() -> None:
     parser.add_argument("--ltf-retest-enable", action="store_true", default=cfg.ltf_retest_enable)
     parser.add_argument("--no-ltf-retest-enable", action="store_false", dest="ltf_retest_enable")
     parser.add_argument("--ltf-retest-bars", type=int, default=cfg.ltf_retest_bars)
+    parser.add_argument("--ltf-retest-min-bars", type=int, default=cfg.ltf_retest_min_bars)
     parser.add_argument("--ltf-retest-tol-atr-mult", type=float, default=cfg.ltf_retest_tol_atr_mult)
+    parser.add_argument("--retest-score-min", type=int, default=cfg.retest_score_min)
+    parser.add_argument("--retest-use-weighted-score", action="store_true", default=cfg.retest_use_weighted_score)
+    parser.add_argument("--no-retest-use-weighted-score", action="store_false", dest="retest_use_weighted_score")
+    parser.add_argument("--retest-score-min-float", type=float, default=cfg.retest_score_min_float)
+    parser.add_argument("--retest-score-use-resistance", action="store_true", default=cfg.retest_score_use_resistance)
+    parser.add_argument("--no-retest-score-use-resistance", action="store_false", dest="retest_score_use_resistance")
+    parser.add_argument("--retest-score-use-volume", action="store_true", default=cfg.retest_score_use_volume)
+    parser.add_argument("--no-retest-score-use-volume", action="store_false", dest="retest_score_use_volume")
+    parser.add_argument(
+        "--retest-score-use-reject-strength",
+        action="store_true",
+        default=cfg.retest_score_use_reject_strength,
+    )
+    parser.add_argument(
+        "--no-retest-score-use-reject-strength",
+        action="store_false",
+        dest="retest_score_use_reject_strength",
+    )
+    parser.add_argument("--retest-score-vol-mult-min", type=float, default=cfg.retest_score_vol_mult_min)
+    parser.add_argument("--retest-score-reject-atr-mult", type=float, default=cfg.retest_score_reject_atr_mult)
+    parser.add_argument("--retest-score-weight-resistance", type=float, default=cfg.retest_score_weight_resistance)
+    parser.add_argument("--retest-score-weight-volume", type=float, default=cfg.retest_score_weight_volume)
+    parser.add_argument("--retest-score-weight-reject", type=float, default=cfg.retest_score_weight_reject)
     parser.add_argument("--ltf-wait-counter-momo", action="store_true", default=cfg.ltf_wait_counter_momo)
     parser.add_argument("--no-ltf-wait-counter-momo", action="store_false", dest="ltf_wait_counter_momo")
     parser.add_argument("--ltf-counter-momo-bars", type=int, default=cfg.ltf_counter_momo_bars)
+    parser.add_argument("--ltf-resistance-require", action="store_true", default=cfg.ltf_resistance_require)
+    parser.add_argument("--no-ltf-resistance-require", action="store_false", dest="ltf_resistance_require")
+    parser.add_argument("--ltf-resistance-as-gate", action="store_true", default=cfg.ltf_resistance_as_gate)
+    parser.add_argument("--no-ltf-resistance-as-gate", action="store_false", dest="ltf_resistance_as_gate")
+    parser.add_argument("--ltf-resistance-lookback", type=int, default=cfg.ltf_resistance_lookback)
+    parser.add_argument("--ltf-resistance-touch-bars", type=int, default=cfg.ltf_resistance_touch_bars)
+    parser.add_argument(
+        "--ltf-resistance-touch-tol-atr-mult", type=float, default=cfg.ltf_resistance_touch_tol_atr_mult
+    )
+    parser.add_argument("--ltf-resistance-reject-min-pct", type=float, default=cfg.ltf_resistance_reject_min_pct)
 
     parser.add_argument("--sl-min-pct", type=float, default=cfg.sl_min_pct)
     parser.add_argument("--sl-max-pct", type=float, default=cfg.sl_max_pct)
     parser.add_argument("--sl-floor-atr-mult", type=float, default=cfg.sl_floor_atr_mult)
+    parser.add_argument("--sl-use-entry-floor", action="store_true", default=cfg.sl_use_entry_floor)
+    parser.add_argument("--no-sl-use-entry-floor", action="store_false", dest="sl_use_entry_floor")
+    parser.add_argument("--sl-use-retest-high", action="store_true", default=cfg.sl_use_retest_high)
+    parser.add_argument("--no-sl-use-retest-high", action="store_false", dest="sl_use_retest_high")
+    parser.add_argument("--sl-retest-buffer-atr-mult", type=float, default=cfg.sl_retest_buffer_atr_mult)
     parser.add_argument("--tp-min-pct", type=float, default=cfg.tp_min_pct)
     parser.add_argument("--tp-max-pct", type=float, default=cfg.tp_max_pct)
     parser.add_argument("--rr-min", type=float, default=cfg.rr_min)
@@ -226,17 +301,30 @@ def run_backtest() -> None:
         "no_data": 0,
         "uptrend_fail": 0,
         "rise_fail": 0,
+        "h1_data_fail": 0,
+        "h1_rise_fail": 0,
+        "h1_top_zone_fail": 0,
+        "h1_resist_fail": 0,
+        "h1_dev_fail": 0,
+        "h1_bend_fail": 0,
         "ema_stack_fail": 0,
         "hh_fail": 0,
         "top_zone_fail": 0,
+        "htf_resist_fail": 0,
+        "htf_dev_fail": 0,
         "htf_vol_fail": 0,
         "htf_vol_spike_fail": 0,
         "bend_fail": 0,
         "bend_strength_fail": 0,
+        "bend_two_step_fail": 0,
+        "bend_wick_fail": 0,
+        "bend_close_pos_fail": 0,
         "armed": 0,
         "confirm_fail": 0,
         "retest_fail": 0,
+        "retest_score_fail": 0,
         "two_step_fail": 0,
+        "ltf_resist_fail": 0,
         "counter_momo_fail": 0,
         "counter_momo_hit": 0,
         "entry_hit": 0,
@@ -275,20 +363,40 @@ def run_backtest() -> None:
             common_warmup_dir=common_dir if use_common else None,
             common_only=args.common_only,
         )
-        if not rows15 or not rows3:
+        rows1h = []
+        if bool(args.use_1h_regime):
+            rows1h = _fetch_ohlcv_all(
+                exchange,
+                sym,
+                "1h",
+                start_ms,
+                end_ms,
+                cache_only=args.cache_only,
+                common_warmup_dir=common_dir if use_common else None,
+                common_only=args.common_only,
+            )
+        if (not rows15) or (not rows3) or (bool(args.use_1h_regime) and not rows1h):
             gates["no_data"] += 1
             continue
 
         d15 = pd.DataFrame(rows15, columns=["ts", "open", "high", "low", "close", "volume"])
         d3 = pd.DataFrame(rows3, columns=["ts", "open", "high", "low", "close", "volume"])
+        d1h = pd.DataFrame(rows1h, columns=["ts", "open", "high", "low", "close", "volume"]) if rows1h else pd.DataFrame()
         d15 = d15.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
         d3 = d3.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+        if not d1h.empty:
+            d1h = d1h.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
 
         if args.use_confirmed and len(d15) > 0:
             d15 = d15.iloc[:-1].reset_index(drop=True)
         if args.use_confirmed and len(d3) > 0:
             d3 = d3.iloc[:-1].reset_index(drop=True)
+        if args.use_confirmed and not d1h.empty:
+            d1h = d1h.iloc[:-1].reset_index(drop=True)
         if len(d15) < max(int(args.lookback_15m) + 2, int(args.ema_slow_len) + 2) or len(d3) < 200:
+            gates["no_data"] += 1
+            continue
+        if bool(args.use_1h_regime) and len(d1h) < max(int(args.lookback_1h) + 2, int(args.h1_ema_len) + 2):
             gates["no_data"] += 1
             continue
 
@@ -302,6 +410,15 @@ def run_backtest() -> None:
         d3["vol_sma20"] = d3["volume"].astype(float).rolling(20, min_periods=1).mean()
         d3["swing_low_prev"] = d3["low"].astype(float).rolling(int(args.swing_lookback_3m), min_periods=2).min().shift(1)
         d3["atr"] = _atr(d3, 14).fillna(0.0)
+        d3["res_high_prev"] = (
+            d3["high"].astype(float).rolling(max(int(args.ltf_resistance_lookback), 2), min_periods=2).max().shift(1)
+        )
+        d3["recent_high_prev"] = (
+            d3["high"].astype(float).rolling(max(int(args.ltf_resistance_touch_bars), 2), min_periods=1).max().shift(1)
+        )
+        ts_1h = d1h["ts"].values if not d1h.empty else np.array([], dtype=np.int64)
+        if not d1h.empty:
+            d1h["ema_h1"] = _ema(d1h["close"].astype(float), int(args.h1_ema_len))
 
         sym_stats = per_symbol.setdefault(sym, _new_stats())
         next_eligible_ts = eval_start_ms
@@ -311,6 +428,56 @@ def run_backtest() -> None:
             ts15 = int(d15.at[i, "ts"])
             if ts15 < eval_start_ms or ts15 < next_eligible_ts:
                 continue
+            if bool(args.use_1h_regime):
+                decision_ts = ts15 - (60 * 60 * 1000 if bool(args.use_confirmed) else 0)
+                idx1h = int(np.searchsorted(ts_1h, decision_ts, side="right") - 1)
+                if idx1h < max(int(args.lookback_1h), 2):
+                    gates["h1_data_fail"] += 1
+                    continue
+                h0 = idx1h - int(args.lookback_1h) + 1
+                highs1 = d1h["high"].iloc[h0 : idx1h + 1].astype(float)
+                lows1 = d1h["low"].iloc[h0 : idx1h + 1].astype(float)
+                if len(highs1) < int(args.lookback_1h):
+                    gates["h1_data_fail"] += 1
+                    continue
+                h1_low = max(float(lows1.min()), 1e-12)
+                h1_high = float(highs1.max())
+                h1_rise_pct = (h1_high - h1_low) / h1_low * 100.0
+                if bool(args.h1_use_rise_filter):
+                    if h1_rise_pct < float(args.h1_rise_min_pct):
+                        gates["h1_rise_fail"] += 1
+                        continue
+                h1_range = max(h1_high - h1_low, 1e-12)
+                h1_top_ratio = max(min(float(args.h1_top_zone_ratio), 0.9), 0.05)
+                h1_top_floor = h1_high - (h1_range * h1_top_ratio)
+                close1 = float(d1h.at[idx1h, "close"])
+                if close1 < h1_top_floor:
+                    gates["h1_top_zone_fail"] += 1
+                    continue
+                high1 = float(d1h.at[idx1h, "high"])
+                tol1 = max(float(args.h1_resistance_touch_tol_pct), 0.0)
+                rej1 = max(float(args.h1_resistance_reject_min_pct), 0.0)
+                near_res1 = ((h1_high - high1) / max(h1_high, 1e-12)) <= tol1
+                reject_res1 = close1 <= (h1_high * (1.0 - rej1))
+                if not (near_res1 or reject_res1):
+                    gates["h1_resist_fail"] += 1
+                    continue
+                ema1 = max(float(d1h.at[idx1h, "ema_h1"]), 1e-12)
+                h1_dev_pct = (close1 - ema1) / ema1 * 100.0
+                if bool(args.h1_use_dev_filter):
+                    if h1_dev_pct < float(args.h1_dev_min_pct):
+                        gates["h1_dev_fail"] += 1
+                        continue
+                if bool(args.h1_bend_require):
+                    if idx1h < 1:
+                        gates["h1_bend_fail"] += 1
+                        continue
+                    prev_h1_high = float(d1h.at[idx1h - 1, "high"])
+                    prev_h1_close = float(d1h.at[idx1h - 1, "close"])
+                    bend1 = (high1 < prev_h1_high) and (close1 < prev_h1_close)
+                    if not bend1:
+                        gates["h1_bend_fail"] += 1
+                        continue
 
             w0 = i - int(args.lookback_15m)
             w1 = i  # 이전 구간(꺾임 직전)까지
@@ -344,6 +511,22 @@ def run_backtest() -> None:
             if float(d15.at[i - 1, "close"]) < top_zone_floor:
                 gates["top_zone_fail"] += 1
                 continue
+            if bool(args.htf_resistance_require):
+                prev_high = float(d15.at[i - 1, "high"])
+                prev_close = float(d15.at[i - 1, "close"])
+                resist_tol = max(float(args.htf_resistance_touch_tol_pct), 0.0)
+                reject_min = max(float(args.htf_resistance_reject_min_pct), 0.0)
+                near_res = ((rolling_high - prev_high) / max(rolling_high, 1e-12)) <= resist_tol
+                reject_from_res = prev_close <= (rolling_high * (1.0 - reject_min))
+                if not (near_res or reject_from_res):
+                    gates["htf_resist_fail"] += 1
+                    continue
+            prev_close_for_dev = float(d15.at[i - 1, "close"])
+            dev_base = max(float(d15.at[i - 1, "ema_fast"]), 1e-12)
+            dev_pct = (prev_close_for_dev - dev_base) / dev_base * 100.0
+            if dev_pct < float(args.htf_dev_min_pct):
+                gates["htf_dev_fail"] += 1
+                continue
 
             prev_high = float(d15.at[i - 1, "high"])
             prev_low = float(d15.at[i - 1, "low"])
@@ -353,7 +536,10 @@ def run_backtest() -> None:
             now_low = float(d15.at[i, "low"])
             now_close = float(d15.at[i, "close"])
             atr15 = max(float(d15.at[i, "atr"]), 1e-12)
-            body_ratio = abs(now_close - now_open) / max(now_high - now_low, 1e-12)
+            range_now = max(now_high - now_low, 1e-12)
+            body_ratio = abs(now_close - now_open) / range_now
+            upper_wick_ratio = (now_high - max(now_open, now_close)) / range_now
+            close_pos_ratio = (now_close - now_low) / range_now
             drop_atr = (prev_close - now_close) / atr15
             bend = now_high < prev_high and (now_close < prev_close)
             if bend and bool(args.bend_require_prev_low_break):
@@ -361,6 +547,28 @@ def run_backtest() -> None:
             if bend and (drop_atr < float(args.bend_min_drop_atr) or body_ratio < float(args.bend_min_body_ratio)):
                 gates["bend_strength_fail"] += 1
                 bend = False
+            if bend and bool(args.bend_two_step_enable):
+                if i < 2:
+                    gates["bend_two_step_fail"] += 1
+                    bend = False
+                else:
+                    prev2_high = float(d15.at[i - 2, "high"])
+                    prev2_close = float(d15.at[i - 2, "close"])
+                    prev_bend = (prev_high < prev2_high) and (prev_close < prev2_close)
+                    if bool(args.bend_require_prev_low_break):
+                        prev2_low = float(d15.at[i - 2, "low"])
+                        prev_bend = prev_bend and (prev_close < prev2_low)
+                    if not prev_bend:
+                        gates["bend_two_step_fail"] += 1
+                        bend = False
+            if bend and bool(args.bend_use_upper_wick_filter):
+                if upper_wick_ratio < float(args.bend_min_upper_wick_ratio):
+                    gates["bend_wick_fail"] += 1
+                    bend = False
+            if bend and bool(args.bend_use_close_location_filter):
+                if close_pos_ratio > float(args.bend_max_close_pos_ratio):
+                    gates["bend_close_pos_fail"] += 1
+                    bend = False
             if not bend:
                 gates["bend_fail"] += 1
                 continue
@@ -388,6 +596,8 @@ def run_backtest() -> None:
                 continue
 
             entry_ref_j = -1
+            retest_high_ref = np.nan
+            resist_blocked = False
             for j in c3.index:
                 c = float(d3.at[j, "close"])
                 ema_ltf = float(d3.at[j, "ema_ltf"])
@@ -408,22 +618,93 @@ def run_backtest() -> None:
 
                 retest_ok = False
                 atr3 = max(float(d3.at[j, "atr"]), 1e-12)
-                tol = atr3 * float(args.ltf_retest_tol_atr_mult)
-                end_j = min(int(j) + max(int(args.ltf_retest_bars), 1), len(d3) - 2)
-                for j2 in range(int(j) + 1, end_j + 1):
+                tol = atr3 * max(float(args.ltf_retest_tol_atr_mult), 0.0)
+                min_wait = max(int(args.ltf_retest_min_bars), 1)
+                max_wait = max(int(args.ltf_retest_bars), min_wait)
+                start_j = int(j) + min_wait
+                end_j = min(int(j) + max_wait, len(d3) - 2)
+                for j2 in range(start_j, end_j + 1):
                     h2 = float(d3.at[j2, "high"])
                     c2 = float(d3.at[j2, "close"])
                     ema2 = float(d3.at[j2, "ema_ltf"])
                     touched = h2 >= (sw_low - tol)
-                    retest_fail = touched and (c2 < sw_low) and (c2 < ema2)
-                    if retest_fail:
-                        entry_ref_j = int(j2)
-                        retest_ok = True
-                        break
+                    if not touched:
+                        continue
+
+                    reject_same = (c2 < sw_low) and (c2 < ema2)
+                    reject_next = False
+                    rej_j = j2
+                    if not reject_same and (j2 + 1) < len(d3):
+                        j3 = j2 + 1
+                        c3n = float(d3.at[j3, "close"])
+                        h3n = float(d3.at[j3, "high"])
+                        ema3n = float(d3.at[j3, "ema_ltf"])
+                        reject_next = (c3n < sw_low) and (c3n < ema3n) and (h3n <= (sw_low + tol))
+                        if reject_next:
+                            rej_j = j3
+                    if not (reject_same or reject_next):
+                        continue
+
+                    ltf_res_ok = True
+                    if bool(args.ltf_resistance_require):
+                        res3 = d3.at[rej_j, "res_high_prev"]
+                        recent_h = d3.at[rej_j, "recent_high_prev"]
+                        if not (np.isfinite(res3) and np.isfinite(recent_h)):
+                            ltf_res_ok = False
+                        else:
+                            res3f = float(res3)
+                            recent_hf = float(recent_h)
+                            atr_rej = max(float(d3.at[rej_j, "atr"]), 1e-12)
+                            tol_res = atr_rej * max(float(args.ltf_resistance_touch_tol_atr_mult), 0.0)
+                            touched_res = recent_hf >= (res3f - tol_res)
+                            reject_res = float(d3.at[rej_j, "close"]) <= (
+                                res3f * (1.0 - max(float(args.ltf_resistance_reject_min_pct), 0.0))
+                            )
+                            ltf_res_ok = touched_res and reject_res
+                    if bool(args.ltf_resistance_as_gate) and (not ltf_res_ok):
+                        resist_blocked = True
+                        continue
+
+                    score = 0
+                    score_f = 0.0
+                    if bool(args.retest_score_use_resistance):
+                        if ltf_res_ok:
+                            score += 1
+                            score_f += float(args.retest_score_weight_resistance)
+                    if bool(args.retest_score_use_volume):
+                        vol_now = float(d3.at[rej_j, "volume"])
+                        vol_sma_now = max(float(d3.at[rej_j, "vol_sma20"]), 1e-12)
+                        if vol_now >= (vol_sma_now * float(args.retest_score_vol_mult_min)):
+                            score += 1
+                            score_f += float(args.retest_score_weight_volume)
+                    if bool(args.retest_score_use_reject_strength):
+                        close_now = float(d3.at[rej_j, "close"])
+                        atr_now = max(float(d3.at[rej_j, "atr"]), 1e-12)
+                        if (sw_low - close_now) >= (atr_now * float(args.retest_score_reject_atr_mult)):
+                            score += 1
+                            score_f += float(args.retest_score_weight_reject)
+                    if bool(args.retest_use_weighted_score):
+                        if score_f < max(float(args.retest_score_min_float), 0.0):
+                            gates["retest_score_fail"] += 1
+                            continue
+                    else:
+                        if score < max(int(args.retest_score_min), 0):
+                            gates["retest_score_fail"] += 1
+                            continue
+
+                    entry_ref_j = int(rej_j)
+                    retest_high_ref = max(
+                        float(d3.at[j2, "high"]),
+                        float(d3.at[rej_j, "high"]),
+                    )
+                    retest_ok = True
+                    break
                 if retest_ok:
                     break
 
             if entry_ref_j < 0:
+                if bool(args.ltf_resistance_require) and bool(args.ltf_resistance_as_gate) and resist_blocked:
+                    gates["ltf_resist_fail"] += 1
                 if bool(args.ltf_retest_enable):
                     gates["retest_fail"] += 1
                 gates["confirm_fail"] += 1
@@ -473,10 +754,14 @@ def run_backtest() -> None:
             entry_px = float(d3.at[entry_i, "open"])
             bend_high = float(now_high)
             sl_by_bend = bend_high * (1.0 + float(args.bend_sl_buffer_pct))
-            sl_by_floor = entry_px * (1.0 + float(args.sl_min_pct))
             atr3_entry = max(float(d3.at[entry_i, "atr"]), 1e-12)
             sl_by_atr = entry_px + (atr3_entry * max(float(args.sl_floor_atr_mult), 0.0))
-            sl = max(sl_by_bend, sl_by_floor, sl_by_atr)
+            sl_candidates = [sl_by_bend, sl_by_atr]
+            if bool(args.sl_use_entry_floor):
+                sl_candidates.append(entry_px * (1.0 + float(args.sl_min_pct)))
+            if bool(args.sl_use_retest_high) and np.isfinite(retest_high_ref):
+                sl_candidates.append(float(retest_high_ref) + (atr3_entry * max(float(args.sl_retest_buffer_atr_mult), 0.0)))
+            sl = max(sl_candidates)
             risk = max(sl - entry_px, entry_px * 0.001)
             tp_rr = entry_px - risk * float(args.rr_min)
             tp_floor = entry_px * (1.0 - float(args.tp_min_pct))

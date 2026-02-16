@@ -1472,7 +1472,7 @@ COMMON_WARMUP_MAX_FETCH = int(os.getenv("COMMON_WARMUP_MAX_FETCH", "30"))
 COMMON_WARMUP_ALWAYS = os.getenv("COMMON_WARMUP_ALWAYS", "1") not in ("0", "false", "off", "no")
 COMMON_WARMUP_WS = os.getenv("COMMON_WARMUP_WS", "0") in ("1", "true", "on", "yes")
 COMMON_UNIVERSE_REFRESH_ENABLED = os.getenv("COMMON_UNIVERSE_REFRESH_ENABLED", "1") not in ("0", "false", "off", "no")
-COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "12"))
+COMMON_UNIVERSE_REFRESH_HOUR = int(os.getenv("COMMON_UNIVERSE_REFRESH_HOUR", "9"))
 COMMON_UNIVERSE_REFRESH_MINUTE = max(0, min(59, int(os.getenv("COMMON_UNIVERSE_REFRESH_MINUTE", "0"))))
 COMMON_UNIVERSE_TOP_N = int(os.getenv("COMMON_UNIVERSE_TOP_N", "50"))
 COMMON_UNIVERSE_POS_TOP_N = int(os.getenv("COMMON_UNIVERSE_POS_TOP_N", "35"))
@@ -1518,8 +1518,8 @@ COMMON_CYCLE_REFRESH_TFS = tuple(
 # Run common cache maintenance off the main trading path to avoid missing LTF cycles.
 COMMON_MAINT_ASYNC_ENABLED = os.getenv("COMMON_MAINT_ASYNC_ENABLED", "1") not in ("0", "false", "off", "no")
 COMMON_MAINT_MIN_START_INTERVAL_SEC = float(os.getenv("COMMON_MAINT_MIN_START_INTERVAL_SEC", "15"))
-COMMON_MAINT_GAP_REPAIR_MAX_FETCH_RT = int(os.getenv("COMMON_MAINT_GAP_REPAIR_MAX_FETCH_RT", "8"))
-COMMON_MAINT_CYCLE_REFRESH_MAX_FETCH_RT = int(os.getenv("COMMON_MAINT_CYCLE_REFRESH_MAX_FETCH_RT", "2"))
+COMMON_MAINT_GAP_REPAIR_MAX_FETCH_RT = int(os.getenv("COMMON_MAINT_GAP_REPAIR_MAX_FETCH_RT", "20"))
+COMMON_MAINT_CYCLE_REFRESH_MAX_FETCH_RT = int(os.getenv("COMMON_MAINT_CYCLE_REFRESH_MAX_FETCH_RT", "12"))
 _COMMON_MAINT_THREAD = None
 _COMMON_MAINT_LOCK = threading.Lock()
 LIVE_OHLCV_SNAPSHOT_ENABLED = os.getenv("LIVE_OHLCV_SNAPSHOT_ENABLED", "1") not in ("0", "false", "off", "no")
@@ -2327,7 +2327,17 @@ def _maybe_repair_common_warmup_gaps(
         "1d": 24 * 60 * 60 * 1000,
     }
     now_ms = int(time.time() * 1000)
-    for sym in universe:
+    scan_universe = list(universe or [])
+    total_syms = len(scan_universe)
+    start_idx = 0
+    if total_syms > 0:
+        try:
+            start_idx = int(state.get("_common_gap_scan_start_idx", 0) or 0) % total_syms
+        except Exception:
+            start_idx = 0
+        if start_idx > 0:
+            scan_universe = scan_universe[start_idx:] + scan_universe[:start_idx]
+    for sym in scan_universe:
         for tf in COMMON_WARMUP_TFS:
             checked += 1
             try:
@@ -2373,6 +2383,12 @@ def _maybe_repair_common_warmup_gaps(
                     break
         if max_fetch > 0 and repaired >= max_fetch:
             break
+    if total_syms > 0:
+        try:
+            step = repaired if repaired > 0 else 1
+            state["_common_gap_scan_start_idx"] = (start_idx + step) % total_syms
+        except Exception:
+            pass
     if repaired:
         print(f"[common-gap] repaired {repaired}/{candidates} checked={checked}")
 
@@ -2409,7 +2425,17 @@ def _maybe_refresh_common_cycle_cache(
     refreshed = 0
     checked = 0
     now_ms = int(time.time() * 1000)
-    for sym in universe:
+    scan_universe = list(universe or [])
+    total_syms = len(scan_universe)
+    start_idx = 0
+    if total_syms > 0:
+        try:
+            start_idx = int(state.get("_common_cycle_scan_start_idx", 0) or 0) % total_syms
+        except Exception:
+            start_idx = 0
+        if start_idx > 0:
+            scan_universe = scan_universe[start_idx:] + scan_universe[:start_idx]
+    for sym in scan_universe:
         for tf in COMMON_CYCLE_REFRESH_TFS:
             checked += 1
             cap = COMMON_CYCLE_REFRESH_MAX_FETCH
@@ -2440,6 +2466,7 @@ def _maybe_refresh_common_cycle_cache(
                 data = exchange.fetch_ohlcv(sym, tf, limit=limit)
                 if data:
                     cycle_cache.set_raw(sym, tf, data)
+                    _dump_common_warmup_ohlcv(sym, tf, data)
                     refreshed += 1
                     if COMMON_WARMUP_LOG_PATH:
                         _append_log_lines(
@@ -2457,6 +2484,12 @@ def _maybe_refresh_common_cycle_cache(
             cap = int(max_fetch_override)
         if refreshed >= cap:
             break
+    if total_syms > 0:
+        try:
+            step = refreshed if refreshed > 0 else 1
+            state["_common_cycle_scan_start_idx"] = (start_idx + step) % total_syms
+        except Exception:
+            pass
     if refreshed:
         print(f"[common-cycle] refreshed {refreshed} checked={checked}")
 
@@ -8815,6 +8848,13 @@ def _run_sr_pro_short_v1_cycle(
         expected_ts = _expected_last_closed_ts(tf, cur_ms)
         last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns and not df.empty else 0
         return bool(last_ts and last_ts < expected_ts)
+
+    def _need_stale_refresh(df: pd.DataFrame, max_age_ms: int, now_ms: Optional[int] = None) -> bool:
+        if df is None or df.empty or "ts" not in df.columns:
+            return False
+        cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        last_ts = int(df.iloc[-1]["ts"]) if not df.empty else 0
+        return bool(last_ts and (cur_ms - last_ts) > max_age_ms)
     for symbol in symbols:
         if symbol in {"BTC/USDT:USDT", "BTC/USDT"}:
             continue
@@ -8831,10 +8871,18 @@ def _run_sr_pro_short_v1_cycle(
             df_1h = _df if _df is not None else pd.DataFrame()
             try:
                 now_ms = int(time.time() * 1000)
-                if _need_boundary_refresh(df_3m, tf_ltf, now_ms=now_ms):
+                if _need_boundary_refresh(df_3m, tf_ltf, now_ms=now_ms) or _need_stale_refresh(df_3m, 7 * 60 * 1000, now_ms=now_ms):
                     df_new = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
                     if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                         df_3m = df_new
+                if _need_stale_refresh(df_15m, 25 * 60 * 1000, now_ms=now_ms):
+                    df_new = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_15m = df_new
+                if _need_stale_refresh(df_1h, 70 * 60 * 1000, now_ms=now_ms):
+                    df_new = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_1h = df_new
             except Exception:
                 pass
         else:
@@ -9501,6 +9549,10 @@ def _run_sr_pro_short_v1_cycle(
                 usdt = _resolve_entry_usdt()
                 if usdt <= 0 or not _admin_is_active():
                     continue
+                if _exit_cooldown_blocked(state, symbol, "sr_pro_short_v1", "SHORT"):
+                    gate_stats["cooldown"] += 1
+                    _dbg(symbol, "stage=exit_cooldown_blocked")
+                    continue
                 _append_sr_pro_short_v1_log(
                     f"SR_PRO_SIGNAL sym={symbol} entry={entry_px:.6f} sl={sl_price:.6f} tp={tp_price:.6f} track={break_type}"
                 )
@@ -9598,8 +9650,12 @@ def _run_sr_pro_long_v1_cycle(
     no_data = 0
     gate_stats = {
         "zone_touch": 0,
+        "zone_accept_pass": 0,
         "hl_15m": 0,
         "break_3m": 0,
+        "pullback_fail": 0,
+        "sweep_reclaim_fail": 0,
+        "break_overheat": 0,
         "retest_seen": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_high": 0,
@@ -9722,6 +9778,13 @@ def _run_sr_pro_long_v1_cycle(
         last_ts = int(df.iloc[-1]["ts"]) if "ts" in df.columns and not df.empty else 0
         return bool(last_ts and last_ts < expected_ts)
 
+    def _need_stale_refresh(df: pd.DataFrame, max_age_ms: int, now_ms: Optional[int] = None) -> bool:
+        if df is None or df.empty or "ts" not in df.columns:
+            return False
+        cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        last_ts = int(df.iloc[-1]["ts"]) if not df.empty else 0
+        return bool(last_ts and (cur_ms - last_ts) > max_age_ms)
+
     def _get_confirmed_df(symbol: str, tf: str, limit: int, retry_sec: float = 3.0) -> pd.DataFrame:
         df = cycle_cache.get_df(symbol, tf, limit=limit)
         if df is None or df.empty:
@@ -9745,11 +9808,19 @@ def _run_sr_pro_long_v1_cycle(
             df_1h = _df if _df is not None else pd.DataFrame()
             try:
                 now_ms = int(time.time() * 1000)
-                if _need_boundary_refresh(df_3m, tf_ltf, now_ms=now_ms):
+                if _need_boundary_refresh(df_3m, tf_ltf, now_ms=now_ms) or _need_stale_refresh(df_3m, 7 * 60 * 1000, now_ms=now_ms):
                     # refresh 3m once near boundary to reduce live-vs-backtest timing drift
                     df_new = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
                     if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                         df_3m = df_new
+                if _need_stale_refresh(df_15m, 25 * 60 * 1000, now_ms=now_ms):
+                    df_new = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_15m = df_new
+                if _need_stale_refresh(df_1h, 70 * 60 * 1000, now_ms=now_ms):
+                    df_new = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_1h = df_new
             except Exception:
                 pass
         else:
@@ -9850,12 +9921,6 @@ def _run_sr_pro_long_v1_cycle(
                 continue
 
             sym_state["last_eval_ts"] = latest_ts_ms
-            cd_until = sym_state.get("cooldown_until_long")
-            if isinstance(cd_until, (int, float)) and latest_ts_ms < int(cd_until):
-                gate_stats["cooldown"] += 1
-                _dbg(symbol, f"stage=cooldown latest_ts={latest_ts_ms} cd_until={int(cd_until)}")
-                continue
-
             decision_ts = latest_ts_ms + ltf_ms
             idx_1h = int(np.searchsorted(ts_1h, decision_ts - _tf_ms(tf_htf), side="right") - 1)
             idx_15m = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(tf_mtf), side="right") - 1)
@@ -9887,6 +9952,7 @@ def _run_sr_pro_long_v1_cycle(
             h1_ts = int(h1["ts"]) if "ts" in h1 else 0
             h1_high = float(h1["high"])
             h1_low = float(h1["low"])
+            h1_open = float(h1["open"])
             h1_close = float(h1["close"])
 
             close_1h = df_1h_hist["close"].astype(float)
@@ -9942,6 +10008,20 @@ def _run_sr_pro_long_v1_cycle(
                 and h1_high >= z["bot"]
                 and z.get("_last_touch_ts") == h1_ts
             ]
+            zone_accept_mode = str(getattr(cfg, "zone_accept_mode", "off") or "off").lower()
+            if support_candidates and zone_accept_mode != "off":
+                def _zone_accept_ok_live(z: dict) -> bool:
+                    if zone_accept_mode == "mid":
+                        return h1_close >= float(z.get("mid", 0.0))
+                    if zone_accept_mode == "top":
+                        return h1_close >= float(z.get("top", 0.0))
+                    if zone_accept_mode == "top_bull":
+                        return h1_close >= float(z.get("top", 0.0)) and h1_close > h1_open
+                    return True
+
+                support_candidates = [z for z in support_candidates if _zone_accept_ok_live(z)]
+                if support_candidates:
+                    gate_stats["zone_accept_pass"] += 1
             if not support_candidates:
                 gate_stats["zone_touch"] += 1
                 _dbg(
@@ -9969,6 +10049,33 @@ def _run_sr_pro_long_v1_cycle(
             o3 = float(df_3m_eval.iloc[-1]["open"])
             h3 = float(df_3m_eval.iloc[-1]["high"])
             l3 = float(df_3m_eval.iloc[-1]["low"])
+            atr_3m = atr(df_3m_eval, 14)
+            atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
+
+            pullback_lb = max(5, int(getattr(cfg, "pullback_lookback", 36) or 36))
+            pb_start = max(0, len(df_3m_eval) - pullback_lb)
+            recent_peak = float(df_3m_eval.iloc[pb_start:]["high"].astype(float).max())
+            dd_abs = max(0.0, recent_peak - l3)
+            dd_pct = (dd_abs / recent_peak) if recent_peak > 0 else 0.0
+            dd_atr = (dd_abs / atr_now) if atr_now > 0 else 0.0
+            if dd_pct < float(getattr(cfg, "pullback_min_pct", 0.0) or 0.0) and dd_atr < float(getattr(cfg, "pullback_min_atr", 0.0) or 0.0):
+                gate_stats["pullback_fail"] += 1
+                _dbg(symbol, f"stage=pullback dd_pct={dd_pct:.4f} dd_atr={dd_atr:.2f} peak={recent_peak:.6f} low={l3:.6f}")
+                continue
+
+            if bool(getattr(cfg, "require_sweep_reclaim", False)):
+                sw_lb = max(3, int(getattr(cfg, "sweep_lookback", 12) or 12))
+                sw_start = max(0, len(df_3m_eval) - 1 - sw_lb)
+                prior_lows = df_3m_eval.iloc[sw_start:-1]["low"].astype(float)
+                prior_low = float(prior_lows.min()) if len(prior_lows) > 0 else l3
+                sweep_tol = atr_now * float(getattr(cfg, "sweep_tol_atr", 0.0) or 0.0) if atr_now > 0 else 0.0
+                sweep_ok = l3 <= (prior_low - sweep_tol)
+                reclaim_ok = c3 > prior_low
+                if not (sweep_ok and reclaim_ok):
+                    gate_stats["sweep_reclaim_fail"] += 1
+                    _dbg(symbol, f"stage=sweep_reclaim sweep={int(sweep_ok)} reclaim={int(reclaim_ok)} prior_low={prior_low:.6f} low={l3:.6f} close={c3:.6f}")
+                    continue
+
             high_prev = [
                 float(df_3m_eval.iloc[-2]["high"]),
                 float(df_3m_eval.iloc[-3]["high"]),
@@ -9984,6 +10091,13 @@ def _run_sr_pro_long_v1_cycle(
                     f"stage=break_3m strong=0 weak=0 c3={c3:.6f} o3={o3:.6f} h3={h3:.6f} high_max={high_max:.6f}",
                 )
                 continue
+            max_break_ext = float(getattr(cfg, "max_break_ext_atr", 0.0) or 0.0)
+            if atr_now > 0 and max_break_ext > 0:
+                break_ext_atr = max(0.0, c3 - high_max) / atr_now
+                if break_ext_atr > max_break_ext:
+                    gate_stats["break_overheat"] += 1
+                    _dbg(symbol, f"stage=break_overheat break_ext_atr={break_ext_atr:.2f} max={max_break_ext:.2f}")
+                    continue
 
             retest_level = float(sym_state.get("retest_level", 0.0) or 0.0)
             break_type = sym_state.get("break_type") or ("strong" if strong_break else "weak")
@@ -10007,8 +10121,6 @@ def _run_sr_pro_long_v1_cycle(
                 gate_stats["retest_seen"] += 1
 
             if sym_state.get("retest_active") and now_ts_ms <= int(sym_state.get("retest_until", 0) or 0):
-                atr_3m = atr(df_3m_eval, 14)
-                atr_now = float(atr_3m.iloc[-1]) if not np.isnan(atr_3m.iloc[-1]) else 0.0
                 rng = float(df_3m_eval.iloc[-1]["high"]) - float(df_3m_eval.iloc[-1]["low"])
                 lower_wick = min(float(df_3m_eval.iloc[-1]["open"]), float(df_3m_eval.iloc[-1]["close"])) - float(df_3m_eval.iloc[-1]["low"])
                 lower_wick_ratio = (lower_wick / rng) if rng > 0 else 0.0
@@ -10109,8 +10221,12 @@ def _run_sr_pro_long_v1_cycle(
         f"{cycle_tag}_GATE_SUMMARY "
         f"checked={checked} no_data={no_data} "
         f"zone_touch={gate_stats['zone_touch']} "
+        f"zone_accept_pass={gate_stats['zone_accept_pass']} "
         f"hl_15m={gate_stats['hl_15m']} "
         f"break_3m={gate_stats['break_3m']} "
+        f"pullback_fail={gate_stats['pullback_fail']} "
+        f"sweep_reclaim_fail={gate_stats['sweep_reclaim_fail']} "
+        f"break_overheat={gate_stats['break_overheat']} "
         f"retest_seen={gate_stats['retest_seen']} "
         f"entry_by_pass_close={gate_stats['entry_by_pass_close']} "
         f"entry_by_pass_high={gate_stats['entry_by_pass_high']} "
@@ -10126,8 +10242,12 @@ def _run_sr_pro_long_v1_cycle(
             f"{cycle_tag}_GATE_SUMMARY "
             f"checked={checked} no_data={no_data} "
             f"zone_touch={gate_stats['zone_touch']} "
+            f"zone_accept_pass={gate_stats['zone_accept_pass']} "
             f"hl_15m={gate_stats['hl_15m']} "
             f"break_3m={gate_stats['break_3m']} "
+            f"pullback_fail={gate_stats['pullback_fail']} "
+            f"sweep_reclaim_fail={gate_stats['sweep_reclaim_fail']} "
+            f"break_overheat={gate_stats['break_overheat']} "
             f"retest_seen={gate_stats['retest_seen']} "
             f"entry_by_pass_close={gate_stats['entry_by_pass_close']} "
             f"entry_by_pass_high={gate_stats['entry_by_pass_high']} "
@@ -14607,7 +14727,6 @@ def _run_manage_cycle(state: dict, exchange, cached_long_ex, send_telegram) -> N
                     sr_state_key = "_sr_pro_long_v2_state" if str(meta.get("reason") or "").lower() == "sr_pro_long_v2" else "_sr_pro_long_v1_state"
                     sr_state = state.setdefault(sr_state_key, {})
                     sym_state = sr_state.setdefault(sym, {})
-                    sym_state["cooldown_until_long"] = (now * 1000.0) + (15 * 60 * 1000)
                     sym_state["last_fast_fail_ts"] = now
                     sym_state["last_fast_fail_level"] = fast_fail_level
                     sym_state["last_fast_fail_atr"] = fast_fail_atr
@@ -19377,8 +19496,22 @@ def run():
                         time.sleep(10)
                         continue
 
-                    # daily common universe refresh (KST)
-                    if _maybe_daily_refresh_common_universe(state, tickers, symbols):
+                    # common universe sequencing:
+                    # 1) daily refresh runs once after configured KST time
+                    # 2) engines only run when a synced universe list exists
+                    try:
+                        now_kst = _kst_now()
+                        today_kst = now_kst.strftime("%Y-%m-%d")
+                        now_minute_of_day = int(now_kst.hour) * 60 + int(now_kst.minute)
+                        refresh_minute_of_day = int(COMMON_UNIVERSE_REFRESH_HOUR) * 60 + int(COMMON_UNIVERSE_REFRESH_MINUTE)
+                    except Exception:
+                        now_kst = None
+                        today_kst = None
+                        now_minute_of_day = -1
+                        refresh_minute_of_day = -1
+
+                    refreshed_today = _maybe_daily_refresh_common_universe(state, tickers, symbols)
+                    if refreshed_today:
                         COMMON_UNIVERSE = (
                             list(state.get("_common_universe") or [])
                             if isinstance(state.get("_common_universe"), list)
@@ -19387,26 +19520,44 @@ def run():
                         COMMON_UNIVERSE_READY = True
                         COMMON_WARMUP_DONE = False
                         _reset_common_warmup_state(state)
+                        state["_common_universe_sync_ts"] = time.time()
+                        state["_common_universe_sync_cycle"] = int(cycle_count or 0)
                         print(f"[common-universe] daily refresh done size={len(COMMON_UNIVERSE)}")
 
+                    # Initial sync when state is missing/corrupted.
                     if not COMMON_UNIVERSE_READY or not isinstance(state.get("_common_universe"), list):
-                        COMMON_UNIVERSE = _build_common_universe(tickers, symbols)
+                        try:
+                            initial_universe = _build_common_universe(tickers, symbols)
+                        except Exception as e:
+                            print(f"[common-universe] initial sync failed: {e}")
+                            time.sleep(1.0)
+                            continue
+                        if not isinstance(initial_universe, list) or not initial_universe:
+                            print("[common-universe] initial sync empty; skip cycle")
+                            time.sleep(3.0)
+                            continue
+                        COMMON_UNIVERSE = list(initial_universe)
                         state["_common_universe"] = list(COMMON_UNIVERSE)
                         state["_common_universe_ready"] = True
+                        if isinstance(today_kst, str):
+                            state["_common_universe_refresh_date"] = today_kst
+                        state["_common_universe_sync_ts"] = time.time()
+                        state["_common_universe_sync_cycle"] = int(cycle_count or 0)
                         COMMON_UNIVERSE_READY = True
-                        print(f"[common-universe] refreshed size={len(COMMON_UNIVERSE)}")
-                        if COMMON_UNIVERSE_LOG_PATH and COMMON_UNIVERSE:
-                            try:
-                                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, [f"COMMON_UNIVERSE refresh size={len(COMMON_UNIVERSE)}"])
-                                _append_log_lines(COMMON_UNIVERSE_LOG_PATH, COMMON_UNIVERSE)
-                            except Exception:
-                                pass
-                        try:
-                            os.makedirs(os.path.join("logs", "common_universe"), exist_ok=True)
-                            with open(os.path.join("logs", "common_universe", "latest.txt"), "w", encoding="utf-8") as f:
-                                f.write("\n".join(COMMON_UNIVERSE))
-                        except Exception:
-                            pass
+                        print(f"[common-universe] initial sync done size={len(COMMON_UNIVERSE)}")
+
+                    # After refresh time, require today's sync marker before running engines.
+                    if (
+                        isinstance(today_kst, str)
+                        and now_minute_of_day >= refresh_minute_of_day
+                        and state.get("_common_universe_refresh_date") != today_kst
+                    ):
+                        print(
+                            f"[common-universe] waiting daily refresh "
+                            f"target={today_kst} current={state.get('_common_universe_refresh_date')}"
+                        )
+                        time.sleep(3.0)
+                        continue
                     # protect against accidental state key pollution (must remain list of symbols)
                     if not isinstance(state.get("_common_universe"), list):
                         state["_common_universe"] = list(COMMON_UNIVERSE or [])

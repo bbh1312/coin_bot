@@ -281,6 +281,13 @@ def run_backtest() -> None:
     parser.add_argument("--require-reject-close", action="store_true")
     parser.add_argument("--reject-mode", type=str, default="top", choices=["top", "mid"])
     parser.add_argument("--reject-source", type=str, default="1h", choices=["1h", "15m"])
+    parser.add_argument(
+        "--zone-accept-mode",
+        type=str,
+        default=str(getattr(cfg_live, "zone_accept_mode", "off")),
+        choices=["off", "mid", "top", "top_bull"],
+        help="Support zone acceptance on latest 1h bar: off/mid/top/top_bull(close>open).",
+    )
     parser.add_argument("--ema200-filter", action="store_true", default=True)
     parser.add_argument("--no-ema200-filter", action="store_false", dest="ema200_filter")
     parser.add_argument("--ema-filter-len", type=int, default=int(cfg_live.ema_filter_len))
@@ -291,6 +298,14 @@ def run_backtest() -> None:
     parser.add_argument("--retest-dyn", action="store_true", default=bool(cfg_live.retest_dyn))
     parser.add_argument("--retest-dyn-th", type=float, default=float(cfg_live.retest_dyn_th))
     parser.add_argument("--retest-dyn-bars", type=int, default=int(cfg_live.retest_dyn_bars))
+    parser.add_argument("--pullback-lookback", type=int, default=int(cfg_live.pullback_lookback))
+    parser.add_argument("--pullback-min-pct", type=float, default=float(cfg_live.pullback_min_pct))
+    parser.add_argument("--pullback-min-atr", type=float, default=float(cfg_live.pullback_min_atr))
+    parser.add_argument("--require-sweep-reclaim", action="store_true", default=bool(cfg_live.require_sweep_reclaim))
+    parser.add_argument("--no-require-sweep-reclaim", action="store_false", dest="require_sweep_reclaim")
+    parser.add_argument("--sweep-lookback", type=int, default=int(cfg_live.sweep_lookback))
+    parser.add_argument("--sweep-tol-atr", type=float, default=float(cfg_live.sweep_tol_atr))
+    parser.add_argument("--max-break-ext-atr", type=float, default=float(cfg_live.max_break_ext_atr))
     parser.add_argument("--shallow-atr-mult", type=float, default=float(cfg_live.shallow_atr_mult))
     parser.add_argument("--shallow-wick-max", type=float, default=float(cfg_live.shallow_wick_max))
     parser.add_argument("--shallow-dvf-min", type=float, default=float(cfg_live.shallow_dvf_min))
@@ -463,6 +478,9 @@ def run_backtest() -> None:
         "break_3m": 0,
         "break_3m_strong": 0,
         "break_3m_weak": 0,
+        "pullback_fail": 0,
+        "sweep_reclaim_fail": 0,
+        "break_overheat": 0,
         "retest_seen": 0,
         "retest_pass_close": 0,
         "retest_pass_high": 0,
@@ -471,6 +489,7 @@ def run_backtest() -> None:
         "entry_by_pass_high": 0,
         "reject_pass_1h": 0,
         "reject_pass_15m": 0,
+        "zone_accept_pass": 0,
         "ema200_pass": 0,
         "time_block": 0,
         "ltf_sr_bias_block": 0,
@@ -794,6 +813,7 @@ def run_backtest() -> None:
 
             h1_high = float(high_1h.iloc[idx_1h])
             h1_low = float(low_1h.iloc[idx_1h])
+            h1_open = float(open_1h.iloc[idx_1h])
             h1_close = float(close_1h.iloc[idx_1h])
             h1_touch_level = "mid" if args.touch_mode == "mid" else "top"
             dvf_norm = float(dvf.iloc[idx_1h]) / float(vol_ema.iloc[idx_1h]) if float(vol_ema.iloc[idx_1h]) > 0 else 0.0
@@ -833,6 +853,19 @@ def run_backtest() -> None:
                 and h1_high >= z.bot
                 and getattr(z, "last_touch_ts", 0) == h1_ts
             ]
+            if support_candidates and args.zone_accept_mode != "off":
+                def _zone_accept_ok(z: Zone) -> bool:
+                    if args.zone_accept_mode == "mid":
+                        return h1_close >= z.mid
+                    if args.zone_accept_mode == "top":
+                        return h1_close >= z.top
+                    if args.zone_accept_mode == "top_bull":
+                        return h1_close >= z.top and h1_close > h1_open
+                    return True
+
+                support_candidates = [z for z in support_candidates if _zone_accept_ok(z)]
+                if support_candidates and args.log_gates:
+                    gate_counts["zone_accept_pass"] += 1
             if support_candidates and args.require_reject_close:
                 reject_level = "mid" if args.reject_mode == "mid" else "top"
                 if args.reject_source == "1h":
@@ -909,6 +942,38 @@ def run_backtest() -> None:
 
             close_now = float(df_3m.at[i3, "close"])
             open_now = float(df_3m.at[i3, "open"])
+            low_now = float(df_3m.at[i3, "low"])
+            high_now = float(df_3m.at[i3, "high"])
+            atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
+
+            pullback_lb = max(5, int(args.pullback_lookback))
+            pb_start = max(0, i3 - pullback_lb + 1)
+            recent_peak = float(df_3m.iloc[pb_start : i3 + 1]["high"].astype(float).max())
+            dd_abs = max(0.0, recent_peak - low_now)
+            dd_pct = (dd_abs / recent_peak) if recent_peak > 0 else 0.0
+            dd_atr = (dd_abs / atr_now) if atr_now > 0 else 0.0
+            if dd_pct < float(args.pullback_min_pct) and dd_atr < float(args.pullback_min_atr):
+                if args.log_gates:
+                    gate_counts["pullback_fail"] += 1
+                if dbg_on:
+                    _dbg(ts, "pullback", f"dd_pct={dd_pct:.4f} dd_atr={dd_atr:.2f} peak={recent_peak:.6f} low={low_now:.6f}")
+                continue
+
+            if bool(args.require_sweep_reclaim):
+                sw_lb = max(3, int(args.sweep_lookback))
+                sw_start = max(0, i3 - sw_lb)
+                prior_lows = df_3m.iloc[sw_start:i3]["low"].astype(float)
+                prior_low = float(prior_lows.min()) if len(prior_lows) > 0 else low_now
+                sweep_tol = atr_now * float(args.sweep_tol_atr) if atr_now > 0 else 0.0
+                sweep_ok = low_now <= (prior_low - sweep_tol)
+                reclaim_ok = close_now > prior_low
+                if not (sweep_ok and reclaim_ok):
+                    if args.log_gates:
+                        gate_counts["sweep_reclaim_fail"] += 1
+                    if dbg_on:
+                        _dbg(ts, "sweep_reclaim", f"sweep={int(sweep_ok)} reclaim={int(reclaim_ok)} prior_low={prior_low:.6f} low={low_now:.6f} close={close_now:.6f}")
+                    continue
+
             high_prev = [
                 float(df_3m.at[i3 - 1, "high"]),
                 float(df_3m.at[i3 - 2, "high"]),
@@ -916,7 +981,7 @@ def run_backtest() -> None:
             ]
             high_max = max(high_prev)
             strong_break = close_now > high_max
-            weak_break = (float(df_3m.at[i3, "high"]) > high_max) and (close_now <= high_max) and (close_now > open_now)
+            weak_break = (high_now > high_max) and (close_now <= high_max) and (close_now > open_now)
             if not strong_break and not weak_break:
                 if dbg_on:
                     dbg_counts["fail_break_3m"] += 1
@@ -924,6 +989,14 @@ def run_backtest() -> None:
                 if args.log_gates:
                     gate_counts["break_3m"] += 1
                 continue
+            if atr_now > 0 and float(args.max_break_ext_atr) > 0:
+                break_ext_atr = max(0.0, close_now - high_max) / atr_now
+                if break_ext_atr > float(args.max_break_ext_atr):
+                    if args.log_gates:
+                        gate_counts["break_overheat"] += 1
+                    if dbg_on:
+                        _dbg(ts, "break_overheat", f"break_ext_atr={break_ext_atr:.2f} max={float(args.max_break_ext_atr):.2f}")
+                    continue
             # time block (KST hours)
             hour_kst = int(_ts_kst(ts).split(" ")[1].split(":")[0])
             if block_hours and hour_kst in block_hours:
@@ -952,12 +1025,9 @@ def run_backtest() -> None:
                 gate_counts["retest_seen"] += 1
 
             if retest_active and i3 <= retest_until:
-                low_now = float(df_3m.at[i3, "low"])
-                high_now = float(df_3m.at[i3, "high"])
                 rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
                 lower_wick = min(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"])) - float(df_3m.at[i3, "low"])
                 lower_wick_ratio = (lower_wick / rng) if rng > 0 else 0.0
-                atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
                 if low_now <= retest_level + (atr_now * float(args.retest_atr_mult)):
                     entry_ok = False
                     entry_reason = None
