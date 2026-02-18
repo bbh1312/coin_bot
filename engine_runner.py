@@ -9958,6 +9958,8 @@ def _run_sr_pro_long_v1_cycle(
         "zone_accept_pass": 0,
         "hl_15m": 0,
         "break_3m": 0,
+        "entry_candle_fail": 0,
+        "retest_breakdown_fail": 0,
         "pullback_fail": 0,
         "sweep_reclaim_fail": 0,
         "retest_reclaim_fail": 0,
@@ -10525,6 +10527,19 @@ def _run_sr_pro_long_v1_cycle(
                                 ),
                             )
                             continue
+                    breakdown_block_atr = float(getattr(cfg, "retest_breakdown_block_atr", 0.03) or 0.0)
+                    if breakdown_block_atr > 0:
+                        breakdown_th = retest_level - (atr_now * breakdown_block_atr)
+                        if l3 < breakdown_th:
+                            gate_stats["retest_breakdown_fail"] += 1
+                            _dbg(
+                                symbol,
+                                (
+                                    f"stage=retest_breakdown_block low={l3:.6f} "
+                                    f"th={breakdown_th:.6f} level={retest_level:.6f} atr3={atr_now:.6f}"
+                                ),
+                            )
+                            continue
 
                     ema_entry = None
                     try:
@@ -10532,14 +10547,23 @@ def _run_sr_pro_long_v1_cycle(
                     except Exception:
                         ema_entry = None
                     entry_target = None
+                    entry_offset = float(cfg.entry_atr_offset if break_type == "strong" else getattr(cfg, "entry_atr_offset_weak", cfg.entry_atr_offset))
                     if isinstance(ema_entry, (int, float)) and atr_now > 0:
-                        entry_target = float(ema_entry) - (atr_now * float(cfg.entry_atr_offset))
+                        entry_target = float(ema_entry) - (atr_now * entry_offset)
                     if entry_target is None or l3 > entry_target:
                         _dbg(
                             symbol,
                             f"stage=entry_target low={l3:.6f} target={entry_target if entry_target is not None else 'None'} ema={ema_entry if ema_entry is not None else 'None'} atr3={atr_now:.6f}",
                         )
                         continue
+                    if bool(getattr(cfg, "entry_candle_guard", True)):
+                        if not (c3 >= o3):
+                            gate_stats["entry_candle_fail"] += 1
+                            _dbg(
+                                symbol,
+                                f"stage=entry_candle_guard close={c3:.6f} open={o3:.6f} target={float(entry_target):.6f}",
+                            )
+                            continue
                     entry_px = float(entry_target)
                     nearest = min(support_candidates, key=lambda z: abs(z["mid"] - entry_px))
                     if not (c3 >= nearest["mid"] or entry_px >= nearest["top"] - (atr_now * 0.2)):
@@ -10614,6 +10638,8 @@ def _run_sr_pro_long_v1_cycle(
         f"zone_accept_pass={gate_stats['zone_accept_pass']} "
         f"hl_15m={gate_stats['hl_15m']} "
         f"break_3m={gate_stats['break_3m']} "
+        f"entry_candle_fail={gate_stats['entry_candle_fail']} "
+        f"retest_breakdown_fail={gate_stats['retest_breakdown_fail']} "
         f"pullback_fail={gate_stats['pullback_fail']} "
         f"sweep_reclaim_fail={gate_stats['sweep_reclaim_fail']} "
         f"retest_reclaim_fail={gate_stats['retest_reclaim_fail']} "
@@ -10636,6 +10662,8 @@ def _run_sr_pro_long_v1_cycle(
             f"zone_accept_pass={gate_stats['zone_accept_pass']} "
             f"hl_15m={gate_stats['hl_15m']} "
             f"break_3m={gate_stats['break_3m']} "
+            f"entry_candle_fail={gate_stats['entry_candle_fail']} "
+            f"retest_breakdown_fail={gate_stats['retest_breakdown_fail']} "
             f"pullback_fail={gate_stats['pullback_fail']} "
             f"sweep_reclaim_fail={gate_stats['sweep_reclaim_fail']} "
             f"retest_reclaim_fail={gate_stats['retest_reclaim_fail']} "

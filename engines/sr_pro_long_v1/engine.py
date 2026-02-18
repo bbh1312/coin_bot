@@ -48,6 +48,9 @@ class SrProLongV1Config:
     shallow_dvf_min: float = 0.0
     entry_ema_len: int = 7
     entry_atr_offset: float = 0.15
+    entry_atr_offset_weak: float = 0.15
+    entry_candle_guard: bool = False
+    retest_breakdown_block_atr: float = 0.0
     sl_buffer: float = 0.00
     sl_atr_mult: float = 0.04
     sl_cap_pct: float = 0.018

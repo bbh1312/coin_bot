@@ -427,6 +427,7 @@ def run_backtest() -> None:
     parser.add_argument("--ema-filter-len", type=int, default=int(cfg_live.ema_filter_len))
     parser.add_argument("--retest-bars", type=int, default=int(cfg_live.retest_bars))
     parser.add_argument("--retest-atr-mult", type=float, default=float(cfg_live.retest_atr_mult))
+    parser.add_argument("--retest-breakdown-block-atr", type=float, default=float(getattr(cfg_live, "retest_breakdown_block_atr", 0.03)))
     parser.add_argument("--retest-reclaim-min-atr", type=float, default=float(getattr(cfg_live, "retest_reclaim_min_atr", 0.0)))
     parser.add_argument("--retest-near-atr-mult", type=float, default=float(cfg_live.retest_near_atr_mult))
     parser.add_argument("--retest-wick-max", type=float, default=float(cfg_live.retest_wick_max))
@@ -447,6 +448,9 @@ def run_backtest() -> None:
     parser.add_argument("--shallow-dvf-min", type=float, default=float(cfg_live.shallow_dvf_min))
     parser.add_argument("--entry-ema-len", type=int, default=int(cfg_live.entry_ema_len))
     parser.add_argument("--entry-atr-offset", type=float, default=float(cfg_live.entry_atr_offset))
+    parser.add_argument("--entry-atr-offset-weak", type=float, default=float(getattr(cfg_live, "entry_atr_offset_weak", cfg_live.entry_atr_offset)))
+    parser.add_argument("--entry-candle-guard", action="store_true", default=bool(getattr(cfg_live, "entry_candle_guard", True)))
+    parser.add_argument("--no-entry-candle-guard", action="store_false", dest="entry_candle_guard")
     parser.add_argument("--sl-buffer", type=float, default=float(cfg_live.sl_buffer))
     parser.add_argument("--sl-atr-mult", type=float, default=float(cfg_live.sl_atr_mult))
     parser.add_argument("--sl-cap-pct", type=float, default=float(getattr(cfg_live, "sl_cap_pct", 0.0)))
@@ -526,6 +530,7 @@ def run_backtest() -> None:
         tp_mult=args.tp_mult,
         entry_ema_len=args.entry_ema_len,
         entry_atr_offset=args.entry_atr_offset,
+        entry_atr_offset_weak=args.entry_atr_offset_weak,
     )
 
     exchange = None if args.cache_only else ccxt.binance({"enableRateLimit": True})
@@ -1355,9 +1360,22 @@ def run_backtest() -> None:
                                     ),
                                 )
                             continue
+                    breakdown_block_atr = float(args.retest_breakdown_block_atr)
+                    if breakdown_block_atr > 0:
+                        breakdown_th = retest_level - (atr_now * breakdown_block_atr)
+                        if low_now < breakdown_th:
+                            if args.log_gates:
+                                gate_counts["retest_fail_shallow"] += 1
+                            if dbg_on:
+                                _dbg(
+                                    ts,
+                                    "retest_breakdown_block",
+                                    f"low={low_now:.6f} th={breakdown_th:.6f} level={retest_level:.6f} atr3={atr_now:.6f}",
+                                )
+                            continue
 
                     ema_entry = float(ema_3m_entry.iloc[i3]) if len(ema_3m_entry) > i3 and not np.isnan(ema_3m_entry.iloc[i3]) else None
-                    entry_offset = float(cfg.entry_atr_offset)
+                    entry_offset = float(cfg.entry_atr_offset if strong_break else getattr(cfg, "entry_atr_offset_weak", cfg.entry_atr_offset))
                     entry_target = None
                     if isinstance(ema_entry, (int, float)) and atr_now > 0:
                         entry_target = float(ema_entry) - (atr_now * entry_offset)
@@ -1371,6 +1389,17 @@ def run_backtest() -> None:
                                 f"ema_entry={(ema_entry if isinstance(ema_entry,(int,float)) else float('nan')):.6f} atr3={atr_now:.6f}",
                             )
                         continue
+                    if bool(args.entry_candle_guard):
+                        # Avoid filling while 3m candle still pushes down.
+                        if not (close_now >= open_now):
+                            if dbg_on:
+                                dbg_counts["fail_entry_target"] += 1
+                                _dbg(
+                                    ts,
+                                    "entry_candle_guard",
+                                    f"close={close_now:.6f} open={open_now:.6f} target={float(entry_target):.6f}",
+                                )
+                            continue
                     entry_px = float(entry_target)
                     if args.ltf_sr_bias:
                         lb = max(5, int(args.ltf_sr_lookback))
