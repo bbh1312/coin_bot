@@ -390,7 +390,7 @@ def run_backtest() -> None:
     parser.add_argument("--delta-len", type=int, default=2)
     parser.add_argument("--cluster-atr", type=float, default=1.5)
     parser.add_argument("--max-zones-per-side", type=int, default=8)
-    parser.add_argument("--touch-mode", type=str, default=str(cfg_live.touch_mode), choices=["bot", "mid"])
+    parser.add_argument("--touch-mode", type=str, default=str(cfg_live.touch_mode), choices=["bot", "mid", "top"])
     parser.add_argument("--touch-use-close", action="store_true")
     parser.add_argument("--enable-boundary-guard", action="store_true")
     parser.add_argument("--enable-hourly-boundary-guard", action="store_true")
@@ -401,18 +401,39 @@ def run_backtest() -> None:
     parser.add_argument("--no-dvf-slope-enabled", action="store_false", dest="dvf_slope_enabled")
     parser.set_defaults(dvf_slope_enabled=bool(getattr(cfg_live, "dvf_slope_enabled", False)))
     parser.add_argument("--dvf-confirm-bars", type=int, default=1)
-    parser.add_argument("--require-reject-close", action="store_true")
+    parser.add_argument("--require-reject-close", action="store_true", dest="require_reject_close")
+    parser.add_argument("--no-require-reject-close", action="store_false", dest="require_reject_close")
+    parser.set_defaults(require_reject_close=bool(getattr(cfg_live, "require_reject_close", True)))
     parser.add_argument("--reject-mode", type=str, default="bot", choices=["bot", "mid"])
     parser.add_argument("--reject-source", type=str, default="1h", choices=["1h", "15m"])
+    parser.add_argument("--reject-wick-min", type=float, default=float(getattr(cfg_live, "reject_wick_min", 0.45)))
+    parser.add_argument("--reject-vol-mult", type=float, default=float(getattr(cfg_live, "reject_vol_mult", 1.2)))
+    parser.add_argument("--reject-vol-enabled", action="store_true", dest="reject_vol_enabled")
+    parser.add_argument("--no-reject-vol-enabled", action="store_false", dest="reject_vol_enabled")
+    parser.set_defaults(reject_vol_enabled=bool(getattr(cfg_live, "reject_vol_enabled", False)))
+    parser.add_argument("--reject-dvf-extra-th", type=float, default=float(getattr(cfg_live, "reject_dvf_extra_th", -0.15)))
+    parser.add_argument("--reject-lh-lookback", type=int, default=int(getattr(cfg_live, "reject_lh_lookback", 8)))
     parser.add_argument("--ema200-filter", action="store_true")
     parser.add_argument("--ema-filter-len", type=int, default=200)
-    parser.add_argument("--btc-filter-enabled", action="store_true")
-    parser.add_argument("--btc-filter-tf", type=str, default="1h", choices=["1h", "30m"])
-    parser.add_argument("--btc-filter-ema-len", type=int, default=200)
+    parser.add_argument("--btc-filter-enabled", action="store_true", dest="btc_filter_enabled")
+    parser.add_argument("--no-btc-filter-enabled", action="store_false", dest="btc_filter_enabled")
+    parser.set_defaults(btc_filter_enabled=bool(getattr(cfg_live, "btc_filter_enabled", False)))
+    parser.add_argument("--btc-filter-tf", type=str, default=str(getattr(cfg_live, "btc_filter_tf", "1h")), choices=["1h", "30m"])
+    parser.add_argument("--btc-filter-ema-len", type=int, default=int(getattr(cfg_live, "btc_filter_ema_len", 200)))
+    parser.add_argument("--btc-filter-slope-len", type=int, default=int(getattr(cfg_live, "btc_filter_slope_len", 4)))
+    parser.add_argument("--btc-bull-dvf-only", action="store_true", dest="btc_bull_dvf_only")
+    parser.add_argument("--no-btc-bull-dvf-only", action="store_false", dest="btc_bull_dvf_only")
+    parser.set_defaults(btc_bull_dvf_only=bool(getattr(cfg_live, "btc_bull_dvf_only", True)))
     parser.add_argument("--block-hours", type=str, default="")
     parser.add_argument("--cooldown-sec", type=int, default=-1)
     parser.add_argument("--disable-weak", action="store_true")
-    parser.add_argument("--retest-bars", type=int, default=6)
+    parser.add_argument("--use-weak-break", action="store_true", dest="use_weak_break")
+    parser.add_argument("--no-use-weak-break", action="store_false", dest="use_weak_break")
+    parser.set_defaults(use_weak_break=bool(getattr(cfg_live, "use_weak_break", False)))
+    parser.add_argument("--retest-bars", type=int, default=int(getattr(cfg_live, "retest_bars", 4)))
+    parser.add_argument("--retest-entry-enabled", action="store_true", dest="retest_entry_enabled")
+    parser.add_argument("--no-retest-entry-enabled", action="store_false", dest="retest_entry_enabled")
+    parser.set_defaults(retest_entry_enabled=bool(getattr(cfg_live, "retest_entry_enabled", False)))
     parser.add_argument("--retest-atr-mult", type=float, default=0.6)
     parser.add_argument("--retest-above-atr-mult", type=float, default=0.25)
     parser.add_argument("--reclaim-up-atr-mult", type=float, default=0.1)
@@ -429,10 +450,23 @@ def run_backtest() -> None:
     parser.add_argument("--big-bear-strong-only", action="store_true", dest="big_bear_strong_only")
     parser.add_argument("--no-big-bear-strong-only", action="store_false", dest="big_bear_strong_only")
     parser.set_defaults(big_bear_strong_only=bool(getattr(cfg_live, "big_bear_strong_only", True)))
+    parser.add_argument("--disable-immediate-big-bear", action="store_true", dest="disable_immediate_big_bear")
+    parser.add_argument("--no-disable-immediate-big-bear", action="store_false", dest="disable_immediate_big_bear")
+    parser.set_defaults(disable_immediate_big_bear=bool(getattr(cfg_live, "disable_immediate_big_bear", True)))
+    parser.add_argument("--disable-immediate-dvf-accel", action="store_true", dest="disable_immediate_dvf_accel")
+    parser.add_argument("--no-disable-immediate-dvf-accel", action="store_false", dest="disable_immediate_dvf_accel")
+    parser.set_defaults(disable_immediate_dvf_accel=bool(getattr(cfg_live, "disable_immediate_dvf_accel", True)))
+    parser.add_argument("--disable-immediate-dvf-slope", action="store_true", dest="disable_immediate_dvf_slope")
+    parser.add_argument("--no-disable-immediate-dvf-slope", action="store_false", dest="disable_immediate_dvf_slope")
+    parser.set_defaults(disable_immediate_dvf_slope=bool(getattr(cfg_live, "disable_immediate_dvf_slope", True)))
+    parser.add_argument("--big-bear-near-bonus-atr", type=float, default=float(getattr(cfg_live, "big_bear_near_bonus_atr", 0.05)))
+    parser.add_argument("--dvf-accel-retest-bars", type=int, default=int(getattr(cfg_live, "dvf_accel_retest_bars", 4)))
     parser.add_argument("--atr-filter-len", type=int, default=20)
     parser.add_argument("--atr-filter-mult", type=float, default=0.7)
     parser.add_argument("--ema60-15m-len", type=int, default=60)
     parser.add_argument("--ema120-15m-len", type=int, default=120)
+    parser.add_argument("--mtf-bos-lookback", type=int, default=int(getattr(cfg_live, "mtf_bos_lookback", 5)))
+    parser.add_argument("--mtf-swing-lookback", type=int, default=int(getattr(cfg_live, "mtf_swing_lookback", 8)))
     parser.add_argument("--ema-slope-min", type=float, default=0.001)
     parser.add_argument("--sl-buffer", type=float, default=float(cfg_live.sl_buffer))
     parser.add_argument("--sl-atr-mult", type=float, default=0.4)
@@ -749,23 +783,43 @@ def run_backtest() -> None:
     open_logs: List[dict] = []
     gate_counts = {
         "zone_touch": 0,
+        "h1_reject_fail": 0,
         "lh_15m": 0,
+        "mtf_reversal_fail": 0,
+        "mtf_reversal_pass": 0,
         "break_3m": 0,
         "break_3m_strong": 0,
         "break_3m_weak": 0,
         "retest_seen": 0,
         "retest_pass_close": 0,
         "retest_pass_low": 0,
+        "retest_pass_near": 0,
+        "confirm_pass": 0,
+        "confirm_fail": 0,
+        "confirm_fail_ema": 0,
+        "confirm_fail_lowbreak": 0,
+        "confirm_fail_both": 0,
         "retest_fail_far": 0,
         "retest_fail_shallow": 0,
         "retest_fail_no_touch": 0,
+        "retest_min_gap_atr_sum": 0.0,
+        "retest_min_gap_atr_count": 0,
+        "retest_best_touch_atr_sum": 0.0,
+        "retest_best_touch_count": 0,
+        "entry_delay_sum_bars": 0.0,
+        "entry_delay_count": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
         "entry_by_big_bear": 0,
+        "armed_by_big_bear": 0,
         "big_bear_weak_block": 0,
         "entry_by_dvf_accel": 0,
+        "armed_by_dvf_accel": 0,
         "entry_by_dvf_slope": 0,
+        "armed_by_dvf_slope": 0,
         "entry_by_timeout": 0,
+        "entry_by_retest_confirm": 0,
+        "immediate_entry_blocked": 0,
         "atr_filter": 0,
         "ema_slope_block": 0,
         "reject_pass_1h": 0,
@@ -1048,6 +1102,11 @@ def run_backtest() -> None:
         retest_until = -1
         break_i3 = -1
         break_low_min = 0.0
+        break_low_candle = 0.0
+        retest_best_touch_atr: Optional[float] = None
+        arm_big_bear = False
+        arm_dvf_accel = False
+        arm_dvf_slope = False
         dvf_pending_active = False
         dvf_pending_until = -1
         dvf_pending_level = 0.0
@@ -1131,6 +1190,7 @@ def run_backtest() -> None:
             if idx_1h < 0:
                 continue
 
+            btc_bullish_regime = False
             if args.btc_filter_enabled:
                 if btc_close is None or btc_ema is None or len(btc_ts) == 0:
                     if args.log_gates:
@@ -1146,10 +1206,18 @@ def run_backtest() -> None:
                     continue
                 btc_close_now = float(btc_close.iloc[idx_btc])
                 btc_ema_now = float(btc_ema.iloc[idx_btc]) if not np.isnan(btc_ema.iloc[idx_btc]) else btc_close_now
-                if not (btc_close_now < btc_ema_now):
-                    if args.log_gates:
-                        gate_counts["btc_filter"] += 1
-                    continue
+                slope_len = max(1, int(args.btc_filter_slope_len))
+                prev_idx_btc = max(0, idx_btc - slope_len)
+                btc_ema_prev = (
+                    float(btc_ema.iloc[prev_idx_btc])
+                    if not np.isnan(btc_ema.iloc[prev_idx_btc])
+                    else btc_ema_now
+                )
+                btc_ema_slope_up = btc_ema_now > btc_ema_prev
+                btc_bullish_regime = bool(btc_close_now >= btc_ema_now and btc_ema_slope_up)
+                # In bullish BTC regime, don't fully block shorts; restrict to dvf_accel-only path.
+                if btc_bullish_regime and args.log_gates:
+                    gate_counts["btc_filter"] += 1
 
 
             if args.rolling_zones and not zones_snapshot_in:
@@ -1322,6 +1390,7 @@ def run_backtest() -> None:
             h1_high = float(high_1h.iloc[idx_1h_touch])
             h1_low = float(low_1h.iloc[idx_1h_touch])
             h1_close = float(close_1h.iloc[idx_1h_touch])
+            atr1h_now = float(atr_1h.iloc[idx_1h_touch]) if idx_1h_touch >= 0 and not np.isnan(atr_1h.iloc[idx_1h_touch]) else 0.0
             dvf_norm = (
                 float(dvf.iloc[idx_1h_touch]) / float(vol_ema.iloc[idx_1h_touch])
                 if float(vol_ema.iloc[idx_1h_touch]) > 0
@@ -1334,6 +1403,7 @@ def run_backtest() -> None:
             )
             dvf_norm_diff = dvf_norm - dvf_prev
             h1_touch_px = h1_close if args.touch_use_close else h1_high
+            touch_level = str(args.touch_mode or "top").lower()
             if args.ema200_filter:
                 ema_len = max(1, int(args.ema_filter_len))
                 ema_line = _ema(close_1h, ema_len)
@@ -1350,11 +1420,15 @@ def run_backtest() -> None:
                 if not z.live:
                     setattr(z, "last_touch_ts", 0)
                     continue
+                touch_px_ok = (
+                    h1_touch_px >= z.top if touch_level == "top"
+                    else (h1_touch_px >= z.mid if touch_level == "mid" else h1_touch_px >= z.bot)
+                )
                 touched_now = (
                     z.side == 1
                     and h1_high >= z.bot
                     and h1_low <= z.top
-                    and h1_touch_px >= z.bot
+                    and touch_px_ok
                 )
                 setattr(z, "last_touch_ts", h1_ts if touched_now else 0)
             resist_candidates = [
@@ -1368,29 +1442,35 @@ def run_backtest() -> None:
                 and getattr(z, "last_touch_ts", 0) == h1_ts
             ]
             if resist_candidates and args.require_reject_close:
-                reject_level = "mid" if args.reject_mode == "mid" else "bot"
-                if args.reject_source == "1h":
-                    resist_candidates = [
-                        z
-                        for z in resist_candidates
-                        if h1_close < (z.mid if reject_level == "mid" else z.bot)
-                    ]
-                    if resist_candidates and args.log_gates:
+                h1_open = float(open_1h.iloc[idx_1h_touch])
+                h1_rng = max(h1_high - h1_low, 1e-12)
+                h1_upper_wick = h1_high - max(h1_open, h1_close)
+                h1_upper_wick_ratio = (h1_upper_wick / h1_rng) if h1_rng > 0 else 0.0
+                vol_sma = float(volume_1h.iloc[max(0, idx_1h_touch - 20):idx_1h_touch].mean()) if idx_1h_touch > 0 else 0.0
+                vol_spike = bool(vol_sma > 0 and float(volume_1h.iloc[idx_1h_touch]) >= (vol_sma * float(args.reject_vol_mult)))
+                lh_lb = max(3, int(args.reject_lh_lookback))
+                prev_hh = float(high_1h.iloc[max(0, idx_1h_touch - lh_lb):idx_1h_touch].max()) if idx_1h_touch > 0 else h1_high
+                filtered = []
+                for z in resist_candidates:
+                    z_top = float(z.top)
+                    cond_zone_pos = bool(h1_high >= (z_top - (atr1h_now * 0.15)))
+                    core_a_wick = bool(h1_upper_wick_ratio >= float(args.reject_wick_min))
+                    core_b_bear_close = bool(h1_close <= h1_open)
+                    core_c_reclaim = bool(h1_close <= (z_top - (atr1h_now * 0.05)))
+                    core_score = int(core_a_wick) + int(core_b_bear_close) + int(core_c_reclaim)
+                    cond_lh = bool(idx_1h_touch > 0 and h1_high < prev_hh)
+                    cond_dvf_strict = bool(dvf_norm <= float(args.reject_dvf_extra_th))
+                    bonus_score = int(cond_lh) + int(vol_spike) + int(cond_dvf_strict)
+                    if cond_zone_pos and (core_score >= 2 or (core_score >= 1 and bonus_score >= 2)):
+                        filtered.append(z)
+                resist_candidates = filtered
+                if resist_candidates:
+                    if args.log_gates:
                         gate_counts["reject_pass_1h"] += 1
                 else:
-                    if _use_decision_index():
-                        idx_15m_rej = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(cfg.tf_mtf), side="right") - 1)
-                    else:
-                        idx_15m_rej = int(np.searchsorted(ts_15m, ts, side="right") - 1)
-                    if idx_15m_rej >= 0:
-                        close_15m = float(df_15m.at[idx_15m_rej, "close"])
-                        resist_candidates = [
-                            z
-                            for z in resist_candidates
-                            if close_15m < (z.mid if reject_level == "mid" else z.bot)
-                        ]
-                        if resist_candidates and args.log_gates:
-                            gate_counts["reject_pass_15m"] += 1
+                    if args.log_gates:
+                        gate_counts["h1_reject_fail"] += 1
+                    continue
             if args.debug_zone and (i3 % 200 == 0):
                 live_res = [z for z in zones if z.live and z.side == 1]
                 live_sup = [z for z in zones if z.live and z.side == -1]
@@ -1448,7 +1528,7 @@ def run_backtest() -> None:
                 if args.log_gates:
                     gate_counts["lh_15m"] += 1
                 continue
-            # 15m EMA60/EMA120 slope filter (skip if steeply rising)
+            # 15m EMA60/EMA120 slope filter (strict: both non-positive required)
             try:
                 ema60 = _ema(df_15m["close"], int(args.ema60_15m_len))
                 ema120 = _ema(df_15m["close"], int(args.ema120_15m_len))
@@ -1461,6 +1541,31 @@ def run_backtest() -> None:
                         continue
             except Exception:
                 pass
+            # 15m reversal quality gate: require BOS or EMA reclaim-fail
+            try:
+                bos_lb = max(3, int(args.mtf_bos_lookback))
+                low_window_start = max(0, idx_15m - bos_lb)
+                low_window = df_15m["low"].iloc[low_window_start:idx_15m].astype(float)
+                mtf_bos = bool((not low_window.empty) and (close15 < float(low_window.min())))
+                ema20_line = _ema(df_15m["close"], 20)
+                ema60_line = _ema(df_15m["close"], int(args.ema60_15m_len))
+                ema20_now = float(ema20_line.iloc[idx_15m]) if len(ema20_line) > idx_15m else close15
+                ema60_now = float(ema60_line.iloc[idx_15m]) if len(ema60_line) > idx_15m else close15
+                mtf_reclaim_fail = bool(h15_0 > ema20_now and close15 < ema20_now)
+                swing_lb = max(4, int(args.mtf_swing_lookback))
+                swing_high_prev = df_15m["high"].iloc[max(0, idx_15m - swing_lb):idx_15m].astype(float)
+                prev_swing_high = float(swing_high_prev.max()) if not swing_high_prev.empty else h15_1
+                mtf_sweep_fail = bool(h15_0 > prev_swing_high and close15 < prev_swing_high)
+                if not (mtf_bos or mtf_reclaim_fail or mtf_sweep_fail):
+                    if args.log_gates:
+                        gate_counts["mtf_reversal_fail"] += 1
+                    continue
+                if args.log_gates:
+                    gate_counts["mtf_reversal_pass"] += 1
+            except Exception:
+                if args.log_gates:
+                    gate_counts["mtf_reversal_fail"] += 1
+                continue
 
             # 3m structure break: close < min(low[-3:])
             close_now = float(df_3m.at[i3, "close"])
@@ -1492,7 +1597,7 @@ def run_backtest() -> None:
             except Exception:
                 pass
             strong_break = close_now < low_min
-            weak_break = float(df_3m.at[i3, "low"]) <= low_min
+            weak_break = bool(args.use_weak_break) and (float(df_3m.at[i3, "low"]) <= low_min) and (close_now >= low_min) and (close_now < open_now)
             if args.disable_weak:
                 weak_break = False
             if args.log_gates:
@@ -1523,9 +1628,23 @@ def run_backtest() -> None:
                 continue
             # arm retest after break (before any immediate-entry tracks)
             if not retest_active or i3 > retest_until:
+                # Live parity: retest level is the broken low reference.
                 retest_level = low_min
                 retest_active = True
                 retest_bars = int(args.retest_bars)
+                body = abs(close_now - open_now)
+                bodies = (df_3m["close"] - df_3m["open"]).abs()
+                avg_body = float(bodies.iloc[i3-6:i3].mean()) if i3 >= 6 else float(bodies.iloc[:i3].mean())
+                arm_big_bear = bool(
+                    strong_break
+                    and avg_body > 0
+                    and close_now < open_now
+                    and body >= (avg_body * float(args.big_bear_body_mult))
+                )
+                arm_dvf_accel = bool(strong_break and dvf_norm <= float(args.dvf_norm_immediate))
+                arm_dvf_slope = bool(strong_break and args.dvf_slope_enabled and dvf_norm_diff <= float(args.dvf_norm_diff_th))
+                if arm_dvf_accel:
+                    retest_bars = min(retest_bars, max(1, int(args.dvf_accel_retest_bars)))
                 if args.retest_dyn:
                     try:
                         atr3 = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
@@ -1537,7 +1656,16 @@ def run_backtest() -> None:
                 retest_until = i3 + retest_bars
                 break_i3 = i3
                 break_low_min = low_min
+                break_low_candle = low_now
                 retest_is_strong = strong_break
+                retest_best_touch_atr = None
+                if args.log_gates:
+                    if arm_big_bear:
+                        gate_counts["armed_by_big_bear"] += 1
+                    if arm_dvf_accel:
+                        gate_counts["armed_by_dvf_accel"] += 1
+                    if arm_dvf_slope:
+                        gate_counts["armed_by_dvf_slope"] += 1
                 if args.debug_retest:
                     print(
                         "[BACKTEST][RET_ARM] "
@@ -1623,10 +1751,21 @@ def run_backtest() -> None:
                             f"level={retest_level:.6f} high={high_now:.6f} close={close_now:.6f} "
                             f"approach_tol={approach_tol:.6f} reclaim_up={reclaim_up_buf:.6f}"
                         )
+                # diagnostics: how far did price get from retest_level in ATR units
+                if atr_now > 0:
+                    gap_atr = (low_now - retest_level) / atr_now
+                    if retest_best_touch_atr is None or gap_atr < retest_best_touch_atr:
+                        retest_best_touch_atr = gap_atr
             elif retest_active and i3 > retest_until:
                 if args.log_gates:
                     gate_counts["retest_fail_far"] += 1
+                    if retest_best_touch_atr is not None:
+                        gate_counts["retest_min_gap_atr_sum"] += float(retest_best_touch_atr)
+                        gate_counts["retest_min_gap_atr_count"] += 1
+                        gate_counts["retest_best_touch_atr_sum"] += float(retest_best_touch_atr)
+                        gate_counts["retest_best_touch_count"] += 1
                 retest_active = False
+                retest_best_touch_atr = None
 
             # DVF pending confirm (next bar check)
             if dvf_pending_active and (not args.require_retest_touch or retest_touch):
@@ -1673,57 +1812,76 @@ def run_backtest() -> None:
                 return
             # Big bear break candle -> immediate entry (skip retest)
             try:
-                if args.require_retest_touch and not retest_touch:
-                    if args.log_gates:
-                        gate_counts["retest_fail_no_touch"] += 1
-                    continue
-                body = abs(close_now - open_now)
-                bodies = (df_3m["close"] - df_3m["open"]).abs()
-                avg_body = float(bodies.iloc[i3-6:i3].mean()) if i3 >= 6 else float(bodies.iloc[:i3].mean())
-                if avg_body > 0 and close_now < open_now and body >= (avg_body * float(args.big_bear_body_mult)):
-                    if args.big_bear_strong_only and (not strong_break):
+                if btc_bullish_regime and bool(args.btc_bull_dvf_only):
+                    pass
+                else:
+                    if bool(args.disable_immediate_big_bear):
                         if args.log_gates:
-                            gate_counts["big_bear_weak_block"] += 1
+                            gate_counts["immediate_entry_blocked"] += 0
+                        raise StopIteration
+                    if args.require_retest_touch and not retest_touch:
+                        if args.log_gates:
+                            gate_counts["retest_fail_no_touch"] += 1
                         continue
-                    entry_px = float(df_3m.at[i3 + 1, "open"])
-                    if not _ltf_sr_bias_pass(entry_px, track="big_bear"):
+                    body = abs(close_now - open_now)
+                    bodies = (df_3m["close"] - df_3m["open"]).abs()
+                    avg_body = float(bodies.iloc[i3-6:i3].mean()) if i3 >= 6 else float(bodies.iloc[:i3].mean())
+                    if avg_body > 0 and close_now < open_now and body >= (avg_body * float(args.big_bear_body_mult)):
+                        if not strong_break:
+                            if args.log_gates:
+                                gate_counts["big_bear_weak_block"] += 1
+                            continue
+                        if args.big_bear_strong_only and (not strong_break):
+                            if args.log_gates:
+                                gate_counts["big_bear_weak_block"] += 1
+                            continue
+                        entry_px = float(df_3m.at[i3 + 1, "open"])
+                        if not _ltf_sr_bias_pass(entry_px, track="big_bear"):
+                            continue
+                        nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
+                        sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
+                        sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                        sl_price = _apply_sl_cap(entry_px, sl_price, atr_now)
+                        tp_price = entry_px * float(args.tp_mult)
+                        trade = {
+                            "entry_px": entry_px,
+                            "sl_price": sl_price,
+                            "tp_price": tp_price,
+                            "mfe": 0.0,
+                            "mae": 0.0,
+                            "hold_bars": 0,
+                            "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                            "signal_ts": int(df_3m.at[i3, "ts"]),
+                            "track": "big_bear",
+                        }
+                        stats["entries"] += 1
+                        sym_stats["entries"] += 1
+                        entry_symbols.add(sym)
+                        if args.log_gates:
+                            gate_counts["entry_by_big_bear"] += 1
+                        _record_entry_ts(trade["entry_ts"])
+                        _log_signal_ctx(
+                            "big_bear",
+                            nearest,
+                            entry_px,
+                            atr_now,
+                            extra=f"body={body:.6f} avg_body={avg_body:.6f} body_mult={body/avg_body if avg_body>0 else 0:.3f}",
+                        )
+                        retest_active = False
                         continue
-                    nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
-                    sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
-                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                    sl_price = _apply_sl_cap(entry_px, sl_price, atr_now)
-                    tp_price = entry_px * float(args.tp_mult)
-                    trade = {
-                        "entry_px": entry_px,
-                        "sl_price": sl_price,
-                        "tp_price": tp_price,
-                        "mfe": 0.0,
-                        "mae": 0.0,
-                        "hold_bars": 0,
-                        "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
-                        "signal_ts": int(df_3m.at[i3, "ts"]),
-                        "track": "big_bear",
-                    }
-                    stats["entries"] += 1
-                    sym_stats["entries"] += 1
-                    entry_symbols.add(sym)
-                    if args.log_gates:
-                        gate_counts["entry_by_big_bear"] += 1
-                    _record_entry_ts(trade["entry_ts"])
-                    _log_signal_ctx(
-                        "big_bear",
-                        nearest,
-                        entry_px,
-                        atr_now,
-                        extra=f"body={body:.6f} avg_body={avg_body:.6f} body_mult={body/avg_body if avg_body>0 else 0:.3f}",
-                    )
-                    retest_active = False
-                    continue
+            except StopIteration:
+                pass
             except Exception:
                 pass
             # DVF acceleration -> immediate entry (skip retest)
             try:
+                if bool(args.disable_immediate_dvf_accel):
+                    if args.log_gates:
+                        gate_counts["immediate_entry_blocked"] += 0
+                    raise StopIteration
                 if dvf_norm <= float(args.dvf_norm_immediate):
+                    if not strong_break:
+                        continue
                     if args.require_retest_touch and not retest_touch:
                         if args.log_gates:
                             gate_counts["retest_fail_no_touch"] += 1
@@ -1761,18 +1919,26 @@ def run_backtest() -> None:
                     _record_entry_ts(trade["entry_ts"])
                     _log_signal_ctx("dvf_accel", nearest, entry_px, atr_now)
                     retest_active = False
+                    if args.log_gates and retest_best_touch_atr is not None:
+                        gate_counts["retest_min_gap_atr_sum"] += float(retest_best_touch_atr)
+                        gate_counts["retest_min_gap_atr_count"] += 1
+                        gate_counts["retest_best_touch_atr_sum"] += float(retest_best_touch_atr)
+                        gate_counts["retest_best_touch_count"] += 1
+                    retest_best_touch_atr = None
                     continue
+            except StopIteration:
+                pass
             except Exception:
                 pass
-            if args.log_gates:
-                if strong_break:
-                    gate_counts["break_3m_strong"] += 1
-                elif weak_break:
-                    gate_counts["break_3m_weak"] += 1
-
             # DVF slope acceleration -> immediate entry (skip retest)
             try:
-                if args.dvf_slope_enabled and dvf_norm_diff <= float(args.dvf_norm_diff_th):
+                if bool(args.disable_immediate_dvf_slope):
+                    if args.log_gates:
+                        gate_counts["immediate_entry_blocked"] += 0
+                    raise StopIteration
+                if (not (btc_bullish_regime and bool(args.btc_bull_dvf_only))) and args.dvf_slope_enabled and dvf_norm_diff <= float(args.dvf_norm_diff_th):
+                    if not strong_break:
+                        continue
                     if args.require_retest_touch and not retest_touch:
                         if args.log_gates:
                             gate_counts["retest_fail_no_touch"] += 1
@@ -1811,10 +1977,15 @@ def run_backtest() -> None:
                     _log_signal_ctx("dvf_slope", nearest, entry_px, atr_now)
                     retest_active = False
                     continue
+            except StopIteration:
+                pass
             except Exception:
                 pass
 
             if retest_active and i3 <= retest_until:
+                if btc_bullish_regime and bool(args.btc_bull_dvf_only):
+                    retest_active = False
+                    continue
                 high_now = float(df_3m.at[i3, "high"])
                 low_now = float(df_3m.at[i3, "low"])
                 atr_now = float(atr_3m.iloc[i3]) if not np.isnan(atr_3m.iloc[i3]) else 0.0
@@ -1861,31 +2032,59 @@ def run_backtest() -> None:
                     retest_active = False
                     continue
 
-                if retest_touch:
-                    rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
-                    upper_wick = float(df_3m.at[i3, "high"]) - max(float(df_3m.at[i3, "open"]), float(df_3m.at[i3, "close"]))
-                    wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
-                    entry_px = float(df_3m.at[i3 + 1, "open"])
-                    if not _ltf_sr_bias_pass(entry_px, track="retest"):
-                        continue
-                    nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
-                    sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
-                    sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
-                    sl_price = _apply_sl_cap(entry_px, sl_price, atr_now)
-                    tp_price = entry_px * float(args.tp_mult)
-                    if close_now < retest_level:
-                        if args.log_gates:
-                            gate_counts["retest_pass_close"] += 1
-                    elif low_now < retest_level and close_now < float(df_3m.at[i3, "open"]) and wick_ratio <= float(args.retest_wick_max):
-                        if args.log_gates:
-                            gate_counts["retest_pass_low"] += 1
-                    elif high_now < retest_level + (atr_now * float(args.shallow_atr_mult)) and close_now < float(df_3m.at[i3, "open"]) and dvf_norm <= float(args.shallow_dvf_max) and wick_ratio <= float(args.shallow_wick_max):
-                        if args.log_gates:
-                            gate_counts["retest_pass_low"] += 1
-                    else:
-                        continue
                 if not retest_touch:
                     continue
+                rng = float(df_3m.at[i3, "high"]) - float(df_3m.at[i3, "low"])
+                open_now_i3 = float(df_3m.at[i3, "open"])
+                upper_wick = float(df_3m.at[i3, "high"]) - max(open_now_i3, float(df_3m.at[i3, "close"]))
+                wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+                pass_low_exact = bool(low_now <= retest_level)
+                near_mult = float(args.retest_near_atr_mult) + (float(args.big_bear_near_bonus_atr) if arm_big_bear else 0.0)
+                pass_low_near = bool(low_now <= (retest_level + (atr_now * near_mult)))
+                pass_shallow = bool(
+                    high_now < retest_level + (atr_now * float(args.shallow_atr_mult))
+                    and close_now < open_now_i3
+                    and dvf_norm <= float(args.shallow_dvf_max)
+                    and wick_ratio <= float(args.shallow_wick_max)
+                )
+                passed_retest = False
+                if strong_break:
+                    passed_retest = (pass_low_exact or pass_low_near)
+                else:
+                    passed_retest = (pass_low_exact or pass_low_near or pass_shallow)
+                if not passed_retest:
+                    continue
+                if args.log_gates:
+                    if pass_low_exact:
+                        gate_counts["retest_pass_low"] += 1
+                    elif pass_low_near:
+                        gate_counts["retest_pass_near"] += 1
+                    else:
+                        gate_counts["retest_pass_low"] += 1
+                # Live parity confirm: current bar closes below EMA20.
+                ema20_3m = _ema(df_3m["close"], 20)
+                ema20_now = float(ema20_3m.iloc[i3]) if not np.isnan(ema20_3m.iloc[i3]) else close_now
+                confirm_ok = bool(close_now < ema20_now)
+                if args.log_gates:
+                    if confirm_ok:
+                        gate_counts["confirm_pass"] += 1
+                    else:
+                        gate_counts["confirm_fail"] += 1
+                        gate_counts["confirm_fail_ema"] += 1
+                if not confirm_ok:
+                    continue
+                if not bool(args.retest_entry_enabled):
+                    retest_active = False
+                    continue
+                entry_idx = i3 + 1
+                entry_px = float(df_3m.at[entry_idx, "open"])
+                if not _ltf_sr_bias_pass(entry_px, track="retest"):
+                    continue
+                nearest = min(resist_candidates, key=lambda z: abs(z.mid - entry_px))
+                sl_raw = nearest.top + (atr_now * float(args.sl_atr_mult))
+                sl_price = max(sl_raw, entry_px + (atr_now * 1.0))
+                sl_price = _apply_sl_cap(entry_px, sl_price, atr_now)
+                tp_price = entry_px * float(args.tp_mult)
                 trade = {
                     "entry_px": entry_px,
                     "sl_price": sl_price,
@@ -1893,7 +2092,7 @@ def run_backtest() -> None:
                     "mfe": 0.0,
                     "mae": 0.0,
                     "hold_bars": 0,
-                    "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                    "entry_ts": int(df_3m.at[entry_idx, "ts"]),
                     "signal_ts": int(df_3m.at[i3, "ts"]),
                     "track": "strong" if strong_break else "weak",
                 }
@@ -1903,15 +2102,21 @@ def run_backtest() -> None:
                 _record_entry_ts(trade["entry_ts"])
                 _log_signal_ctx("strong" if strong_break else "weak", nearest, entry_px, atr_now)
                 if args.log_gates:
-                    if close_now < retest_level:
-                        gate_counts["entry_by_pass_close"] += 1
-                    else:
-                        gate_counts["entry_by_pass_low"] += 1
+                    gate_counts["entry_by_retest_confirm"] += 1
+                    gate_counts["entry_by_pass_low"] += 1
+                    gate_counts["entry_delay_sum_bars"] += 1.0
+                    gate_counts["entry_delay_count"] += 1
                     if strong_break:
                         gate_counts["entries_strong"] += 1
                     else:
                         gate_counts["entries_weak"] += 1
                 retest_active = False
+                if args.log_gates and retest_best_touch_atr is not None:
+                    gate_counts["retest_min_gap_atr_sum"] += float(retest_best_touch_atr)
+                    gate_counts["retest_min_gap_atr_count"] += 1
+                    gate_counts["retest_best_touch_atr_sum"] += float(retest_best_touch_atr)
+                    gate_counts["retest_best_touch_count"] += 1
+                retest_best_touch_atr = None
                 if i3 >= retest_until:
                     if args.log_gates:
                         gate_counts["retest_fail_far"] += 1
@@ -2028,24 +2233,56 @@ def run_backtest() -> None:
                 f"net_sum_usdt={bucket.get('net_sum_usdt', 0.0):.3f}"
             )
     if args.verbose:
+        retest_min_gap_atr_avg = (
+            gate_counts["retest_min_gap_atr_sum"] / gate_counts["retest_min_gap_atr_count"]
+            if gate_counts["retest_min_gap_atr_count"] > 0
+            else 0.0
+        )
+        retest_best_touch_atr_avg = (
+            gate_counts["retest_best_touch_atr_sum"] / gate_counts["retest_best_touch_count"]
+            if gate_counts["retest_best_touch_count"] > 0
+            else 0.0
+        )
+        entry_delay_avg = (
+            gate_counts["entry_delay_sum_bars"] / gate_counts["entry_delay_count"]
+            if gate_counts["entry_delay_count"] > 0
+            else 0.0
+        )
         print(
             "[BACKTEST] GATE_COUNTS "
             f"zone_touch={gate_counts['zone_touch']} "
+            f"h1_reject_fail={gate_counts['h1_reject_fail']} "
             f"lh_15m={gate_counts['lh_15m']} "
+            f"mtf_reversal_pass={gate_counts['mtf_reversal_pass']} "
+            f"mtf_reversal_fail={gate_counts['mtf_reversal_fail']} "
             f"break_3m={gate_counts['break_3m']} "
             f"break_strong={gate_counts['break_3m_strong']} "
             f"break_weak={gate_counts['break_3m_weak']} "
             f"retest_seen={gate_counts['retest_seen']} "
             f"retest_pass_close={gate_counts['retest_pass_close']} "
             f"retest_pass_low={gate_counts['retest_pass_low']} "
+            f"retest_pass_near={gate_counts['retest_pass_near']} "
+            f"confirm_pass={gate_counts['confirm_pass']} "
+            f"confirm_fail={gate_counts['confirm_fail']} "
+            f"confirm_fail_ema={gate_counts['confirm_fail_ema']} "
+            f"confirm_fail_lowbreak={gate_counts['confirm_fail_lowbreak']} "
+            f"confirm_fail_both={gate_counts['confirm_fail_both']} "
+            f"entry_delay_avg={entry_delay_avg:.2f} "
             f"retest_fail_far={gate_counts['retest_fail_far']} "
             f"retest_fail_shallow={gate_counts['retest_fail_shallow']} "
             f"retest_fail_no_touch={gate_counts['retest_fail_no_touch']} "
+            f"retest_min_gap_atr_avg={retest_min_gap_atr_avg:.3f} "
+            f"retest_best_touch_atr_avg={retest_best_touch_atr_avg:.3f} "
             f"entry_by_dvf_accel={gate_counts['entry_by_dvf_accel']} "
             f"entry_by_dvf_slope={gate_counts['entry_by_dvf_slope']} "
             f"entry_by_big_bear={gate_counts['entry_by_big_bear']} "
+            f"armed_by_dvf_accel={gate_counts['armed_by_dvf_accel']} "
+            f"armed_by_dvf_slope={gate_counts['armed_by_dvf_slope']} "
+            f"armed_by_big_bear={gate_counts['armed_by_big_bear']} "
             f"big_bear_weak_block={gate_counts['big_bear_weak_block']} "
             f"entry_by_timeout={gate_counts['entry_by_timeout']} "
+            f"entry_by_retest_confirm={gate_counts['entry_by_retest_confirm']} "
+            f"immediate_entry_blocked={gate_counts['immediate_entry_blocked']} "
             f"entry_by_pass_close={gate_counts['entry_by_pass_close']} "
             f"entry_by_pass_low={gate_counts['entry_by_pass_low']} "
             f"reject_pass_1h={gate_counts['reject_pass_1h']} "

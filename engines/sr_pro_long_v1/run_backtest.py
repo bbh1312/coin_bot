@@ -427,6 +427,7 @@ def run_backtest() -> None:
     parser.add_argument("--ema-filter-len", type=int, default=int(cfg_live.ema_filter_len))
     parser.add_argument("--retest-bars", type=int, default=int(cfg_live.retest_bars))
     parser.add_argument("--retest-atr-mult", type=float, default=float(cfg_live.retest_atr_mult))
+    parser.add_argument("--retest-reclaim-min-atr", type=float, default=float(getattr(cfg_live, "retest_reclaim_min_atr", 0.0)))
     parser.add_argument("--retest-near-atr-mult", type=float, default=float(cfg_live.retest_near_atr_mult))
     parser.add_argument("--retest-wick-max", type=float, default=float(cfg_live.retest_wick_max))
     parser.add_argument("--retest-dyn", action="store_true", default=bool(cfg_live.retest_dyn))
@@ -448,6 +449,8 @@ def run_backtest() -> None:
     parser.add_argument("--entry-atr-offset", type=float, default=float(cfg_live.entry_atr_offset))
     parser.add_argument("--sl-buffer", type=float, default=float(cfg_live.sl_buffer))
     parser.add_argument("--sl-atr-mult", type=float, default=float(cfg_live.sl_atr_mult))
+    parser.add_argument("--sl-cap-pct", type=float, default=float(getattr(cfg_live, "sl_cap_pct", 0.0)))
+    parser.add_argument("--sl-cap-atr-mult", type=float, default=float(getattr(cfg_live, "sl_cap_atr_mult", 0.0)))
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
     parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
     parser.add_argument("--tp-mult", type=float, default=float(cfg_live.tp_mult))
@@ -1335,6 +1338,23 @@ def run_backtest() -> None:
                                 f"retest_level={retest_level:.6f}",
                             )
                         continue
+                    reclaim_min_atr = float(args.retest_reclaim_min_atr)
+                    if reclaim_min_atr > 0:
+                        reclaim_margin = close_now - retest_level
+                        if reclaim_margin < (atr_now * reclaim_min_atr):
+                            if args.log_gates:
+                                gate_counts["retest_fail_shallow"] += 1
+                            if dbg_on:
+                                _dbg(
+                                    ts,
+                                    "retest_reclaim_gate",
+                                    (
+                                        f"margin={reclaim_margin:.6f} "
+                                        f"need={(atr_now * reclaim_min_atr):.6f} "
+                                        f"atr3={atr_now:.6f} level={retest_level:.6f} close={close_now:.6f}"
+                                    ),
+                                )
+                            continue
 
                     ema_entry = float(ema_3m_entry.iloc[i3]) if len(ema_3m_entry) > i3 and not np.isnan(ema_3m_entry.iloc[i3]) else None
                     entry_offset = float(cfg.entry_atr_offset)
@@ -1403,6 +1423,12 @@ def run_backtest() -> None:
                         continue
                     sl_raw = nearest.bot - (atr_now * float(args.sl_atr_mult))
                     sl_price = min(sl_raw, entry_px - (atr_now * 1.0))
+                    cap_pct = max(
+                        float(args.sl_cap_pct),
+                        ((atr_now * float(args.sl_cap_atr_mult)) / entry_px) if entry_px > 0 else 0.0,
+                    )
+                    if cap_pct > 0 and entry_px > 0:
+                        sl_price = max(sl_price, entry_px * (1.0 - cap_pct))
                     tp_atr = float(args.tp_atr_mult_weak) if (not strong_break and float(args.tp_atr_mult_weak) > 0) else float(args.tp_atr_mult)
                     if tp_atr > 0:
                         tp_price = entry_px + (atr_now * tp_atr)

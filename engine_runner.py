@@ -8798,11 +8798,17 @@ def _run_sr_pro_short_v1_cycle(
     no_data = 0
     gate_stats = {
         "zone_touch": 0,
+        "btc_filter": 0,
+        "h1_reject_fail": 0,
         "lh_15m": 0,
+        "mtf_reversal_pass": 0,
+        "mtf_reversal_fail": 0,
         "break_3m": 0,
         "retest_seen": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_low": 0,
+        "confirm_pass": 0,
+        "confirm_fail": 0,
         "entry_by_big_bear": 0,
         "big_bear_weak_block": 0,
         "entry_by_dvf_accel": 0,
@@ -8860,6 +8866,13 @@ def _run_sr_pro_short_v1_cycle(
     min_ltf_fetch = min_ltf + 1
     min_mtf_fetch = min_mtf + 1
     min_htf_fetch = min_htf + 1
+    btc_filter_enabled = bool(getattr(cfg, "btc_filter_enabled", False))
+    btc_filter_tf = str(getattr(cfg, "btc_filter_tf", "1h") or "1h").lower()
+    if btc_filter_tf not in {"1h", "30m"}:
+        btc_filter_tf = "1h"
+    btc_filter_ema_len = max(1, int(getattr(cfg, "btc_filter_ema_len", 200)))
+    btc_filter_slope_len = max(1, int(getattr(cfg, "btc_filter_slope_len", 4)))
+    btc_bull_dvf_only = bool(getattr(cfg, "btc_bull_dvf_only", True))
 
     sr_state = state.setdefault("_sr_pro_short_v1_state", {})
     symbols = list(effective_universe or [])
@@ -8941,6 +8954,50 @@ def _run_sr_pro_short_v1_cycle(
                 _append_common_warmup_ohlcv(symbol, tf, rows)
         except Exception:
             pass
+    btc_ts = np.array([])
+    btc_close = None
+    btc_ema = None
+    if btc_filter_enabled:
+        min_btc_fetch = max(min_htf_fetch, btc_filter_ema_len + btc_filter_slope_len + 10)
+        df_btc = pd.DataFrame()
+        if SR_PRO_USE_COMMON_CACHE:
+            _df = _load_common_warmup_ohlcv("BTC/USDT:USDT", btc_filter_tf, limit=min_btc_fetch)
+            df_btc = _df if _df is not None else pd.DataFrame()
+            if df_btc.empty:
+                _df = _load_common_warmup_ohlcv("BTC/USDT", btc_filter_tf, limit=min_btc_fetch)
+                df_btc = _df if _df is not None else pd.DataFrame()
+            try:
+                now_ms = int(time.time() * 1000)
+                if df_btc.empty or _need_stale_refresh(df_btc, max(_tf_ms(btc_filter_tf), 20 * 60 * 1000), now_ms=now_ms):
+                    df_new = cycle_cache.get_df("BTC/USDT:USDT", btc_filter_tf, limit=min_btc_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_btc = df_new
+                        _persist_common_from_df("BTC/USDT:USDT", btc_filter_tf, df_btc)
+                if df_btc.empty:
+                    df_new = cycle_cache.get_df("BTC/USDT", btc_filter_tf, limit=min_btc_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_btc = df_new
+                        _persist_common_from_df("BTC/USDT", btc_filter_tf, df_btc)
+            except Exception:
+                pass
+        else:
+            df_new = cycle_cache.get_df("BTC/USDT:USDT", btc_filter_tf, limit=min_btc_fetch)
+            if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                df_btc = df_new
+            else:
+                df_new = cycle_cache.get_df("BTC/USDT", btc_filter_tf, limit=min_btc_fetch)
+                if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                    df_btc = df_new
+        try:
+            btc_sig = _confirmed_df(df_btc, btc_filter_tf)
+            if isinstance(btc_sig, pd.DataFrame) and not btc_sig.empty:
+                btc_ts = btc_sig["ts"].values
+                btc_close = btc_sig["close"].astype(float)
+                btc_ema = ema(btc_close, btc_filter_ema_len)
+        except Exception:
+            btc_ts = np.array([])
+            btc_close = None
+            btc_ema = None
     for symbol in symbols:
         if symbol in {"BTC/USDT:USDT", "BTC/USDT"}:
             continue
@@ -9083,6 +9140,33 @@ def _run_sr_pro_short_v1_cycle(
         min_15m_hist = 2 if mtf_mode == "strict" else 0
         if idx_1h < 0 or idx_15m < min_15m_hist:
             continue
+        btc_bullish_regime = False
+        if btc_filter_enabled:
+            if btc_close is None or btc_ema is None or len(btc_ts) == 0:
+                gate_stats["btc_filter"] += 1
+                _dbg(symbol, "stage=btc_filter_no_data")
+                continue
+            idx_btc = int(np.searchsorted(btc_ts, latest_ts_ms, side="right") - 1)
+            if idx_btc < 0 or idx_btc >= len(btc_close):
+                gate_stats["btc_filter"] += 1
+                _dbg(symbol, f"stage=btc_filter_idx_miss idx={idx_btc}")
+                continue
+            btc_close_now = float(btc_close.iloc[idx_btc])
+            btc_ema_now = float(btc_ema.iloc[idx_btc]) if not np.isnan(btc_ema.iloc[idx_btc]) else btc_close_now
+            prev_idx_btc = max(0, idx_btc - btc_filter_slope_len)
+            btc_ema_prev = (
+                float(btc_ema.iloc[prev_idx_btc])
+                if not np.isnan(btc_ema.iloc[prev_idx_btc])
+                else btc_ema_now
+            )
+            btc_ema_slope_up = btc_ema_now > btc_ema_prev
+            btc_bullish_regime = bool(btc_close_now >= btc_ema_now and btc_ema_slope_up)
+            if btc_bullish_regime:
+                gate_stats["btc_filter"] += 1
+                _dbg(
+                    symbol,
+                    f"stage=btc_filter_bull_mode btc_close={btc_close_now:.6f} btc_ema={btc_ema_now:.6f} slope_up={int(btc_ema_slope_up)}",
+                )
 
         # zones: fixed-anchor mode keeps static zone snapshot per symbol/anchor.
         if SR_PRO_SHORT_V1_FIXED_EVEN_DAY_0030_KST and fixed_anchor_ms > 0:
@@ -9109,6 +9193,7 @@ def _run_sr_pro_short_v1_cycle(
         # current 1h bar by decision_ts mapping (match backtest)
         h1 = df_1h_hist.iloc[idx_1h]
         h1_ts = int(h1["ts"]) if "ts" in h1 else 0
+        h1_open = float(h1["open"])
         h1_high = float(h1["high"])
         h1_low = float(h1["low"])
         h1_close = float(h1["close"])
@@ -9146,6 +9231,7 @@ def _run_sr_pro_short_v1_cycle(
             pass
 
         h1_touch_px = h1_close if cfg.touch_use_close else h1_high
+        touch_level = str(getattr(cfg, "touch_mode", "top") or "top").lower()
         ema_now = None
         if cfg.ema200_filter:
             ema_len = max(1, int(getattr(cfg, "ema_filter_len", 200)))
@@ -9160,11 +9246,15 @@ def _run_sr_pro_short_v1_cycle(
             if not z.get("live", True):
                 z["_last_touch_ts"] = 0
                 continue
+            touch_px_ok = (
+                h1_touch_px >= float(z.get("top", 0.0)) if touch_level == "top"
+                else (h1_touch_px >= float(z.get("mid", 0.0)) if touch_level == "mid" else h1_touch_px >= float(z.get("bot", 0.0))
+            ))
             touched_now = (
                 z.get("side") == 1
                 and h1_high >= float(z.get("bot", 0.0))
                 and h1_low <= float(z.get("top", 0.0))
-                and h1_touch_px >= float(z.get("bot", 0.0))
+                and touch_px_ok
             )
             z["_last_touch_ts"] = h1_ts if touched_now else 0
         resist_candidates = [
@@ -9176,6 +9266,33 @@ def _run_sr_pro_short_v1_cycle(
             and h1_low <= float(z.get("top", 0.0))
             and z.get("_last_touch_ts") == h1_ts
         ]
+        if resist_candidates and bool(getattr(cfg, "require_reject_close", True)):
+            h1_rng = max(h1_high - h1_low, 1e-12)
+            h1_upper_wick = h1_high - max(h1_open, h1_close)
+            h1_upper_wick_ratio = (h1_upper_wick / h1_rng) if h1_rng > 0 else 0.0
+            vol_lb = max(5, 20)
+            vol_sma = float(vol_1h.iloc[max(0, idx_1h - vol_lb):idx_1h].mean()) if idx_1h > 0 else 0.0
+            vol_spike = bool(vol_sma > 0 and float(vol_1h.iloc[idx_1h]) >= (vol_sma * float(getattr(cfg, "reject_vol_mult", 1.2))))
+            lh_lb = max(3, int(getattr(cfg, "reject_lh_lookback", 8)))
+            prev_hh = float(df_1h_hist["high"].astype(float).iloc[max(0, idx_1h - lh_lb):idx_1h].max()) if idx_1h > 0 else h1_high
+            filtered_candidates = []
+            for z in resist_candidates:
+                z_top = float(z.get("top", 0.0))
+                cond_zone_pos = bool(h1_high >= (z_top - (atr1h_now * 0.15)))
+                core_a_wick = bool(h1_upper_wick_ratio >= float(getattr(cfg, "reject_wick_min", 0.40)))
+                core_b_bear_close = bool(h1_close <= h1_open)
+                core_c_reclaim = bool(h1_close <= (z_top - (atr1h_now * 0.05)))
+                core_score = int(core_a_wick) + int(core_b_bear_close) + int(core_c_reclaim)
+                cond_lh = bool(idx_1h > 0 and h1_high < prev_hh)
+                cond_dvf_strict = bool(dvf_norm <= float(getattr(cfg, "reject_dvf_extra_th", -0.15)))
+                bonus_score = int(cond_lh) + int(vol_spike) + int(cond_dvf_strict)
+                if cond_zone_pos and (core_score >= 2 or (core_score >= 1 and bonus_score >= 2)):
+                    filtered_candidates.append(z)
+            resist_candidates = filtered_candidates
+            if not resist_candidates:
+                gate_stats["h1_reject_fail"] += 1
+                _dbg(symbol, f"stage=h1_reject_fail wick={h1_upper_wick_ratio:.3f} vol_spike={int(vol_spike)}")
+                continue
         if not resist_candidates:
             # Only treat touch as valid for the latest confirmed 1h bar.
             # If current 1h does not touch, clear any prior touch/retest state.
@@ -9277,6 +9394,28 @@ def _run_sr_pro_short_v1_cycle(
                     continue
         except Exception:
             pass
+        # 15m reversal quality gate: require BOS or EMA reclaim-fail
+        try:
+            bos_lb = max(3, int(getattr(cfg, "mtf_bos_lookback", 5)))
+            low_window = df_15m_sig["low"].iloc[max(0, idx_15m - bos_lb):idx_15m].astype(float)
+            mtf_bos = bool((not low_window.empty) and (close15 < float(low_window.min())))
+            ema20_line = ema(df_15m_sig["close"], 20)
+            ema60_line = ema(df_15m_sig["close"], int(cfg.ema60_15m_len))
+            ema20_now = float(ema20_line.iloc[idx_15m]) if len(ema20_line) > idx_15m and not np.isnan(ema20_line.iloc[idx_15m]) else close15
+            ema60_now = float(ema60_line.iloc[idx_15m]) if len(ema60_line) > idx_15m and not np.isnan(ema60_line.iloc[idx_15m]) else close15
+            mtf_reclaim_fail = bool(h15_0 > ema20_now and close15 < ema20_now)
+            swing_lb = max(4, int(getattr(cfg, "mtf_swing_lookback", 8)))
+            swing_high_prev = df_15m_sig["high"].iloc[max(0, idx_15m - swing_lb):idx_15m].astype(float)
+            prev_swing_high = float(swing_high_prev.max()) if not swing_high_prev.empty else h15_1
+            mtf_sweep_fail = bool(h15_0 > prev_swing_high and close15 < prev_swing_high)
+            if not (mtf_bos or mtf_reclaim_fail or mtf_sweep_fail):
+                gate_stats["mtf_reversal_fail"] += 1
+                _dbg(symbol, f"stage=mtf_reversal_fail bos={int(mtf_bos)} reclaim={int(mtf_reclaim_fail)} sweep={int(mtf_sweep_fail)}")
+                continue
+            gate_stats["mtf_reversal_pass"] += 1
+        except Exception:
+            gate_stats["mtf_reversal_fail"] += 1
+            continue
 
         # 3m break
         if len(df_3m_sig) < 4:
@@ -9294,7 +9433,8 @@ def _run_sr_pro_short_v1_cycle(
         ]
         low_min = min(low_prev)
         strong_break = c3 < low_min
-        weak_break = float(df_3m_sig.iloc[-1]["low"]) <= low_min
+        use_weak_break = bool(getattr(cfg, "use_weak_break", False))
+        weak_break = bool(use_weak_break) and (float(df_3m_sig.iloc[-1]["low"]) <= low_min) and (c3 >= low_min) and (c3 < o3)
         if not strong_break and not weak_break:
             gate_stats["break_3m"] += 1
             _dbg(symbol, f"stage=break_fail c3={c3:.6f} o3={o3:.6f} low_min={low_min:.6f}")
@@ -9413,10 +9553,15 @@ def _run_sr_pro_short_v1_cycle(
                     continue
         # Big bear break candle -> immediate entry (skip retest)
         try:
+            if btc_bullish_regime and btc_bull_dvf_only:
+                continue
             body = abs(c3 - o3)
             bodies = (df_3m_sig["close"] - df_3m_sig["open"]).abs()
             avg_body = float(bodies.iloc[-6:-1].mean()) if len(bodies) >= 6 else float(bodies.iloc[:-1].mean())
             if avg_body > 0 and c3 < o3 and body >= (avg_body * float(cfg.big_bear_body_mult)):
+                if not strong_break:
+                    gate_stats["big_bear_weak_block"] += 1
+                    continue
                 if bool(getattr(cfg, "big_bear_strong_only", True)) and (not strong_break):
                     gate_stats["big_bear_weak_block"] += 1
                     continue
@@ -9466,6 +9611,8 @@ def _run_sr_pro_short_v1_cycle(
         # DVF acceleration -> immediate entry (skip retest)
         try:
             if dvf_norm <= float(cfg.dvf_norm_immediate):
+                if not strong_break:
+                    continue
                 if int(getattr(cfg, "dvf_confirm_bars", 0)) > 0:
                     sym_state["dvf_pending_until"] = now_ts_ms + int(cfg.dvf_confirm_bars) * 3 * 60 * 1000
                     sym_state["dvf_pending_level"] = low_min
@@ -9512,7 +9659,11 @@ def _run_sr_pro_short_v1_cycle(
             pass
         # DVF slope acceleration -> immediate entry (skip retest)
         try:
+            if btc_bullish_regime and btc_bull_dvf_only:
+                continue
             if bool(getattr(cfg, "dvf_slope_enabled", False)) and dvf_norm_diff <= float(cfg.dvf_norm_diff_th):
+                if not strong_break:
+                    continue
                 if int(getattr(cfg, "dvf_confirm_bars", 0)) > 0:
                     sym_state["dvf_pending_until"] = now_ts_ms + int(cfg.dvf_confirm_bars) * 3 * 60 * 1000
                     sym_state["dvf_pending_level"] = low_min
@@ -9585,6 +9736,9 @@ def _run_sr_pro_short_v1_cycle(
             gate_stats["retest_seen"] += 1
 
         if retest_active and now_ts_ms <= retest_until:
+            if btc_bullish_regime and btc_bull_dvf_only:
+                sym_state["retest_active"] = False
+                continue
             # retest checks on current confirmed 3m bar
             h3 = float(df_3m_sig.iloc[-1]["high"])
             l3 = float(df_3m_sig.iloc[-1]["low"])
@@ -9659,13 +9813,27 @@ def _run_sr_pro_short_v1_cycle(
                 rng = float(df_3m_sig.iloc[-1]["high"]) - float(df_3m_sig.iloc[-1]["low"])
                 upper_wick = float(df_3m_sig.iloc[-1]["high"]) - max(float(df_3m_sig.iloc[-1]["open"]), float(df_3m_sig.iloc[-1]["close"]))
                 wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
-                if c3 < retest_level:
-                    gate_stats["entry_by_pass_close"] += 1
+                ema20_3m = ema(df_3m_sig["close"].astype(float), 20)
+                ema20_3m_now = float(ema20_3m.iloc[-1]) if len(ema20_3m) > 0 and not np.isnan(ema20_3m.iloc[-1]) else c3
+                if strong_break:
+                    if l3 < retest_level and c3 < o3 and wick_ratio <= float(cfg.retest_wick_max):
+                        gate_stats["entry_by_pass_low"] += 1
+                    else:
+                        continue
                 elif l3 < retest_level and c3 < o3 and wick_ratio <= float(cfg.retest_wick_max):
                     gate_stats["entry_by_pass_low"] += 1
                 elif h3 < retest_level + (atr_now * float(cfg.shallow_atr_mult)) and c3 < o3 and dvf_norm <= float(cfg.shallow_dvf_max) and wick_ratio <= float(cfg.shallow_wick_max):
                     gate_stats["entry_by_pass_low"] += 1
                 else:
+                    continue
+                confirm_ok = bool(c3 < ema20_3m_now)
+                if confirm_ok:
+                    gate_stats["confirm_pass"] += 1
+                else:
+                    gate_stats["confirm_fail"] += 1
+                    continue
+                if not bool(getattr(cfg, "retest_entry_enabled", False)):
+                    sym_state["retest_active"] = False
                     continue
 
                 tp_price = entry_px * float(cfg.tp_mult)
@@ -9724,7 +9892,8 @@ def _run_sr_pro_short_v1_cycle(
     elapsed = time.time() - start_ts
     _append_sr_pro_short_v1_log(
         f"SR_PRO_CYCLE_END elapsed={elapsed:.2f}s checked={checked} entries={result['entries']} no_data={no_data} "
-        f"zone_fail={gate_stats['zone_touch']} lh_fail={gate_stats['lh_15m']} break_fail={gate_stats['break_3m']} "
+        f"zone_fail={gate_stats['zone_touch']} h1_reject_fail={gate_stats['h1_reject_fail']} "
+        f"lh_fail={gate_stats['lh_15m']} mtf_reversal_fail={gate_stats['mtf_reversal_fail']} break_fail={gate_stats['break_3m']} "
         f"retest_seen={gate_stats['retest_seen']} pass_close={gate_stats['entry_by_pass_close']} pass_low={gate_stats['entry_by_pass_low']} "
         f"cooldown={gate_stats.get('cooldown', 0)} skip_stale_ts={gate_stats.get('skip_stale_ts', 0)} "
         f"no_data_ltf={gate_stats.get('no_data_ltf', 0)} no_data_mtf={gate_stats.get('no_data_mtf', 0)} no_data_htf={gate_stats.get('no_data_htf', 0)}"
@@ -9791,6 +9960,7 @@ def _run_sr_pro_long_v1_cycle(
         "break_3m": 0,
         "pullback_fail": 0,
         "sweep_reclaim_fail": 0,
+        "retest_reclaim_fail": 0,
         "break_overheat": 0,
         "retest_seen": 0,
         "entry_by_pass_close": 0,
@@ -10341,6 +10511,20 @@ def _run_sr_pro_long_v1_cycle(
                             f"stage=retest pattern_fail strong={int(strong_break)} weak={int(weak_break)} c3={c3:.6f} o3={o3:.6f} h3={h3:.6f} l3={l3:.6f} level={retest_level:.6f}",
                         )
                         continue
+                    reclaim_min_atr = float(getattr(cfg, "retest_reclaim_min_atr", 0.0) or 0.0)
+                    if reclaim_min_atr > 0:
+                        reclaim_margin = c3 - retest_level
+                        if reclaim_margin < (atr_now * reclaim_min_atr):
+                            gate_stats["retest_reclaim_fail"] += 1
+                            _dbg(
+                                symbol,
+                                (
+                                    f"stage=retest_reclaim_gate margin={reclaim_margin:.6f} "
+                                    f"need={(atr_now * reclaim_min_atr):.6f} atr3={atr_now:.6f} "
+                                    f"level={retest_level:.6f} close={c3:.6f}"
+                                ),
+                            )
+                            continue
 
                     ema_entry = None
                     try:
@@ -10374,6 +10558,12 @@ def _run_sr_pro_long_v1_cycle(
                         continue
                     sl_raw = nearest["bot"] - (atr_now * float(cfg.sl_atr_mult))
                     sl_price = min(sl_raw, entry_px - (atr_now * 1.0))
+                    cap_pct = max(
+                        float(getattr(cfg, "sl_cap_pct", 0.0) or 0.0),
+                        ((atr_now * float(getattr(cfg, "sl_cap_atr_mult", 0.0) or 0.0)) / entry_px) if entry_px > 0 else 0.0,
+                    )
+                    if cap_pct > 0 and entry_px > 0:
+                        sl_price = max(sl_price, entry_px * (1.0 - cap_pct))
                     tp_atr = cfg.tp_atr_mult_weak if break_type == "weak" else cfg.tp_atr_mult
                     if tp_atr and tp_atr > 0:
                         tp_price = entry_px + (atr_now * float(tp_atr))
@@ -10426,6 +10616,7 @@ def _run_sr_pro_long_v1_cycle(
         f"break_3m={gate_stats['break_3m']} "
         f"pullback_fail={gate_stats['pullback_fail']} "
         f"sweep_reclaim_fail={gate_stats['sweep_reclaim_fail']} "
+        f"retest_reclaim_fail={gate_stats['retest_reclaim_fail']} "
         f"break_overheat={gate_stats['break_overheat']} "
         f"retest_seen={gate_stats['retest_seen']} "
         f"entry_by_pass_close={gate_stats['entry_by_pass_close']} "
@@ -10447,6 +10638,7 @@ def _run_sr_pro_long_v1_cycle(
             f"break_3m={gate_stats['break_3m']} "
             f"pullback_fail={gate_stats['pullback_fail']} "
             f"sweep_reclaim_fail={gate_stats['sweep_reclaim_fail']} "
+            f"retest_reclaim_fail={gate_stats['retest_reclaim_fail']} "
             f"break_overheat={gate_stats['break_overheat']} "
             f"retest_seen={gate_stats['retest_seen']} "
             f"entry_by_pass_close={gate_stats['entry_by_pass_close']} "

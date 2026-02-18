@@ -32,6 +32,7 @@ class SrProLongV1Config:
     retest_atr_mult: float = 0.20
     retest_near_atr_mult: float = 0.15
     retest_wick_max: float = 0.4
+    retest_reclaim_min_atr: float = 0.05
     retest_dyn: bool = False
     retest_dyn_th: float = 0.6
     retest_dyn_bars: int = 10
@@ -47,12 +48,14 @@ class SrProLongV1Config:
     shallow_dvf_min: float = 0.0
     entry_ema_len: int = 7
     entry_atr_offset: float = 0.15
-    sl_buffer: float = 0.01
-    sl_atr_mult: float = 0.10
+    sl_buffer: float = 0.00
+    sl_atr_mult: float = 0.04
+    sl_cap_pct: float = 0.018
+    sl_cap_atr_mult: float = 0.0
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 1.015
-    tp_mult_weak: float = 1.02
+    tp_mult: float = 1.020
+    tp_mult_weak: float = 1.022
 
 
 class SrProLongV1Engine(BaseEngine):
