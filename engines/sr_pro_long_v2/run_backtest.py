@@ -210,7 +210,7 @@ def _minute_str(ts_ms: int) -> str:
 def _latest_even_day_0030_kst_anchor_ms(now_ms: int) -> int:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
-    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_HOUR", "0") or 0)))
+    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
     anchor_minute = max(0, min(59, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
     anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
     if now_kst < anchor_kst:
@@ -238,7 +238,7 @@ def _even_day_anchor_series_ms(eval_start_ms: int, end_ms: int) -> List[int]:
 def _latest_daily_0030_kst_anchor_ms(now_ms: int) -> int:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
-    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_HOUR", "0") or 0)))
+    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
     anchor_minute = max(0, min(59, int(os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
     anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
     if now_kst < anchor_kst:
@@ -269,16 +269,29 @@ def _load_common_universe_from_snapshot_log(
     if not os.path.isdir(logs_dir):
         return [], ""
     candidates: List[tuple[float, str]] = []
+
+    def _parse_name_ts(name: str) -> float:
+        try:
+            # common_universe_YYYYMMDD_HHMMSS.log (KST wall clock)
+            stem = str(name).removesuffix(".log")
+            ts_part = stem.replace("common_universe_", "", 1)
+            dt_kst = datetime.strptime(ts_part, "%Y%m%d_%H%M%S").replace(tzinfo=timezone(timedelta(hours=9)))
+            return float(dt_kst.timestamp())
+        except Exception:
+            return 0.0
+
     try:
         for name in os.listdir(logs_dir):
             if not (name.startswith("common_universe_") and name.endswith(".log")):
                 continue
             full = os.path.join(logs_dir, name)
-            try:
-                mtime_sec = os.path.getmtime(full)
-            except Exception:
-                continue
-            candidates.append((mtime_sec, full))
+            ts_sec = _parse_name_ts(name)
+            if ts_sec <= 0:
+                try:
+                    ts_sec = float(os.path.getmtime(full))
+                except Exception:
+                    continue
+            candidates.append((ts_sec, full))
     except Exception:
         return [], ""
 
@@ -469,6 +482,7 @@ def run_backtest() -> None:
     parser.add_argument("--ltf-sr-lookback", type=int, default=60)
     parser.add_argument("--debug-symbol", type=str, default="")
     parser.add_argument("--block-hours", type=str, default="")
+    parser.add_argument("--cooldown-sec", type=int, default=-1)
     args = parser.parse_args()
     bt_fixed_default = os.getenv("SR_PRO_LONG_V2_BT_FIXED_ANCHOR", "1").strip().lower() not in ("0", "false", "off", "no")
     bt_replay_cadence = os.getenv("SR_PRO_LONG_V2_BT_FIXED_REPLAY_CADENCE", "daily").strip().lower()
@@ -727,7 +741,32 @@ def run_backtest() -> None:
                 return set()
         return set()
 
+    def _load_exit_cooldown_sec() -> int:
+        if int(args.cooldown_sec) >= 0:
+            return int(args.cooldown_sec)
+        try:
+            if os.path.exists("state.json"):
+                with open("state.json", "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                if isinstance(st, dict):
+                    raw_h = st.get("_exit_cooldown_hours", st.get("exit_cooldown_h"))
+                    if isinstance(raw_h, (int, float)):
+                        return max(0, int(float(raw_h) * 3600.0))
+                    raw_sec = st.get("_cooldown_sec", st.get("cooldown_sec"))
+                    if isinstance(raw_sec, (int, float)):
+                        return max(0, int(float(raw_sec)))
+        except Exception:
+            pass
+        raw_env = os.getenv("COOLDOWN_SEC", "").strip()
+        if raw_env:
+            try:
+                return max(0, int(float(raw_env)))
+            except Exception:
+                pass
+        return 1800
+
     block_hours = _load_entry_block_hours()
+    cooldown_ms = max(0, _load_exit_cooldown_sec()) * 1000
 
     entries_by_day: Dict[str, int] = {}
     entry_reason_stats: Dict[str, Dict[str, float]] = {}
@@ -1011,7 +1050,8 @@ def run_backtest() -> None:
                             "pnl_pct": pnl_pct,
                         }
                     )
-                    cooldown_until[(sym, "LONG")] = ts + (60 * 60 * 1000)
+                    if cooldown_ms > 0:
+                        cooldown_until[(sym, "LONG")] = ts + cooldown_ms
                     if dbg_on:
                         dbg_counts["exits"] += 1
                         _dbg(ts, "exit_sl", f"entry_ts={_iso_kst(trade['entry_ts'])} exit_px={exit_px:.6f}")
@@ -1058,6 +1098,8 @@ def run_backtest() -> None:
                     if dbg_on:
                         dbg_counts["exits"] += 1
                         _dbg(ts, "exit_tp", f"entry_ts={_iso_kst(trade['entry_ts'])} exit_px={exit_px:.6f}")
+                    if cooldown_ms > 0:
+                        cooldown_until[(sym, "LONG")] = ts + cooldown_ms
                     trade = None
                 continue
 

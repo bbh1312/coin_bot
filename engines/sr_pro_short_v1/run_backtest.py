@@ -214,16 +214,29 @@ def _load_common_universe_from_snapshot_log(
     if not os.path.isdir(logs_dir):
         return [], ""
     candidates: List[tuple[float, str]] = []
+
+    def _parse_name_ts(name: str) -> float:
+        try:
+            # common_universe_YYYYMMDD_HHMMSS.log (KST wall clock)
+            stem = str(name).removesuffix(".log")
+            ts_part = stem.replace("common_universe_", "", 1)
+            dt_kst = datetime.strptime(ts_part, "%Y%m%d_%H%M%S").replace(tzinfo=timezone(timedelta(hours=9)))
+            return float(dt_kst.timestamp())
+        except Exception:
+            return 0.0
+
     try:
         for name in os.listdir(logs_dir):
             if not (name.startswith("common_universe_") and name.endswith(".log")):
                 continue
             full = os.path.join(logs_dir, name)
-            try:
-                mtime_sec = os.path.getmtime(full)
-            except Exception:
-                continue
-            candidates.append((mtime_sec, full))
+            ts_sec = _parse_name_ts(name)
+            if ts_sec <= 0:
+                try:
+                    ts_sec = os.path.getmtime(full)
+                except Exception:
+                    continue
+            candidates.append((float(ts_sec), full))
     except Exception:
         return [], ""
 
@@ -362,7 +375,7 @@ def run_backtest() -> None:
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--universe", type=str, default="common")
     parser.add_argument("--use-confirmed", action="store_true")
-    parser.add_argument("--index-mode", type=str, default="ts", choices=["auto", "ts", "decision"])
+    parser.add_argument("--index-mode", type=str, default="auto", choices=["auto", "ts", "decision"])
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
     parser.add_argument("--common-warmup-dir", type=str, default="")
@@ -396,7 +409,8 @@ def run_backtest() -> None:
     parser.add_argument("--btc-filter-enabled", action="store_true")
     parser.add_argument("--btc-filter-tf", type=str, default="1h", choices=["1h", "30m"])
     parser.add_argument("--btc-filter-ema-len", type=int, default=200)
-    parser.add_argument("--block-hours", type=str, default="4,5,9,11,15")
+    parser.add_argument("--block-hours", type=str, default="")
+    parser.add_argument("--cooldown-sec", type=int, default=-1)
     parser.add_argument("--disable-weak", action="store_true")
     parser.add_argument("--retest-bars", type=int, default=6)
     parser.add_argument("--retest-atr-mult", type=float, default=0.6)
@@ -552,6 +566,13 @@ def run_backtest() -> None:
         cfg.tf_mtf: 120,
         cfg.tf_htf: 120,
     }
+    window_bars_1h_live_like = int(args.total_window_days * 24) if args.total_window_days else 0
+    min_htf_live_like = max(
+        int(args.lookback) * 2 + 50,
+        220,
+        window_bars_1h_live_like + 5 if window_bars_1h_live_like else 0,
+    )
+    min_htf_fetch_live_like = int(min_htf_live_like + 1)
     if args.total_window_days:
         if args.total_window_days <= 0:
             print("[BACKTEST] total_window_days must be > 0")
@@ -766,10 +787,12 @@ def run_backtest() -> None:
         "hold_strong_sum": 0.0,
         "hold_weak_sum": 0.0,
         "time_block": 0,
+        "cooldown_block": 0,
         "boundary_block": 0,
         "skip_stale_ts": 0,
         "ltf_sr_bias_block": 0,
         "both_hit_sl_priority": 0,
+        "already_in_position": 0,
     }
     def _parse_entry_block_hours_raw(raw: str) -> set[int]:
         if not isinstance(raw, str):
@@ -826,7 +849,32 @@ def run_backtest() -> None:
                 return hours
         return set()
 
+    def _load_exit_cooldown_sec() -> int:
+        if int(args.cooldown_sec) >= 0:
+            return int(args.cooldown_sec)
+        try:
+            if os.path.exists("state.json"):
+                with open("state.json", "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                if isinstance(st, dict):
+                    raw_h = st.get("_exit_cooldown_hours", st.get("exit_cooldown_h"))
+                    if isinstance(raw_h, (int, float)):
+                        return max(0, int(float(raw_h) * 3600.0))
+                    raw_sec = st.get("_cooldown_sec", st.get("cooldown_sec"))
+                    if isinstance(raw_sec, (int, float)):
+                        return max(0, int(float(raw_sec)))
+        except Exception:
+            pass
+        raw_env = os.getenv("COOLDOWN_SEC", "").strip()
+        if raw_env:
+            try:
+                return max(0, int(float(raw_env)))
+            except Exception:
+                pass
+        return 1800
+
     block_hours = _load_entry_block_hours()
+    cooldown_ms = max(0, _load_exit_cooldown_sec()) * 1000
 
     entries_by_day: Dict[str, int] = {}
     entry_symbols: set[str] = set()
@@ -956,7 +1004,8 @@ def run_backtest() -> None:
                 zone_end_idx = int(np.searchsorted(df_1h["ts"].values, eval_start_ms, side="right"))
             if zone_end_idx <= 0:
                 continue
-            zones_raw = build_sr_zones(df_1h.iloc[:zone_end_idx], cfg, window_bars=window_bars_1h)
+            left = max(0, zone_end_idx - min_htf_fetch_live_like)
+            zones_raw = build_sr_zones(df_1h.iloc[left:zone_end_idx], cfg, window_bars=window_bars_1h)
             zones = [
                 Zone(
                     mid=float(z["mid"]),
@@ -992,6 +1041,7 @@ def run_backtest() -> None:
         ts_3m = df_3m["ts"].values
 
         trade = None
+        cooldown_until = 0
         retest_active = False
         retest_is_strong = False
         retest_level = 0.0
@@ -1050,6 +1100,10 @@ def run_backtest() -> None:
                     )
                 except Exception:
                     pass
+            if trade is None and cooldown_ms > 0 and ts < cooldown_until:
+                if args.log_gates:
+                    gate_counts["cooldown_block"] += 1
+                continue
             # entry block hours (KST) - apply to all entry paths
             if block_hours:
                 hour_kst = int(_ts_kst(ts).split(" ")[1].split(":")[0])
@@ -1100,7 +1154,8 @@ def run_backtest() -> None:
 
             if args.rolling_zones and not zones_snapshot_in:
                 if last_zone_end_idx != idx_1h:
-                    zones_raw = build_sr_zones(df_1h.iloc[: idx_1h + 1], cfg, window_bars=window_bars_1h)
+                    left = max(0, (idx_1h + 1) - min_htf_fetch_live_like)
+                    zones_raw = build_sr_zones(df_1h.iloc[left : idx_1h + 1], cfg, window_bars=window_bars_1h)
                     zones = [
                         Zone(
                             mid=float(z["mid"]),
@@ -1120,7 +1175,8 @@ def run_backtest() -> None:
                 if zone_end_idx <= 0:
                     continue
                 if last_zone_end_idx != zone_end_idx:
-                    zones_raw = build_sr_zones(df_1h.iloc[:zone_end_idx], cfg, window_bars=window_bars_1h)
+                    left = max(0, zone_end_idx - min_htf_fetch_live_like)
+                    zones_raw = build_sr_zones(df_1h.iloc[left:zone_end_idx], cfg, window_bars=window_bars_1h)
                     zones = [
                         Zone(
                             mid=float(z["mid"]),
@@ -1192,6 +1248,7 @@ def run_backtest() -> None:
                             "mode": "sr_pro_short_v1",
                             "side": "SHORT",
                             "entry_ts": trade["entry_ts"],
+                            "signal_ts": int(trade.get("signal_ts", trade["entry_ts"])),
                             "exit_ts": ts,
                             "entry_px": trade["entry_px"],
                             "exit_px": exit_px,
@@ -1203,6 +1260,8 @@ def run_backtest() -> None:
                         }
                     )
                     trade = None
+                    if cooldown_ms > 0:
+                        cooldown_until = ts + cooldown_ms
                     continue
                 elif hit_tp:
                     exit_px = trade["tp_price"]
@@ -1240,6 +1299,7 @@ def run_backtest() -> None:
                             "mode": "sr_pro_short_v1",
                             "side": "SHORT",
                             "entry_ts": trade["entry_ts"],
+                            "signal_ts": int(trade.get("signal_ts", trade["entry_ts"])),
                             "exit_ts": ts,
                             "entry_px": trade["entry_px"],
                             "exit_px": exit_px,
@@ -1251,7 +1311,10 @@ def run_backtest() -> None:
                         }
                     )
                     trade = None
+                    if cooldown_ms > 0:
+                        cooldown_until = ts + cooldown_ms
                     continue
+                gate_counts["already_in_position"] += 1
                 continue
 
             # 1h in-progress bar touching resistance zone with negative delta
@@ -1281,6 +1344,19 @@ def run_backtest() -> None:
                     continue
                 if args.log_gates:
                     gate_counts["ema200_pass"] += 1
+            # Live parity: only zones touched by the latest confirmed 1h bar are eligible.
+            h1_ts = int(ts_1h[idx_1h_touch]) if idx_1h_touch >= 0 else 0
+            for z in zones:
+                if not z.live:
+                    setattr(z, "last_touch_ts", 0)
+                    continue
+                touched_now = (
+                    z.side == 1
+                    and h1_high >= z.bot
+                    and h1_low <= z.top
+                    and h1_touch_px >= z.bot
+                )
+                setattr(z, "last_touch_ts", h1_ts if touched_now else 0)
             resist_candidates = [
                 z
                 for z in zones
@@ -1289,6 +1365,7 @@ def run_backtest() -> None:
                 and dvf_norm <= float(args.dvf_norm_max)
                 and h1_high >= z.bot
                 and h1_low <= z.top
+                and getattr(z, "last_touch_ts", 0) == h1_ts
             ]
             if resist_candidates and args.require_reject_close:
                 reject_level = "mid" if args.reject_mode == "mid" else "bot"
@@ -1575,6 +1652,7 @@ def run_backtest() -> None:
                             "mae": 0.0,
                             "hold_bars": 0,
                             "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                            "signal_ts": int(df_3m.at[i3, "ts"]),
                             "track": track,
                         }
                         stats["entries"] += 1
@@ -1592,41 +1670,7 @@ def run_backtest() -> None:
                         retest_active = False
                         continue
             def _log_signal_ctx(track: str, nearest_zone, entry_px: float, atr_now: float | None = None, extra: str = "") -> None:
-                try:
-                    parts = [
-                        "[BACKTEST][SIGNAL_CTX]",
-                        f"sym={sym}",
-                        f"track={track}",
-                        f"h1_close={h1_close:.6f}",
-                        f"h1_high={h1_high:.6f}",
-                        f"h1_low={h1_low:.6f}",
-                        f"dvf_norm={dvf_norm:.4f}",
-                        f"zone_mid={nearest_zone.mid:.6f}",
-                        f"zone_bot={nearest_zone.bot:.6f}",
-                        f"zone_top={nearest_zone.top:.6f}",
-                        f"h15_0={h15_0:.6f}",
-                        f"h15_1={h15_1:.6f}",
-                        f"h15_2={h15_2:.6f}",
-                        f"c3={close_now:.6f}",
-                        f"o3={float(df_3m.at[i3, 'open']):.6f}",
-                        f"h3={high_now:.6f}",
-                        f"l3={low_now:.6f}",
-                        f"low_min={low_min:.6f}",
-                        f"strong={int(strong_break)}",
-                        f"weak={int(weak_break)}",
-                        f"retest_level={retest_level:.6f}",
-                        f"retest_until={retest_until}",
-                        f"df_low_last={float(df_3m.at[i3, 'low']):.6f}",
-                        f"df_close_last={float(df_3m.at[i3, 'close']):.6f}",
-                        f"df_ts_last={int(df_3m.at[i3, 'ts'])}",
-                    ]
-                    if isinstance(atr_now, (int, float)):
-                        parts.append(f"atr3={atr_now:.6f}")
-                    if extra:
-                        parts.append(extra)
-                    print(" ".join(parts))
-                except Exception:
-                    pass
+                return
             # Big bear break candle -> immediate entry (skip retest)
             try:
                 if args.require_retest_touch and not retest_touch:
@@ -1657,6 +1701,7 @@ def run_backtest() -> None:
                         "mae": 0.0,
                         "hold_bars": 0,
                         "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                        "signal_ts": int(df_3m.at[i3, "ts"]),
                         "track": "big_bear",
                     }
                     stats["entries"] += 1
@@ -1705,6 +1750,7 @@ def run_backtest() -> None:
                         "mae": 0.0,
                         "hold_bars": 0,
                         "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                        "signal_ts": int(df_3m.at[i3, "ts"]),
                         "track": "dvf_accel",
                     }
                     stats["entries"] += 1
@@ -1753,6 +1799,7 @@ def run_backtest() -> None:
                         "mae": 0.0,
                         "hold_bars": 0,
                         "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                        "signal_ts": int(df_3m.at[i3, "ts"]),
                         "track": "dvf_slope",
                     }
                     stats["entries"] += 1
@@ -1801,6 +1848,7 @@ def run_backtest() -> None:
                         "mae": 0.0,
                         "hold_bars": 0,
                         "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                        "signal_ts": int(df_3m.at[i3, "ts"]),
                         "track": "timeout",
                     }
                     stats["entries"] += 1
@@ -1846,6 +1894,7 @@ def run_backtest() -> None:
                     "mae": 0.0,
                     "hold_bars": 0,
                     "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                    "signal_ts": int(df_3m.at[i3, "ts"]),
                     "track": "strong" if strong_break else "weak",
                 }
                 stats["entries"] += 1
@@ -1880,6 +1929,7 @@ def run_backtest() -> None:
                     "mode": "sr_pro_short_v1",
                     "side": "SHORT",
                     "entry_ts": trade["entry_ts"],
+                    "signal_ts": int(trade.get("signal_ts", trade["entry_ts"])),
                     "entry_px": trade["entry_px"],
                     "last_px": last_px,
                     "last_ts": last_ts,
@@ -1933,6 +1983,7 @@ def run_backtest() -> None:
                 print(
                     "[BACKTEST][EXIT] "
                     f"sym={item['sym']} mode={item['mode']} side={item['side']} "
+                    f"signal_dt={_minute_str(item.get('signal_ts', item['entry_ts']))} "
                     f"entry_dt={_minute_str(item['entry_ts'])} exit_dt={_minute_str(item['exit_ts'])} "
                     f"entry_px={item['entry_px']:.6f} exit_px={item['exit_px']:.6f} "
                     f"reason={item['reason']} result={item.get('result','')} "
@@ -1942,6 +1993,7 @@ def run_backtest() -> None:
                 print(
                     "[BACKTEST][OPEN] "
                     f"sym={item['sym']} mode={item['mode']} side={item['side']} "
+                    f"signal_dt={_minute_str(item.get('signal_ts', item['entry_ts']))} "
                     f"entry_dt={_minute_str(item['entry_ts'])} exit_dt= "
                     f"entry_px={item['entry_px']:.6f} last_px={item['last_px']:.6f} "
                     f"last_dt={_minute_str(item['last_ts'])} unrealized_pct={item['unrealized_pct']:.2f}%"
@@ -2000,6 +2052,7 @@ def run_backtest() -> None:
             f"reject_pass_15m={gate_counts['reject_pass_15m']} "
             f"skip_stale_ts={gate_counts['skip_stale_ts']} "
             f"boundary_block={gate_counts['boundary_block']} "
+            f"cooldown_block={gate_counts['cooldown_block']} "
             f"ema200_pass={gate_counts['ema200_pass']} "
             f"btc_filter={gate_counts['btc_filter']} "
             f"entries_strong={gate_counts['entries_strong']} "
@@ -2018,6 +2071,7 @@ def run_backtest() -> None:
             f"hold_weak={gate_counts['hold_weak_sum']:.1f} "
             f"ltf_sr_bias_block={gate_counts['ltf_sr_bias_block']} "
             f"both_hit_sl_priority={gate_counts['both_hit_sl_priority']}"
+            f" already_in_position={gate_counts['already_in_position']}"
         )
 
     print("[BACKTEST] BY_HOUR(KST) hour entries tp sl sl_rate")

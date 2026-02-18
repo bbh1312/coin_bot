@@ -6,7 +6,7 @@ import csv
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import ccxt
@@ -207,6 +207,140 @@ def _minute_str(ts_ms: int) -> str:
     return _ts_kst(ts_ms)
 
 
+def _latest_even_day_0030_kst_anchor_ms(now_ms: int) -> int:
+    kst = timezone(timedelta(hours=9))
+    now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
+    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
+    anchor_minute = max(0, min(59, int(os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
+    anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
+    if now_kst < anchor_kst:
+        anchor_kst -= timedelta(days=1)
+    while (anchor_kst.day % 2) != 0:
+        anchor_kst -= timedelta(days=1)
+    return int(anchor_kst.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def _even_day_anchor_series_ms(eval_start_ms: int, end_ms: int) -> List[int]:
+    if end_ms <= 0:
+        return []
+    first = _latest_even_day_0030_kst_anchor_ms(eval_start_ms)
+    out: List[int] = []
+    cur = first
+    step = 2 * 24 * 60 * 60 * 1000
+    while cur < end_ms:
+        out.append(int(cur))
+        cur += step
+    if not out:
+        out.append(int(first))
+    return sorted(set(out))
+
+
+def _latest_daily_0030_kst_anchor_ms(now_ms: int) -> int:
+    kst = timezone(timedelta(hours=9))
+    now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
+    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
+    anchor_minute = max(0, min(59, int(os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
+    anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
+    if now_kst < anchor_kst:
+        anchor_kst -= timedelta(days=1)
+    return int(anchor_kst.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def _daily_anchor_series_ms(eval_start_ms: int, end_ms: int) -> List[int]:
+    if end_ms <= 0:
+        return []
+    first = _latest_daily_0030_kst_anchor_ms(eval_start_ms)
+    out: List[int] = []
+    cur = first
+    step = 24 * 60 * 60 * 1000
+    while cur < end_ms:
+        out.append(int(cur))
+        cur += step
+    if not out:
+        out.append(int(first))
+    return sorted(set(out))
+
+
+def _load_common_universe_from_snapshot_log(
+    anchor_ms: int,
+    top_n: int,
+    logs_dir: str = os.path.join("logs", "common_universe"),
+) -> tuple[List[str], str]:
+    if not os.path.isdir(logs_dir):
+        return [], ""
+    candidates: List[tuple[float, str]] = []
+    try:
+        for name in os.listdir(logs_dir):
+            if not (name.startswith("common_universe_") and name.endswith(".log")):
+                continue
+            full = os.path.join(logs_dir, name)
+            try:
+                mtime_sec = os.path.getmtime(full)
+            except Exception:
+                continue
+            candidates.append((mtime_sec, full))
+    except Exception:
+        return [], ""
+
+    if not candidates:
+        return [], ""
+
+    anchor_sec = anchor_ms / 1000.0
+    before_or_eq = [c for c in candidates if c[0] <= anchor_sec]
+    if before_or_eq:
+        before_or_eq.sort(key=lambda x: x[0], reverse=True)
+        chosen = before_or_eq[0][1]
+    else:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        chosen = candidates[0][1]
+
+    out: List[str] = []
+    try:
+        with open(chosen, "r", encoding="utf-8") as f:
+            for line in f:
+                sym = line.strip()
+                if not sym:
+                    continue
+                if sym.startswith("COMMON_UNIVERSE"):
+                    continue
+                out.append(sym)
+    except Exception:
+        return [], chosen
+    if top_n > 0:
+        out = out[:top_n]
+    return out, chosen
+
+
+def _build_fixed_anchor_replay_schedule(
+    eval_start_ms: int,
+    end_ms: int,
+    top_n: int,
+    cadence: str = "even",
+) -> List[dict]:
+    cadence_key = str(cadence or "even").lower()
+    if cadence_key == "daily":
+        anchors = _daily_anchor_series_ms(eval_start_ms, end_ms)
+    else:
+        anchors = _even_day_anchor_series_ms(eval_start_ms, end_ms)
+    if not anchors:
+        return []
+    sched: List[dict] = []
+    for i, a_ms in enumerate(anchors):
+        start = int(max(eval_start_ms, a_ms))
+        end = int(end_ms if i + 1 >= len(anchors) else anchors[i + 1])
+        uni, src = _load_common_universe_from_snapshot_log(a_ms, top_n=top_n)
+        sched.append(
+            {
+                "anchor_ms": int(a_ms),
+                "start_ms": int(start),
+                "end_ms": int(end),
+                "universe": list(uni),
+                "source": src,
+            }
+        )
+    return sched
+
+
 def _fmt_summary_line(
     symbol: Optional[str],
     stats: Dict[str, float],
@@ -305,6 +439,7 @@ def run_backtest() -> None:
     parser.add_argument("--no-require-sweep-reclaim", action="store_false", dest="require_sweep_reclaim")
     parser.add_argument("--sweep-lookback", type=int, default=int(cfg_live.sweep_lookback))
     parser.add_argument("--sweep-tol-atr", type=float, default=float(cfg_live.sweep_tol_atr))
+    parser.add_argument("--sweep-reclaim-wait-bars", type=int, default=0)
     parser.add_argument("--max-break-ext-atr", type=float, default=float(cfg_live.max_break_ext_atr))
     parser.add_argument("--shallow-atr-mult", type=float, default=float(cfg_live.shallow_atr_mult))
     parser.add_argument("--shallow-wick-max", type=float, default=float(cfg_live.shallow_wick_max))
@@ -323,6 +458,21 @@ def run_backtest() -> None:
     parser.add_argument("--total-window-days", type=int, default=14)
     parser.add_argument("--rolling-zones", action="store_true", default=True)
     parser.add_argument("--no-rolling-zones", action="store_false", dest="rolling_zones")
+    parser.add_argument(
+        "--fixed-even-day-0030-kst",
+        action="store_true",
+        help="Fix universe/zones to latest even-day configured KST anchor snapshot (default 09:00).",
+    )
+    parser.add_argument(
+        "--fixed-even-day-0030-kst-replay",
+        action="store_true",
+        help="Replay mode: refresh anchor/universe every even-day configured KST anchor within eval window.",
+    )
+    parser.add_argument(
+        "--fixed-daily-0030-kst-replay",
+        action="store_true",
+        help="Replay mode: refresh anchor/universe every day configured KST anchor within eval window.",
+    )
     parser.add_argument("--zones-snapshot-in", type=str, default="")
     parser.add_argument("--zones-snapshot-out", type=str, default="")
     parser.add_argument("--log-gates", action="store_true")
@@ -332,6 +482,20 @@ def run_backtest() -> None:
     parser.add_argument("--debug-symbol", type=str, default="")
     parser.add_argument("--block-hours", type=str, default="")
     args = parser.parse_args()
+    bt_fixed_default = os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR", "1").strip().lower() not in ("0", "false", "off", "no")
+    bt_replay_cadence = os.getenv("SR_PRO_LONG_V1_BT_FIXED_REPLAY_CADENCE", "daily").strip().lower()
+    if (
+        bt_fixed_default
+        and args.universe in ("common", "common_universe")
+        and not args.fixed_even_day_0030_kst
+        and not args.fixed_even_day_0030_kst_replay
+        and not args.fixed_daily_0030_kst_replay
+    ):
+        args.fixed_even_day_0030_kst = True
+        if bt_replay_cadence == "even":
+            args.fixed_even_day_0030_kst_replay = True
+        else:
+            args.fixed_daily_0030_kst_replay = True
 
     def _tf_ms(tf: str) -> int:
         try:
@@ -363,6 +527,18 @@ def run_backtest() -> None:
 
     exchange = None if args.cache_only else ccxt.binance({"enableRateLimit": True})
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    anchor_ms = 0
+    if args.fixed_even_day_0030_kst:
+        if args.fixed_daily_0030_kst_replay and not args.fixed_even_day_0030_kst_replay:
+            anchor_ms = _latest_daily_0030_kst_anchor_ms(end_ms)
+            anchor_mode = "daily_config_kst"
+        else:
+            anchor_ms = _latest_even_day_0030_kst_anchor_ms(end_ms)
+            anchor_mode = "even_day_config_kst"
+        print(
+            f"[BACKTEST] fixed_anchor_mode={anchor_mode} "
+            f"anchor_kst={_ts_kst(anchor_ms)} anchor_utc={datetime.fromtimestamp(anchor_ms/1000.0, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+        )
     min_bars = {cfg.tf_ltf: 120, cfg.tf_mtf: 120, cfg.tf_htf: 120}
     if args.total_window_days:
         if args.total_window_days < args.days:
@@ -395,7 +571,53 @@ def run_backtest() -> None:
             common_dir = os.getenv("COMMON_WARMUP_CACHE_DIR", os.path.join("logs", "common_warmup", "ohlcv"))
     if not common_dir:
         common_dir = os.path.join("logs", "common_warmup", "ohlcv")
-    universe = load_common_universe(args.universe, exchange, args.cache_only, top_n=args.top_n)
+    replay_schedule: List[dict] = []
+    universe: List[str] = []
+    if (
+        args.fixed_even_day_0030_kst
+        and (args.fixed_even_day_0030_kst_replay or args.fixed_daily_0030_kst_replay)
+        and args.universe in ("common", "common_universe")
+    ):
+        cadence = "daily" if args.fixed_daily_0030_kst_replay else "even"
+        replay_schedule = _build_fixed_anchor_replay_schedule(
+            eval_start_ms=eval_start_ms,
+            end_ms=end_ms,
+            top_n=args.top_n,
+            cadence=cadence,
+        )
+        union_syms: List[str] = []
+        seen_syms = set()
+        for seg in replay_schedule:
+            for s in seg.get("universe", []):
+                if s in seen_syms:
+                    continue
+                seen_syms.add(s)
+                union_syms.append(s)
+        universe = union_syms
+        print(
+            f"[BACKTEST] fixed_replay_schedule cadence={cadence} segments={len(replay_schedule)} "
+            f"union_symbols={len(universe)}"
+        )
+        for seg in replay_schedule:
+            print(
+                f"[BACKTEST] fixed_replay_seg "
+                f"anchor_kst={_ts_kst(int(seg['anchor_ms']))} "
+                f"start_kst={_ts_kst(int(seg['start_ms']))} "
+                f"end_kst={_ts_kst(int(seg['end_ms']))} "
+                f"size={len(seg.get('universe', []))} "
+                f"file='{seg.get('source', '')}'"
+            )
+    elif args.fixed_even_day_0030_kst and args.universe in ("common", "common_universe"):
+        universe, chosen_file = _load_common_universe_from_snapshot_log(
+            anchor_ms=anchor_ms,
+            top_n=args.top_n,
+        )
+        print(
+            f"[BACKTEST] fixed_universe_snapshot "
+            f"file='{chosen_file}' size={len(universe)} top_n={args.top_n}"
+        )
+    if not universe:
+        universe = load_common_universe(args.universe, exchange, args.cache_only, top_n=args.top_n)
     if not universe:
         print("[BACKTEST] no_universe")
         return
@@ -661,14 +883,39 @@ def run_backtest() -> None:
         retest_active = False
         retest_level = 0.0
         retest_until = -1
+        sweep_state_active = False
+        sweep_state_level = 0.0
+        sweep_state_until = -1
         last_zone_end_idx = None
+        replay_anchor_index = 0
+        replay_anchor_ms_cur = 0
+        replay_anchor_universe: set[str] = set()
+        if replay_schedule:
+            for idx, seg in enumerate(replay_schedule):
+                if int(seg.get("start_ms", 0)) <= eval_start_ms < int(seg.get("end_ms", 0)):
+                    replay_anchor_index = idx
+                    break
+            replay_anchor_ms_cur = int(replay_schedule[replay_anchor_index].get("anchor_ms", 0))
+            replay_anchor_universe = set(replay_schedule[replay_anchor_index].get("universe", []))
 
         for i3 in range(3, len(df_3m) - 1):
             ts = int(ts_3m[i3])
             if ts < eval_start_ms:
                 continue
+            if replay_schedule:
+                while (
+                    replay_anchor_index + 1 < len(replay_schedule)
+                    and ts >= int(replay_schedule[replay_anchor_index].get("end_ms", end_ms))
+                ):
+                    replay_anchor_index += 1
+                    replay_anchor_ms_cur = int(replay_schedule[replay_anchor_index].get("anchor_ms", 0))
+                    replay_anchor_universe = set(replay_schedule[replay_anchor_index].get("universe", []))
+                if sym not in replay_anchor_universe and trade is None:
+                    continue
             if dbg_on:
                 dbg_counts["eval_bars"] += 1
+            if sweep_state_active and i3 > sweep_state_until:
+                sweep_state_active = False
             cd_until = cooldown_until.get((sym, "LONG"))
             if isinstance(cd_until, int) and ts < cd_until:
                 if dbg_on:
@@ -705,6 +952,26 @@ def run_backtest() -> None:
                         for z in zones_raw
                     ]
                     last_zone_end_idx = idx_1h
+            elif replay_schedule:
+                zone_end_idx = int(np.searchsorted(df_1h["ts"].values, replay_anchor_ms_cur, side="right"))
+                if zone_end_idx <= 0:
+                    continue
+                if last_zone_end_idx != zone_end_idx:
+                    zones_raw = build_sr_zones(df_1h.iloc[:zone_end_idx], cfg, window_bars=window_bars_1h)
+                    zones = [
+                        Zone(
+                            mid=float(z["mid"]),
+                            top=float(z["top"]),
+                            bot=float(z["bot"]),
+                            side=int(z["side"]),
+                            live=True,
+                            born=int(z["born"]),
+                            start=int(z["start"]),
+                            vol=float(z["vol"]),
+                        )
+                        for z in zones_raw
+                    ]
+                    last_zone_end_idx = zone_end_idx
 
             close_1h_now = float(close_1h.iloc[idx_1h])
             for z in zones:
@@ -960,6 +1227,13 @@ def run_backtest() -> None:
                 continue
 
             if bool(args.require_sweep_reclaim):
+                if sweep_state_active:
+                    if close_now > sweep_state_level:
+                        sweep_state_active = False
+                    else:
+                        if args.log_gates:
+                            gate_counts["sweep_reclaim_fail"] += 1
+                        continue
                 sw_lb = max(3, int(args.sweep_lookback))
                 sw_start = max(0, i3 - sw_lb)
                 prior_lows = df_3m.iloc[sw_start:i3]["low"].astype(float)
@@ -968,6 +1242,10 @@ def run_backtest() -> None:
                 sweep_ok = low_now <= (prior_low - sweep_tol)
                 reclaim_ok = close_now > prior_low
                 if not (sweep_ok and reclaim_ok):
+                    if sweep_ok and int(args.sweep_reclaim_wait_bars) > 0:
+                        sweep_state_active = True
+                        sweep_state_level = prior_low
+                        sweep_state_until = i3 + max(1, int(args.sweep_reclaim_wait_bars))
                     if args.log_gates:
                         gate_counts["sweep_reclaim_fail"] += 1
                     if dbg_on:

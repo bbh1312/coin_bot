@@ -237,7 +237,7 @@ except Exception:
     TIER_COORDINATOR = None
 EXIT_SL_ICON = os.getenv("EXIT_SL_ICON", "🚨🚨🚨")
 MIN_LISTING_AGE_DAYS = float(os.getenv("MIN_LISTING_AGE_DAYS", "14"))
-MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "600"))
+MANAGE_QUEUE_PENDING_TTL_SEC = float(os.getenv("MANAGE_QUEUE_PENDING_TTL_SEC", "120"))
 MANAGE_QUEUE_ENTRY_MAX_AGE_SEC = float(os.getenv("MANAGE_QUEUE_ENTRY_MAX_AGE_SEC", "180"))
 MANUAL_ALERT_TTL_SEC = float(os.getenv("MANUAL_ALERT_TTL_SEC", "3600"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
@@ -1274,7 +1274,7 @@ ONLY_DIV15M_SHORT = False
 RSI_ENABLED = False
 MANAGE_EXIT_COOLDOWN_SEC: int = 5
 MANAGE_PING_COOLDOWN_SEC: int = 7200
-MANAGE_EVAL_COOLDOWN_SEC: int = 3
+MANAGE_EVAL_COOLDOWN_SEC: int = int(float(os.getenv("MANAGE_EVAL_COOLDOWN_SEC", "1")))
 MANUAL_CLOSE_GRACE_SEC: int = 60
 AUTO_EXIT_GRACE_SEC: int = 30
 COOLDOWN_SEC: int = int(float(os.getenv("COOLDOWN_SEC", "1800")))
@@ -1284,7 +1284,7 @@ EXIT_COOLDOWN_SEC: int = COOLDOWN_SEC
 _DISK_STATE_CACHE = {"ts": 0.0, "data": {}}
 _DB_EXIT_CACHE = {"ts": 0.0, "data": {}}
 MANAGE_LOOP_ENABLED: bool = True
-MANAGE_LOOP_SLEEP_SEC: float = 2.0
+MANAGE_LOOP_SLEEP_SEC: float = float(os.getenv("MANAGE_LOOP_SLEEP_SEC", "1.0"))
 MANAGE_TICKER_TTL_SEC: float = 5.0
 RUNTIME_CONFIG_RELOAD_SEC: float = 5.0
 MANAGE_WS_MODE: bool = False
@@ -1537,9 +1537,19 @@ SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR = max(0, min(23, int(os.getenv("SR_PRO_SHO
 SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE = max(0, min(59, int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
 SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR = os.getenv("SR_PRO_SHORT_V1_FIXED_UNIVERSE_LOG_DIR", os.path.join("logs", "common_universe")).strip()
 SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N = int(os.getenv("SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N", str(COMMON_UNIVERSE_TOP_N or 50)))
+SR_PRO_SHORT_DEBUG_SYMBOLS = {
+    s.strip().upper()
+    for s in os.getenv("SR_PRO_SHORT_DEBUG_SYMBOLS", "").split(",")
+    if s.strip()
+}
+SR_PRO_LONG_V1_FIXED_EVEN_DAY_0030_KST = os.getenv("SR_PRO_LONG_V1_FIXED_EVEN_DAY_0030_KST", "1") not in ("0", "false", "off", "no")
+SR_PRO_LONG_V1_FIXED_ANCHOR_CADENCE_DAYS = max(1, int(os.getenv("SR_PRO_LONG_V1_FIXED_ANCHOR_CADENCE_DAYS", "1") or 1))
+SR_PRO_LONG_V1_FIXED_ANCHOR_KST_HOUR = max(0, min(23, int(os.getenv("SR_PRO_LONG_V1_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
+SR_PRO_LONG_V1_FIXED_ANCHOR_KST_MINUTE = max(0, min(59, int(os.getenv("SR_PRO_LONG_V1_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
+SR_PRO_LONG_V1_FIXED_UNIVERSE_TOP_N = int(os.getenv("SR_PRO_LONG_V1_FIXED_UNIVERSE_TOP_N", str(COMMON_UNIVERSE_TOP_N or 50)))
 SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST = os.getenv("SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST", "1") not in ("0", "false", "off", "no")
 SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS = max(1, int(os.getenv("SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS", "1") or 1))
-SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR", "0") or 0)))
+SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR = max(0, min(23, int(os.getenv("SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
 SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE = max(0, min(59, int(os.getenv("SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
 SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N = int(os.getenv("SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N", str(COMMON_UNIVERSE_TOP_N or 50)))
 
@@ -2392,6 +2402,36 @@ def _maybe_repair_common_warmup_gaps(
     if repaired:
         print(f"[common-gap] repaired {repaired}/{candidates} checked={checked}")
 
+
+def _common_warmup_has_pending_issues(universe: list) -> tuple[bool, int, int]:
+    if not universe:
+        return False, 0, 0
+    if not COMMON_WARMUP_TFS:
+        return False, 0, 0
+    now_ms = int(time.time() * 1000)
+    checked = 0
+    issues = 0
+    for sym in list(universe or []):
+        for tf in COMMON_WARMUP_TFS:
+            checked += 1
+            try:
+                limit = _tf_bars_for_days(tf, COMMON_WARMUP_DAYS)
+            except Exception:
+                limit = 0
+            if limit <= 0:
+                continue
+            file_ts = _read_warmup_ts(sym, tf)
+            file_has = isinstance(file_ts, list) and len(file_ts) >= limit
+            file_gap = _has_time_gaps_ts(file_ts, tf, tail=limit) if file_has else True
+            last_ts = int(file_ts[-1]) if file_has else 0
+            tf_ms = _tf_ms(tf)
+            expected_last_open = (now_ms // tf_ms) * tf_ms if tf_ms else 0
+            # allow one-bar lag for freshness
+            file_stale = bool(tf_ms and last_ts and last_ts < (expected_last_open - tf_ms))
+            if (not file_has) or file_gap or file_stale:
+                issues += 1
+    return issues > 0, issues, checked
+
 def _maybe_refresh_common_cycle_cache(
     state: dict,
     exchange,
@@ -2633,16 +2673,29 @@ def _load_common_universe_snapshot_for_anchor(anchor_ms: int, top_n: int) -> tup
     if (not log_dir) or (not os.path.isdir(log_dir)):
         return [], ""
     candidates: list[tuple[float, str]] = []
+
+    def _parse_name_ts(name: str) -> float:
+        try:
+            # common_universe_YYYYMMDD_HHMMSS.log (KST wall clock)
+            stem = str(name).removesuffix(".log")
+            ts_part = stem.replace("common_universe_", "", 1)
+            dt_kst = datetime.strptime(ts_part, "%Y%m%d_%H%M%S").replace(tzinfo=timezone(timedelta(hours=9)))
+            return float(dt_kst.timestamp())
+        except Exception:
+            return 0.0
+
     try:
         for name in os.listdir(log_dir):
             if not (name.startswith("common_universe_") and name.endswith(".log")):
                 continue
             full = os.path.join(log_dir, name)
-            try:
-                mtime = float(os.path.getmtime(full))
-            except Exception:
-                continue
-            candidates.append((mtime, full))
+            ts_sec = _parse_name_ts(name)
+            if ts_sec <= 0:
+                try:
+                    ts_sec = float(os.path.getmtime(full))
+                except Exception:
+                    continue
+            candidates.append((ts_sec, full))
     except Exception:
         return [], ""
     if not candidates:
@@ -2703,6 +2756,9 @@ def _reset_common_warmup_state(state: dict) -> None:
     state.pop("_common_warmup_missing_pass", None)
     state.pop("_common_warmup_backoff_until", None)
     state.pop("_common_warmup_backoff_secs", None)
+    # Ensure refreshed universe gets a full warmup-gap sync before engine cycles.
+    state["_common_gap_repair_force"] = True
+    state.pop("_common_gap_repair_once", None)
     meta = state.setdefault("_meta", {}) if isinstance(state, dict) else {}
     if isinstance(meta, dict):
         meta.pop("common_warmup_notified", None)
@@ -7207,10 +7263,18 @@ def _display_engine_label(label: Optional[str]) -> str:
 
 def _telegram_reason_text(engine_label: Optional[str], fallback: Optional[str] = None) -> str:
     key = (engine_label or "").strip().upper()
+    fb = (fallback or "").strip()
+    fb_up = fb.upper()
+    # Keep explicit exit/manual tags unchanged.
+    if fb_up in {"SL", "TP", "MANUAL", "FAST_FAIL", "AUTO_EXIT_SL", "AUTO_EXIT_TP"}:
+        return fb
+    if key == "SR_PRO_LONG_V1":
+        return "저점회복형"
+    if key == "SR_PRO_LONG_V2":
+        return "추세추종형"
     if key == "SCOUT_ONLY_EXHAUSTION_SHORT":
         return "정찰숏"
-    text = (fallback or "").strip()
-    return text if text else "N/A"
+    return fb if fb else "N/A"
 
 def _is_engine_enabled(engine: str) -> bool:
     key = (engine or "").upper()
@@ -8855,12 +8919,35 @@ def _run_sr_pro_short_v1_cycle(
         cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
         last_ts = int(df.iloc[-1]["ts"]) if not df.empty else 0
         return bool(last_ts and (cur_ms - last_ts) > max_age_ms)
+
+    def _dbg(symbol: str, msg: str) -> None:
+        try:
+            if str(symbol or "").upper() not in SR_PRO_SHORT_DEBUG_SYMBOLS:
+                return
+            _append_sr_pro_short_v1_log(f"SR_PRO_SHORT_DBG sym={symbol} {msg}")
+        except Exception:
+            pass
+    def _persist_common_from_df(symbol: str, tf: str, df: "pd.DataFrame") -> None:
+        if not SR_PRO_USE_COMMON_CACHE:
+            return
+        try:
+            if df is None or df.empty:
+                return
+            cols = ["ts", "open", "high", "low", "close", "volume"]
+            if not all(c in df.columns for c in cols):
+                return
+            rows = df[cols].values.tolist()
+            if rows:
+                _append_common_warmup_ohlcv(symbol, tf, rows)
+        except Exception:
+            pass
     for symbol in symbols:
         if symbol in {"BTC/USDT:USDT", "BTC/USDT"}:
             continue
         checked += 1
         if _entry_blocked_now(ENTRY_BLOCK_HOURS):
             gate_stats["time_block"] += 1
+            _dbg(symbol, f"stage=time_block hours={ENTRY_BLOCK_HOURS}")
             continue
         if SR_PRO_USE_COMMON_CACHE:
             _df = _load_common_warmup_ohlcv(symbol, tf_ltf, limit=min_ltf_fetch)
@@ -8875,14 +8962,36 @@ def _run_sr_pro_short_v1_cycle(
                     df_new = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
                     if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                         df_3m = df_new
+                        _persist_common_from_df(symbol, tf_ltf, df_3m)
                 if _need_stale_refresh(df_15m, 25 * 60 * 1000, now_ms=now_ms):
                     df_new = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
                     if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                         df_15m = df_new
+                        _persist_common_from_df(symbol, tf_mtf, df_15m)
                 if _need_stale_refresh(df_1h, 70 * 60 * 1000, now_ms=now_ms):
                     df_new = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
                     if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                         df_1h = df_new
+                        _persist_common_from_df(symbol, tf_htf, df_1h)
+            except Exception:
+                pass
+            # If any timeframe is still missing, force-fetch once and persist into common warmup.
+            try:
+                if df_3m.empty:
+                    df_new = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_3m = df_new
+                        _persist_common_from_df(symbol, tf_ltf, df_3m)
+                if df_15m.empty:
+                    df_new = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_15m = df_new
+                        _persist_common_from_df(symbol, tf_mtf, df_15m)
+                if df_1h.empty:
+                    df_new = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_1h = df_new
+                        _persist_common_from_df(symbol, tf_htf, df_1h)
             except Exception:
                 pass
         else:
@@ -8956,18 +9065,20 @@ def _run_sr_pro_short_v1_cycle(
         latest_ts_ms = int(df_3m_sig.iloc[-1]["ts"])
         if sym_state.get("last_eval_ts") == latest_ts_ms:
             gate_stats["skip_stale_ts"] += 1
+            _dbg(symbol, f"stage=skip_stale ts={latest_ts_ms}")
             continue
         sym_state["last_eval_ts"] = latest_ts_ms
         # block exact 15m boundary bars to reduce boundary-index sensitivity
         if SR_PRO_SHORT_BOUNDARY_GUARD_ENABLED and (((latest_ts_ms // 60000) % 60) % 15 == 0):
             gate_stats["boundary_block"] += 1
+            _dbg(symbol, f"stage=boundary_block ts={latest_ts_ms}")
             continue
 
         ts_1h = df_1h_hist["ts"].values
         ts_15m = df_15m_sig["ts"].values
-        decision_ts = latest_ts_ms + _tf_ms(tf_ltf)
-        idx_1h = int(np.searchsorted(ts_1h, decision_ts - _tf_ms(tf_htf), side="right") - 1)
-        idx_15m = int(np.searchsorted(ts_15m, decision_ts - _tf_ms(tf_mtf), side="right") - 1)
+        # Align live short-v1 indexing with backtest default(ts): map by current 3m bar ts.
+        idx_1h = int(np.searchsorted(ts_1h, latest_ts_ms, side="right") - 1)
+        idx_15m = int(np.searchsorted(ts_15m, latest_ts_ms, side="right") - 1)
         mtf_mode = str(getattr(cfg, "mtf_mode", "ema_only") or "ema_only").lower()
         min_15m_hist = 2 if mtf_mode == "strict" else 0
         if idx_1h < 0 or idx_15m < min_15m_hist:
@@ -9042,6 +9153,7 @@ def _run_sr_pro_short_v1_cycle(
             ema_now = float(ema_line.iloc[idx_1h])
             if h1_close >= ema_now:
                 gate_stats["zone_touch"] += 1
+                _dbg(symbol, f"stage=zone_ema_block h1_close={h1_close:.6f} ema={ema_now:.6f}")
                 continue
         # Only accept zones touched by the latest confirmed 1h bar
         for z in zones:
@@ -9074,6 +9186,11 @@ def _run_sr_pro_short_v1_cycle(
             sym_state["break_low_min"] = 0.0
             sym_state["break_type"] = None
             gate_stats["zone_touch"] += 1
+            _dbg(
+                symbol,
+                f"stage=zone_touch_fail h1_ts={h1_ts} h1_high={h1_high:.6f} h1_low={h1_low:.6f} "
+                f"h1_close={h1_close:.6f} dvf_norm={dvf_norm:.4f} zones={len(zones)}",
+            )
             continue
 
         def _log_signal_ctx(track: str, nearest_zone: dict, entry_px: float, atr_now: float | None = None, extra: str = "") -> None:
@@ -9138,9 +9255,11 @@ def _run_sr_pro_short_v1_cycle(
             ema20_15m_ok = False
         if not ema20_15m_ok:
             gate_stats["lh_15m"] += 1
+            _dbg(symbol, f"stage=lh_fail ema20 close15={close15:.6f} open15={open15:.6f}")
             continue
         if not (close15 < open15):
             gate_stats["lh_15m"] += 1
+            _dbg(symbol, f"stage=lh_fail bearish close15={close15:.6f} open15={open15:.6f}")
             continue
         # 15m EMA60/EMA120 slope filter (skip if steeply rising)
         try:
@@ -9151,6 +9270,10 @@ def _run_sr_pro_short_v1_cycle(
                 ema120_slope = (float(ema120.iloc[idx_15m]) - float(ema120.iloc[idx_15m - 1])) / float(ema120.iloc[idx_15m - 1])
                 if ema60_slope > float(cfg.ema_slope_min) or ema120_slope > float(cfg.ema_slope_min):
                     gate_stats["ema_slope_block"] += 1
+                    _dbg(
+                        symbol,
+                        f"stage=ema_slope_block s60={ema60_slope:.6f} s120={ema120_slope:.6f} min={float(cfg.ema_slope_min):.6f}",
+                    )
                     continue
         except Exception:
             pass
@@ -9174,6 +9297,7 @@ def _run_sr_pro_short_v1_cycle(
         weak_break = float(df_3m_sig.iloc[-1]["low"]) <= low_min
         if not strong_break and not weak_break:
             gate_stats["break_3m"] += 1
+            _dbg(symbol, f"stage=break_fail c3={c3:.6f} o3={o3:.6f} low_min={low_min:.6f}")
             continue
         # aggressive break entry (no retest)
         if getattr(cfg, "aggr_break_enabled", False) and strong_break:
@@ -9644,7 +9768,19 @@ def _run_sr_pro_long_v1_cycle(
     if not LONG_LIVE_TRADING:
         return result
     cfg = cfg_cls()
-    apply_fixed_anchor = (str(engine_name or "").upper() == "SR_PRO_LONG_V2") and bool(SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST)
+    engine_upper = str(engine_name or "").upper()
+    if engine_upper == "SR_PRO_LONG_V2":
+        apply_fixed_anchor = bool(SR_PRO_LONG_V2_FIXED_EVEN_DAY_0030_KST)
+        anchor_cadence_days = SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS
+        anchor_hour = SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR
+        anchor_minute = SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE
+        anchor_top_n = SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N
+    else:
+        apply_fixed_anchor = bool(SR_PRO_LONG_V1_FIXED_EVEN_DAY_0030_KST)
+        anchor_cadence_days = SR_PRO_LONG_V1_FIXED_ANCHOR_CADENCE_DAYS
+        anchor_hour = SR_PRO_LONG_V1_FIXED_ANCHOR_KST_HOUR
+        anchor_minute = SR_PRO_LONG_V1_FIXED_ANCHOR_KST_MINUTE
+        anchor_top_n = SR_PRO_LONG_V1_FIXED_UNIVERSE_TOP_N
     start_ts = time.time()
     checked = 0
     no_data = 0
@@ -9667,9 +9803,9 @@ def _run_sr_pro_long_v1_cycle(
     }
     fixed_anchor_ms = (
         _latest_kst_anchor_ms(
-            cadence_days=SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS,
-            anchor_hour=SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR,
-            anchor_minute=SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE,
+            cadence_days=anchor_cadence_days,
+            anchor_hour=anchor_hour,
+            anchor_minute=anchor_minute,
         )
         if apply_fixed_anchor
         else 0
@@ -9680,7 +9816,7 @@ def _run_sr_pro_long_v1_cycle(
     if apply_fixed_anchor:
         u_fix, u_file = _load_common_universe_snapshot_for_anchor(
             anchor_ms=fixed_anchor_ms,
-            top_n=SR_PRO_LONG_V2_FIXED_UNIVERSE_TOP_N,
+            top_n=anchor_top_n,
         )
         if u_fix:
             effective_universe = list(u_fix)
@@ -9688,16 +9824,16 @@ def _run_sr_pro_long_v1_cycle(
     log_fn(
         f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
         f"fixed_anchor={int(apply_fixed_anchor)} anchor_kst={fixed_anchor_kst} "
-        f"anchor_cadence_days={SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS} "
-        f"anchor_hm={SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR:02d}:{SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE:02d} "
+        f"anchor_cadence_days={anchor_cadence_days} "
+        f"anchor_hm={anchor_hour:02d}:{anchor_minute:02d} "
         f"universe_file={fixed_universe_file or '-'}"
     )
     try:
         print(
             f"{cycle_tag}_CYCLE_START cycle_id={cycle_id} universe={len(effective_universe)} "
             f"fixed_anchor={int(apply_fixed_anchor)} anchor_kst={fixed_anchor_kst} "
-            f"anchor_cadence_days={SR_PRO_LONG_V2_FIXED_ANCHOR_CADENCE_DAYS} "
-            f"anchor_hm={SR_PRO_LONG_V2_FIXED_ANCHOR_KST_HOUR:02d}:{SR_PRO_LONG_V2_FIXED_ANCHOR_KST_MINUTE:02d}"
+            f"anchor_cadence_days={anchor_cadence_days} "
+            f"anchor_hm={anchor_hour:02d}:{anchor_minute:02d}"
         )
     except Exception:
         pass
@@ -9797,6 +9933,21 @@ def _run_sr_pro_long_v1_cycle(
             df = cycle_cache.get_df(symbol, tf, limit=limit, force=True)
         return df
 
+    def _persist_common_from_df(symbol: str, tf: str, df: "pd.DataFrame") -> None:
+        if not SR_PRO_USE_COMMON_CACHE:
+            return
+        try:
+            if df is None or df.empty:
+                return
+            cols = ["ts", "open", "high", "low", "close", "volume"]
+            if not all(c in df.columns for c in cols):
+                return
+            rows = df[cols].values.tolist()
+            if rows:
+                _append_common_warmup_ohlcv(symbol, tf, rows)
+        except Exception:
+            pass
+
     for symbol in symbols:
         checked += 1
         if SR_PRO_USE_COMMON_CACHE:
@@ -9813,14 +9964,35 @@ def _run_sr_pro_long_v1_cycle(
                     df_new = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
                     if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                         df_3m = df_new
+                        _persist_common_from_df(symbol, tf_ltf, df_3m)
                 if _need_stale_refresh(df_15m, 25 * 60 * 1000, now_ms=now_ms):
                     df_new = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
                     if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                         df_15m = df_new
+                        _persist_common_from_df(symbol, tf_mtf, df_15m)
                 if _need_stale_refresh(df_1h, 70 * 60 * 1000, now_ms=now_ms):
                     df_new = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
                     if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                         df_1h = df_new
+                        _persist_common_from_df(symbol, tf_htf, df_1h)
+            except Exception:
+                pass
+            try:
+                if df_3m.empty:
+                    df_new = cycle_cache.get_df(symbol, tf_ltf, limit=min_ltf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_3m = df_new
+                        _persist_common_from_df(symbol, tf_ltf, df_3m)
+                if df_15m.empty:
+                    df_new = cycle_cache.get_df(symbol, tf_mtf, limit=min_mtf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_15m = df_new
+                        _persist_common_from_df(symbol, tf_mtf, df_15m)
+                if df_1h.empty:
+                    df_new = cycle_cache.get_df(symbol, tf_htf, limit=min_htf_fetch, force=True)
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        df_1h = df_new
+                        _persist_common_from_df(symbol, tf_htf, df_1h)
             except Exception:
                 pass
         else:
@@ -10033,17 +10205,45 @@ def _run_sr_pro_long_v1_cycle(
             l15_0 = float(df_15m_sig.iloc[idx_15m]["low"])
             l15_1 = float(df_15m_sig.iloc[idx_15m - 1]["low"])
             l15_2 = float(df_15m_sig.iloc[idx_15m - 2]["low"])
-            if not (l15_0 > l15_1 or l15_1 > l15_2):
-                gate_stats["hl_15m"] += 1
-                _dbg(symbol, f"stage=hl_15m lows={l15_2:.6f},{l15_1:.6f},{l15_0:.6f}")
-                continue
-            if not (float(df_15m_sig.iloc[idx_15m]["close"]) > float(df_15m_sig.iloc[idx_15m]["open"])):
-                gate_stats["hl_15m"] += 1
-                _dbg(
-                    symbol,
-                    f"stage=hl_15m close_open_fail c={float(df_15m_sig.iloc[idx_15m]['close']):.6f} o={float(df_15m_sig.iloc[idx_15m]['open']):.6f}",
+            c15_0 = float(df_15m_sig.iloc[idx_15m]["close"])
+            c15_1 = float(df_15m_sig.iloc[idx_15m - 1]["close"])
+            c15_2 = float(df_15m_sig.iloc[idx_15m - 2]["close"])
+            o15_0 = float(df_15m_sig.iloc[idx_15m]["open"])
+            o15_1 = float(df_15m_sig.iloc[idx_15m - 1]["open"])
+            o15_2 = float(df_15m_sig.iloc[idx_15m - 2]["open"])
+            if str(reason_name or "").lower() == "sr_pro_long_v2":
+                # V2 parity with backtest: block only on strong 15m bearish sequence.
+                strong_bear_15m = (
+                    (c15_0 < o15_0)
+                    and (c15_1 < o15_1)
+                    and (c15_2 < o15_2)
+                    and (l15_0 < l15_1 < l15_2)
                 )
-                continue
+                if strong_bear_15m:
+                    gate_stats["hl_15m"] += 1
+                    _dbg(
+                        symbol,
+                        (
+                            "stage=hl_15m strong_bear_block "
+                            f"c0={c15_0:.6f}<o0={o15_0:.6f} "
+                            f"c1={c15_1:.6f}<o1={o15_1:.6f} "
+                            f"c2={c15_2:.6f}<o2={o15_2:.6f} "
+                            f"l0={l15_0:.6f}<l1={l15_1:.6f}<l2={l15_2:.6f}"
+                        ),
+                    )
+                    continue
+            else:
+                if not (l15_0 > l15_1 or l15_1 > l15_2):
+                    gate_stats["hl_15m"] += 1
+                    _dbg(symbol, f"stage=hl_15m lows={l15_2:.6f},{l15_1:.6f},{l15_0:.6f}")
+                    continue
+                if not (c15_0 > o15_0):
+                    gate_stats["hl_15m"] += 1
+                    _dbg(
+                        symbol,
+                        f"stage=hl_15m close_open_fail c={c15_0:.6f} o={o15_0:.6f}",
+                    )
+                    continue
 
             c3 = float(df_3m_eval.iloc[-1]["close"])
             o3 = float(df_3m_eval.iloc[-1]["open"])
@@ -19520,6 +19720,7 @@ def run():
                         COMMON_UNIVERSE_READY = True
                         COMMON_WARMUP_DONE = False
                         _reset_common_warmup_state(state)
+                        state["_common_gap_repair_force"] = True
                         state["_common_universe_sync_ts"] = time.time()
                         state["_common_universe_sync_cycle"] = int(cycle_count or 0)
                         print(f"[common-universe] daily refresh done size={len(COMMON_UNIVERSE)}")
@@ -19543,6 +19744,7 @@ def run():
                             state["_common_universe_refresh_date"] = today_kst
                         state["_common_universe_sync_ts"] = time.time()
                         state["_common_universe_sync_cycle"] = int(cycle_count or 0)
+                        state["_common_gap_repair_force"] = True
                         COMMON_UNIVERSE_READY = True
                         print(f"[common-universe] initial sync done size={len(COMMON_UNIVERSE)}")
 
@@ -19715,6 +19917,25 @@ def run():
                                 meta["common_warmup_last_notify_ts"] = now_ts
                             _COMMON_WARMUP_NOTIFY_TS_MEM = now_ts
                             save_state(state)
+
+                    # Hard gate: after universe refresh/warmup reset, ensure common cache has no missing/gap/stale
+                    # for the active shared universe before running engines in this cycle.
+                    if bool(state.get("_common_gap_repair_force")):
+                        try:
+                            _maybe_repair_common_warmup_gaps(state, exchange, shared_universe, force_full=True)
+                        except Exception as e:
+                            print(f"[common-gap] forced sync repair failed: {e}")
+                            time.sleep(1.0)
+                            continue
+                        has_issues, issues, checked_items = _common_warmup_has_pending_issues(shared_universe)
+                        if has_issues:
+                            print(f"[common-gap] pending after force repair issues={issues} checked={checked_items}; retry next cycle")
+                            time.sleep(1.0)
+                            continue
+                        state["_common_gap_repair_force"] = False
+                        state["_common_gap_repair_once"] = True
+                        state["_common_universe_cache_synced_ts"] = time.time()
+                        print(f"[common-gap] sync complete checked={checked_items}")
 
                     # periodic common cache maintenance is async to protect realtime entry loops.
                     try:

@@ -19,8 +19,8 @@ class SrProLongV1Config:
     max_zones_per_side: int = 8
     touch_mode: str = "top"
     touch_use_close: bool = False
-    zone_accept_mode: str = "mid"
-    dvf_norm_min: float = 0.2
+    zone_accept_mode: str = "off"
+    dvf_norm_min: float = 0.08
     require_reject_close: bool = False
     reject_mode: str = "top"
     reject_source: str = "1h"
@@ -36,12 +36,12 @@ class SrProLongV1Config:
     retest_dyn_th: float = 0.6
     retest_dyn_bars: int = 10
     pullback_lookback: int = 36
-    pullback_min_pct: float = 0.012
-    pullback_min_atr: float = 1.2
-    require_sweep_reclaim: bool = True
+    pullback_min_pct: float = 0.0
+    pullback_min_atr: float = 0.0
+    require_sweep_reclaim: bool = False
     sweep_lookback: int = 12
     sweep_tol_atr: float = 0.05
-    max_break_ext_atr: float = 0.8
+    max_break_ext_atr: float = 3.0
     shallow_atr_mult: float = 0.35
     shallow_wick_max: float = 0.35
     shallow_dvf_min: float = 0.0
