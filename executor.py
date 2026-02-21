@@ -70,6 +70,8 @@ def _alt_symbol_key(symbol: str) -> Optional[str]:
 
 # --- Balance TTL cache (USDT available) ---
 _BAL_TTL_SEC = 5.0
+_MARKETS_TTL_SEC = float(os.getenv("EXEC_MARKETS_TTL_SEC", "300"))
+_MARKET_RULES_TTL_SEC = float(os.getenv("EXEC_MARKET_RULES_TTL_SEC", "600"))
 
 # 전역 레이트리밋 백오프 (engine_runner와 공유 목적)
 GLOBAL_BACKOFF_UNTIL = 0.0
@@ -119,6 +121,11 @@ class ExecutorContext:
         self.bal_ttl_sec = _BAL_TTL_SEC
         self.bal_cache = {"ts": 0.0, "available": None}
         self.bal_lock = threading.Lock()
+        self.market_cache_lock = threading.Lock()
+        self.markets_loaded_ts = 0.0
+        self.markets_ttl_sec = float(_MARKETS_TTL_SEC)
+        self.market_rules_ttl_sec = float(_MARKET_RULES_TTL_SEC)
+        self.market_rules_cache = {}
 
         self.posmode_cache_ts = 0.0
         self.posmode_cache_val = False
@@ -547,18 +554,74 @@ def is_hedge_mode() -> bool:
     ctx.posmode_cache_val = hedge
     return hedge
 
-def ensure_ready():
-    # DRY_RUN이면 키 없이도 마켓 로드는 시도
+def _ensure_markets_loaded(force: bool = False) -> None:
     ctx = _get_ctx()
-    if ctx.dry_run:
-        try:
-            ctx.exchange.load_markets()
+    now = time.time()
+    ttl = max(1.0, float(ctx.markets_ttl_sec or _MARKETS_TTL_SEC))
+    if (not force) and ctx.markets_loaded_ts and ((now - float(ctx.markets_loaded_ts)) <= ttl):
+        return
+    with ctx.market_cache_lock:
+        now = time.time()
+        if (not force) and ctx.markets_loaded_ts and ((now - float(ctx.markets_loaded_ts)) <= ttl):
             return
-        except Exception:
-            pass
-    if not ctx.exchange.apiKey or not ctx.exchange.secret:
-        raise RuntimeError("환경변수 BINANCE_API_KEY / BINANCE_API_SECRET 설정 필요")
-    ctx.exchange.load_markets()
+        if (not ctx.dry_run) and (not ctx.exchange.apiKey or not ctx.exchange.secret):
+            raise RuntimeError("환경변수 BINANCE_API_KEY / BINANCE_API_SECRET 설정 필요")
+        ctx.exchange.load_markets()
+        ctx.markets_loaded_ts = time.time()
+
+
+def ensure_ready():
+    _ensure_markets_loaded(force=False)
+
+
+def _get_market_rules_cached(symbol: str) -> dict:
+    ctx = _get_ctx()
+    now = time.time()
+    ttl = max(5.0, float(ctx.market_rules_ttl_sec or _MARKET_RULES_TTL_SEC))
+    cached = ctx.market_rules_cache.get(symbol) if isinstance(ctx.market_rules_cache, dict) else None
+    if isinstance(cached, dict):
+        ts = float(cached.get("ts", 0.0) or 0.0)
+        if ts > 0 and (now - ts) <= ttl:
+            return cached
+    _ensure_markets_loaded(force=False)
+    market = ctx.exchange.market(symbol)
+    limits = market.get("limits") or {}
+    min_qty = None
+    min_notional = None
+    try:
+        min_qty = float((limits.get("amount") or {}).get("min"))
+    except Exception:
+        min_qty = None
+    try:
+        min_notional = float((limits.get("cost") or {}).get("min"))
+    except Exception:
+        min_notional = None
+    try:
+        for f in market.get("info", {}).get("filters", []) or []:
+            ftype = str(f.get("filterType") or "").upper()
+            if min_notional is None and ftype in ("MIN_NOTIONAL", "MIN_NOTIONAL_FILTER", "NOTIONAL"):
+                val = f.get("notional") or f.get("minNotional")
+                try:
+                    min_notional = float(val)
+                except Exception:
+                    pass
+            if min_qty is None and ftype in ("MARKET_LOT_SIZE", "LOT_SIZE"):
+                val = f.get("minQty")
+                try:
+                    min_qty = float(val)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    out = {
+        "ts": now,
+        "market": market,
+        "min_qty": min_qty,
+        "min_notional": min_notional,
+    }
+    if isinstance(ctx.market_rules_cache, dict):
+        ctx.market_rules_cache[symbol] = out
+    return out
 
 def set_dry_run(flag: bool) -> bool:
     """런타임에 DRY_RUN 토글. True=dry-run, False=live"""
@@ -1042,43 +1105,16 @@ def short_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: in
     ctx = _get_ctx()
     ensure_ready()
     set_leverage_and_margin(symbol, leverage=leverage, margin_mode=margin_mode)
-    market = ctx.exchange.market(symbol)
+    rules = _get_market_rules_cached(symbol)
+    market = rules.get("market") or ctx.exchange.market(symbol)
     last = float(ctx.exchange.fetch_ticker(symbol)["last"])
     # usdt_amount를 증거금으로 해석하고 레버리지를 곱해 명목가로 변환
     notional = float(usdt_amount) * float(leverage)
     amount = float(ctx.exchange.amount_to_precision(symbol, notional / last))
 
     # 최소 수량/명목 조건 확인
-    limits = market.get("limits") or {}
-    min_qty = None
-    min_notional = None
-    try:
-        min_qty = float((limits.get("amount") or {}).get("min"))
-    except Exception:
-        min_qty = None
-    try:
-        min_notional = float((limits.get("cost") or {}).get("min"))
-    except Exception:
-        min_notional = None
-
-    # 필터에서 보조 추출 (Binance notional/lot size)
-    try:
-        for f in market.get("info", {}).get("filters", []) or []:
-            ftype = str(f.get("filterType") or "").upper()
-            if min_notional is None and ftype in ("MIN_NOTIONAL", "MIN_NOTIONAL_FILTER", "NOTIONAL"):
-                val = f.get("notional") or f.get("minNotional")
-                try:
-                    min_notional = float(val)
-                except Exception:
-                    pass
-            if min_qty is None and ftype in ("MARKET_LOT_SIZE", "LOT_SIZE"):
-                val = f.get("minQty")
-                try:
-                    min_qty = float(val)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    min_qty = rules.get("min_qty")
+    min_notional = rules.get("min_notional")
 
     notional_after = amount * last
     if amount <= 0:
@@ -1136,38 +1172,13 @@ def short_limit(
     if price <= 0:
         return {"status": "skip", "reason": "price_unavailable", "symbol": symbol}
     set_leverage_and_margin(symbol, leverage=leverage, margin_mode=margin_mode)
-    market = ctx.exchange.market(symbol)
+    rules = _get_market_rules_cached(symbol)
+    market = rules.get("market") or ctx.exchange.market(symbol)
     notional = float(usdt_amount) * float(leverage)
     amount = float(ctx.exchange.amount_to_precision(symbol, notional / float(price)))
 
-    limits = market.get("limits") or {}
-    min_qty = None
-    min_notional = None
-    try:
-        min_qty = float((limits.get("amount") or {}).get("min"))
-    except Exception:
-        min_qty = None
-    try:
-        min_notional = float((limits.get("cost") or {}).get("min"))
-    except Exception:
-        min_notional = None
-    try:
-        for f in market.get("info", {}).get("filters", []) or []:
-            ftype = str(f.get("filterType") or "").upper()
-            if min_notional is None and ftype in ("MIN_NOTIONAL", "MIN_NOTIONAL_FILTER", "NOTIONAL"):
-                val = f.get("notional") or f.get("minNotional")
-                try:
-                    min_notional = float(val)
-                except Exception:
-                    pass
-            if min_qty is None and ftype in ("MARKET_LOT_SIZE", "LOT_SIZE"):
-                val = f.get("minQty")
-                try:
-                    min_qty = float(val)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    min_qty = rules.get("min_qty")
+    min_notional = rules.get("min_notional")
 
     notional_after = amount * float(price)
     if amount <= 0:
@@ -1217,39 +1228,14 @@ def long_market(symbol: str, usdt_amount: float = BASE_ENTRY_USDT, leverage: int
     ctx = _get_ctx()
     ensure_ready()
     set_leverage_and_margin(symbol, leverage=leverage, margin_mode=margin_mode)
-    market = ctx.exchange.market(symbol)
+    rules = _get_market_rules_cached(symbol)
+    market = rules.get("market") or ctx.exchange.market(symbol)
     last = float(ctx.exchange.fetch_ticker(symbol)["last"])
     notional = float(usdt_amount) * float(leverage)
     amount = float(ctx.exchange.amount_to_precision(symbol, notional / last))
 
-    limits = market.get("limits") or {}
-    min_qty = None
-    min_notional = None
-    try:
-        min_qty = float((limits.get("amount") or {}).get("min"))
-    except Exception:
-        min_qty = None
-    try:
-        min_notional = float((limits.get("cost") or {}).get("min"))
-    except Exception:
-        min_notional = None
-    try:
-        for f in market.get("info", {}).get("filters", []) or []:
-            ftype = str(f.get("filterType") or "").upper()
-            if min_notional is None and ftype in ("MIN_NOTIONAL", "MIN_NOTIONAL_FILTER", "NOTIONAL"):
-                val = f.get("notional") or f.get("minNotional")
-                try:
-                    min_notional = float(val)
-                except Exception:
-                    pass
-            if min_qty is None and ftype in ("MARKET_LOT_SIZE", "LOT_SIZE"):
-                val = f.get("minQty")
-                try:
-                    min_qty = float(val)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    min_qty = rules.get("min_qty")
+    min_notional = rules.get("min_notional")
 
     notional_after = amount * last
     if amount <= 0:

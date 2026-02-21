@@ -44,16 +44,14 @@
 - `engine_runner.py`의 `_process_manage_queue()` 내 `allowed_engines`에 엔진 라벨 추가
 - 관리모드에서 `engine_removed`로 스킵되면 이 목록 누락이 원인
 - 추가 절차(필수):
-  - 엔진 라벨은 대문자 기준으로 맞춰 추가 (예: `SCOUT_ONLY_EXHAUSTION_SHORT`)
+  - 엔진 라벨은 대문자 기준으로 맞춰 추가
   - 신규 엔진 연결/라벨 변경 시 `allowed_engines` 동시 수정
   - 수정 후 프로세스 재기동 (미재기동 시 기존 allowlist로 계속 동작)
 - 현재 기준 허용 라벨(2026-02-15):
   - `SR_PRO_SHORT_V1`
-  - `SR_PRO_SHORT_V2`
-  - `SHORT_BEND_15M3M`
+  - `SR_PRO_LONG_V3`
   - `SR_PRO_LONG_V1`
   - `SR_PRO_LONG_V2`
-  - `SCOUT_ONLY_EXHAUSTION_SHORT`
   - `MANUAL`
   - `UNKNOWN`
 
@@ -86,7 +84,6 @@
 - 메인 루프에서 엔진 스레드가 실제 호출되는지 확인
 - 콘솔 로그에 `*_CYCLE_START/END`가 찍히는지 확인
 - 텔레그램/웹에 엔진 ON/OFF 토글이 있는지 확인
-- `short_bend_15m3m` 신규 시 `/short_bend_15m3m on|off|status` + 웹 토글 동시 반영
 - 텔레그램 `/engine_name on|off|status`가 실제 상태키를 갱신하는지 확인
 - 웹 `/status` 응답에 엔진 토글 키가 포함되는지 확인
 - `/status`에 엔진 상태/공통 워밍업 상태가 표시되는지 확인

@@ -60,9 +60,14 @@ def _ensure_broadcast_contexts() -> None:
     except Exception:
         pass
 
-def _follow_manual_entry(symbol: str, side: str) -> None:
+def _follow_manual_entry(state: dict, symbol: str, side: str) -> None:
     if not symbol or side not in ("LONG", "SHORT"):
         return
+    try:
+        if er._manual_follow_dedupe_blocked(state, symbol, side):
+            return
+    except Exception:
+        pass
     _ensure_broadcast_contexts()
     followers = er._follower_contexts_for_sync(include_inactive=True)
     if not followers:
@@ -73,6 +78,12 @@ def _follow_manual_entry(symbol: str, side: str) -> None:
     for acct in followers:
         # Manual entry sync from admin is forced for all follower accounts.
         # Do not gate by account active/manual-follow flags here.
+        try:
+            # Manual follow is low-frequency: force fresh position snapshot
+            # to avoid stale-cache skip on recently closed symbols.
+            acct.executor.refresh_positions_cache(force=True)
+        except Exception:
+            pass
         pct = None
         try:
             pct = float(getattr(acct.settings, "entry_pct", er.USDT_PER_TRADE))
@@ -105,6 +116,10 @@ def _follow_manual_entry(symbol: str, side: str) -> None:
             {"symbol": symbol},
             enforce_active=False,
         )
+        try:
+            er._mark_manual_follow_dedupe(state, symbol, side, source="manage_ws")
+        except Exception:
+            pass
 
 def _is_startup_position(state: dict, symbol: str) -> bool:
     if not symbol or not isinstance(state, dict):
@@ -819,8 +834,43 @@ def _trade_engine_label(tr: Optional[dict]) -> str:
     if isinstance(tr, dict):
         meta = tr.get("meta") if isinstance(tr.get("meta"), dict) else {}
         reason = (meta or {}).get("reason")
-        # manual_entry reason should always win over stale engine_label metadata.
+        # manual_entry can still be a strategy-origin trade; keep strategy label if available.
         if reason == "manual_entry":
+            meta_engine = str((meta or {}).get("engine") or "").strip().upper()
+            if meta_engine and meta_engine not in (
+                "UNKNOWN",
+                "MANUAL",
+                "MANUAL_ENTRY",
+                "MANUAL_ADMIN",
+                "관리자수동진입",
+                "BROADCAST",
+            ):
+                return meta_engine
+            label = tr.get("engine_label")
+            if isinstance(label, str):
+                label_up = label.strip().upper()
+                if label_up and label_up not in (
+                    "UNKNOWN",
+                    "MANUAL",
+                    "MANUAL_ENTRY",
+                    "MANUAL_ADMIN",
+                    "관리자수동진입",
+                    "BROADCAST",
+                ):
+                    return label_up
+            entry_order_id = tr.get("entry_order_id")
+            entry_engine = _get_entry_event_engine(str(entry_order_id) if entry_order_id else None)
+            if entry_engine:
+                ent_up = str(entry_engine).strip().upper()
+                if ent_up and ent_up not in (
+                    "UNKNOWN",
+                    "MANUAL",
+                    "MANUAL_ENTRY",
+                    "MANUAL_ADMIN",
+                    "관리자수동진입",
+                    "BROADCAST",
+                ):
+                    return ent_up
             return "MANUAL"
         label = tr.get("engine_label")
         if isinstance(label, str) and label:
@@ -835,6 +885,62 @@ def _trade_engine_label(tr: Optional[dict]) -> str:
             return str(entry_engine)
         return base_label
     return "UNKNOWN"
+
+
+_NON_STRATEGY_ENGINE_LABELS = {
+    "",
+    "UNKNOWN",
+    "MANUAL",
+    "MANUAL_ADMIN",
+    "관리자수동진입",
+    "BROADCAST",
+    "MANUAL_ENTRY",
+}
+
+
+def _is_strategy_engine_label(label: Optional[str]) -> bool:
+    key = str(label or "").strip().upper()
+    return key not in _NON_STRATEGY_ENGINE_LABELS
+
+
+def _resolve_engine_label_for_exit(
+    state: dict,
+    symbol: str,
+    side: str,
+    open_tr: Optional[dict],
+    now_ts: float,
+) -> str:
+    candidates: list[str] = []
+    base = _trade_engine_label(open_tr)
+    if isinstance(base, str):
+        candidates.append(base)
+    if isinstance(open_tr, dict):
+        raw_label = open_tr.get("engine_label")
+        if isinstance(raw_label, str):
+            candidates.append(raw_label)
+        meta = open_tr.get("meta") if isinstance(open_tr.get("meta"), dict) else {}
+        meta_engine = meta.get("engine")
+        if isinstance(meta_engine, str):
+            candidates.append(meta_engine)
+        entry_order_id = open_tr.get("entry_order_id")
+        entry_engine = _get_entry_event_engine(str(entry_order_id) if entry_order_id else None)
+        if isinstance(entry_engine, str):
+            candidates.append(entry_engine)
+    rec = _find_entry_event_for_trade(symbol, side, entry_ts=(open_tr or {}).get("entry_ts") if isinstance(open_tr, dict) else None, now_ts=now_ts, window_sec=7 * 24 * 3600)
+    if isinstance(rec, dict):
+        rec_engine = rec.get("engine")
+        if isinstance(rec_engine, str):
+            candidates.append(rec_engine)
+    for cand in candidates:
+        key = str(cand or "").strip().upper()
+        if _is_strategy_engine_label(key):
+            if isinstance(open_tr, dict):
+                open_tr["engine_label"] = key
+                meta = open_tr.get("meta") if isinstance(open_tr.get("meta"), dict) else {}
+                meta["engine"] = key
+                open_tr["meta"] = meta
+            return key
+    return str(base or "UNKNOWN").strip().upper() or "UNKNOWN"
 
 
 def _should_rebind_to_manual(open_tr: Optional[dict], live_entry: Optional[float]) -> bool:
@@ -853,6 +959,30 @@ def _should_rebind_to_manual(open_tr: Optional[dict], live_entry: Optional[float
     except Exception:
         return False
     return diff >= max(float(MANUAL_REBIND_ENTRY_DIFF_PCT), 0.0)
+
+
+def _should_force_manual_rebind_on_fresh_position(
+    symbol: str,
+    side: str,
+    prev_amt: float,
+    cur_amt: float,
+    open_tr: Optional[dict],
+    now_ts: float,
+) -> bool:
+    if prev_amt > 0 or cur_amt <= 0:
+        return False
+    if not isinstance(open_tr, dict):
+        return False
+    eng = _trade_engine_label(open_tr)
+    if eng in ("MANUAL", "UNKNOWN"):
+        return False
+    recent = _get_recent_entry_event(symbol, side, now_ts=now_ts, window_sec=300.0)
+    if isinstance(recent, dict):
+        # A fresh strategy entry was observed recently; keep current engine binding.
+        return False
+    # Fresh live position appeared without recent strategy entry event:
+    # this is likely a manual reopen on a stale open-trade record.
+    return True
 
 
 def _rebind_open_trade_to_manual(
@@ -1147,6 +1277,15 @@ def _cancel_side_sl_orders(symbol: str, side: str) -> None:
 
 
 def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: Optional[float] = None):
+    # Guard against transient zero-position reads: confirm admin long is truly flat.
+    try:
+        for _ in range(2):
+            executor_mod.refresh_positions_cache(force=True)
+            if float(executor_mod.get_long_position_amount(symbol) or 0.0) > 0.0:
+                return
+            time.sleep(0.05)
+    except Exception:
+        pass
     open_tr = er._get_open_trade(state, "LONG", symbol)
     if not open_tr:
         _cancel_side_sl_orders(symbol, "LONG")
@@ -1254,6 +1393,15 @@ def _manual_close_long(state, symbol, now_ts, report_ok: bool = True, mark_px: O
 
 
 def _manual_close_short(state, symbol, now_ts, report_ok: bool = True, mark_px: Optional[float] = None):
+    # Guard against transient zero-position reads: confirm admin short is truly flat.
+    try:
+        for _ in range(2):
+            executor_mod.refresh_positions_cache(force=True)
+            if float(executor_mod.get_short_position_amount(symbol) or 0.0) > 0.0:
+                return
+            time.sleep(0.05)
+    except Exception:
+        pass
     open_tr = er._get_open_trade(state, "SHORT", symbol)
     if not open_tr:
         _cancel_side_sl_orders(symbol, "SHORT")
@@ -1368,7 +1516,7 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
         return False
     profit_unlev = (float(mark_px) - float(entry_px)) / float(entry_px) * 100.0
     open_tr = er._get_open_trade(state, "LONG", symbol)
-    engine_label = _trade_engine_label(open_tr)
+    engine_label = _resolve_engine_label_for_exit(state, symbol, "LONG", open_tr, now_ts)
     tp_pct = None
     if isinstance(open_tr, dict):
         meta = open_tr.get("meta")
@@ -1380,7 +1528,7 @@ def _handle_long_tp(state, symbol, detail, mark_px, now_ts) -> bool:
                 try:
                     tp_price = float(meta.get("tp_price"))
                     if tp_price > 0:
-                        tp_calc = (float(entry_px) - tp_price) / float(entry_px) * 100.0
+                        tp_calc = (tp_price - float(entry_px)) / float(entry_px) * 100.0
                         if tp_calc > 0:
                             tp_pct = tp_calc
                 except Exception:
@@ -1449,7 +1597,7 @@ def _handle_short_tp(state, symbol, detail, mark_px, now_ts) -> bool:
         return False
     profit_unlev = (float(entry_px) - float(mark_px)) / float(entry_px) * 100.0
     open_tr = er._get_open_trade(state, "SHORT", symbol)
-    engine_label = _trade_engine_label(open_tr)
+    engine_label = _resolve_engine_label_for_exit(state, symbol, "SHORT", open_tr, now_ts)
     tp_pct = None
     if isinstance(open_tr, dict):
         meta = open_tr.get("meta")
@@ -1937,7 +2085,14 @@ def main():
                         live_detail = {}
                     live_entry = live_detail.get("entry") if isinstance(live_detail, dict) else None
                     live_qty = live_detail.get("qty") if isinstance(live_detail, dict) else None
-                    if _should_rebind_to_manual(open_long, live_entry):
+                    if _should_force_manual_rebind_on_fresh_position(
+                        symbol=symbol,
+                        side="LONG",
+                        prev_amt=float(prev_long_amt or 0.0),
+                        cur_amt=float(long_amt or 0.0),
+                        open_tr=open_long,
+                        now_ts=now_ts,
+                    ) or _should_rebind_to_manual(open_long, live_entry):
                         _rebind_open_trade_to_manual(
                             state=state,
                             symbol=symbol,
@@ -2006,7 +2161,7 @@ def main():
                                 tp=None,
                                 state=state,
                             )
-                            _follow_manual_entry(symbol, "LONG")
+                            _follow_manual_entry(state, symbol, "LONG")
                             st[alert_key] = True
                             st[f"{alert_key}_ts"] = now_ts
                             st[f"{alert_key}_reason"] = "sent"
@@ -2023,7 +2178,14 @@ def main():
                         live_detail = {}
                     live_entry = live_detail.get("entry") if isinstance(live_detail, dict) else None
                     live_qty = live_detail.get("qty") if isinstance(live_detail, dict) else None
-                    if _should_rebind_to_manual(open_short, live_entry):
+                    if _should_force_manual_rebind_on_fresh_position(
+                        symbol=symbol,
+                        side="SHORT",
+                        prev_amt=float(prev_short_amt or 0.0),
+                        cur_amt=float(short_amt or 0.0),
+                        open_tr=open_short,
+                        now_ts=now_ts,
+                    ) or _should_rebind_to_manual(open_short, live_entry):
                         _rebind_open_trade_to_manual(
                             state=state,
                             symbol=symbol,
@@ -2092,7 +2254,7 @@ def main():
                                 tp=None,
                                 state=state,
                             )
-                            _follow_manual_entry(symbol, "SHORT")
+                            _follow_manual_entry(state, symbol, "SHORT")
                             st[alert_key] = True
                             st[f"{alert_key}_ts"] = now_ts
                             st[f"{alert_key}_reason"] = "sent"
@@ -2185,7 +2347,7 @@ def main():
                                             tp=None,
                                             state=state,
                                         )
-                                        _follow_manual_entry(symbol, "LONG")
+                                        _follow_manual_entry(state, symbol, "LONG")
                                         st[alert_key] = True
                                         st[f"{alert_key}_ts"] = now_ts
                                         st[f"{alert_key}_reason"] = "sent"
@@ -2279,7 +2441,7 @@ def main():
                                             tp=None,
                                             state=state,
                                         )
-                                        _follow_manual_entry(symbol, "SHORT")
+                                        _follow_manual_entry(state, symbol, "SHORT")
                                         st[alert_key] = True
                                         st[f"{alert_key}_ts"] = now_ts
                                         st[f"{alert_key}_reason"] = "sent"

@@ -1,5 +1,8 @@
 # RSI Scanner + Auto SHORT (Binance USDT Perpetual)
 
+## 운영 기준선
+- 운영 기준 문서: `OPERATING_BASELINE.md`
+
 ## Install
 pip install ccxt pandas requests websocket-client
 

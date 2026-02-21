@@ -23,7 +23,7 @@ class SrProShortV1Config:
     dvf_norm_immediate: float = -0.25
     dvf_norm_diff_th: float = -0.03
     dvf_slope_enabled: bool = False
-    require_reject_close: bool = True
+    require_reject_close: bool = False
     reject_mode: str = "bot"
     reject_source: str = "1h"
     reject_wick_min: float = 0.45
@@ -57,8 +57,8 @@ class SrProShortV1Config:
     big_bear_body_mult: float = 1.4
     big_bear_strong_only: bool = True
     disable_immediate_big_bear: bool = False
-    disable_immediate_dvf_accel: bool = False
-    disable_immediate_dvf_slope: bool = False
+    disable_immediate_dvf_accel: bool = True
+    disable_immediate_dvf_slope: bool = True
     big_bear_near_bonus_atr: float = 0.05
     dvf_accel_retest_bars: int = 4
     use_weak_break: bool = False
@@ -70,12 +70,12 @@ class SrProShortV1Config:
     ema_slope_min: float = 0.0
     sl_buffer: float = 0.009
     sl_atr_mult: float = 0.4
-    sl_cap_pct: float = 0.02
-    sl_cap_atr_mult: float = 0.6
+    sl_cap_pct: float = 0.01
+    sl_cap_atr_mult: float = 0.0
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 0.992
-    tp_mult_weak: float = 0.992
+    tp_mult: float = 0.99
+    tp_mult_weak: float = 0.99
     dvf_confirm_bars: int = 1
 
 

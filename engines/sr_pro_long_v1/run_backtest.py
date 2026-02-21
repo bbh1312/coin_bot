@@ -4,6 +4,7 @@ import argparse
 import json
 import csv
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,9 @@ if ROOT not in sys.path:
 from engines.backtest_common import calc_warmup_window, load_common_universe, log_warmup_info
 from engines.sr_pro_long_v1.engine import SrProLongV1Config
 from engines.sr_pro_common import build_sr_zones
+from env_loader import load_env
+
+load_env(os.path.join(ROOT, ".env"))
 
 
 def _read_cached_csv(path: str) -> List[List[float]]:
@@ -210,8 +214,32 @@ def _minute_str(ts_ms: int) -> str:
 def _latest_even_day_0030_kst_anchor_ms(now_ms: int) -> int:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
-    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
-    anchor_minute = max(0, min(59, int(os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
+    anchor_hour = max(
+        0,
+        min(
+            23,
+            int(
+                os.getenv(
+                    "SR_PRO_LONG_V1_FIXED_ANCHOR_KST_HOUR",
+                    os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_HOUR", "9"),
+                )
+                or 9
+            ),
+        ),
+    )
+    anchor_minute = max(
+        0,
+        min(
+            59,
+            int(
+                os.getenv(
+                    "SR_PRO_LONG_V1_FIXED_ANCHOR_KST_MINUTE",
+                    os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_MINUTE", "0"),
+                )
+                or 0
+            ),
+        ),
+    )
     anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
     if now_kst < anchor_kst:
         anchor_kst -= timedelta(days=1)
@@ -238,8 +266,32 @@ def _even_day_anchor_series_ms(eval_start_ms: int, end_ms: int) -> List[int]:
 def _latest_daily_0030_kst_anchor_ms(now_ms: int) -> int:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
-    anchor_hour = max(0, min(23, int(os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_HOUR", "9") or 9)))
-    anchor_minute = max(0, min(59, int(os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_MINUTE", "0") or 0)))
+    anchor_hour = max(
+        0,
+        min(
+            23,
+            int(
+                os.getenv(
+                    "SR_PRO_LONG_V1_FIXED_ANCHOR_KST_HOUR",
+                    os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_HOUR", "9"),
+                )
+                or 9
+            ),
+        ),
+    )
+    anchor_minute = max(
+        0,
+        min(
+            59,
+            int(
+                os.getenv(
+                    "SR_PRO_LONG_V1_FIXED_ANCHOR_KST_MINUTE",
+                    os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR_KST_MINUTE", "0"),
+                )
+                or 0
+            ),
+        ),
+    )
     anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
     if now_kst < anchor_kst:
         anchor_kst -= timedelta(days=1)
@@ -269,24 +321,40 @@ def _load_common_universe_from_snapshot_log(
     if not os.path.isdir(logs_dir):
         return [], ""
     candidates: List[tuple[float, str]] = []
+
+    def _parse_name_ts(name: str) -> float:
+        try:
+            # Fallback-only: filename timestamp may drift from actual refresh timing.
+            stem = str(name).removesuffix(".log")
+            ts_part = stem.replace("common_universe_", "", 1)
+            dt_kst = datetime.strptime(ts_part, "%Y%m%d_%H%M%S").replace(
+                tzinfo=timezone(timedelta(hours=9))
+            )
+            return float(dt_kst.timestamp())
+        except Exception:
+            return 0.0
+
     try:
         for name in os.listdir(logs_dir):
             if not (name.startswith("common_universe_") and name.endswith(".log")):
                 continue
             full = os.path.join(logs_dir, name)
-            try:
-                mtime_sec = os.path.getmtime(full)
-            except Exception:
-                continue
-            candidates.append((mtime_sec, full))
+            # Match live selector: filename timestamp first, then mtime fallback.
+            ts_sec = _parse_name_ts(name)
+            if ts_sec <= 0:
+                try:
+                    ts_sec = float(os.path.getmtime(full))
+                except Exception:
+                    continue
+            candidates.append((ts_sec, full))
     except Exception:
         return [], ""
 
     if not candidates:
         return [], ""
 
-    anchor_sec = anchor_ms / 1000.0
-    before_or_eq = [c for c in candidates if c[0] <= anchor_sec]
+    cutoff_sec = (anchor_ms / 1000.0) if isinstance(anchor_ms, (int, float)) and anchor_ms > 0 else 0.0
+    before_or_eq = [c for c in candidates if c[0] <= cutoff_sec] if cutoff_sec > 0 else []
     if before_or_eq:
         before_or_eq.sort(key=lambda x: x[0], reverse=True)
         chosen = before_or_eq[0][1]
@@ -316,18 +384,38 @@ def _build_fixed_anchor_replay_schedule(
     end_ms: int,
     top_n: int,
     cadence: str = "even",
+    cadence_days: int = 1,
+    cadence_phase: int = 0,
 ) -> List[dict]:
     cadence_key = str(cadence or "even").lower()
+    # Include at least one anchor before eval_start so pre-anchor window
+    # (e.g. 00:00~08:59 KST) uses the same fixed universe/zone anchor as live.
+    lookback_days = max(2, int(cadence_days or 1) + 2)
+    anchors_start_ms = int(eval_start_ms - lookback_days * 24 * 60 * 60 * 1000)
     if cadence_key == "daily":
-        anchors = _daily_anchor_series_ms(eval_start_ms, end_ms)
+        anchors = _daily_anchor_series_ms(anchors_start_ms, end_ms)
     else:
-        anchors = _even_day_anchor_series_ms(eval_start_ms, end_ms)
+        anchors = _even_day_anchor_series_ms(anchors_start_ms, end_ms)
+    cadence_days = max(1, int(cadence_days or 1))
+    cadence_phase = max(0, int(cadence_phase or 0)) % cadence_days
+    if cadence_days > 1 and anchors:
+        filtered: List[int] = []
+        for a_ms in anchors:
+            dt_kst = datetime.fromtimestamp(int(a_ms) / 1000.0, tz=timezone.utc) + timedelta(hours=9)
+            day = int(dt_kst.day)
+            if ((day - 1 - cadence_phase) % cadence_days) == 0:
+                filtered.append(int(a_ms))
+        anchors = filtered if filtered else [int(anchors[0])]
     if not anchors:
         return []
     sched: List[dict] = []
     for i, a_ms in enumerate(anchors):
-        start = int(max(eval_start_ms, a_ms))
         end = int(end_ms if i + 1 >= len(anchors) else anchors[i + 1])
+        if end <= int(eval_start_ms):
+            continue
+        start = int(max(eval_start_ms, a_ms))
+        if end <= start:
+            continue
         uni, src = _load_common_universe_from_snapshot_log(a_ms, top_n=top_n)
         sched.append(
             {
@@ -397,9 +485,33 @@ def run_backtest() -> None:
     parser.add_argument("--use-live-cache", action="store_true")
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
+    parser.add_argument("--live-parity", action="store_true", help="Force live-equivalent data/parity mode.")
+    parser.add_argument(
+        "--entry-model",
+        type=str,
+        default="auto",
+        choices=["auto", "next_open", "signal_close"],
+        help="Entry timing model: auto(live-parity=>signal_close), next_open(legacy), signal_close(immediate).",
+    )
+    parser.add_argument(
+        "--bootstrap-bars",
+        type=int,
+        default=int(os.getenv("SR_PRO_LONG_V1_BOOTSTRAP_BARS", "1440") or 1440),
+        help="Pre-roll bars for --live-parity (ltf bars).",
+    )
     parser.add_argument("--auto-fill-cache", action="store_true", default=False)
     parser.add_argument("--common-warmup-dir", type=str, default="")
-    parser.add_argument("--top-n", type=int, default=50)
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=int(
+            os.getenv(
+                "SR_PRO_LONG_V1_FIXED_UNIVERSE_TOP_N",
+                os.getenv("COMMON_UNIVERSE_TOP_N", "50"),
+            )
+            or 50
+        ),
+    )
     parser.add_argument("--lookback", type=int, default=int(cfg_live.lookback))
     parser.add_argument("--relaxed-lookback", type=int, default=int(cfg_live.relaxed_lookback))
     parser.add_argument("--auto-relax", action="store_true", dest="auto_relax")
@@ -422,7 +534,11 @@ def run_backtest() -> None:
         choices=["off", "mid", "top", "top_bull"],
         help="Support zone acceptance on latest 1h bar: off/mid/top/top_bull(close>open).",
     )
-    parser.add_argument("--ema200-filter", action="store_true", default=True)
+    parser.add_argument(
+        "--ema200-filter",
+        action="store_true",
+        default=bool(getattr(cfg_live, "ema200_filter", True)),
+    )
     parser.add_argument("--no-ema200-filter", action="store_false", dest="ema200_filter")
     parser.add_argument("--ema-filter-len", type=int, default=int(cfg_live.ema_filter_len))
     parser.add_argument("--retest-bars", type=int, default=int(cfg_live.retest_bars))
@@ -449,6 +565,17 @@ def run_backtest() -> None:
     parser.add_argument("--entry-ema-len", type=int, default=int(cfg_live.entry_ema_len))
     parser.add_argument("--entry-atr-offset", type=float, default=float(cfg_live.entry_atr_offset))
     parser.add_argument("--entry-atr-offset-weak", type=float, default=float(getattr(cfg_live, "entry_atr_offset_weak", cfg_live.entry_atr_offset)))
+    parser.add_argument("--entry-ema-max-dev-pct", type=float, default=float(getattr(cfg_live, "entry_ema_max_dev_pct", 0.0)))
+    parser.add_argument("--entry-immediate-on-close-reclaim", action="store_true", default=bool(getattr(cfg_live, "entry_immediate_on_close_reclaim", False)))
+    parser.add_argument("--no-entry-immediate-on-close-reclaim", action="store_false", dest="entry_immediate_on_close_reclaim")
+    parser.add_argument(
+        "--immediate-entry-fill",
+        type=str,
+        default=os.getenv("SR_PRO_LONG_BT_IMMEDIATE_ENTRY_FILL", "close"),
+        choices=["close", "next_open"],
+        help="Fill price model for immediate entry: close(current confirmed bar) or next_open(next 3m open).",
+    )
+    parser.add_argument("--entry-immediate-max-chase-pct", type=float, default=float(getattr(cfg_live, "entry_immediate_max_chase_pct", 0.0)))
     parser.add_argument("--entry-candle-guard", action="store_true", default=bool(getattr(cfg_live, "entry_candle_guard", True)))
     parser.add_argument("--no-entry-candle-guard", action="store_false", dest="entry_candle_guard")
     parser.add_argument("--sl-buffer", type=float, default=float(cfg_live.sl_buffer))
@@ -459,6 +586,8 @@ def run_backtest() -> None:
     parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
     parser.add_argument("--tp-mult", type=float, default=float(cfg_live.tp_mult))
     parser.add_argument("--tp-mult-weak", type=float, default=float(cfg_live.tp_mult_weak))
+    parser.add_argument("--strong-be-trigger-mult", type=float, default=float(getattr(cfg_live, "strong_be_trigger_mult", 0.0)))
+    parser.add_argument("--strong-be-stop-buffer-pct", type=float, default=float(getattr(cfg_live, "strong_be_stop_buffer_pct", 0.0)))
     parser.add_argument("--base-usdt", type=float, default=1000.0)
     parser.add_argument("--entry-usdt", type=float, default=10.0)
     parser.add_argument("--freeze-zones", action="store_true")
@@ -488,9 +617,42 @@ def run_backtest() -> None:
     parser.add_argument("--ltf-sr-lookback", type=int, default=60)
     parser.add_argument("--debug-symbol", type=str, default="")
     parser.add_argument("--block-hours", type=str, default="")
+    parser.add_argument("--cooldown-sec", type=int, default=-1)
+    parser.add_argument(
+        "--fixed-replay-cadence-days",
+        type=int,
+        default=int(
+            os.getenv(
+                "SR_PRO_LONG_V1_FIXED_ANCHOR_CADENCE_DAYS",
+                os.getenv("SR_PRO_LONG_V1_BT_FIXED_REPLAY_CADENCE_DAYS", "2"),
+            )
+            or 2
+        ),
+    )
+    parser.add_argument(
+        "--fixed-replay-cadence-phase",
+        type=int,
+        default=int(
+            os.getenv(
+                "SR_PRO_LONG_V1_FIXED_ANCHOR_PHASE_DAYS",
+                os.getenv("SR_PRO_LONG_V1_BT_FIXED_REPLAY_CADENCE_PHASE", "1"),
+            )
+            or 1
+        ),
+    )
     args = parser.parse_args()
+    if bool(args.live_parity):
+        args.use_live_cache = True
+        args.cache_only = True
+        args.common_only = True
+        args.use_confirmed = True
+    entry_model = str(args.entry_model or "auto").strip().lower()
+    if entry_model == "auto":
+        entry_model = "signal_close" if bool(args.live_parity) else "next_open"
     bt_fixed_default = os.getenv("SR_PRO_LONG_V1_BT_FIXED_ANCHOR", "1").strip().lower() not in ("0", "false", "off", "no")
-    bt_replay_cadence = os.getenv("SR_PRO_LONG_V1_BT_FIXED_REPLAY_CADENCE", "daily").strip().lower()
+    live_cadence_days = max(1, int(os.getenv("SR_PRO_LONG_V1_FIXED_ANCHOR_CADENCE_DAYS", "2") or 2))
+    default_replay_cadence = "daily" if live_cadence_days == 1 else "even"
+    bt_replay_cadence = os.getenv("SR_PRO_LONG_V1_BT_FIXED_REPLAY_CADENCE", default_replay_cadence).strip().lower()
     if (
         bt_fixed_default
         and args.universe in ("common", "common_universe")
@@ -559,6 +721,13 @@ def run_backtest() -> None:
         eval_start_ms = end_ms - int(args.days * 24 * 60 * 60 * 1000)
     else:
         start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(args.days, end_ms, min_bars)
+    if bool(args.live_parity):
+        pre_bars = max(30, int(args.bootstrap_bars))
+        start_ms = min(start_ms, int(eval_start_ms - (pre_bars * _tf_ms(cfg_live.tf_ltf))))
+        print(
+            f"[BACKTEST] live_parity=1 cache_only=1 common_only=1 use_confirmed=1 "
+            f"bootstrap_bars={pre_bars}"
+        )
 
     if args.rolling_zones and not args.total_window_days:
         print("[BACKTEST] rolling_zones requires total_window_days")
@@ -592,6 +761,8 @@ def run_backtest() -> None:
             end_ms=end_ms,
             top_n=args.top_n,
             cadence=cadence,
+            cadence_days=max(1, int(args.fixed_replay_cadence_days or 1)),
+            cadence_phase=int(args.fixed_replay_cadence_phase or 0),
         )
         union_syms: List[str] = []
         seen_syms = set()
@@ -603,7 +774,10 @@ def run_backtest() -> None:
                 union_syms.append(s)
         universe = union_syms
         print(
-            f"[BACKTEST] fixed_replay_schedule cadence={cadence} segments={len(replay_schedule)} "
+            f"[BACKTEST] fixed_replay_schedule cadence={cadence} "
+            f"cadence_days={max(1, int(args.fixed_replay_cadence_days or 1))} "
+            f"cadence_phase={max(0, int(args.fixed_replay_cadence_phase or 0)) % max(1, int(args.fixed_replay_cadence_days or 1))} "
+            f"segments={len(replay_schedule)} "
             f"union_symbols={len(universe)}"
         )
         for seg in replay_schedule:
@@ -717,6 +891,8 @@ def run_backtest() -> None:
         "retest_fail_shallow": 0,
         "entry_by_pass_close": 0,
         "entry_by_pass_high": 0,
+        "entry_immediate": 0,
+        "entry_ema_dev_fail": 0,
         "reject_pass_1h": 0,
         "reject_pass_15m": 0,
         "zone_accept_pass": 0,
@@ -725,24 +901,86 @@ def run_backtest() -> None:
         "ltf_sr_bias_block": 0,
     }
 
+    def _load_admin_runtime_settings_from_db() -> dict:
+        db_path = os.getenv("TRADES_DB_PATH", os.path.join("logs", "trades.db")).strip()
+        if not db_path or not os.path.exists(db_path):
+            return {}
+        con = None
+        try:
+            con = sqlite3.connect(db_path)
+            cur = con.cursor()
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(account_settings)").fetchall()]
+            if not cols:
+                return {}
+            admin_id = None
+            try:
+                row = cur.execute(
+                    "SELECT id FROM accounts WHERE name='admin' ORDER BY id ASC LIMIT 1"
+                ).fetchone()
+                if row:
+                    admin_id = int(row[0])
+            except Exception:
+                admin_id = None
+            if admin_id is None:
+                try:
+                    row = cur.execute(
+                        "SELECT account_id FROM account_settings ORDER BY account_id ASC LIMIT 1"
+                    ).fetchone()
+                    if row:
+                        admin_id = int(row[0])
+                except Exception:
+                    admin_id = None
+            if admin_id is None:
+                return {}
+            row = cur.execute(
+                "SELECT * FROM account_settings WHERE account_id = ? LIMIT 1",
+                (admin_id,),
+            ).fetchone()
+            if not row:
+                return {}
+            return dict(zip(cols, row))
+        except Exception:
+            return {}
+        finally:
+            try:
+                if con is not None:
+                    con.close()
+            except Exception:
+                pass
+
+    _runtime_db = _load_admin_runtime_settings_from_db()
+
+    def _load_state_runtime_settings() -> dict:
+        try:
+            if not os.path.exists("state.json"):
+                return {}
+            with open("state.json", "r", encoding="utf-8") as f:
+                st = json.load(f)
+            return st if isinstance(st, dict) else {}
+        except Exception:
+            return {}
+
+    _runtime_state = _load_state_runtime_settings()
+
     def _load_entry_block_hours() -> set[int]:
-        # prefer explicit args, else read from state.json or ENV ENTRY_BLOCK_HOURS
+        # explicit args -> admin account_settings(DB) -> state.json -> ENV
         if args.block_hours:
             try:
                 return {int(h.strip()) for h in args.block_hours.split(",") if h.strip() != ""}
             except Exception:
                 return set()
-        try:
-            if os.path.exists("state.json"):
-                with open("state.json", "r", encoding="utf-8") as f:
-                    st = json.load(f)
-                raw = ""
-                if isinstance(st, dict):
-                    raw = str(st.get("_entry_block_hours") or st.get("entry_block_hours") or "")
-                if raw:
-                    return {int(h.strip()) for h in raw.split(",") if h.strip() != ""}
-        except Exception:
-            pass
+        raw_db = str(_runtime_db.get("entry_block_hours") or "").strip()
+        if raw_db:
+            try:
+                return {int(h.strip()) for h in raw_db.split(",") if h.strip() != ""}
+            except Exception:
+                pass
+        raw_state = str(_runtime_state.get("_entry_block_hours") or _runtime_state.get("entry_block_hours") or "").strip()
+        if raw_state:
+            try:
+                return {int(h.strip()) for h in raw_state.split(",") if h.strip() != ""}
+            except Exception:
+                pass
         raw_env = os.getenv("ENTRY_BLOCK_HOURS", "").strip()
         if raw_env:
             try:
@@ -751,7 +989,38 @@ def run_backtest() -> None:
                 return set()
         return set()
 
+    def _load_exit_cooldown_sec() -> int:
+        if int(args.cooldown_sec) >= 0:
+            return int(args.cooldown_sec)
+        raw_db_h = _runtime_db.get("exit_cooldown_h")
+        if raw_db_h is not None:
+            try:
+                return max(0, int(float(raw_db_h) * 3600.0))
+            except Exception:
+                pass
+        raw_h = _runtime_state.get("_exit_cooldown_hours", _runtime_state.get("exit_cooldown_h"))
+        if raw_h is not None:
+            try:
+                return max(0, int(float(raw_h) * 3600.0))
+            except Exception:
+                pass
+        raw_sec = _runtime_state.get("_cooldown_sec", _runtime_state.get("cooldown_sec"))
+        if raw_sec is not None:
+            try:
+                return max(0, int(float(raw_sec)))
+            except Exception:
+                pass
+        return 0
+
     block_hours = _load_entry_block_hours()
+    cooldown_ms = max(0, _load_exit_cooldown_sec()) * 1000
+    print(
+        f"[BACKTEST] runtime_sync entry_block_hours="
+        f"{','.join(str(h) for h in sorted(block_hours)) if block_hours else 'none'} "
+        f"cooldown_sec={int(cooldown_ms/1000)} "
+        f"entry_model={entry_model} "
+        f"db_settings={int(bool(_runtime_db))} state_settings={int(bool(_runtime_state))}"
+    )
 
     entries_by_day: Dict[str, int] = {}
     entry_reason_stats: Dict[str, Dict[str, float]] = {}
@@ -994,6 +1263,17 @@ def run_backtest() -> None:
                 trade["hold_bars"] += 1
                 trade["mfe"] = max(trade["mfe"], max(0.0, (high_i - trade["entry_px"]) / trade["entry_px"]))
                 trade["mae"] = max(trade["mae"], max(0.0, (trade["entry_px"] - low_i) / trade["entry_px"]))
+                # Strong-only protective stop raise: once price reaches trigger, lift stop near entry.
+                if (
+                    str(trade.get("track") or "").lower() == "strong"
+                    and float(args.strong_be_trigger_mult) > 0
+                    and float(args.strong_be_stop_buffer_pct) >= 0
+                    and trade["entry_px"] > 0
+                    and high_i >= (trade["entry_px"] * float(args.strong_be_trigger_mult))
+                ):
+                    be_stop = trade["entry_px"] * (1.0 - float(args.strong_be_stop_buffer_pct))
+                    if be_stop > float(trade.get("sl_price", 0.0)):
+                        trade["sl_price"] = be_stop
                 sl_hit = low_i <= trade["sl_price"]
                 tp_hit = high_i >= trade["tp_price"]
                 # On same-bar TP/SL touch, force SL-first to avoid optimistic fills.
@@ -1036,7 +1316,8 @@ def run_backtest() -> None:
                             "pnl_pct": pnl_pct,
                         }
                     )
-                    cooldown_until[(sym, "LONG")] = ts + (60 * 60 * 1000)
+                    if cooldown_ms > 0:
+                        cooldown_until[(sym, "LONG")] = ts + cooldown_ms
                     if dbg_on:
                         dbg_counts["exits"] += 1
                         _dbg(ts, "exit_sl", f"entry_ts={_iso_kst(trade['entry_ts'])} exit_px={exit_px:.6f}")
@@ -1377,9 +1658,10 @@ def run_backtest() -> None:
                     ema_entry = float(ema_3m_entry.iloc[i3]) if len(ema_3m_entry) > i3 and not np.isnan(ema_3m_entry.iloc[i3]) else None
                     entry_offset = float(cfg.entry_atr_offset if strong_break else getattr(cfg, "entry_atr_offset_weak", cfg.entry_atr_offset))
                     entry_target = None
+                    immediate_entry = bool(getattr(args, "entry_immediate_on_close_reclaim", False)) and (entry_reason == "close_reclaim")
                     if isinstance(ema_entry, (int, float)) and atr_now > 0:
                         entry_target = float(ema_entry) - (atr_now * entry_offset)
-                    if entry_target is None or low_now > entry_target:
+                    if (not immediate_entry) and (entry_target is None or low_now > entry_target):
                         if dbg_on:
                             dbg_counts["fail_entry_target"] += 1
                             _dbg(
@@ -1400,7 +1682,65 @@ def run_backtest() -> None:
                                     f"close={close_now:.6f} open={open_now:.6f} target={float(entry_target):.6f}",
                                 )
                             continue
-                    entry_px = float(entry_target)
+                    max_dev_pct = float(getattr(args, "entry_ema_max_dev_pct", 0.0) or 0.0)
+                    if (
+                        max_dev_pct > 0
+                        and isinstance(ema_entry, (int, float))
+                        and float(ema_entry) > 0
+                    ):
+                        ema_dev_pct = (close_now - float(ema_entry)) / float(ema_entry)
+                        if ema_dev_pct > max_dev_pct:
+                            if args.log_gates:
+                                gate_counts["entry_ema_dev_fail"] += 1
+                            if dbg_on:
+                                _dbg(
+                                    ts,
+                                    "entry_ema_dev",
+                                    (
+                                        f"close={close_now:.6f} ema={float(ema_entry):.6f} "
+                                        f"dev_pct={ema_dev_pct*100.0:.2f} max={max_dev_pct*100.0:.2f}"
+                                    ),
+                                )
+                            continue
+                    next_idx = i3 + 1
+                    if next_idx >= len(df_3m):
+                        continue
+                    entry_ts_ms = int(df_3m.at[next_idx, "ts"])
+                    if entry_model == "signal_close":
+                        entry_px = float(close_now)
+                        entry_ts_ms = int(ts)
+                        if args.log_gates:
+                            gate_counts["entry_immediate"] += 1
+                    elif immediate_entry:
+                        chase_cap = float(getattr(args, "entry_immediate_max_chase_pct", 0.0) or 0.0)
+                        if (
+                            chase_cap > 0
+                            and isinstance(ema_entry, (int, float))
+                            and float(ema_entry) > 0
+                        ):
+                            chase_pct = (close_now - float(ema_entry)) / float(ema_entry)
+                            if chase_pct > chase_cap:
+                                if dbg_on:
+                                    dbg_counts["fail_entry_target"] += 1
+                                    _dbg(
+                                        ts,
+                                        "entry_immediate_chase",
+                                        (
+                                            f"close={close_now:.6f} ema={float(ema_entry):.6f} "
+                                            f"chase_pct={chase_pct*100.0:.2f} max={chase_cap*100.0:.2f}"
+                                        ),
+                                    )
+                                continue
+                        if str(getattr(args, "immediate_entry_fill", "close")).lower() == "next_open":
+                            entry_px = float(df_3m.at[next_idx, "open"])
+                            entry_ts_ms = int(df_3m.at[next_idx, "ts"])
+                        else:
+                            entry_px = float(close_now)
+                            entry_ts_ms = int(ts)
+                        if args.log_gates:
+                            gate_counts["entry_immediate"] += 1
+                    else:
+                        entry_px = float(entry_target)
                     if args.ltf_sr_bias:
                         lb = max(5, int(args.ltf_sr_lookback))
                         start = max(0, i3 - lb + 1)
@@ -1471,7 +1811,7 @@ def run_backtest() -> None:
                         "mfe": 0.0,
                         "mae": 0.0,
                         "hold_bars": 0,
-                        "entry_ts": int(df_3m.at[i3 + 1, "ts"]),
+                        "entry_ts": int(entry_ts_ms),
                         "track": "strong" if strong_break else "weak",
                         "reason": entry_reason,
                     }

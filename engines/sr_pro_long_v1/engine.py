@@ -24,7 +24,7 @@ class SrProLongV1Config:
     require_reject_close: bool = False
     reject_mode: str = "top"
     reject_source: str = "1h"
-    ema200_filter: bool = True
+    ema200_filter: bool = False
     ema_filter_len: int = 200
     total_window_days: int = 14
     rolling_zones: bool = True
@@ -32,7 +32,7 @@ class SrProLongV1Config:
     retest_atr_mult: float = 0.20
     retest_near_atr_mult: float = 0.15
     retest_wick_max: float = 0.4
-    retest_reclaim_min_atr: float = 0.05
+    retest_reclaim_min_atr: float = 0.03
     retest_dyn: bool = False
     retest_dyn_th: float = 0.6
     retest_dyn_bars: int = 10
@@ -42,23 +42,29 @@ class SrProLongV1Config:
     require_sweep_reclaim: bool = False
     sweep_lookback: int = 12
     sweep_tol_atr: float = 0.05
-    max_break_ext_atr: float = 3.0
+    max_break_ext_atr: float = 2.2
     shallow_atr_mult: float = 0.35
     shallow_wick_max: float = 0.35
     shallow_dvf_min: float = 0.0
     entry_ema_len: int = 7
     entry_atr_offset: float = 0.15
-    entry_atr_offset_weak: float = 0.15
-    entry_candle_guard: bool = False
+    entry_atr_offset_weak: float = 0.18
+    entry_ema_max_dev_pct: float = 0.02
+    entry_immediate_on_close_reclaim: bool = True
+    entry_immediate_max_chase_pct: float = 0.0
+    entry_candle_guard: bool = True
     retest_breakdown_block_atr: float = 0.0
     sl_buffer: float = 0.00
-    sl_atr_mult: float = 0.04
-    sl_cap_pct: float = 0.018
+    # 1% 고정형 SL: cap을 1%로 두고 ATR 기반 원시 SL을 충분히 넓혀 cap이 주로 적용되게 설정
+    sl_atr_mult: float = 10.0
+    sl_cap_pct: float = 0.010
     sl_cap_atr_mult: float = 0.0
     tp_atr_mult: float = 0.0
     tp_atr_mult_weak: float = 0.0
-    tp_mult: float = 1.020
-    tp_mult_weak: float = 1.022
+    tp_mult: float = 1.010
+    tp_mult_weak: float = 1.010
+    strong_be_trigger_mult: float = 0.0
+    strong_be_stop_buffer_pct: float = 0.0
 
 
 class SrProLongV1Engine(BaseEngine):

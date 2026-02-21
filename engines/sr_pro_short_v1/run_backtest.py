@@ -20,6 +20,23 @@ if ROOT not in sys.path:
 from engines.backtest_common import calc_warmup_window, load_common_universe, log_warmup_info
 from engines.sr_pro_short_v1.engine import SrProShortV1Config
 from engines.sr_pro_common import build_sr_zones
+from env_loader import load_env
+
+load_env(os.path.join(ROOT, ".env"))
+
+
+def _parse_kst_datetime_to_ms(raw: str) -> int:
+    s = str(raw or "").strip()
+    if not s:
+        raise ValueError("empty datetime")
+    kst = timezone(timedelta(hours=9))
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=kst)
+            return int(dt.astimezone(timezone.utc).timestamp() * 1000)
+        except Exception:
+            continue
+    raise ValueError(f"invalid KST datetime format: {raw}")
 
 
 def _read_cached_csv(path: str) -> List[List[float]]:
@@ -155,16 +172,18 @@ def _latest_kst_anchor_ms(
     cadence_days: int = 2,
     anchor_hour: int = 0,
     anchor_minute: int = 30,
+    phase_days: int = 0,
 ) -> int:
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(kst)
     cadence_days = max(1, int(cadence_days))
+    phase_days = max(0, int(phase_days)) % cadence_days
     anchor_hour = max(0, min(23, int(anchor_hour)))
     anchor_minute = max(0, min(59, int(anchor_minute)))
     anchor_kst = now_kst.replace(hour=anchor_hour, minute=anchor_minute, second=0, microsecond=0)
     if now_kst < anchor_kst:
         anchor_kst -= timedelta(days=1)
-    while ((anchor_kst.day - 1) % cadence_days) != 0:
+    while ((anchor_kst.day - 1 - phase_days) % cadence_days) != 0:
         anchor_kst -= timedelta(days=1)
     return int(anchor_kst.astimezone(timezone.utc).timestamp() * 1000)
 
@@ -185,6 +204,7 @@ def _anchor_series_ms(
     cadence_days: int = 2,
     anchor_hour: int = 0,
     anchor_minute: int = 30,
+    phase_days: int = 0,
 ) -> List[int]:
     if end_ms <= 0:
         return []
@@ -194,6 +214,7 @@ def _anchor_series_ms(
         cadence_days=cadence_days,
         anchor_hour=anchor_hour,
         anchor_minute=anchor_minute,
+        phase_days=phase_days,
     )
     out: List[int] = []
     cur = first
@@ -217,7 +238,7 @@ def _load_common_universe_from_snapshot_log(
 
     def _parse_name_ts(name: str) -> float:
         try:
-            # common_universe_YYYYMMDD_HHMMSS.log (KST wall clock)
+            # Fallback-only: filename timestamp may drift from actual refresh timing.
             stem = str(name).removesuffix(".log")
             ts_part = stem.replace("common_universe_", "", 1)
             dt_kst = datetime.strptime(ts_part, "%Y%m%d_%H%M%S").replace(tzinfo=timezone(timedelta(hours=9)))
@@ -230,10 +251,11 @@ def _load_common_universe_from_snapshot_log(
             if not (name.startswith("common_universe_") and name.endswith(".log")):
                 continue
             full = os.path.join(logs_dir, name)
+            # Match live selector: filename timestamp first, then mtime fallback.
             ts_sec = _parse_name_ts(name)
             if ts_sec <= 0:
                 try:
-                    ts_sec = os.path.getmtime(full)
+                    ts_sec = float(os.path.getmtime(full))
                 except Exception:
                     continue
             candidates.append((float(ts_sec), full))
@@ -243,8 +265,8 @@ def _load_common_universe_from_snapshot_log(
     if not candidates:
         return [], ""
 
-    anchor_sec = anchor_ms / 1000.0
-    before_or_eq = [c for c in candidates if c[0] <= anchor_sec]
+    cutoff_sec = (anchor_ms / 1000.0) if isinstance(anchor_ms, (int, float)) and anchor_ms > 0 else 0.0
+    before_or_eq = [c for c in candidates if c[0] <= cutoff_sec] if cutoff_sec > 0 else []
     if before_or_eq:
         before_or_eq.sort(key=lambda x: x[0], reverse=True)
         chosen = before_or_eq[0][1]
@@ -276,6 +298,7 @@ def _build_fixed_anchor_replay_schedule(
     cadence_days: int = 2,
     anchor_hour: int = 0,
     anchor_minute: int = 30,
+    phase_days: int = 0,
 ) -> List[dict]:
     anchors = _anchor_series_ms(
         eval_start_ms=eval_start_ms,
@@ -283,6 +306,7 @@ def _build_fixed_anchor_replay_schedule(
         cadence_days=cadence_days,
         anchor_hour=anchor_hour,
         anchor_minute=anchor_minute,
+        phase_days=phase_days,
     )
     if not anchors:
         return []
@@ -373,13 +397,43 @@ def run_backtest() -> None:
     cfg_live = SrProShortV1Config()
     parser = argparse.ArgumentParser("sr_pro_short_v1 backtest")
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument(
+        "--start-kst",
+        type=str,
+        default="",
+        help="Fixed eval start datetime in KST (e.g. '2026-02-19 09:00').",
+    )
+    parser.add_argument(
+        "--end-kst",
+        type=str,
+        default="",
+        help="Fixed eval end datetime in KST (e.g. '2026-02-19 12:10').",
+    )
     parser.add_argument("--universe", type=str, default="common")
     parser.add_argument("--use-confirmed", action="store_true")
-    parser.add_argument("--index-mode", type=str, default="auto", choices=["auto", "ts", "decision"])
+    parser.add_argument("--no-use-confirmed", dest="use_confirmed", action="store_false")
+    parser.add_argument("--index-mode", type=str, default="ts", choices=["auto", "ts", "decision"])
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--common-only", action="store_true")
     parser.add_argument("--common-warmup-dir", type=str, default="")
-    parser.add_argument("--top-n", type=int, default=50)
+    parser.add_argument("--live-parity", action="store_true", help="Force live-equivalent data/parity mode.")
+    parser.add_argument(
+        "--bootstrap-bars",
+        type=int,
+        default=int(os.getenv("SR_PRO_SHORT_V1_BOOTSTRAP_BARS", "1440") or 1440),
+        help="Pre-roll bars for --live-parity (ltf bars).",
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=int(
+            os.getenv(
+                "SR_PRO_SHORT_V1_FIXED_UNIVERSE_TOP_N",
+                os.getenv("COMMON_UNIVERSE_TOP_N", "50"),
+            )
+            or 50
+        ),
+    )
     parser.add_argument("--exclude-symbols", type=str, default="")
     parser.add_argument("--lookback", type=int, default=20)
     parser.add_argument("--relaxed-lookback", type=int, default=10)
@@ -470,8 +524,8 @@ def run_backtest() -> None:
     parser.add_argument("--ema-slope-min", type=float, default=0.001)
     parser.add_argument("--sl-buffer", type=float, default=float(cfg_live.sl_buffer))
     parser.add_argument("--sl-atr-mult", type=float, default=0.4)
-    parser.add_argument("--sl-cap-pct", type=float, default=0.02)
-    parser.add_argument("--sl-cap-atr-mult", type=float, default=0.6)
+    parser.add_argument("--sl-cap-pct", type=float, default=float(getattr(cfg_live, "sl_cap_pct", 0.01)))
+    parser.add_argument("--sl-cap-atr-mult", type=float, default=float(getattr(cfg_live, "sl_cap_atr_mult", 0.0)))
     parser.add_argument("--tp-atr-mult", type=float, default=0.0)
     parser.add_argument("--tp-atr-mult-weak", type=float, default=0.0)
     parser.add_argument("--tp-mult", type=float, default=float(cfg_live.tp_mult))
@@ -507,9 +561,26 @@ def run_backtest() -> None:
         help="Disable replay mode and use a single fixed anchor for full eval window.",
     )
     parser.set_defaults(fixed_even_day_0030_kst_replay=True)
-    parser.add_argument("--fixed-anchor-cadence-days", type=int, default=1)
-    parser.add_argument("--fixed-kst-anchor-hour", type=int, default=9)
-    parser.add_argument("--fixed-kst-anchor-minute", type=int, default=0)
+    parser.add_argument(
+        "--fixed-anchor-cadence-days",
+        type=int,
+        default=int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_CADENCE_DAYS", "1") or 1),
+    )
+    parser.add_argument(
+        "--fixed-anchor-phase-days",
+        type=int,
+        default=int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_PHASE_DAYS", "0") or 0),
+    )
+    parser.add_argument(
+        "--fixed-kst-anchor-hour",
+        type=int,
+        default=int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_HOUR", "9") or 9),
+    )
+    parser.add_argument(
+        "--fixed-kst-anchor-minute",
+        type=int,
+        default=int(os.getenv("SR_PRO_SHORT_V1_FIXED_ANCHOR_KST_MINUTE", "0") or 0),
+    )
     parser.add_argument("--zones-snapshot-in", type=str, default="")
     parser.add_argument("--zones-snapshot-out", type=str, default="")
     parser.add_argument("--verbose", action="store_true")
@@ -521,6 +592,11 @@ def run_backtest() -> None:
     parser.add_argument("--ltf-sr-bias", action="store_true")
     parser.add_argument("--ltf-sr-lookback", type=int, default=60)
     args = parser.parse_args()
+    if bool(args.live_parity):
+        args.cache_only = True
+        args.common_only = True
+        args.use_confirmed = True
+        args.index_mode = "ts"
     if args.fixed_even_day_0030_kst and args.rolling_zones:
         args.rolling_zones = False
         print("[BACKTEST] fixed_anchor_mode forces rolling_zones=False")
@@ -582,6 +658,12 @@ def run_backtest() -> None:
 
     exchange = None if args.cache_only else ccxt.binance({"enableRateLimit": True})
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if args.end_kst:
+        try:
+            end_ms = _parse_kst_datetime_to_ms(args.end_kst)
+        except Exception as e:
+            print(f"[BACKTEST] end_kst_parse_error={e}")
+            return
     anchor_ms = 0
     if args.fixed_even_day_0030_kst:
         anchor_ms = _latest_kst_anchor_ms(
@@ -589,9 +671,11 @@ def run_backtest() -> None:
             cadence_days=args.fixed_anchor_cadence_days,
             anchor_hour=args.fixed_kst_anchor_hour,
             anchor_minute=args.fixed_kst_anchor_minute,
+            phase_days=args.fixed_anchor_phase_days,
         )
         print(
             f"[BACKTEST] fixed_anchor_mode=kst_{int(args.fixed_anchor_cadence_days)}d_"
+            f"p{int(args.fixed_anchor_phase_days)}_"
             f"{int(args.fixed_kst_anchor_hour):02d}{int(args.fixed_kst_anchor_minute):02d} "
             f"anchor_kst={_ts_kst(anchor_ms)} anchor_utc={datetime.fromtimestamp(anchor_ms/1000.0, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}"
         )
@@ -619,6 +703,33 @@ def run_backtest() -> None:
     else:
         start_ms, eval_start_ms, warmup_days, warmup_minutes = calc_warmup_window(
             args.days, end_ms, min_bars
+        )
+
+    if args.start_kst:
+        try:
+            eval_start_ms = _parse_kst_datetime_to_ms(args.start_kst)
+        except Exception as e:
+            print(f"[BACKTEST] start_kst_parse_error={e}")
+            return
+        if eval_start_ms >= end_ms:
+            print("[BACKTEST] start_kst must be earlier than end_kst/now")
+            return
+        if args.total_window_days:
+            start_ms = eval_start_ms - int(args.total_window_days * 24 * 60 * 60 * 1000)
+        else:
+            warmup_ms = int(max(1, warmup_minutes) * 60 * 1000)
+            start_ms = eval_start_ms - warmup_ms
+        print(
+            f"[BACKTEST] fixed_eval_window "
+            f"start_kst={_ts_kst(eval_start_ms)} end_kst={_ts_kst(end_ms)} "
+            f"warmup_start_kst={_ts_kst(start_ms)}"
+        )
+    if bool(args.live_parity):
+        pre_bars = max(30, int(args.bootstrap_bars))
+        start_ms = min(start_ms, int(eval_start_ms - (pre_bars * _tf_ms(cfg_live.tf_ltf))))
+        print(
+            f"[BACKTEST] live_parity=1 cache_only=1 common_only=1 use_confirmed=1 "
+            f"index_mode=ts bootstrap_bars={pre_bars}"
         )
 
     if args.rolling_zones and not args.total_window_days:
@@ -652,6 +763,7 @@ def run_backtest() -> None:
             cadence_days=args.fixed_anchor_cadence_days,
             anchor_hour=args.fixed_kst_anchor_hour,
             anchor_minute=args.fixed_kst_anchor_minute,
+            phase_days=args.fixed_anchor_phase_days,
         )
         union_syms: List[str] = []
         seen_syms = set()
@@ -663,7 +775,8 @@ def run_backtest() -> None:
                 union_syms.append(s)
         universe = union_syms
         print(
-            f"[BACKTEST] fixed_replay_schedule segments={len(replay_schedule)} "
+            f"[BACKTEST] fixed_replay_schedule cadence_days={int(args.fixed_anchor_cadence_days)} "
+            f"phase_days={int(args.fixed_anchor_phase_days)} segments={len(replay_schedule)} "
             f"union_symbols={len(universe)}"
         )
         for seg in replay_schedule:
@@ -1683,10 +1796,10 @@ def run_backtest() -> None:
             except Exception:
                 atr_now = 0.0
             def _apply_sl_cap(entry_px: float, sl_price: float, atr_now: float) -> float:
-                cap_pct = float(args.sl_cap_pct)
-                if entry_px > 0 and atr_now > 0:
-                    cap_pct = max(cap_pct, (atr_now * float(args.sl_cap_atr_mult)) / entry_px)
-                return min(sl_price, entry_px * (1.0 + cap_pct))
+                # Keep short SL distance fixed at sl_cap_pct from entry.
+                if entry_px <= 0:
+                    return sl_price
+                return entry_px * (1.0 + float(args.sl_cap_pct))
 
             def _ltf_sr_bias_pass(entry_px: float, track: str = "") -> bool:
                 if not args.ltf_sr_bias:

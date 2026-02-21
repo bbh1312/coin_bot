@@ -7,16 +7,13 @@
 - /entry_usdt 값 확인
 - 엔진 토글 ON/OFF 확인 (웹/텔레그램)
   - /sr_pro_short_v1 on|off|status
-  - /sr_pro_short_v2 on|off|status
-  - /short_bend_15m3m on|off|status
+  - /sr_pro_long_v3 on|off|status
   - /sr_pro_long_v1 on|off|status
-  - /scout_only_exhaustion_short on|off|status
 
 ## 2) TP/SL 적용
 - 공통 TP/SL: /l_exit_tp, /l_exit_sl, /s_exit_tp, /s_exit_sl
 - 엔진별 TP/SL override: /engine_exit ENGINE SIDE tp sl
-- 엔진명 표기: SR_PRO_SHORT_V1, SR_PRO_SHORT_V2, SR_PRO_LONG_V1, SCOUT_ONLY_EXHAUSTION_SHORT, DTFX, DIV15M_LONG, DIV15M_SHORT, RSI
-  - short_bend 엔진: SHORT_BEND_15M3M
+- 엔진명 표기: SR_PRO_SHORT_V1, SR_PRO_LONG_V3, SR_PRO_LONG_V1, DTFX, DIV15M_LONG, DIV15M_SHORT, RSI
 
 ## 3) 엔트리 게이트
 - max_pos 제한 적용 여부 확인
@@ -32,7 +29,6 @@
 - 재시작 시 API 기준 동기화 완료 여부
 - state.json의 엔진 토글/override 값 정상 반영
 - in_pos/entry_order_id 동기화 확인
-  - _scout_only_exhaustion_short_enabled 값 반영 확인
 
 ## 6) 관리모드 화이트리스트
 - `_process_manage_queue()`의 `allowed_engines`에 신규 엔진 라벨 포함 확인
